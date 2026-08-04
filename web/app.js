@@ -79,6 +79,10 @@ function displayJobLog(lines) {
       visible.push(text.replace("@@TEST_STEP@@ ", "Running test suite: "));
       continue;
     }
+    if (plain.startsWith("@@TEST_ERROR@@ ")) {
+      visible.push(text.replace("@@TEST_ERROR@@ ", "Test infrastructure error: "));
+      continue;
+    }
     if (plain.startsWith("TEST summary ")) {
       testRunning = false;
       continue;
@@ -89,9 +93,6 @@ function displayJobLog(lines) {
     if (testRunning) {
       if (/^\{.*"Action"\s*:/.test(plain)) {
         continue;
-      }
-      if (/^ERROR:\s/.test(plain)) {
-        visible.push(text);
       }
       continue;
     }

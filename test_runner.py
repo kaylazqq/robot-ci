@@ -277,10 +277,10 @@ def run_command(command: dict[str, Any], repo_dir: Path, report_dir: Path) -> tu
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
         print(output, end="" if output.endswith("\n") else "\n", flush=True)
-        print("ERROR: test command timed out", flush=True)
+        print("@@TEST_ERROR@@ test command timed out", flush=True)
         return 124, output + "\nERROR: timeout", int((time.monotonic() - started) * 1000)
     except OSError as exc:
-        print(f"ERROR: {exc}", flush=True)
+        print(f"@@TEST_ERROR@@ {exc}", flush=True)
         return 127, str(exc), int((time.monotonic() - started) * 1000)
 
 
