@@ -90,7 +90,7 @@ function displayJobLog(lines) {
       if (/^\{.*"Action"\s*:/.test(plain)) {
         continue;
       }
-      if (/(^|\s)(error|failed|failure|panic|traceback)(:|\s|$)/i.test(plain)) {
+      if (/^ERROR:\s/.test(plain)) {
         visible.push(text);
       }
       continue;
@@ -232,7 +232,7 @@ function renderTestResult(job) {
     });
     table.appendChild(body);
     root.appendChild(table);
-    if (pageCount > 1) {
+    {
       const pager = document.createElement("div");
       pager.className = "test-pager";
       const sizeControl = document.createElement("label");
