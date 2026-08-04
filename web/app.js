@@ -6,6 +6,7 @@ let pollFails = 0;
 const branchCache = {};
 let testCasePage = 1;
 let testCaseJobId = "";
+let testCasePageSize = 10;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -71,11 +72,11 @@ function displayJobLog(lines) {
     const plain = text.replace(/^\[[^\]]+\]\s*/, "").trim();
     if (plain.startsWith("tests start ")) {
       testRunning = true;
-      visible.push(text.replace("tests start", "当前步骤：开始执行测试"));
+      visible.push(text.replace("tests start", "Starting tests"));
       continue;
     }
     if (plain.startsWith("@@TEST_STEP@@ ")) {
-      visible.push(text.replace("@@TEST_STEP@@ ", "当前步骤：执行测试 - "));
+      visible.push(text.replace("@@TEST_STEP@@ ", "Running test suite: "));
       continue;
     }
     if (plain.startsWith("TEST summary ")) {
@@ -86,6 +87,9 @@ function displayJobLog(lines) {
       continue;
     }
     if (testRunning) {
+      if (/^\{.*"Action"\s*:/.test(plain)) {
+        continue;
+      }
       if (/(^|\s)(error|failed|failure|panic|traceback)(:|\s|$)/i.test(plain)) {
         visible.push(text);
       }
@@ -101,7 +105,11 @@ function displayJobLog(lines) {
 
 function shortCaseName(name) {
   const value = String(name || "");
-  if (value.startsWith("github.com/")) return value.slice(value.lastIndexOf(".") + 1);
+  if (value.startsWith("Test") || value.startsWith("test_")) return value;
+  if (value.startsWith("github.com/")) {
+    const testMarker = value.indexOf(".Test");
+    return testMarker >= 0 ? value.slice(testMarker + 1) : value;
+  }
   const parts = value.split(".");
   return parts.length > 2 ? parts.slice(-2).join(".") : value;
 }
@@ -138,9 +146,21 @@ function renderTestResult(job) {
   head.append(title, overview);
   root.appendChild(head);
 
-  const rows = cases.length ? cases : commands;
+  const gateHint = document.createElement("div");
+  gateHint.className = "test-gate-hint";
+  gateHint.textContent = "当前测试结果不阻塞镜像构建和推送";
+  root.appendChild(gateHint);
+
+  const sourceRows = cases.length ? cases : commands;
+  const statusPriority = { failed: 0, error: 0, skipped: 1, passed: 2 };
+  const rows = cases.length
+    ? sourceRows.map((item, index) => ({ item, index }))
+        .sort((left, right) =>
+          (statusPriority[left.item.status] ?? 0) - (statusPriority[right.item.status] ?? 0) || left.index - right.index)
+        .map(({ item }) => item)
+    : sourceRows;
   if (rows.length) {
-    const pageSize = 25;
+    const pageSize = testCasePageSize;
     const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
     testCasePage = Math.min(testCasePage, pageCount);
     const start = (testCasePage - 1) * pageSize;
@@ -159,17 +179,27 @@ function renderTestResult(job) {
     const body = document.createElement("tbody");
     pageRows.forEach((command, index) => {
       const row = document.createElement("tr");
-      if (cases.length && (index === 0 || pageRows[index - 1].command !== command.command)) {
+      const sourceFile = command.file || command.command;
+      const previousSourceFile = index > 0 ? (pageRows[index - 1].file || pageRows[index - 1].command) : "";
+      if (cases.length && (index === 0 || previousSourceFile !== sourceFile)) {
         const script = document.createElement("td");
         script.className = "test-script";
-        script.textContent = command.command || "测试脚本";
+        script.textContent = sourceFile || "测试脚本";
         let span = 1;
-        while (index + span < pageRows.length && pageRows[index + span].command === command.command) span += 1;
+        while (index + span < pageRows.length && (pageRows[index + span].file || pageRows[index + span].command) === sourceFile) span += 1;
         script.rowSpan = span;
         row.appendChild(script);
       }
       const name = document.createElement("td");
-      name.textContent = cases.length ? shortCaseName(command.name) : command.name || "测试脚本";
+      const caseName = document.createElement("div");
+      caseName.textContent = cases.length ? shortCaseName(command.name) : command.name || "测试脚本";
+      name.appendChild(caseName);
+      if (command.detail && command.status !== "passed") {
+        const detail = document.createElement("div");
+        detail.className = "test-case-detail";
+        detail.textContent = command.detail;
+        name.appendChild(detail);
+      }
       const status = document.createElement("td");
       const caseStatus = command.status;
       const passed = caseStatus ? caseStatus === "passed" : Number(command.exit_code) === 0;
@@ -186,6 +216,23 @@ function renderTestResult(job) {
     if (pageCount > 1) {
       const pager = document.createElement("div");
       pager.className = "test-pager";
+      const sizeControl = document.createElement("label");
+      sizeControl.className = "test-page-size";
+      sizeControl.append("每页 ");
+      const sizeSelect = document.createElement("select");
+      [10, 25, 50, 100].forEach((size) => {
+        const option = document.createElement("option");
+        option.value = String(size);
+        option.textContent = String(size);
+        option.selected = size === testCasePageSize;
+        sizeSelect.appendChild(option);
+      });
+      sizeSelect.addEventListener("change", () => {
+        testCasePageSize = Number(sizeSelect.value) || 10;
+        testCasePage = 1;
+        renderTestResult(job);
+      });
+      sizeControl.append(sizeSelect, " 条");
       const previous = document.createElement("button");
       previous.type = "button";
       previous.className = "btn ghost";
@@ -200,7 +247,7 @@ function renderTestResult(job) {
       next.textContent = "下一页";
       next.disabled = testCasePage >= pageCount;
       next.addEventListener("click", () => { testCasePage += 1; renderTestResult(job); });
-      pager.append(previous, position, next);
+      pager.append(sizeControl, previous, position, next);
       root.appendChild(pager);
     }
   }

@@ -37,10 +37,18 @@ def failure(name: str, detail: str) -> dict[str, str]:
     return {"name": name, "detail": (detail or "test command failed").strip()[:1000]}
 
 
-def test_case(name: str, status: str, duration_ms: float | int | None = None, detail: str = "") -> dict[str, Any]:
+def test_case(
+    name: str,
+    status: str,
+    duration_ms: float | int | None = None,
+    detail: str = "",
+    source_file: str = "",
+) -> dict[str, Any]:
     item: dict[str, Any] = {"name": name, "status": status, "duration_ms": duration_ms}
     if detail:
         item["detail"] = detail.strip()[:1000]
+    if source_file:
+        item["file"] = source_file
     return item
 
 
@@ -52,8 +60,47 @@ def failure_cases(cases: list[dict[str, Any]]) -> list[dict[str, str]]:
     ]
 
 
+def _go_test_file_map(repo_dir: Path, packages: set[str]) -> dict[tuple[str, str], str]:
+    modules: list[tuple[str, Path]] = []
+    candidates = {repo_dir / "go.mod", *repo_dir.glob("*/go.mod"), *repo_dir.glob("*/*/go.mod")}
+    for go_mod in candidates:
+        if not go_mod.is_file():
+            continue
+        match = re.search(r"^module\s+(\S+)", go_mod.read_text(encoding="utf-8", errors="replace"), re.MULTILINE)
+        if match:
+            modules.append((match.group(1), go_mod.parent))
+
+    mapping: dict[tuple[str, str], str] = {}
+    for package in packages:
+        matches = [(module, root) for module, root in modules if package == module or package.startswith(module + "/")]
+        if not matches:
+            continue
+        module, module_root = max(matches, key=lambda item: len(item[0]))
+        suffix = package[len(module) :].lstrip("/")
+        package_dir = module_root / Path(suffix)
+        for test_file in sorted(package_dir.glob("*_test.go")):
+            content = test_file.read_text(encoding="utf-8", errors="replace")
+            relative = test_file.relative_to(repo_dir).as_posix()
+            for match in re.finditer(r"^\s*func\s+(Test[A-Za-z0-9_]+)\s*\(", content, re.MULTILINE):
+                mapping[(package, match.group(1))] = relative
+    return mapping
+
+
+def _go_case_detail(raw: str, status: str) -> str:
+    if status != "skipped":
+        return raw
+    reasons = []
+    for line in raw.splitlines():
+        clean = line.strip()
+        if not clean or clean.startswith(("=== RUN", "--- SKIP")):
+            continue
+        clean = re.sub(r"^[^:]+_test\.go:\d+:\s*", "", clean)
+        reasons.append(clean)
+    return reasons[-1] if reasons else "test skipped by source test"
+
+
 def parse_go_json(
-    path: Path, command_name: str, output: str
+    path: Path, command_name: str, output: str, repo_dir: Path
 ) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
     states: dict[tuple[str, str], str] = {}
     details: dict[tuple[str, str], str] = {}
@@ -86,17 +133,43 @@ def parse_go_json(
                 durations[key] = round(float(elapsed) * 1000, 3) if isinstance(elapsed, (int, float)) else None
                 if event_time and started.get(key):
                     durations[key] = max(0, round((event_time - started[key]).total_seconds() * 1000, 3))
-    cases = [
-        test_case(f"{package}.{test}", state, durations.get((package, test)), details.get((package, test), output if state == "failed" else ""))
-        for (package, test), state in states.items()
-    ]
+    parent_keys: set[tuple[str, str]] = set()
+    for package, test in states:
+        parts = test.split("/")
+        for index in range(1, len(parts)):
+            parent_keys.add((package, "/".join(parts[:index])))
+    source_files = _go_test_file_map(repo_dir, {package for package, _test in states})
+    cases = []
+    for (package, test), state in states.items():
+        if (package, test) in parent_keys:
+            continue
+        raw_detail = details.get((package, test), output if state == "failed" else "")
+        case_detail = "" if state == "passed" else _go_case_detail(raw_detail, state)
+        cases.append(
+            test_case(
+                test,
+                state,
+                durations.get((package, test)),
+                case_detail,
+                source_files.get((package, test.split("/", 1)[0]), ""),
+            )
+        )
     if not cases and output:
         cases = [test_case(command_name, "failed", None, output)]
     return len(cases), sum(item["status"] == "passed" for item in cases), sum(item["status"] == "failed" for item in cases), failure_cases(cases), cases
 
 
+def _python_case_location(repo_dir: Path, classname: str) -> tuple[str, str]:
+    parts = [part for part in classname.split(".") if part]
+    for size in range(len(parts), 0, -1):
+        candidate = repo_dir.joinpath(*parts[:size]).with_suffix(".py")
+        if candidate.is_file():
+            return candidate.relative_to(repo_dir).as_posix(), ".".join(parts[size:])
+    return "", classname
+
+
 def parse_junit(
-    path: Path, command_name: str, output: str
+    path: Path, command_name: str, output: str, repo_dir: Path
 ) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
     if not path.is_file():
         cases = [test_case(command_name, "error", None, output or "JUnit report was not produced")]
@@ -109,7 +182,8 @@ def parse_junit(
     cases = root.findall(".//testcase")
     parsed: list[dict[str, Any]] = []
     for case in cases:
-        label = ".".join(part for part in (case.get("classname"), case.get("name")) if part) or command_name
+        source_file, class_name = _python_case_location(repo_dir, case.get("classname") or "")
+        label = ".".join(part for part in (class_name, case.get("name")) if part) or command_name
         try:
             duration_ms = round(float(case.get("time") or 0) * 1000, 3)
         except ValueError:
@@ -120,10 +194,13 @@ def parse_junit(
             problem = case.find("error")
             if problem is not None:
                 status = "error"
-        if problem is None and case.find("skipped") is not None:
+        skipped = case.find("skipped")
+        if problem is None and skipped is not None:
             status = "skipped"
         detail = (problem.text or problem.get("message") or "test failed") if problem is not None else ""
-        parsed.append(test_case(label, status, duration_ms, detail))
+        if skipped is not None:
+            detail = skipped.get("message") or skipped.text or "test skipped by source test"
+        parsed.append(test_case(label, status, duration_ms, detail, source_file))
     return len(parsed), sum(item["status"] == "passed" for item in parsed), sum(item["status"] == "failed" for item in parsed), failure_cases(parsed), parsed
 
 
@@ -252,9 +329,9 @@ def main() -> int:
         code, output, elapsed = run_command(command, args.repo, args.report_dir)
         parser_name = command.get("parser") or "shell"
         if parser_name == "go-json":
-            total, passed, failed, failures, cases = parse_go_json(args.report_dir / command["report"], name, output)
+            total, passed, failed, failures, cases = parse_go_json(args.report_dir / command["report"], name, output, args.repo)
         elif parser_name == "junit":
-            total, passed, failed, failures, cases = parse_junit(args.report_dir / command["report"], name, output)
+            total, passed, failed, failures, cases = parse_junit(args.report_dir / command["report"], name, output, args.repo)
         elif parser_name == "case-json":
             total, passed, failed, failures, cases = parse_case_json(args.report_dir / command["report"], name, output)
         elif parser_name == "unittest":

@@ -22,7 +22,8 @@ def main() -> int:
         proc = subprocess.run(["bash", str(path)], cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
         detail = (proc.stdout or "").strip()[-1000:]
         item = {
-            "name": path.relative_to(root).as_posix(),
+            "name": path.name,
+            "file": path.relative_to(root).as_posix(),
             "status": "passed" if proc.returncode == 0 else "failed",
             "duration_ms": round((time.monotonic() - started) * 1000, 3),
         }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -22,11 +23,21 @@ class TimingResult(unittest.TextTestResult):
 
     def _record(self, test: unittest.TestCase, status: str, detail: str = "") -> None:
         started = self.started.pop(id(test), time.monotonic())
+        module_name = test.__class__.__module__
+        full_name = test.id()
+        display_name = full_name[len(module_name) + 1 :] if full_name.startswith(module_name + ".") else full_name
         item: dict[str, Any] = {
-            "name": test.id(),
+            "name": display_name,
             "status": status,
             "duration_ms": round((time.monotonic() - started) * 1000, 3),
         }
+        module = sys.modules.get(module_name)
+        source = Path(getattr(module, "__file__", "")) if module else None
+        if source and source.is_file():
+            try:
+                item["file"] = source.resolve().relative_to(Path.cwd().resolve()).as_posix()
+            except ValueError:
+                pass
         if detail:
             item["detail"] = detail.strip()[:1000]
         self.cases.append(item)
