@@ -1,0 +1,1316 @@
+#!/usr/bin/env python3
+"""SWR push helper for sharing: web login + GitHub branch → local build → push SWR."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlparse, urlunparse
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parent
+WEB_DIR = ROOT / "web"
+LOG_DIR = ROOT / "logs"
+CONFIG_PATH = ROOT / "config.json"
+SERVICES_PATH = ROOT / "services.json"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_jobs: dict[str, dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+_login_ok = False
+_login_lock = threading.Lock()
+_login_probe_cache: tuple[float, bool] | None = None  # (ts, ok)
+_token_cache: str | None = None
+_docker_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def job_meta_path(job_id: str) -> Path:
+    return LOG_DIR / f"job-{job_id}.json"
+
+
+def persist_job_meta(job_id: str) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        meta = {
+            k: job.get(k)
+            for k in ("id", "service_id", "branch", "status", "error", "remote")
+        }
+    try:
+        job_meta_path(job_id).write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
+    if not re.fullmatch(r"[0-9a-f]{8,32}", job_id or ""):
+        return None
+    meta_path = job_meta_path(job_id)
+    log_path = LOG_DIR / f"job-{job_id}.log"
+    if not meta_path.is_file() and not log_path.is_file():
+        return None
+    meta: dict[str, Any] = {"id": job_id, "status": "unknown"}
+    if meta_path.is_file():
+        try:
+            meta.update(json.loads(meta_path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            pass
+    log_lines: list[str] = []
+    if log_path.is_file():
+        try:
+            log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            pass
+    return {
+        "id": job_id,
+        "service_id": meta.get("service_id"),
+        "branch": meta.get("branch"),
+        "status": meta.get("status") or "unknown",
+        "error": meta.get("error"),
+        "remote": meta.get("remote"),
+        "log": log_lines,
+    }
+
+
+def load_config() -> dict[str, Any]:
+    cfg = {}
+    if CONFIG_PATH.is_file():
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    ws = (cfg.get("workspace_root") or "").strip()
+    if ws:
+        cfg["workspace_root"] = str(Path(ws).expanduser().resolve())
+    else:
+        # Prefer D: for WSL I/O; fall back to helper dir
+        preferred = Path(r"D:\swr-workspaces")
+        try:
+            preferred.mkdir(parents=True, exist_ok=True)
+            cfg["workspace_root"] = str(preferred.resolve())
+        except OSError:
+            cfg["workspace_root"] = str((ROOT / "workspaces").resolve())
+    Path(cfg["workspace_root"]).mkdir(parents=True, exist_ok=True)
+    cfg["host"] = cfg.get("host") or "127.0.0.1"
+    cfg["port"] = int(cfg.get("port") or 18888)
+    cfg["allow_remote"] = bool(cfg.get("allow_remote")) or str(
+        os.environ.get("SWR_ALLOW_REMOTE") or ""
+    ).lower() in ("1", "true", "yes")
+    cfg["swr_registry"] = cfg.get("swr_registry") or "swr.cn-southwest-2.myhuaweicloud.com"
+    cfg["swr_org"] = cfg.get("swr_org") or "public_ai"
+    cfg["wsl_distro"] = cfg.get("wsl_distro") or "Ubuntu"
+    cfg["build_timeout_sec"] = int(cfg.get("build_timeout_sec") or 7200)
+    cfg["github_token"] = (
+        (cfg.get("github_token") or "").strip()
+        or (os.environ.get("SWR_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+    )
+    ssh_key = (cfg.get("github_ssh_key") or os.environ.get("SWR_GITHUB_SSH_KEY") or "").strip()
+    if not ssh_key:
+        for cand in (
+            Path.home() / ".ssh" / "id_ed25519_github",
+            Path.home() / ".ssh" / "id_ed25519",
+            Path.home() / ".ssh" / "id_rsa",
+        ):
+            if cand.is_file():
+                ssh_key = str(cand)
+                break
+    cfg["github_ssh_key"] = ssh_key
+    # Prefer SSH when a key is present (server shared deploy)
+    if "github_use_ssh" in cfg:
+        cfg["github_use_ssh"] = bool(cfg.get("github_use_ssh"))
+    else:
+        cfg["github_use_ssh"] = bool(ssh_key)
+    cfg["helper_root"] = str(ROOT)
+    return cfg
+
+
+def save_config_value(key: str, value: Any) -> None:
+    global _token_cache
+    data = {}
+    if CONFIG_PATH.is_file():
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    data[key] = value
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if key == "github_token":
+        _token_cache = None
+
+
+CFG = load_config()
+
+
+def reload_cfg() -> None:
+    global CFG, _token_cache
+    CFG = load_config()
+    _token_cache = None
+
+
+def load_services() -> list[dict[str, Any]]:
+    return json.loads(SERVICES_PATH.read_text(encoding="utf-8"))
+
+
+def use_wsl() -> bool:
+    """Windows helper uses WSL Docker; Linux server uses native docker/bash."""
+    if os.name != "nt":
+        return False
+    return bool(shutil.which("wsl.exe") or shutil.which("wsl"))
+
+
+def wsl_prefix() -> list[str]:
+    return ["wsl.exe", "-d", CFG["wsl_distro"], "-u", "root", "--"]
+
+
+def shell_prefix() -> list[str]:
+    return wsl_prefix() if use_wsl() else []
+
+
+def bash_lc(script: str) -> list[str]:
+    return shell_prefix() + ["bash", "-lc", script]
+
+
+def host_path(path: Path) -> str:
+    """Path string usable inside the shell/docker host (WSL path on Windows)."""
+    if use_wsl():
+        return win_to_wsl(path)
+    return str(path.resolve()).replace("\\", "/")
+
+
+def run_cmd(
+    args: list[str],
+    timeout: int | None = 600,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
+    try:
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+        )
+        out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
+        return p.returncode, out.strip()
+    except subprocess.TimeoutExpired as e:
+        out = ((e.stdout or "") + "\n" + (e.stderr or "")).strip()
+        return 124, out + "\nERROR: timeout"
+    except FileNotFoundError:
+        return 127, f"ERROR: not found: {args[0]}"
+
+
+def run_cmd_stdin(args: list[str], stdin_text: str, timeout: int | None = 120) -> tuple[int, str]:
+    try:
+        p = subprocess.run(
+            args,
+            input=stdin_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
+        return p.returncode, out.strip()
+    except Exception as e:  # noqa: BLE001
+        return 1, str(e)
+
+
+def docker_cmd(*docker_args: str, timeout: int | None = 600) -> tuple[int, str]:
+    if use_wsl():
+        return run_cmd(wsl_prefix() + ["docker", *docker_args], timeout=timeout)
+    return run_cmd(["docker", *docker_args], timeout=timeout)
+
+
+def win_to_wsl(path: Path) -> str:
+    s = str(path.resolve())
+    m = re.match(r"^([A-Za-z]):[\\/](.*)$", s)
+    if not m:
+        return s.replace("\\", "/")
+    return f"/mnt/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}"
+
+
+def append_job_log(job_id: str, line: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    text = f"[{ts}] {line}"
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["log"].append(text)
+        Path(job["log_file"]).open("a", encoding="utf-8").write(text + "\n")
+
+
+def set_job(job_id: str, **fields: Any) -> None:
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(fields)
+    persist_job_meta(job_id)
+
+
+def git_bin() -> str:
+    return shutil.which("git") or "git"
+
+
+def git_env() -> dict[str, str]:
+    """Non-interactive git env; attach SSH key for GitHub when configured."""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    env["GIT_ASKPASS"] = ""
+    env["SSH_ASKPASS"] = ""
+    env["GCM_PRESERVE_CREDENTIALS"] = "true"
+    key = (CFG.get("github_ssh_key") or "").strip()
+    if key and Path(key).is_file():
+        # BatchMode=yes → never prompt for passphrase / host confirmation hang
+        env["GIT_SSH_COMMAND"] = (
+            f'ssh -i "{key}" -o IdentitiesOnly=yes -o BatchMode=yes '
+            f"-o StrictHostKeyChecking=accept-new"
+        )
+    return env
+
+
+def git_args(*args: str) -> list[str]:
+    """git with HTTPS credential helper disabled."""
+    return [
+        git_bin(),
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.interactive=never",
+        *args,
+    ]
+
+
+def to_github_ssh_url(url: str) -> str:
+    """https://github.com/org/repo.git -> git@github.com:org/repo.git"""
+    if url.startswith("git@"):
+        return url
+    pub = public_github_url(url)
+    m = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", pub)
+    if not m:
+        return url
+    return f"git@github.com:{m.group(1)}/{m.group(2)}.git"
+
+
+def clone_url_for(url: str) -> str:
+    if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
+        return to_github_ssh_url(url)
+    if gh_token():
+        return auth_github_url(public_github_url(url))
+    return public_github_url(url)
+
+
+def gh_token() -> str:
+    """Token from page/env, or non-interactive `gh auth token` (no GCM GUI)."""
+    global _token_cache
+    if _token_cache:
+        return _token_cache
+    tok = (CFG.get("github_token") or "").strip()
+    if tok:
+        _token_cache = tok
+        return tok
+    # gh CLI can return a token without opening the account-picker GUI
+    if shutil.which("gh"):
+        code, out = run_cmd(
+            ["gh", "auth", "token"],
+            timeout=8,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1", "GIT_TERMINAL_PROMPT": "0"},
+        )
+        if code == 0 and out.strip():
+            _token_cache = out.strip().splitlines()[0].strip()
+            return _token_cache
+    return ""
+
+
+def auth_github_url(url: str) -> str:
+    token = gh_token()
+    if not token or not url:
+        return url
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or "github.com" not in (parsed.hostname or "").lower():
+        return url
+    if parsed.username:
+        return url
+    netloc = f"x-access-token:{quote(token, safe='')}@{parsed.hostname}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def public_github_url(url: str) -> str:
+    parsed = urlparse(url or "")
+    if not parsed.hostname:
+        return url or ""
+    netloc = parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+    return urlunparse((parsed.scheme or "https", netloc, parsed.path, "", "", ""))
+
+
+def repo_full_name(svc: dict[str, Any]) -> str:
+    if svc.get("repo"):
+        return svc["repo"]
+    gh = public_github_url(svc.get("github") or "")
+    m = re.search(r"github\.com/([^/]+/[^/]+?)(?:\.git)?$", gh)
+    return m.group(1) if m else ""
+
+
+def clone_dir_name(svc: dict[str, Any]) -> str:
+    name = repo_full_name(svc).rsplit("/", 1)[-1] or svc["id"]
+    return re.sub(r"[^\w.\-]+", "_", name)
+
+
+def repo_dir(svc: dict[str, Any]) -> Path:
+    return Path(CFG["workspace_root"]) / clone_dir_name(svc)
+
+
+def check_docker(force: bool = False) -> dict[str, Any]:
+    """Probe Docker via `docker info` (native Linux or WSL). Cached ~45s."""
+    global _docker_cache
+    now = time.time()
+    if not force and _docker_cache and now - _docker_cache[0] < 45:
+        return dict(_docker_cache[1])
+    if use_wsl():
+        pass
+    elif shutil.which("docker") is None:
+        st = {"ok": False, "detail": "docker not installed"}
+        _docker_cache = (now, st)
+        return dict(st)
+    code, out = docker_cmd("info", timeout=8)
+    if code != 0:
+        st = {"ok": False, "detail": ((out or "")[-400:] or "docker unavailable")}
+        _docker_cache = (now, st)
+        return dict(st)
+    where = f"WSL:{CFG['wsl_distro']}" if use_wsl() else "native"
+    st = {"ok": True, "detail": f"Docker ok / {where}"}
+    _docker_cache = (now, st)
+    return dict(st)
+
+
+def docker_config_has_swr_auth() -> bool:
+    """Fast local check: docker config.json contains auth for SWR registry."""
+    registry = (CFG.get("swr_registry") or "").strip()
+    if not registry:
+        return False
+    cfg_path = Path.home() / ".docker" / "config.json"
+    if not cfg_path.is_file():
+        return False
+    try:
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    auths = data.get("auths") or {}
+    if not isinstance(auths, dict):
+        return False
+    for key, val in auths.items():
+        if registry in str(key) or str(key) in registry:
+            if isinstance(val, dict) and (val.get("auth") or val.get("identitytoken")):
+                return True
+            if val:
+                return True
+    return False
+
+
+def login_status_fast() -> bool:
+    """UI/health: memory flag or local docker auth presence (no network)."""
+    with _login_lock:
+        if _login_ok:
+            return True
+        if _login_probe_cache and time.time() - _login_probe_cache[0] < 60:
+            return bool(_login_probe_cache[1])
+    return docker_config_has_swr_auth()
+
+
+def docker_status_cached() -> dict[str, Any]:
+    """Never block HTTP handlers on `docker info` (slow during builds)."""
+    if _docker_cache:
+        return dict(_docker_cache[1])
+    return {"ok": True, "detail": "Docker (后台检测中)"}
+
+
+def schedule_docker_probe() -> None:
+    """Refresh docker cache in background if stale/missing."""
+    now = time.time()
+    if _docker_cache and now - _docker_cache[0] < 45:
+        return
+
+    def _run() -> None:
+        try:
+            check_docker(force=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def do_login(command: str) -> tuple[bool, str]:
+    global _login_ok, _login_probe_cache
+    cmd = command.strip()
+    if not cmd:
+        return False, "empty login command"
+    m = re.search(r"docker\s+login\s+-u\s+(\S+)\s+-p\s+(\S+)\s+(\S+)", cmd, re.I)
+    if m:
+        user, password, registry = m.group(1), m.group(2), m.group(3)
+        login_args = ["docker", "login", "-u", user, "--password-stdin", registry]
+        if use_wsl():
+            login_args = wsl_prefix() + login_args
+        code, out = run_cmd_stdin(login_args, password, timeout=120)
+    else:
+        code, out = run_cmd(bash_lc(cmd), timeout=120)
+    ok = code == 0 and "succeeded" in out.lower()
+    with _login_lock:
+        _login_ok = ok
+        _login_probe_cache = (time.time(), ok)
+    return ok, out
+
+
+def do_logout() -> tuple[bool, str]:
+    """Clear shared SWR docker credentials on this server."""
+    global _login_ok, _login_probe_cache
+    registry = (CFG.get("swr_registry") or "").strip()
+    if not registry:
+        return False, "missing swr_registry"
+    code, out = docker_cmd("logout", registry, timeout=60)
+    # Also drop local auth entry if docker logout left remnants
+    cfg_path = Path.home() / ".docker" / "config.json"
+    if cfg_path.is_file():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            auths = data.get("auths") or {}
+            if isinstance(auths, dict):
+                for key in list(auths.keys()):
+                    if registry in str(key) or str(key) in registry:
+                        auths.pop(key, None)
+                data["auths"] = auths
+                cfg_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    with _login_lock:
+        _login_ok = False
+        _login_probe_cache = (time.time(), False)
+    # docker logout returns 0 even when not logged in
+    msg = (out or "").strip() or f"Logged out of {registry}"
+    ok = code == 0 or "not logged in" in msg.lower() or "removing login" in msg.lower()
+    return ok, msg
+
+
+def check_login(force: bool = False) -> bool:
+    """Validate SWR auth. Uses short cache; force=True always hits registry."""
+    global _login_ok, _login_probe_cache
+    now = time.time()
+    if not force and _login_probe_cache and now - _login_probe_cache[0] < 45:
+        ok = bool(_login_probe_cache[1])
+        with _login_lock:
+            _login_ok = ok
+        return ok
+
+    remote = f"{CFG['swr_registry']}/{CFG['swr_org']}/___probe_does_not_exist___"
+    code, out = docker_cmd("manifest", "inspect", remote, timeout=12)
+    text = (out or "").lower()
+    # Missing image is fine; only auth failures mean not logged in.
+    if "unauthorized" in text or "authentication required" in text or "denied" in text:
+        ok = False
+    elif code == 0 or "manifest unknown" in text or "not found" in text or "no such" in text:
+        ok = True
+    elif not docker_config_has_swr_auth():
+        ok = False
+    else:
+        # Ambiguous network error but local auth exists — keep previous optimism for UI;
+        # push will surface real failures.
+        ok = True
+    with _login_lock:
+        _login_ok = ok
+        _login_probe_cache = (now, ok)
+    return ok
+
+
+def run_stream(
+    job_id: str,
+    args: list[str],
+    timeout: int = 7200,
+    env: dict[str, str] | None = None,
+) -> int:
+    shown = [re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", a) for a in args]
+    append_job_log(job_id, "$ " + " ".join(shown))
+    try:
+        p = subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+    except FileNotFoundError:
+        append_job_log(job_id, f"ERROR: not found: {args[0]}")
+        return 127
+    assert p.stdout is not None
+    start = time.time()
+    for line in p.stdout:
+        append_job_log(job_id, re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", line.rstrip("\n")))
+        if time.time() - start > timeout:
+            p.kill()
+            append_job_log(job_id, "ERROR: timeout")
+            return 124
+    return p.wait() or 0
+
+
+def list_branches_api(repo: str) -> tuple[bool, list[str] | str]:
+    if not repo:
+        return False, "missing repo"
+
+    # 1) SSH ls-remote (preferred on shared server)
+    if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
+        ssh_url = f"git@github.com:{repo}.git"
+        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=120, env=git_env())
+        if code == 0:
+            names = []
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
+                    names.append(parts[1][len("refs/heads/") :])
+            return True, names
+        ssh_err = re.sub(r"x-access-token:[^@\s]+@", "***@", out)[-500:]
+    else:
+        ssh_err = "ssh not configured"
+
+    # 2) GitHub API with token
+    token = gh_token()
+    if token:
+        url = f"https://api.github.com/repos/{repo}/branches?per_page=100"
+        req = Request(url)
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return True, [b["name"] for b in data if b.get("name")]
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+
+    return (
+        False,
+        "需要 GitHub SSH 密钥或 Token。"
+        f" SSH: {ssh_err}",
+    )
+
+
+def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]:
+    url = (svc.get("github") or "").strip()
+    if not url and svc.get("repo"):
+        url = f"https://github.com/{svc['repo']}.git"
+    if not url:
+        return False, "missing github url"
+    if not re.match(r"^[\w./\-]+$", branch or ""):
+        return False, f"invalid branch: {branch!r}"
+
+    dest = repo_dir(svc)
+    public = public_github_url(url)
+    clone_url = clone_url_for(url)
+    if clone_url.startswith("https://") and "github.com" in clone_url and not gh_token():
+        return (
+            False,
+            "私有仓需要配置 GitHub SSH 密钥（推荐）或 Token",
+        )
+    genv = git_env()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    append_job_log(job_id, f"github={public}")
+    append_job_log(job_id, f"clone_via={'ssh' if clone_url.startswith('git@') else 'https'}")
+    append_job_log(job_id, f"branch={branch}")
+    append_job_log(job_id, f"workspace={dest}")
+
+    # Clear stale lock left by killed builds
+    lock = dest / ".git" / "index.lock"
+    if lock.is_file():
+        try:
+            lock.unlink()
+            append_job_log(job_id, "removed stale .git/index.lock")
+        except OSError:
+            pass
+
+    if not (dest / ".git").is_dir():
+        if dest.exists() and any(dest.iterdir()):
+            shutil.rmtree(dest, ignore_errors=True)
+        append_job_log(job_id, "git clone…")
+        code = run_stream(
+            job_id,
+            git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
+            timeout=1800,
+            env=genv,
+        )
+        if code != 0:
+            shutil.rmtree(dest, ignore_errors=True)
+            code = run_stream(
+                job_id,
+                git_args("clone", "--depth", "1", clone_url, str(dest)),
+                timeout=1800,
+                env=genv,
+            )
+            if code != 0:
+                return False, "git clone failed"
+            run_stream(
+                job_id,
+                git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
+                timeout=600,
+                env=genv,
+            )
+            code = run_stream(
+                job_id,
+                git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
+                timeout=120,
+                env=genv,
+            )
+            if code != 0:
+                return False, f"checkout {branch} failed"
+    else:
+        append_job_log(job_id, "git fetch…")
+        run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", clone_url), timeout=30, env=genv)
+        code = run_stream(
+            job_id,
+            git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
+            timeout=1200,
+            env=genv,
+        )
+        if code != 0:
+            return False, "git fetch failed"
+        code = run_stream(
+            job_id,
+            git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
+            timeout=120,
+            env=genv,
+        )
+        if code != 0:
+            return False, f"checkout {branch} failed"
+
+    run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
+    if not (dest / "deploy.sh").is_file() and not (dest / "build-image.sh").is_file():
+        return False, "missing deploy.sh/build-image.sh"
+    code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
+    append_job_log(job_id, f"HEAD={head if code == 0 else '?'} @ {branch}")
+    return True, str(dest)
+
+
+def public_service_dir() -> Path:
+    """Sibling of per-service clone dirs: <workspace_root>/public-service."""
+    return Path(CFG["workspace_root"]) / "public-service"
+
+
+def ensure_public_service(job_id: str) -> tuple[bool, str]:
+    """
+    Many microservice deploy.sh scripts source
+    ../public-service/windows-deploy/lib/source-rrd.sh.
+    Helper clones only the service repo, so keep a shared public-service checkout
+    next to it (does not modify service source trees).
+    """
+    dest = public_service_dir()
+    branch = (CFG.get("public_service_branch") or "main").strip() or "main"
+    url = (CFG.get("public_service_github") or "https://github.com/rollingfruit/public-service.git").strip()
+    public = public_github_url(url)
+    clone_url = clone_url_for(url)
+    genv = git_env()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    append_job_log(job_id, f"ensure shared public-service → {dest} @ {branch}")
+
+    lock = dest / ".git" / "index.lock"
+    if lock.is_file():
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+    if not (dest / ".git").is_dir():
+        if dest.exists() and any(dest.iterdir()):
+            shutil.rmtree(dest, ignore_errors=True)
+        append_job_log(job_id, "git clone public-service…")
+        code = run_stream(
+            job_id,
+            git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
+            timeout=1800,
+            env=genv,
+        )
+        if code != 0:
+            shutil.rmtree(dest, ignore_errors=True)
+            code = run_stream(
+                job_id,
+                git_args("clone", "--depth", "1", clone_url, str(dest)),
+                timeout=1800,
+                env=genv,
+            )
+            if code != 0:
+                return False, "git clone public-service failed"
+            run_stream(
+                job_id,
+                git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
+                timeout=600,
+                env=genv,
+            )
+            code = run_stream(
+                job_id,
+                git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
+                timeout=120,
+                env=genv,
+            )
+            if code != 0:
+                return False, f"checkout public-service {branch} failed"
+    else:
+        append_job_log(job_id, "git fetch public-service…")
+        run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", clone_url), timeout=30, env=genv)
+        code = run_stream(
+            job_id,
+            git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
+            timeout=1200,
+            env=genv,
+        )
+        if code != 0:
+            return False, "git fetch public-service failed"
+        code = run_stream(
+            job_id,
+            git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
+            timeout=120,
+            env=genv,
+        )
+        if code != 0:
+            return False, f"checkout public-service {branch} failed"
+
+    run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
+    rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
+    if not rrd.is_file():
+        return False, f"missing {rrd}"
+    code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
+    append_job_log(job_id, f"public-service HEAD={head if code == 0 else '?'} @ {branch}")
+    return True, str(dest)
+
+
+def mattermost_package_marker() -> Path:
+    return Path("/opt/ai/mattermost/.swr_helper_git_hash")
+
+
+def mattermost_package_matches(git_hash: str) -> bool:
+    """True if /opt/ai/mattermost was packaged for this exact git short hash."""
+    if not git_hash or git_hash.startswith("0000"):
+        return False
+    mm = Path("/opt/ai/mattermost")
+    bin_ok = (mm / "mattermost" / "bin" / "mattermost").is_file() or (
+        mm / "bin" / "mattermost"
+    ).is_file()
+    marker = mattermost_package_marker()
+    try:
+        return bin_ok and marker.is_file() and marker.read_text(encoding="utf-8").strip() == git_hash
+    except OSError:
+        return False
+
+
+def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None, str | None]:
+    """Reuse local/<image>:*_<git_hash> when re-pushing the same commit."""
+    if not image or not git_hash or git_hash.startswith("0000"):
+        return None, None
+    code, out = docker_cmd(
+        "images",
+        f"local/{image}",
+        "--format",
+        "{{.Repository}}:{{.Tag}}",
+        timeout=60,
+    )
+    if code != 0:
+        return None, None
+    suffix = f"_{git_hash}"
+    for ln in (out or "").splitlines():
+        ref = ln.strip()
+        if not ref or ":" not in ref or ref.endswith(":none"):
+            continue
+        tag = ref.split(":", 1)[-1]
+        if tag.endswith(suffix):
+            return ref, tag
+    return None, None
+
+
+def build_from_source(job_id: str, svc: dict[str, Any], git_hash: str) -> bool:
+    src = repo_dir(svc)
+    shell_src = host_path(src)
+    ps_dir = host_path(public_service_dir())
+    where = "WSL" if use_wsl() else "host"
+    append_job_log(job_id, f"build on {where}: {src}")
+
+    # Helper-only speedups (do not edit microservice source):
+    # - CCE_SKIP_EXPORT=1: skip multi-hundred-MB docker save tar (we push from local image)
+    # - mattermost SKIP_PACKAGE=1: skip webpack/go when package for this commit already exists
+    extra_env = "CCE_SKIP_EXPORT=1 "
+    if svc.get("id") == "mattermost" and mattermost_package_matches(git_hash):
+        extra_env += "SKIP_PACKAGE=1 "
+        append_job_log(
+            job_id,
+            f"mattermost optimize: SKIP_PACKAGE=1 (package already built for {git_hash})",
+        )
+
+    bash = (
+        "set -euo pipefail; "
+        f"cd '{shell_src}'; "
+        "find . -maxdepth 3 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
+        f"export CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
+        f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
+        "if [[ -f ./deploy.sh ]]; then bash ./deploy.sh; "
+        "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
+        "else echo 'ERROR: no deploy.sh'; exit 1; fi"
+    )
+    code = run_stream(
+        job_id,
+        bash_lc(bash),
+        timeout=int(CFG.get("build_timeout_sec") or 7200),
+    )
+    if code != 0:
+        append_job_log(job_id, f"ERROR build exit={code}")
+        return False
+    append_job_log(job_id, "build finished")
+    if svc.get("id") == "mattermost" and git_hash and not git_hash.startswith("0000"):
+        try:
+            marker = mattermost_package_marker()
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(git_hash + "\n", encoding="utf-8")
+            append_job_log(job_id, f"mattermost package marker -> {git_hash}")
+        except OSError as e:
+            append_job_log(job_id, f"WARN: could not write package marker: {e}")
+    return True
+
+
+def find_latest_tar(svc: dict[str, Any]) -> Path | None:
+    export_dir = repo_dir(svc) / "runtime-images" / "cce-export"
+    if not export_dir.is_dir():
+        return None
+    cands = sorted(export_dir.glob(f"{svc['tar_prefix']}*.tar"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands[0] if cands else None
+
+
+def parse_tag_from_tar(tar_path: Path, image: str) -> str:
+    stem = tar_path.stem
+    prefix = image + "_"
+    if stem.startswith(prefix):
+        return stem[len(prefix) :]
+    parts = stem.split("_", 1)
+    return parts[1] if len(parts) == 2 else stem
+
+
+def resolve_local_image(job_id: str, svc: dict[str, Any]) -> tuple[str | None, str | None]:
+    image = svc["image"]
+    tar_path = find_latest_tar(svc)
+    if tar_path:
+        tag = parse_tag_from_tar(tar_path, image)
+        local_ref = f"local/{image}:{tag}"
+        append_job_log(job_id, f"tar={tar_path.name}")
+        code, _ = docker_cmd("image", "inspect", local_ref, timeout=30)
+        if code != 0:
+            append_job_log(job_id, "docker load…")
+            code, out = docker_cmd("load", "-i", host_path(tar_path), timeout=1800)
+            append_job_log(job_id, (out or "")[-1200:])
+            if code != 0:
+                return None, None
+            m = re.search(r"Loaded image:\s*(\S+)", out or "")
+            if m:
+                local_ref = m.group(1)
+                if ":" in local_ref:
+                    tag = local_ref.split(":", 1)[-1]
+        return local_ref, tag
+
+    # Fallback: newest local/<image>:* from docker images
+    append_job_log(job_id, "no tar; looking up docker images…")
+    code, out = docker_cmd(
+        "images",
+        f"local/{image}",
+        "--format",
+        "{{.Repository}}:{{.Tag}}",
+        timeout=60,
+    )
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip() and ":" in ln and not ln.endswith(":none")]
+    dated = [ln for ln in lines if not ln.endswith(":latest")]
+    pick = (dated or lines)
+    if not pick:
+        return None, None
+    local_ref = pick[0]
+    tag = local_ref.split(":", 1)[-1]
+    append_job_log(job_id, f"using image {local_ref}")
+    return local_ref, tag
+
+
+def push_service(
+    job_id: str,
+    service_id: str,
+    branch: str,
+    login_command: str = "",
+) -> None:
+    try:
+        services = {s["id"]: s for s in load_services()}
+        svc = services.get(service_id)
+        if not svc:
+            set_job(job_id, status="failed", error=f"unknown service: {service_id}")
+            return
+        branch = (branch or svc.get("default_branch") or "main").strip()
+        image = svc["image"]
+        registry, org = CFG["swr_registry"], CFG["swr_org"]
+        append_job_log(job_id, f"service={svc['title']} image={image}")
+        append_job_log(job_id, f"target={registry}/{org}/{image}:*")
+
+        # Shared-server mode: one person's docker login is reused by others until the temp token expires.
+        # Fresh command from the page always re-logins (and refreshes the shared credential).
+        cmd = (login_command or "").strip()
+        if cmd:
+            append_job_log(job_id, "SWR login from page credentials…")
+            ok_login, out_login = do_login(cmd)
+            append_job_log(job_id, (out_login or "")[-800:])
+            if not ok_login:
+                set_job(job_id, status="failed", error="SWR login failed")
+                append_job_log(job_id, "ERROR: paste a valid Huawei SWR temporary login command")
+                return
+        else:
+            append_job_log(job_id, "reusing shared SWR login on this server…")
+            if not check_login():
+                set_job(job_id, status="failed", error="not logged in to SWR")
+                append_job_log(
+                    job_id,
+                    "ERROR: 服务器上尚无有效 SWR 登录（或已过期）。请任一人在页面粘贴 docker login 并登录后再推送。",
+                )
+                return
+            append_job_log(job_id, "shared SWR login still valid")
+
+        ok, detail = sync_repo(job_id, svc, branch)
+        if not ok:
+            set_job(job_id, status="failed", error=detail)
+            append_job_log(job_id, f"ERROR {detail}")
+            return
+
+        ok_ps, detail_ps = ensure_public_service(job_id)
+        if not ok_ps:
+            set_job(job_id, status="failed", error=detail_ps)
+            append_job_log(job_id, f"ERROR {detail_ps}")
+            return
+
+        git = git_bin()
+        code, head = run_cmd([git, "-C", detail, "rev-parse", "--short=7", "HEAD"], timeout=30)
+        git_hash = head if code == 0 else "0000000"
+
+        local_ref, tag = find_local_image_by_git_hash(image, git_hash)
+        if local_ref and tag:
+            append_job_log(
+                job_id,
+                f"optimize: reuse existing image {local_ref} (same git {git_hash}, skip rebuild)",
+            )
+        else:
+            if not build_from_source(job_id, svc, git_hash):
+                set_job(job_id, status="failed", error="build failed")
+                return
+            local_ref, tag = resolve_local_image(job_id, svc)
+            # Prefer exact git-hash tag if resolve picked something else
+            by_hash_ref, by_hash_tag = find_local_image_by_git_hash(image, git_hash)
+            if by_hash_ref and by_hash_tag:
+                local_ref, tag = by_hash_ref, by_hash_tag
+        if not local_ref or not tag:
+            set_job(job_id, status="failed", error="no image/tar after build")
+            return
+
+        remote = f"{registry}/{org}/{image}:{tag}"
+        append_job_log(job_id, f"docker tag {local_ref} -> {remote}")
+        code, out = docker_cmd("tag", local_ref, remote, timeout=60)
+        if code != 0:
+            append_job_log(job_id, out)
+            set_job(job_id, status="failed", error="docker tag failed")
+            return
+
+        # SWR sometimes times out waiting for headers; retry a few times before failing.
+        push_attempts = 4
+        code, out = 1, ""
+        for attempt in range(1, push_attempts + 1):
+            append_job_log(job_id, f"docker push {remote} (try {attempt}/{push_attempts})")
+            code, out = docker_cmd("push", remote, timeout=3600)
+            for line in (out or "").splitlines()[-40:]:
+                append_job_log(job_id, line)
+            if code == 0:
+                break
+            text = (out or "").lower()
+            retryable = any(
+                x in text
+                for x in (
+                    "timeout",
+                    "temporarily unavailable",
+                    "connection reset",
+                    "connection refused",
+                    "tls handshake",
+                    "i/o timeout",
+                    "network is unreachable",
+                    "request canceled",
+                )
+            )
+            if not retryable or attempt >= push_attempts:
+                break
+            wait_s = min(30, 5 * attempt)
+            append_job_log(job_id, f"push network error; retry in {wait_s}s…")
+            time.sleep(wait_s)
+        if code != 0:
+            set_job(job_id, status="failed", error="docker push failed", remote=remote)
+            if "authenticate" in (out or "").lower() or "denied" in (out or "").lower():
+                append_job_log(
+                    job_id,
+                    "ERROR: SWR 鉴权失败。请重新复制华为云临时登录指令到页面后再推送；并确认组织 public_ai 有推送权限",
+                )
+            else:
+                append_job_log(
+                    job_id,
+                    "ERROR: docker push failed（多为到 SWR 的网络超时）。镜像已在服务器构建完成，可重新登录 SWR 后再点一次推送。",
+                )
+            return
+
+        docker_cmd("rmi", remote, timeout=60)
+        set_job(job_id, status="ok", remote=remote, branch=branch)
+        append_job_log(job_id, f"OK {remote}")
+    except Exception as e:  # noqa: BLE001
+        set_job(job_id, status="failed", error=str(e))
+        append_job_log(job_id, f"ERROR {e}")
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(WEB_DIR), **kwargs)
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        if str(args[0]).startswith(("GET /api/", "POST /api/")):
+            return
+        super().log_message(fmt, *args)
+
+    def _json(self, code: int, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            return json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._do_GET()
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._json(500, {"error": str(e)})
+            except Exception:
+                pass
+
+    def _do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/login/status":
+            # Instant: no docker info / no SWR network round-trip.
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "login_cached": login_status_fast(),
+                    "registry": CFG["swr_registry"],
+                    "org": CFG["swr_org"],
+                },
+            )
+            return
+
+        if path == "/api/health":
+            schedule_docker_probe()
+            logged = login_status_fast()
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "agent": "swr-push-helper",
+                    "mode": "local-github",
+                    "docker": docker_status_cached(),
+                    "login_cached": logged,
+                    "registry": CFG["swr_registry"],
+                    "org": CFG["swr_org"],
+                    "workspace_root": CFG["workspace_root"],
+                    "helper_root": CFG["helper_root"],
+                    "github_token_configured": bool((CFG.get("github_token") or "").strip()),
+                    "github_ssh_configured": bool(
+                        CFG.get("github_use_ssh")
+                        and (CFG.get("github_ssh_key") or "")
+                        and Path(CFG.get("github_ssh_key") or "").is_file()
+                    ),
+                    "github_use_ssh": bool(CFG.get("github_use_ssh")),
+                    "allow_remote": bool(CFG.get("allow_remote")),
+                },
+            )
+            return
+
+        if path == "/api/services":
+            items = []
+            for svc in load_services():
+                items.append(
+                    {
+                        "id": svc["id"],
+                        "title": svc["title"],
+                        "image": svc.get("image"),
+                        "repo": repo_full_name(svc),
+                        "github": public_github_url(svc.get("github") or (f"https://github.com/{repo_full_name(svc)}.git")),
+                        "default_branch": svc.get("default_branch") or "main",
+                        "cloned": (repo_dir(svc) / ".git").is_dir(),
+                    }
+                )
+            self._json(200, {"services": items, "registry": CFG["swr_registry"], "org": CFG["swr_org"]})
+            return
+
+        m = re.fullmatch(r"/api/services/([^/]+)/branches", path)
+        if m:
+            svc = next((s for s in load_services() if s["id"] == m.group(1)), None)
+            if not svc:
+                self._json(404, {"error": "unknown service"})
+                return
+            repo = repo_full_name(svc)
+            ok, result = list_branches_api(repo)
+            default = svc.get("default_branch") or "main"
+            if not ok:
+                self._json(200, {"branches": [default], "default_branch": default, "warning": str(result)})
+                return
+            branches = list(result)
+            if default in branches:
+                branches.remove(default)
+                branches.insert(0, default)
+            self._json(200, {"branches": branches, "default_branch": default})
+            return
+
+        if path.startswith("/api/jobs/"):
+            job_id = path[len("/api/jobs/") :].strip("/")
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                if job:
+                    payload = {
+                        k: job.get(k)
+                        for k in ("id", "service_id", "branch", "status", "error", "remote")
+                    }
+                    # Prefer live memory log; also refresh from file if empty
+                    payload["log"] = list(job["log"])
+                    self._json(200, payload)
+                    return
+            disk = load_job_from_disk(job_id)
+            if disk:
+                self._json(200, disk)
+                return
+            self._json(404, {"error": "job not found"})
+            return
+
+        if path in ("/", "/index.html"):
+            self.path = "/index.html"
+        return super().do_GET()
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._do_POST()
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._json(500, {"error": str(e)})
+            except Exception:
+                pass
+
+    def _do_POST(self) -> None:
+        path = urlparse(self.path).path
+        data = self._read_json()
+
+        if path == "/api/login":
+            ok, out = do_login((data.get("command") or "").strip())
+            self._json(200 if ok else 400, {"ok": ok, "output": (out or "")[-2000:]})
+            return
+
+        if path == "/api/login/check":
+            self._json(200, {"ok": check_login(force=True)})
+            return
+
+        if path == "/api/login/logout":
+            ok, out = do_logout()
+            self._json(200 if ok else 400, {"ok": ok, "output": (out or "")[-2000:]})
+            return
+
+        if path == "/api/config/token":
+            save_config_value("github_token", (data.get("github_token") or "").strip())
+            reload_cfg()
+            self._json(200, {"ok": True, "github_token_configured": bool(CFG.get("github_token"))})
+            return
+
+        if path == "/api/push":
+            service_id = (data.get("service_id") or "").strip()
+            branch = (data.get("branch") or "main").strip()
+            login_command = (data.get("login_command") or "").strip()
+            if not service_id:
+                self._json(400, {"error": "service_id required"})
+                return
+            docker = check_docker()
+            if not docker["ok"]:
+                self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
+                return
+            job_id = uuid.uuid4().hex[:12]
+            log_file = LOG_DIR / f"job-{job_id}.log"
+            with _jobs_lock:
+                _jobs[job_id] = {
+                    "id": job_id,
+                    "service_id": service_id,
+                    "branch": branch,
+                    "status": "running",
+                    "error": None,
+                    "remote": None,
+                    "log": [],
+                    "log_file": str(log_file),
+                }
+            persist_job_meta(job_id)
+            append_job_log(job_id, f"job start service={service_id} branch={branch}")
+            threading.Thread(
+                target=push_service,
+                args=(job_id, service_id, branch, login_command),
+                daemon=True,
+            ).start()
+            self._json(200, {"job_id": job_id, "branch": branch})
+            return
+
+        self._json(404, {"error": "not found"})
+
+
+def main() -> None:
+    host, port = CFG["host"], CFG["port"]
+    allow_remote = str(CFG.get("allow_remote") or os.environ.get("SWR_ALLOW_REMOTE") or "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if host not in ("127.0.0.1", "localhost", "::1") and not allow_remote:
+        raise SystemExit("refusing non-localhost (set allow_remote=true in config.json for server deploy)")
+    ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.request_queue_size = 128
+    ThreadingHTTPServer.daemon_threads = True
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    print(f"[swr-push-helper] http://{host}:{port}/", flush=True)
+    print(f"[swr-push-helper] mode: web login + GitHub branch → local build → SWR", flush=True)
+    print(f"[swr-push-helper] SWR: {CFG['swr_registry']}/{CFG['swr_org']}", flush=True)
+    print(f"[swr-push-helper] allow_remote={allow_remote}", flush=True)
+    # Fast local signal for UI; full registry probe in background (don't block startup).
+    fast = login_status_fast()
+    print(f"[swr-push-helper] shared SWR login (local)={fast}", flush=True)
+
+    def _bg_login_probe() -> None:
+        try:
+            ok = check_login(force=True)
+            print(f"[swr-push-helper] shared SWR login (probe)={ok}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[swr-push-helper] shared SWR login probe skipped: {e}", flush=True)
+
+    threading.Thread(target=_bg_login_probe, daemon=True).start()
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

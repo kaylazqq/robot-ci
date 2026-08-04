@@ -1,0 +1,9 @@
+﻿__pycache__/
+*.pyc
+logs/
+dist/
+config.json
+.workspaces/
+*.log
+.DS_Store
+Thumbs.db
