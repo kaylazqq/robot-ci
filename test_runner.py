@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,7 @@ def failure(name: str, detail: str) -> dict[str, str]:
     return {"name": name, "detail": (detail or "test command failed").strip()[:1000]}
 
 
-def test_case(name: str, status: str, duration_ms: int | None = None, detail: str = "") -> dict[str, Any]:
+def test_case(name: str, status: str, duration_ms: float | int | None = None, detail: str = "") -> dict[str, Any]:
     item: dict[str, Any] = {"name": name, "status": status, "duration_ms": duration_ms}
     if detail:
         item["detail"] = detail.strip()[:1000]
@@ -57,6 +58,7 @@ def parse_go_json(
     states: dict[tuple[str, str], str] = {}
     details: dict[tuple[str, str], str] = {}
     durations: dict[tuple[str, str], int | None] = {}
+    started: dict[tuple[str, str], datetime] = {}
     if path.is_file():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
@@ -66,13 +68,24 @@ def parse_go_json(
             test = event.get("Test")
             package = event.get("Package") or "package"
             action = event.get("Action")
+            key = (package, test) if test else None
+            event_time = None
+            if event.get("Time"):
+                try:
+                    event_time = datetime.fromisoformat(str(event["Time"]).replace("Z", "+00:00"))
+                except ValueError:
+                    pass
+            if key and action == "run" and event_time:
+                started[key] = event_time
+            if key and event.get("Output"):
+                details[key] = (details.get(key, "") + str(event["Output"]))[-2000:]
             if test and action in {"pass", "fail", "skip"}:
                 key = (package, test)
                 states[key] = {"pass": "passed", "fail": "failed", "skip": "skipped"}[action]
                 elapsed = event.get("Elapsed")
-                durations[key] = int(float(elapsed) * 1000) if isinstance(elapsed, (int, float)) else None
-                if event.get("Output"):
-                    details[key] = str(event["Output"])
+                durations[key] = round(float(elapsed) * 1000, 3) if isinstance(elapsed, (int, float)) else None
+                if event_time and started.get(key):
+                    durations[key] = max(0, round((event_time - started[key]).total_seconds() * 1000, 3))
     cases = [
         test_case(f"{package}.{test}", state, durations.get((package, test)), details.get((package, test), output if state == "failed" else ""))
         for (package, test), state in states.items()
@@ -98,7 +111,7 @@ def parse_junit(
     for case in cases:
         label = ".".join(part for part in (case.get("classname"), case.get("name")) if part) or command_name
         try:
-            duration_ms = int(float(case.get("time") or 0) * 1000)
+            duration_ms = round(float(case.get("time") or 0) * 1000, 3)
         except ValueError:
             duration_ms = None
         problem = case.find("failure")
@@ -235,6 +248,7 @@ def main() -> int:
     started = time.monotonic()
     for command in profile.get("commands") or []:
         name = command.get("name") or command.get("command") or "test command"
+        print("@@TEST_STEP@@ " + name, flush=True)
         code, output, elapsed = run_command(command, args.repo, args.report_dir)
         parser_name = command.get("parser") or "shell"
         if parser_name == "go-json":

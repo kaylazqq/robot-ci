@@ -6,7 +6,7 @@
     "semantic-gateway": "semantic-gateway-pytest",
     "memory-service": "cellmem-pytest",
     "agentlink": "agentlink-unittest",
-    "observability": "observability-unittest",
+    "observability": "observability-pytest",
     "plugin-market": "plugin-market-go",
     "semantic-schedule": "semantic-schedule-pytest",
     "agent-governance-gw": "governance-go",
@@ -19,12 +19,12 @@
     "router-shell": {"commands": [{"name": "service-router shell UT/DT", "command": "python3 $TEST_RUNNER_ROOT/shell_case_runner.py --report $REPORT_DIR/shell-cases.json --pattern 'tests/test-*.sh' --pattern 'tests/unit/*.sh' --pattern 'tests/dt/*.sh'", "parser": "case-json", "report": "shell-cases.json"}]},
     "semantic-gateway-pytest": {"commands": [{"name": "semantic gateway UT/DT", "command": "python3.11 -m pip install '.[dev]' && PYTHONPATH=src python3.11 -m pytest -q tests --junitxml=$REPORT_DIR/pytest.xml", "parser": "junit", "report": "pytest.xml"}]},
     "cellmem-pytest": {"commands": [{"name": "CellMem pure UT/DT", "command": "python3.11 -m pip install '.[dev]' && PYTHONPATH=src python3.11 -m pytest -q tests/unit tests/dt tests/test_database_config.py tests/test_latency_logging.py tests/test_runtime_start.py --junitxml=$REPORT_DIR/pytest.xml", "parser": "junit", "report": "pytest.xml"}]},
-    "agentlink-unittest": {"commands": [{"name": "AgentLink UT/DT", "command": "python3.11 -m pip install -r requirements.txt && PYTHONPATH=src python3.11 $TEST_RUNNER_ROOT/unittest_case_runner.py --start-dir tests --pattern 'test_*.py' --report $REPORT_DIR/unittest-cases.json", "parser": "case-json", "report": "unittest-cases.json"}]},
-    "observability-unittest": {"commands": [{"name": "observability UT/DT", "command": "PYTHONPATH=. python3.11 $TEST_RUNNER_ROOT/unittest_case_runner.py --start-dir tests --pattern 'test_*.py' --report $REPORT_DIR/unittest-cases.json", "parser": "case-json", "report": "unittest-cases.json"}]},
+    "agentlink-unittest": {"commands": [{"name": "AgentLink UT/DT", "command": "python3.11 -m pip install -r requirements.txt && PYTHONPATH=. python3.11 $TEST_RUNNER_ROOT/unittest_case_runner.py --start-dir tests --pattern 'test_*.py' --report $REPORT_DIR/unittest-cases.json", "parser": "case-json", "report": "unittest-cases.json"}]},
+    "observability-pytest": {"commands": [{"name": "observability UT/DT", "command": "PYTHONPATH=. python3.11 -m pytest -q tests --junitxml=$REPORT_DIR/pytest.xml", "parser": "junit", "report": "pytest.xml"}]},
     "plugin-market-go": {"commands": [{"name": "plugin-market Go UT", "command": "go test -count=1 -json ./... | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json"}]},
-    "semantic-schedule-pytest": {"commands": [{"name": "semantic schedule UT/DT", "command": "python3.11 -m pip install '.[dev]' && PYTHONPATH=src python3.11 -m pytest -q tests --junitxml=$REPORT_DIR/pytest.xml", "parser": "junit", "report": "pytest.xml"}]},
+    "semantic-schedule-pytest": {"commands": [{"name": "semantic schedule pure UT/DT", "command": "python3.11 -m pip install '.[dev]' && PYTHONPATH=src python3.11 -m pytest -q tests/test_task_graph_semantics.py tests/test_planner.py tests/test_plan_enricher.py tests/test_mention_parse.py tests/test_message_format.py tests/test_text_encoding.py tests/test_workspace_context.py tests/test_multica_job_auth.py tests/test_multica_job_client.py tests/test_multica_job_im_context.py tests/test_temporal_namespace.py tests/test_worker_main.py --junitxml=$REPORT_DIR/pytest.xml", "parser": "junit", "report": "pytest.xml"}]},
     "governance-go": {"commands": [{"name": "governance pure Go UT", "command": "go test -count=1 -json ./internal/governance | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json"}]},
     "multica-go": {"commands": [{"name": "multica pure Go UT", "command": "go test -count=1 -json ./pkg/redact ./pkg/taskfailure ./internal/util/secretbox | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json"}]},
-    "mattermost-unit": {"commands": [{"name": "Mattermost server quick UT", "command": "make -C server test-server-quick", "parser": "shell", "timeout_sec": 3600}]}
+    "mattermost-unit": {"commands": [{"name": "Mattermost public API UT", "command": "cd server && go test -count=1 -json ./public/model ./public/plugin/... | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json", "timeout_sec": 3600}]}
   }
 }

@@ -4,6 +4,8 @@ let pollTimer = null;
 let busy = false;
 let pollFails = 0;
 const branchCache = {};
+let testCasePage = 1;
+let testCaseJobId = "";
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -37,7 +39,10 @@ function showJob(msg, logText) {
 
 function formatDuration(ms) {
   const value = Number(ms || 0);
-  if (value < 1000) return value + " ms";
+  if (value === 0) return "<0.001 ms";
+  if (value < 1) return value.toFixed(3) + " ms";
+  if (value < 10) return value.toFixed(2) + " ms";
+  if (value < 1000) return value.toFixed(1) + " ms";
   return (value / 1000).toFixed(value >= 10000 ? 0 : 1) + " s";
 }
 
@@ -60,16 +65,45 @@ function isQuietDependencyLog(line) {
 
 function displayJobLog(lines) {
   const visible = [];
+  let testRunning = false;
   for (const line of lines || []) {
-    if (String(line).includes("@@TEST_SUMMARY@@")) {
+    const text = String(line || "");
+    const plain = text.replace(/^\[[^\]]+\]\s*/, "").trim();
+    if (plain.startsWith("tests start ")) {
+      testRunning = true;
+      visible.push(text.replace("tests start", "当前步骤：开始执行测试"));
       continue;
-    } else if (isQuietDependencyLog(line)) {
-      continue;
-    } else {
-      visible.push(line);
     }
+    if (plain.startsWith("@@TEST_STEP@@ ")) {
+      visible.push(text.replace("@@TEST_STEP@@ ", "当前步骤：执行测试 - "));
+      continue;
+    }
+    if (plain.startsWith("TEST summary ")) {
+      testRunning = false;
+      continue;
+    }
+    if (text.includes("@@TEST_SUMMARY@@")) {
+      continue;
+    }
+    if (testRunning) {
+      if (/(^|\s)(error|failed|failure|panic|traceback)(:|\s|$)/i.test(plain)) {
+        visible.push(text);
+      }
+      continue;
+    }
+    if (isQuietDependencyLog(line)) {
+      continue;
+    }
+    visible.push(line);
   }
   return visible.join("\n") || "(暂无日志)";
+}
+
+function shortCaseName(name) {
+  const value = String(name || "");
+  if (value.startsWith("github.com/")) return value.slice(value.lastIndexOf(".") + 1);
+  const parts = value.split(".");
+  return parts.length > 2 ? parts.slice(-2).join(".") : value;
 }
 
 function renderTestResult(job) {
@@ -86,6 +120,10 @@ function renderTestResult(job) {
   const commands = Array.isArray(job.test_commands) ? job.test_commands : [];
   const cases = Array.isArray(job.test_cases) ? job.test_cases : [];
   const failures = Array.isArray(job.test_failures) ? job.test_failures : [];
+  if (job.id !== testCaseJobId) {
+    testCaseJobId = job.id || "";
+    testCasePage = 1;
+  }
   root.hidden = false;
   root.replaceChildren();
 
@@ -102,11 +140,16 @@ function renderTestResult(job) {
 
   const rows = cases.length ? cases : commands;
   if (rows.length) {
+    const pageSize = 25;
+    const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+    testCasePage = Math.min(testCasePage, pageCount);
+    const start = (testCasePage - 1) * pageSize;
+    const pageRows = rows.slice(start, start + pageSize);
     const table = document.createElement("table");
     table.className = "test-table";
     const thead = document.createElement("thead");
     const header = document.createElement("tr");
-    [cases.length ? "测试用例" : "执行脚本", "结果", "耗时"].forEach((label) => {
+    (cases.length ? ["测试脚本", "测试用例", "结果", "耗时"] : ["执行脚本", "结果", "耗时"]).forEach((label) => {
       const th = document.createElement("th");
       th.textContent = label;
       header.appendChild(th);
@@ -114,10 +157,19 @@ function renderTestResult(job) {
     thead.appendChild(header);
     table.appendChild(thead);
     const body = document.createElement("tbody");
-    rows.forEach((command) => {
+    pageRows.forEach((command, index) => {
       const row = document.createElement("tr");
+      if (cases.length && (index === 0 || pageRows[index - 1].command !== command.command)) {
+        const script = document.createElement("td");
+        script.className = "test-script";
+        script.textContent = command.command || "测试脚本";
+        let span = 1;
+        while (index + span < pageRows.length && pageRows[index + span].command === command.command) span += 1;
+        script.rowSpan = span;
+        row.appendChild(script);
+      }
       const name = document.createElement("td");
-      name.textContent = command.name || "测试脚本";
+      name.textContent = cases.length ? shortCaseName(command.name) : command.name || "测试脚本";
       const status = document.createElement("td");
       const caseStatus = command.status;
       const passed = caseStatus ? caseStatus === "passed" : Number(command.exit_code) === 0;
@@ -131,6 +183,26 @@ function renderTestResult(job) {
     });
     table.appendChild(body);
     root.appendChild(table);
+    if (pageCount > 1) {
+      const pager = document.createElement("div");
+      pager.className = "test-pager";
+      const previous = document.createElement("button");
+      previous.type = "button";
+      previous.className = "btn ghost";
+      previous.textContent = "上一页";
+      previous.disabled = testCasePage <= 1;
+      previous.addEventListener("click", () => { testCasePage -= 1; renderTestResult(job); });
+      const position = document.createElement("span");
+      position.textContent = "第 " + testCasePage + " / " + pageCount + " 页（" + rows.length + " 条用例）";
+      const next = document.createElement("button");
+      next.type = "button";
+      next.className = "btn ghost";
+      next.textContent = "下一页";
+      next.disabled = testCasePage >= pageCount;
+      next.addEventListener("click", () => { testCasePage += 1; renderTestResult(job); });
+      pager.append(previous, position, next);
+      root.appendChild(pager);
+    }
   }
 
   if (failures.length) {

@@ -25,7 +25,7 @@ class TimingResult(unittest.TextTestResult):
         item: dict[str, Any] = {
             "name": test.id(),
             "status": status,
-            "duration_ms": int((time.monotonic() - started) * 1000),
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
         }
         if detail:
             item["detail"] = detail.strip()[:1000]

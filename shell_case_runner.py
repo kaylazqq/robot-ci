@@ -24,7 +24,7 @@ def main() -> int:
         item = {
             "name": path.relative_to(root).as_posix(),
             "status": "passed" if proc.returncode == 0 else "failed",
-            "duration_ms": int((time.monotonic() - started) * 1000),
+            "duration_ms": round((time.monotonic() - started) * 1000, 3),
         }
         if proc.returncode != 0:
             item["detail"] = detail or f"exit={proc.returncode}"
