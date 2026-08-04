@@ -153,10 +153,25 @@ function renderTestResult(job) {
 
   const sourceRows = cases.length ? cases : commands;
   const statusPriority = { failed: 0, error: 0, skipped: 1, passed: 2 };
+  const sourceFileOf = (item) => String(item.file || item.command || "");
+  const scriptPriority = new Map();
+  if (cases.length) {
+    sourceRows.forEach((item) => {
+      const sourceFile = sourceFileOf(item);
+      const priority = statusPriority[item.status] ?? 0;
+      scriptPriority.set(sourceFile, Math.min(scriptPriority.get(sourceFile) ?? priority, priority));
+    });
+  }
   const rows = cases.length
     ? sourceRows.map((item, index) => ({ item, index }))
-        .sort((left, right) =>
-          (statusPriority[left.item.status] ?? 0) - (statusPriority[right.item.status] ?? 0) || left.index - right.index)
+        .sort((left, right) => {
+          const leftFile = sourceFileOf(left.item);
+          const rightFile = sourceFileOf(right.item);
+          return (scriptPriority.get(leftFile) ?? 0) - (scriptPriority.get(rightFile) ?? 0)
+            || leftFile.localeCompare(rightFile, "en")
+            || (statusPriority[left.item.status] ?? 0) - (statusPriority[right.item.status] ?? 0)
+            || left.index - right.index;
+        })
         .map(({ item }) => item)
     : sourceRows;
   if (rows.length) {
@@ -169,9 +184,10 @@ function renderTestResult(job) {
     table.className = "test-table";
     const thead = document.createElement("thead");
     const header = document.createElement("tr");
-    (cases.length ? ["测试脚本", "测试用例", "结果", "耗时"] : ["执行脚本", "结果", "耗时"]).forEach((label) => {
+    (cases.length ? ["测试脚本", "测试用例", "结果", "耗时"] : ["执行脚本", "结果", "耗时"]).forEach((label, index) => {
       const th = document.createElement("th");
       th.textContent = label;
+      if (cases.length && index === 0) th.className = "test-script-column";
       header.appendChild(th);
     });
     thead.appendChild(header);
