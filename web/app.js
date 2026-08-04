@@ -344,6 +344,21 @@ if (chkAll) {
 (async function boot() {
   try {
     await Promise.all([refreshHealth(), refreshServices()]);
+
+    // Auto-recover live running job after page refresh
+    try {
+      const running = await api("/api/running-job");
+      if (running && running.id && running.status === "running") {
+        const summary = running.service_id || "任务";
+        showJob(summary + " · job " + running.id, (running.log || []).join("\n") || "(正在重新连接…)");
+        if (pollTimer) clearInterval(pollTimer);
+        busy = true;
+        setButtonsDisabled(true);
+        pollTimer = setInterval(() => pollJob(running.id, summary), 1500);
+        return;
+      }
+    } catch (_) { /* ignore – backend may not have the endpoint yet */ }
+
     showJob(
       "就绪",
       "可勾选多个微服务后点「构建所选」；同一次任务归档到同一时间戳目录。\n也可点单行「构建并推送」。"

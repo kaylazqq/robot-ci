@@ -584,13 +584,27 @@ def run_stream(
         append_job_log(job_id, f"ERROR: not found: {args[0]}")
         return 127
     assert p.stdout is not None
-    start = time.time()
-    for line in p.stdout:
-        append_job_log(job_id, re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", line.rstrip("\n")))
-        if time.time() - start > timeout:
-            p.kill()
-            append_job_log(job_id, "ERROR: timeout")
-            return 124
+    # Read stdout on a daemon thread so the main thread can enforce a real
+    # wall-clock timeout even when the subprocess dies without flushing.
+    read_done = threading.Event()
+
+    def _reader() -> None:
+        try:
+            for line in p.stdout:
+                append_job_log(job_id, re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", line.rstrip("\n")))
+        except Exception:
+            pass
+        finally:
+            read_done.set()
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    reader.join(timeout=timeout)
+    if reader.is_alive():
+        p.kill()
+        reader.join(timeout=10)
+        append_job_log(job_id, "ERROR: timeout")
+        return 124
     return p.wait() or 0
 
 
@@ -1456,6 +1470,34 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(200, disk)
                 return
             self._json(404, {"error": "job not found"})
+            return
+
+        # Return the single running (in-memory) job so the frontend can
+        # auto-recover polling after a page refresh.
+        if path == "/api/running-job":
+            with _jobs_lock:
+                for jid, j in _jobs.items():
+                    if j.get("status") == "running":
+                        payload = {
+                            k: j.get(k)
+                            for k in (
+                                "id",
+                                "service_id",
+                                "branch",
+                                "status",
+                                "error",
+                                "remote",
+                                "archive",
+                                "archive_dir",
+                                "results",
+                                "progress",
+                                "current",
+                            )
+                        }
+                        payload["log"] = list(j["log"])
+                        self._json(200, payload)
+                        return
+            self._json(200, {"id": None, "status": "idle"})
             return
 
         if path in ("/", "/index.html"):
