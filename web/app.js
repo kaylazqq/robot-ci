@@ -89,7 +89,8 @@ function renderTestResult(job) {
     return;
   }
   const summary = job.test_summary || {};
-  const isOk = job.test_status === "passed" || job.test_status === "not_configured";
+  const isOk = job.test_status === "passed";
+  const overallLabel = isOk ? "通过" : job.test_status === "not_configured" ? "未配置" : "未通过";
   const commands = Array.isArray(job.test_commands) ? job.test_commands : [];
   const failures = Array.isArray(job.test_failures) ? job.test_failures : [];
   root.hidden = false;
@@ -98,7 +99,7 @@ function renderTestResult(job) {
   const head = document.createElement("div");
   head.className = "test-result-head";
   const title = document.createElement("strong");
-  title.textContent = "测试结果：" + (isOk ? "通过" : "未通过");
+  title.textContent = "测试结果：" + overallLabel;
   title.className = "test-status " + (isOk ? "ok" : "bad");
   const overview = document.createElement("span");
   overview.className = "test-result-summary";
