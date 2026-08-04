@@ -34,6 +34,19 @@ function showJob(msg, logText) {
   if (panel) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+function testSummaryText(job) {
+  if (!job || !job.test_status) return "";
+  const s = job.test_summary || {};
+  const parts = [
+    "测试=" + job.test_status,
+    "总计=" + (s.total || 0),
+    "通过=" + (s.passed || 0),
+    "失败=" + (s.failed || 0),
+    "错误=" + (s.errors || 0),
+  ];
+  return " · " + parts.join(" / ");
+}
+
 async function refreshHealth() {
   const h = await api("/api/health");
   setPill($("pillAgent"), "助手在线", "ok");
@@ -219,8 +232,10 @@ async function pollJob(jobId, title, branch) {
       logEl.scrollTop = logEl.scrollHeight;
     }
     const br = job.branch || branch;
+    const testText = testSummaryText(job);
     if (job.status === "running" || job.status === "unknown") {
-      $("jobMeta").textContent = title + " @ " + br + " · 进行中";
+      const stage = job.stage ? " · " + job.stage : "";
+      $("jobMeta").textContent = title + " @ " + br + " · 进行中" + stage + testText;
       return;
     }
     if (pollTimer) clearInterval(pollTimer);
@@ -229,9 +244,9 @@ async function pollJob(jobId, title, branch) {
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
     if (job.status === "ok") {
-      $("jobMeta").textContent = title + " @ " + br + " · 成功 · " + (job.remote || "");
+      $("jobMeta").textContent = title + " @ " + br + " · 成功 · " + (job.remote || "") + testText;
     } else {
-      $("jobMeta").textContent = title + " @ " + br + " · 失败 · " + (job.error || "");
+      $("jobMeta").textContent = title + " @ " + br + " · 失败 · " + (job.error || "") + testText;
     }
   } catch (e) {
     pollFails += 1;

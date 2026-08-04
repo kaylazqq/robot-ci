@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -22,6 +23,8 @@ WEB_DIR = ROOT / "web"
 LOG_DIR = ROOT / "logs"
 CONFIG_PATH = ROOT / "config.json"
 SERVICES_PATH = ROOT / "services.json"
+TEST_PLANS_PATH = ROOT / "test-plans.json"
+TEST_RUNNER_PATH = ROOT / "test_runner.py"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _jobs: dict[str, dict[str, Any]] = {}
@@ -44,7 +47,19 @@ def persist_job_meta(job_id: str) -> None:
             return
         meta = {
             k: job.get(k)
-            for k in ("id", "service_id", "branch", "status", "error", "remote")
+            for k in (
+                "id",
+                "service_id",
+                "branch",
+                "status",
+                "stage",
+                "error",
+                "remote",
+                "commit_sha",
+                "test_status",
+                "test_summary",
+                "test_report",
+            )
         }
     try:
         job_meta_path(job_id).write_text(
@@ -81,6 +96,11 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "status": meta.get("status") or "unknown",
         "error": meta.get("error"),
         "remote": meta.get("remote"),
+        "stage": meta.get("stage"),
+        "commit_sha": meta.get("commit_sha"),
+        "test_status": meta.get("test_status"),
+        "test_summary": meta.get("test_summary"),
+        "test_report": meta.get("test_report"),
         "log": log_lines,
     }
 
@@ -156,6 +176,76 @@ def reload_cfg() -> None:
 
 def load_services() -> list[dict[str, Any]]:
     return json.loads(SERVICES_PATH.read_text(encoding="utf-8"))
+
+
+def test_report_dir(job_id: str) -> Path:
+    return LOG_DIR / "reports" / job_id
+
+
+def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_sha: str) -> dict[str, Any]:
+    """Run trusted UT/DT tests and always return a result that cannot block publishing."""
+    report_dir = test_report_dir(job_id)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = report_dir / "summary.json"
+    if not TEST_PLANS_PATH.is_file() or not TEST_RUNNER_PATH.is_file():
+        result = {
+            "status": "error",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 1,
+            "duration_ms": 0,
+            "failures": [{"name": "test runner", "detail": "test-plans.json or test_runner.py is missing"}],
+        }
+    else:
+        append_job_log(job_id, f"tests start service={service_id} sha={commit_sha}")
+        command = " ".join(
+            (
+                "python3",
+                shlex.quote(host_path(TEST_RUNNER_PATH)),
+                "--plans",
+                shlex.quote(host_path(TEST_PLANS_PATH)),
+                "--service",
+                shlex.quote(service_id),
+                "--repo",
+                shlex.quote(host_path(repo_dir)),
+                "--report-dir",
+                shlex.quote(host_path(report_dir)),
+            )
+        )
+        exit_code = run_stream(job_id, bash_lc(command), timeout=int(CFG.get("test_timeout_sec") or 7200))
+        try:
+            result = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            result = {
+                "status": "timeout" if exit_code == 124 else "error",
+                "total": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 1,
+                "duration_ms": 0,
+                "failures": [{"name": "test runner", "detail": "test summary was not produced"}],
+            }
+    result["commit_sha"] = commit_sha
+    result["report_dir"] = str(report_dir)
+    try:
+        (LOG_DIR / f"job-{job_id}-test.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+    append_job_log(
+        job_id,
+        "TEST summary "
+        f"status={result.get('status')} total={result.get('total', 0)} "
+        f"passed={result.get('passed', 0)} failed={result.get('failed', 0)} "
+        f"errors={result.get('errors', 0)} duration_ms={result.get('duration_ms', 0)}",
+    )
+    for item in (result.get("failures") or [])[:20]:
+        append_job_log(job_id, f"TEST FAIL {item.get('name')}: {item.get('detail')}")
+    if result.get("status") not in ("passed", "not_configured"):
+        append_job_log(job_id, "WARN tests did not pass; phase-1 policy continues to image build")
+    return result
 
 
 def use_wsl() -> bool:
@@ -992,8 +1082,21 @@ def push_service(
             return
 
         git = git_bin()
-        code, head = run_cmd([git, "-C", detail, "rev-parse", "--short=7", "HEAD"], timeout=30)
-        git_hash = head if code == 0 else "0000000"
+        code, commit_sha = run_cmd([git, "-C", detail, "rev-parse", "HEAD"], timeout=30)
+        commit_sha = commit_sha if code == 0 else "0000000000000000000000000000000000000000"
+        git_hash = commit_sha[:7]
+        set_job(job_id, stage="testing", commit_sha=commit_sha)
+        test_result = run_tests_nonblocking(job_id, service_id, Path(detail), commit_sha)
+        set_job(
+            job_id,
+            stage="building",
+            test_status=test_result.get("status"),
+            test_summary={
+                key: test_result.get(key, 0)
+                for key in ("total", "passed", "failed", "errors", "duration_ms")
+            },
+            test_report=str(LOG_DIR / f"job-{job_id}-test.json"),
+        )
 
         local_ref, tag = find_local_image_by_git_hash(image, git_hash)
         if local_ref and tag:
@@ -1014,6 +1117,7 @@ def push_service(
             set_job(job_id, status="failed", error="no image/tar after build")
             return
 
+        set_job(job_id, stage="pushing")
         remote = f"{registry}/{org}/{image}:{tag}"
         append_job_log(job_id, f"docker tag {local_ref} -> {remote}")
         code, out = docker_cmd("tag", local_ref, remote, timeout=60)
@@ -1066,7 +1170,7 @@ def push_service(
             return
 
         docker_cmd("rmi", remote, timeout=60)
-        set_job(job_id, status="ok", remote=remote, branch=branch)
+        set_job(job_id, status="ok", stage="done", remote=remote, branch=branch)
         append_job_log(job_id, f"OK {remote}")
     except Exception as e:  # noqa: BLE001
         set_job(job_id, status="failed", error=str(e))
@@ -1193,7 +1297,19 @@ class Handler(SimpleHTTPRequestHandler):
                 if job:
                     payload = {
                         k: job.get(k)
-                        for k in ("id", "service_id", "branch", "status", "error", "remote")
+                        for k in (
+                            "id",
+                            "service_id",
+                            "branch",
+                            "status",
+                            "stage",
+                            "error",
+                            "remote",
+                            "commit_sha",
+                            "test_status",
+                            "test_summary",
+                            "test_report",
+                        )
                     }
                     # Prefer live memory log; also refresh from file if empty
                     payload["log"] = list(job["log"])
@@ -1262,8 +1378,13 @@ class Handler(SimpleHTTPRequestHandler):
                     "service_id": service_id,
                     "branch": branch,
                     "status": "running",
+                    "stage": "syncing",
                     "error": None,
                     "remote": None,
+                    "commit_sha": None,
+                    "test_status": None,
+                    "test_summary": None,
+                    "test_report": None,
                     "log": [],
                     "log_file": str(log_file),
                 }

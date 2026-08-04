@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "policy": {
+    "allowed": ["unit", "module", "function", "mock", "fake", "temporary-files", "local-http"],
+    "excluded_dependencies": ["postgresql", "redis", "kafka", "temporal-server", "mattermost-server", "swr", "cce"]
+  },
+  "services": {
+    "temporal": {"repository": "aiwelink-temporal", "scope": "Temporal runtime, migration and image fingerprint scripts", "roots": ["tests/unit", "tests/dt"], "convention": "shell"},
+    "service-router": {"repository": "service_router", "scope": "HTTPS mode, Nginx runtime rendering and CCE image export", "roots": ["tests/unit", "tests/dt", "tests/test-*.sh"], "convention": "shell"},
+    "semantic-gateway": {"repository": "semantic-gateway", "scope": "IM ingress, safety filtering, file enrichment and gateway configuration", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "pytest"},
+    "memory-service": {"repository": "CellMem", "scope": "memory payload normalization, configuration, logging and local runtime", "roots": ["tests/unit", "tests/dt", "tests/test_database_config.py", "tests/test_latency_logging.py", "tests/test_runtime_start.py"], "excluded": ["tests/test_postgresql_store.py", "tests/test_postgresql_api_e2e.py"], "convention": "pytest"},
+    "agentlink": {"repository": "AgentLink", "scope": "agent/workspace state, event bridge, provisioning and locking", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "unittest"},
+    "observability": {"repository": "observability", "scope": "event parsing, redaction, trace aggregation and local HTTP handler", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "unittest"},
+    "plugin-market": {"repository": "plugin-market", "scope": "catalog manifests, provider selection and HTTP API", "roots": ["catalog", "internal/httpapi"], "convention": "go"},
+    "semantic-schedule": {"repository": "semantic-schedule", "scope": "task graph, planner, IM context and fake Redis/Kafka adapters", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "pytest"},
+    "agent-governance-gw": {"repository": "agent-governance-gw", "scope": "policy normalization, authorization and dispatcher behavior", "roots": ["internal/governance"], "excluded": ["//go:build integration"], "convention": "go"},
+    "multica-server": {"repository": "multica-aiwelink", "scope": "agent failure classification, secret redaction and encryption helpers", "roots": ["pkg/redact", "pkg/taskfailure", "internal/util/secretbox"], "convention": "go"},
+    "multica-fleet": {"repository": "multica-aiwelink", "scope": "agent failure classification, secret redaction and encryption helpers", "roots": ["pkg/redact", "pkg/taskfailure", "internal/util/secretbox"], "convention": "go"},
+    "mattermost": {"repository": "mattermost", "scope": "Mattermost server short-mode unit tests", "roots": ["server"], "excluded": ["Docker/database/browser E2E"], "convention": "make"}
+  }
+}

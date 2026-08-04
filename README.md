@@ -5,7 +5,7 @@
 只要这些文件，或发 `dist\swr-push-helper-*.zip`：
 
 ```
-start.bat  stop.bat  server.py  services.json  web/  README.md
+start.bat  stop.bat  server.py  services.json  test-plans.json  test-suites/  test_runner.py  web/  README.md
 ```
 
 ## 部署到 Linux 服务器（推荐给多人共用）
@@ -22,6 +22,12 @@ bash deploy-linux.sh
 
 4. 浏览器打开 `http://服务器IP:18888/`
 5. 别人只需粘贴**自己的 SWR 临时登录指令**；拉私有 GitHub 代码用服务器上的 Token，无需再登 GitHub
+
+## 第一阶段测试
+
+工具会在拉取服务代码后执行 `test-plans.json` 中受控的 UT/DT 测试，并在任务日志和页面显示总用例、通过、失败和错误数及失败用例摘要。第一阶段测试不阻断镜像构建或 SWR 推送；数据库、Redis、Temporal 等外部依赖测试不在测试计划中执行。
+
+所有服务的业务范围、测试根目录和新增用例约定集中记录在 `test-suites/README.md` 与 `test-suites/catalog.json`。测试代码保留在各服务仓库，与业务代码同版本提交；部署工具只维护安全的执行白名单。
 
 ## 对方电脑 / 使用方需要
 
