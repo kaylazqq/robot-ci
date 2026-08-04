@@ -195,7 +195,11 @@ textarea { resize: vertical; }
 .test-table th, .test-table td { padding: 0.42rem 0.5rem; text-align: left; border-top: 1px solid var(--line); }
 .test-table th { color: var(--muted); font-weight: 600; }
 .test-script-column { width: 18%; }
+.test-case-column { width: 64%; }
+.test-status-column { width: 8%; }
+.test-duration-column { width: 10%; }
 .test-script { color: var(--text); vertical-align: top; font-weight: 400; word-break: break-word; }
+.test-case { white-space: normal; overflow-wrap: anywhere; word-break: normal; line-height: 1.45; vertical-align: top; }
 .test-case-detail { margin-top: 0.2rem; color: var(--muted); font-size: 0.72rem; white-space: pre-wrap; }
 .test-status { font-weight: 600; }
 .test-status.ok { color: var(--ok); }

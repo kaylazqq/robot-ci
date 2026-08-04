@@ -187,7 +187,9 @@ function renderTestResult(job) {
     (cases.length ? ["测试脚本", "测试用例", "结果", "耗时"] : ["执行脚本", "结果", "耗时"]).forEach((label, index) => {
       const th = document.createElement("th");
       th.textContent = label;
-      if (cases.length && index === 0) th.className = "test-script-column";
+      if (cases.length) {
+        th.className = ["test-script-column", "test-case-column", "test-status-column", "test-duration-column"][index];
+      }
       header.appendChild(th);
     });
     thead.appendChild(header);
@@ -207,6 +209,7 @@ function renderTestResult(job) {
         row.appendChild(script);
       }
       const name = document.createElement("td");
+      name.className = "test-case";
       const caseName = document.createElement("div");
       caseName.textContent = cases.length ? shortCaseName(command.name) : command.name || "测试脚本";
       name.appendChild(caseName);
