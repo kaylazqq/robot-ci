@@ -38,6 +38,8 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 页面支持勾选多个微服务一次构建；同一任务里的镜像会归档到**同一个**时间戳目录。
 
+每次构建开始时会先删除该服务旧的 workspace 再重新 `git clone`（避免历史产物堆积）。构建结束后保留本次 checkout，方便失败时上机排查；下次构建同一服务时再删掉重来。磁盘紧张时会自动清理 `/usr/share/nginx/html/images` 下较旧的时间戳归档目录（默认保留最近 3 个）。
+
 可通过 nginx 直接下载，例如：`http://服务器IP/images/YYYYMMDDHHMMSS/<image>_<tag>.tar`
 
 `config.json` 相关项：

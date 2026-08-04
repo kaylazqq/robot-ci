@@ -634,6 +634,18 @@ def list_branches_api(repo: str) -> tuple[bool, list[str] | str]:
     )
 
 
+def wipe_workspace_dir(job_id: str, dest: Path, label: str = "workspace") -> None:
+    """Delete a previous checkout so the next build always starts from a fresh clone."""
+    if not dest.exists():
+        return
+    append_job_log(job_id, f"remove old {label}: {dest}")
+    shutil.rmtree(dest, ignore_errors=True)
+    if dest.exists():
+        # Retry once — Windows/Docker sometimes briefly locks files.
+        time.sleep(0.5)
+        shutil.rmtree(dest, ignore_errors=True)
+
+
 def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]:
     url = (svc.get("github") or "").strip()
     if not url and svc.get("repo"):
@@ -658,60 +670,32 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     append_job_log(job_id, f"branch={branch}")
     append_job_log(job_id, f"workspace={dest}")
 
-    # Clear stale lock left by killed builds
-    lock = dest / ".git" / "index.lock"
-    if lock.is_file():
-        try:
-            lock.unlink()
-            append_job_log(job_id, "removed stale .git/index.lock")
-        except OSError:
-            pass
+    # Always wipe previous checkout (including leftover runtime-images) then fresh clone.
+    wipe_workspace_dir(job_id, dest, label=f"workspace {svc.get('id') or dest.name}")
 
-    if not (dest / ".git").is_dir():
-        if dest.exists() and any(dest.iterdir()):
-            shutil.rmtree(dest, ignore_errors=True)
-        append_job_log(job_id, "git clone…")
+    append_job_log(job_id, "git clone…")
+    code = run_stream(
+        job_id,
+        git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
+        timeout=1800,
+        env=genv,
+    )
+    if code != 0:
+        wipe_workspace_dir(job_id, dest, label="failed clone")
         code = run_stream(
             job_id,
-            git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
+            git_args("clone", "--depth", "1", clone_url, str(dest)),
             timeout=1800,
             env=genv,
         )
         if code != 0:
-            shutil.rmtree(dest, ignore_errors=True)
-            code = run_stream(
-                job_id,
-                git_args("clone", "--depth", "1", clone_url, str(dest)),
-                timeout=1800,
-                env=genv,
-            )
-            if code != 0:
-                return False, "git clone failed"
-            run_stream(
-                job_id,
-                git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
-                timeout=600,
-                env=genv,
-            )
-            code = run_stream(
-                job_id,
-                git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
-                timeout=120,
-                env=genv,
-            )
-            if code != 0:
-                return False, f"checkout {branch} failed"
-    else:
-        append_job_log(job_id, "git fetch…")
-        run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", clone_url), timeout=30, env=genv)
-        code = run_stream(
+            return False, "git clone failed"
+        run_stream(
             job_id,
             git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
-            timeout=1200,
+            timeout=600,
             env=genv,
         )
-        if code != 0:
-            return False, "git fetch failed"
         code = run_stream(
             job_id,
             git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
@@ -750,58 +734,31 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
     dest.parent.mkdir(parents=True, exist_ok=True)
     append_job_log(job_id, f"ensure shared public-service → {dest} @ {branch}")
 
-    lock = dest / ".git" / "index.lock"
-    if lock.is_file():
-        try:
-            lock.unlink()
-        except OSError:
-            pass
-
-    if not (dest / ".git").is_dir():
-        if dest.exists() and any(dest.iterdir()):
-            shutil.rmtree(dest, ignore_errors=True)
-        append_job_log(job_id, "git clone public-service…")
+    # Fresh clone each job so public-service helpers cannot accumulate junk either.
+    wipe_workspace_dir(job_id, dest, label="public-service")
+    append_job_log(job_id, "git clone public-service…")
+    code = run_stream(
+        job_id,
+        git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
+        timeout=1800,
+        env=genv,
+    )
+    if code != 0:
+        wipe_workspace_dir(job_id, dest, label="failed public-service clone")
         code = run_stream(
             job_id,
-            git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
+            git_args("clone", "--depth", "1", clone_url, str(dest)),
             timeout=1800,
             env=genv,
         )
         if code != 0:
-            shutil.rmtree(dest, ignore_errors=True)
-            code = run_stream(
-                job_id,
-                git_args("clone", "--depth", "1", clone_url, str(dest)),
-                timeout=1800,
-                env=genv,
-            )
-            if code != 0:
-                return False, "git clone public-service failed"
-            run_stream(
-                job_id,
-                git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
-                timeout=600,
-                env=genv,
-            )
-            code = run_stream(
-                job_id,
-                git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
-                timeout=120,
-                env=genv,
-            )
-            if code != 0:
-                return False, f"checkout public-service {branch} failed"
-    else:
-        append_job_log(job_id, "git fetch public-service…")
-        run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", clone_url), timeout=30, env=genv)
-        code = run_stream(
+            return False, "git clone public-service failed"
+        run_stream(
             job_id,
             git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
-            timeout=1200,
+            timeout=600,
             env=genv,
         )
-        if code != 0:
-            return False, "git fetch public-service failed"
         code = run_stream(
             job_id,
             git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
@@ -928,8 +885,58 @@ def parse_tag_from_tar(tar_path: Path, image: str) -> str:
     return parts[1] if len(parts) == 2 else stem
 
 
-def make_archive_dir() -> Path:
+def disk_free_bytes(path: Path | str) -> int | None:
+    try:
+        return shutil.disk_usage(str(path)).free
+    except OSError:
+        return None
+
+
+def prune_nginx_archives(job_id: str, keep_latest: int = 3, min_free_gb: float = 8.0) -> None:
+    """Delete oldest timestamp dirs under archive_root when free space is low."""
+    base = Path((CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/") or ".")
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    free = disk_free_bytes(base)
+    if free is None:
+        return
+    min_free = int(min_free_gb * 1024**3)
+    if free >= min_free:
+        return
+
+    dirs = sorted(
+        [p for p in base.iterdir() if p.is_dir() and re.fullmatch(r"\d{8,14}", p.name)],
+        key=lambda p: p.name,
+    )
+    if len(dirs) <= keep_latest:
+        append_job_log(
+            job_id,
+            f"WARN: disk free={free // (1024**2)}MB < {min_free_gb:.0f}GB but only "
+            f"{len(dirs)} archive dir(s) (keep_latest={keep_latest})",
+        )
+        return
+
+    append_job_log(
+        job_id,
+        f"disk free={free // (1024**2)}MB < {min_free_gb:.0f}GB; pruning old nginx archives…",
+    )
+    for old in dirs[: max(0, len(dirs) - keep_latest)]:
+        append_job_log(job_id, f"remove old archive dir: {old}")
+        shutil.rmtree(old, ignore_errors=True)
+        free = disk_free_bytes(base)
+        if free is not None and free >= min_free:
+            break
+    free2 = disk_free_bytes(base)
+    if free2 is not None:
+        append_job_log(job_id, f"disk free after prune: {free2 // (1024**2)}MB")
+
+
+def make_archive_dir(job_id: str | None = None) -> Path:
     base = (CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/")
+    if job_id:
+        prune_nginx_archives(job_id)
     out_dir = Path(base) / time.strftime("%Y%m%d%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -953,7 +960,7 @@ def archive_image_locally(
 
     if out_dir is None:
         try:
-            out_dir = make_archive_dir()
+            out_dir = make_archive_dir(job_id)
         except OSError as e:
             msg = f"cannot create archive dir: {e}"
             append_job_log(job_id, f"ERROR: {msg}")
@@ -1080,10 +1087,11 @@ def push_one_service(
         "archive": "",
         "error": "",
     }
-
     append_job_log(job_id, f"service={svc['title']} image={image}")
     append_job_log(job_id, f"target={registry}/{org}/{image}:*")
 
+    # Keep checkout after the job so failed builds can be inspected on disk.
+    # The next build for this service wipes it in sync_repo() before re-cloning.
     ok, detail = sync_repo(job_id, svc, branch)
     if not ok:
         result["error"] = detail
@@ -1164,6 +1172,8 @@ def push_one_service(
         docker_cmd("rmi", remote, timeout=60)
         return result
 
+    # Free space before large docker save when disk is tight.
+    prune_nginx_archives(job_id)
     ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
     if not ok_arc:
         result["remote"] = remote
@@ -1231,7 +1241,7 @@ def run_push_job(
         archive_dir: Path | None = None
         if CFG.get("archive_enabled"):
             try:
-                archive_dir = make_archive_dir()
+                archive_dir = make_archive_dir(job_id)
             except OSError as e:
                 if CFG.get("archive_required"):
                     set_job(job_id, status="failed", error=f"cannot create archive dir: {e}")
