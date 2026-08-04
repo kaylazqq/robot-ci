@@ -6,6 +6,7 @@ set -euo pipefail
 APP_DIR="${APP_DIR:-/opt/swr-push-helper}"
 PORT="${SWR_PORT:-18888}"
 KEY="${GITHUB_SSH_KEY:-/root/.ssh/id_ed25519_github}"
+ARCHIVE_ROOT="${SWR_ARCHIVE_ROOT:-/usr/share/nginx/html/images}"
 
 cd "$APP_DIR"
 
@@ -70,20 +71,36 @@ chmod 600 /root/.ssh/config
 mkdir -p /var/lib/swr-workspaces
 chmod 700 /var/lib/swr-workspaces
 
-cat > "$APP_DIR/config.json" <<EOF
-{
-  "host": "0.0.0.0",
-  "port": ${PORT},
-  "allow_remote": true,
-  "swr_registry": "swr.cn-southwest-2.myhuaweicloud.com",
-  "swr_org": "public_ai",
-  "workspace_root": "/var/lib/swr-workspaces",
-  "github_use_ssh": true,
-  "github_ssh_key": "${KEY}",
-  "github_token": "",
-  "build_timeout_sec": 7200
+echo "==> nginx image archive dir"
+mkdir -p "$ARCHIVE_ROOT"
+chmod 755 "$ARCHIVE_ROOT" || true
+
+export APP_DIR PORT KEY ARCHIVE_ROOT
+python3 <<'PY'
+import json, os
+from pathlib import Path
+
+app_dir = Path(os.environ["APP_DIR"])
+cfg = {
+    "host": "0.0.0.0",
+    "port": int(os.environ.get("PORT") or 18888),
+    "allow_remote": True,
+    "swr_registry": "swr.cn-southwest-2.myhuaweicloud.com",
+    "swr_org": "public_ai",
+    "workspace_root": "/var/lib/swr-workspaces",
+    "github_use_ssh": True,
+    "github_ssh_key": os.environ.get("KEY") or "",
+    "github_token": "",
+    "build_timeout_sec": 7200,
+    "archive_enabled": True,
+    "archive_required": True,
+    "archive_root": os.environ.get("ARCHIVE_ROOT") or "/usr/share/nginx/html/images",
 }
-EOF
+(app_dir / "config.json").write_text(
+    json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+)
+print("wrote config.json")
+PY
 chmod 600 "$APP_DIR/config.json"
 
 cat > /etc/systemd/system/swr-push-helper.service <<EOF
@@ -125,3 +142,4 @@ echo "===================================================="
 echo "Then test: ssh -T git@github.com"
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo "Web UI: http://${IP:-YOUR_SERVER_IP}:${PORT}/"
+echo "Image archive: ${ARCHIVE_ROOT}/YYYYMMDDHHMMSS/<image>_<tag>.tar"

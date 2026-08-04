@@ -8,7 +8,7 @@ $stage = Join-Path $env:TEMP ("swr-pack-" + [guid]::NewGuid().ToString("n"))
 $dest = Join-Path $stage "swr-push-helper"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 try {
-  foreach ($name in @("start.bat", "stop.bat", "server.py", "services.json", "README.md", "web", "deploy-linux.sh")) {
+  foreach ($name in @("start.bat", "stop.bat", "server.py", "services.json", "README.md", "web", "deploy-linux.sh", "config.example.json")) {
     Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $dest $name) -Recurse -Force
   }
   Compress-Archive -Path $dest -DestinationPath $zip -Force
