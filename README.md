@@ -36,6 +36,8 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 /usr/share/nginx/html/images/YYYYMMDDHHMMSS/<image>_<tag>.tar
 ```
 
+页面支持勾选多个微服务一次构建；同一任务里的镜像会归档到**同一个**时间戳目录。
+
 可通过 nginx 直接下载，例如：`http://服务器IP/images/YYYYMMDDHHMMSS/<image>_<tag>.tar`
 
 `config.json` 相关项：

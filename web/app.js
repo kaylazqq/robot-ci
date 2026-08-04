@@ -137,10 +137,47 @@ async function loadBranches(serviceId, selectEl, defaultBranch) {
   }
 }
 
+function selectedItems() {
+  const items = [];
+  document.querySelectorAll(".row-svc").forEach((row) => {
+    const cb = row.querySelector('[data-act="pick"]');
+    if (!cb || !cb.checked) return;
+    const id = row.getAttribute("data-id");
+    const title = row.getAttribute("data-title") || id;
+    const select = row.querySelector("[data-branch]");
+    const branch = ((select && select.value) || row.getAttribute("data-default-branch") || "main").trim();
+    items.push({ service_id: id, branch, title });
+  });
+  return items;
+}
+
+function updateBatchUi() {
+  const items = selectedItems();
+  const btn = $("btnBatch");
+  const count = $("selCount");
+  if (count) count.textContent = String(items.length);
+  if (btn) {
+    btn.disabled = busy || items.length === 0;
+    btn.textContent = items.length ? "构建所选 (" + items.length + ")" : "构建所选";
+  }
+  const all = $("chkAll");
+  if (all) {
+    const boxes = Array.from(document.querySelectorAll('[data-act="pick"]'));
+    const checked = boxes.filter((b) => b.checked).length;
+    all.checked = boxes.length > 0 && checked === boxes.length;
+    all.indeterminate = checked > 0 && checked < boxes.length;
+  }
+}
+
 function setButtonsDisabled(disabled) {
   document.querySelectorAll('[data-act="run"]').forEach((btn) => {
     btn.disabled = !!disabled;
   });
+  document.querySelectorAll('[data-act="pick"]').forEach((cb) => {
+    cb.disabled = !!disabled;
+  });
+  if ($("chkAll")) $("chkAll").disabled = !!disabled;
+  if ($("btnBatch")) $("btnBatch").disabled = !!disabled || selectedItems().length === 0;
 }
 
 async function refreshServices() {
@@ -150,7 +187,11 @@ async function refreshServices() {
   for (const s of data.services) {
     const row = document.createElement("div");
     row.className = "row-svc";
+    row.setAttribute("data-id", s.id);
+    row.setAttribute("data-title", s.title || s.id);
+    row.setAttribute("data-default-branch", s.default_branch || "main");
     row.innerHTML =
+      '<label class="svc-pick"><input type="checkbox" data-act="pick" /></label>' +
       "<div>" +
       '<div class="svc-title"></div>' +
       '<div class="svc-meta"></div>' +
@@ -162,54 +203,63 @@ async function refreshServices() {
     const select = row.querySelector("[data-branch]");
     fillBranchSelect(select, [s.default_branch || "main"], s.default_branch || "main");
     setTimeout(() => loadBranches(s.id, select, s.default_branch), 30);
+    row.querySelector('[data-act="pick"]').addEventListener("change", updateBatchUi);
     const btn = row.querySelector('[data-act="run"]');
     btn.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
       const branch = (select.value || s.default_branch || "main").trim();
-      pushOne(s.id, s.title, branch, btn);
+      pushItems([{ service_id: s.id, branch, title: s.title }], btn);
     });
     root.appendChild(row);
   }
+  updateBatchUi();
   if (busy) setButtonsDisabled(true);
 }
 
-async function pushOne(serviceId, title, branch, btn) {
+async function pushItems(items, btn) {
   if (busy) {
     showJob("已有任务进行中，请等待完成");
+    return;
+  }
+  if (!items || !items.length) {
+    showJob("请先勾选要构建的微服务");
     return;
   }
   busy = true;
   setButtonsDisabled(true);
   if (btn) btn.textContent = "进行中…";
-  showJob(title + " @ " + branch + " · 已提交，正在启动…", "正在请求 /api/push …\n");
+  const summary =
+    items.length === 1
+      ? items[0].title + " @ " + items[0].branch
+      : items.length + " 个服务";
+  showJob(summary + " · 已提交，正在启动…", "正在请求 /api/push …\n");
   try {
     const loginCmd = (($("loginCmd") && $("loginCmd").value) || "").trim();
-    // loginCmd may be empty: server reuses shared SWR login if still valid.
     const resp = await api("/api/push", {
       method: "POST",
       body: JSON.stringify({
-        service_id: serviceId,
-        branch: branch,
+        items: items.map((it) => ({ service_id: it.service_id, branch: it.branch })),
         login_command: loginCmd,
       }),
     });
     const jobId = resp.job_id;
     pollFails = 0;
-    showJob(title + " @ " + branch + " · job " + jobId, "job_id=" + jobId + "\n开始轮询日志…\n");
+    showJob(summary + " · job " + jobId, "job_id=" + jobId + "\n开始轮询日志…\n");
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => pollJob(jobId, title, branch), 1500);
-    await pollJob(jobId, title, branch);
+    pollTimer = setInterval(() => pollJob(jobId, summary), 1500);
+    await pollJob(jobId, summary);
   } catch (e) {
     const msg = (e.data && (e.data.detail || e.data.error)) || e.message;
-    showJob(title + " · 失败", String(msg));
+    showJob(summary + " · 失败", String(msg));
     busy = false;
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
+    updateBatchUi();
   }
 }
 
-async function pollJob(jobId, title, branch) {
+async function pollJob(jobId, summary) {
   try {
     const job = await api("/api/jobs/" + jobId);
     pollFails = 0;
@@ -218,9 +268,10 @@ async function pollJob(jobId, title, branch) {
       logEl.textContent = (job.log || []).join("\n") || "(暂无日志)";
       logEl.scrollTop = logEl.scrollHeight;
     }
-    const br = job.branch || branch;
+    const progress = job.progress ? " · " + job.progress : "";
+    const current = job.current ? " · " + job.current : "";
     if (job.status === "running" || job.status === "unknown") {
-      $("jobMeta").textContent = title + " @ " + br + " · 进行中";
+      $("jobMeta").textContent = summary + " · 进行中" + progress + current;
       return;
     }
     if (pollTimer) clearInterval(pollTimer);
@@ -228,18 +279,26 @@ async function pollJob(jobId, title, branch) {
     busy = false;
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
+    updateBatchUi();
+    const archiveHint = job.archive_dir || job.archive || "";
     if (job.status === "ok") {
-      $("jobMeta").textContent = title + " @ " + br + " · 成功 · " + (job.remote || "");
+      $("jobMeta").textContent =
+        summary +
+        " · 成功" +
+        (archiveHint ? " · 归档 " + archiveHint : "") +
+        (job.remote ? " · " + job.remote : "");
     } else {
-      $("jobMeta").textContent = title + " @ " + br + " · 失败 · " + (job.error || "");
+      $("jobMeta").textContent =
+        summary +
+        " · 失败 · " +
+        (job.error || "") +
+        (archiveHint ? " · 归档 " + archiveHint : "");
     }
   } catch (e) {
     pollFails += 1;
-    // Keep polling through transient network blips (Failed to fetch / timeouts)
     if (pollFails < 80) {
       if ($("jobMeta")) {
-        $("jobMeta").textContent =
-          title + " @ " + branch + " · 网络抖动，重连中 (" + pollFails + ")";
+        $("jobMeta").textContent = summary + " · 网络抖动，重连中 (" + pollFails + ")";
       }
       return;
     }
@@ -247,6 +306,7 @@ async function pollJob(jobId, title, branch) {
     pollTimer = null;
     busy = false;
     setButtonsDisabled(false);
+    updateBatchUi();
     showJob("轮询失败", e.message || String(e));
   }
 }
@@ -265,11 +325,29 @@ bind("btnSaveToken", () =>
     $("tokenStatus").style.color = "var(--danger)";
   })
 );
+bind("btnBatch", () => {
+  const items = selectedItems();
+  pushItems(items, $("btnBatch"));
+});
+
+const chkAll = $("chkAll");
+if (chkAll) {
+  chkAll.addEventListener("change", () => {
+    const on = !!chkAll.checked;
+    document.querySelectorAll('[data-act="pick"]').forEach((cb) => {
+      cb.checked = on;
+    });
+    updateBatchUi();
+  });
+}
 
 (async function boot() {
   try {
     await Promise.all([refreshHealth(), refreshServices()]);
-    showJob("就绪", "可直接构建推送；若失败提示未登录，点「检查登录」或重新登录 SWR。");
+    showJob(
+      "就绪",
+      "可勾选多个微服务后点「构建所选」；同一次任务归档到同一时间戳目录。\n也可点单行「构建并推送」。"
+    );
   } catch (e) {
     $("serviceTable").innerHTML = '<p class="hint">无法连接助手，请先运行 start.bat</p>';
     showJob("助手未连接", String(e.message || e));

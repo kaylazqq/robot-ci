@@ -44,7 +44,17 @@ def persist_job_meta(job_id: str) -> None:
             return
         meta = {
             k: job.get(k)
-            for k in ("id", "service_id", "branch", "status", "error", "remote", "archive")
+            for k in (
+                "id",
+                "service_id",
+                "branch",
+                "status",
+                "error",
+                "remote",
+                "archive",
+                "archive_dir",
+                "results",
+            )
         }
     try:
         job_meta_path(job_id).write_text(
@@ -918,31 +928,49 @@ def parse_tag_from_tar(tar_path: Path, image: str) -> str:
     return parts[1] if len(parts) == 2 else stem
 
 
+def make_archive_dir() -> Path:
+    base = (CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/")
+    out_dir = Path(base) / time.strftime("%Y%m%d%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.chmod(0o755)
+    except OSError:
+        pass
+    return out_dir
+
+
 def archive_image_locally(
     job_id: str,
     local_ref: str,
     image: str,
     tag: str,
+    out_dir: Path | None = None,
 ) -> tuple[bool, str]:
-    """docker save image tar under archive_root/YYYYMMDDHHMMSS/ for nginx download."""
+    """docker save image tar under archive dir (shared dir for batch jobs)."""
     if not CFG.get("archive_enabled"):
         append_job_log(job_id, "local archive skipped (disabled)")
         return True, ""
 
-    base = (CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/")
-    ts = time.strftime("%Y%m%d%H%M%S")
-    out_dir = Path(base) / ts
+    if out_dir is None:
+        try:
+            out_dir = make_archive_dir()
+        except OSError as e:
+            msg = f"cannot create archive dir: {e}"
+            append_job_log(job_id, f"ERROR: {msg}")
+            return False, msg
+    else:
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            msg = f"cannot create archive dir {out_dir}: {e}"
+            append_job_log(job_id, f"ERROR: {msg}")
+            return False, msg
+
     safe_tag = re.sub(r"[^\w.\-]+", "_", tag)
     tar_name = f"{image}_{safe_tag}.tar"
     out_file = out_dir / tar_name
 
     append_job_log(job_id, f"archive: docker save {local_ref} → {out_file}")
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        msg = f"cannot create archive dir {out_dir}: {e}"
-        append_job_log(job_id, f"ERROR: {msg}")
-        return False, msg
 
     # Save via docker host path (WSL-aware).
     code, out = docker_cmd("save", "-o", host_path(out_file), local_ref, timeout=3600)
@@ -1007,50 +1035,191 @@ def resolve_local_image(job_id: str, svc: dict[str, Any]) -> tuple[str | None, s
     return local_ref, tag
 
 
-def push_service(
+def ensure_swr_login(job_id: str, login_command: str = "") -> bool:
+    """Shared-server SWR login; returns False and sets job failed on error."""
+    cmd = (login_command or "").strip()
+    if cmd:
+        append_job_log(job_id, "SWR login from page credentials…")
+        ok_login, out_login = do_login(cmd)
+        append_job_log(job_id, (out_login or "")[-800:])
+        if not ok_login:
+            set_job(job_id, status="failed", error="SWR login failed")
+            append_job_log(job_id, "ERROR: paste a valid Huawei SWR temporary login command")
+            return False
+        return True
+
+    append_job_log(job_id, "reusing shared SWR login on this server…")
+    if not check_login():
+        set_job(job_id, status="failed", error="not logged in to SWR")
+        append_job_log(
+            job_id,
+            "ERROR: 服务器上尚无有效 SWR 登录（或已过期）。请任一人在页面粘贴 docker login 并登录后再推送。",
+        )
+        return False
+    append_job_log(job_id, "shared SWR login still valid")
+    return True
+
+
+def push_one_service(
     job_id: str,
-    service_id: str,
+    svc: dict[str, Any],
     branch: str,
+    archive_dir: Path | None,
+) -> dict[str, Any]:
+    """Build/push/archive one service. Does not set final job status."""
+    service_id = svc["id"]
+    branch = (branch or svc.get("default_branch") or "main").strip()
+    image = svc["image"]
+    registry, org = CFG["swr_registry"], CFG["swr_org"]
+    result: dict[str, Any] = {
+        "service_id": service_id,
+        "title": svc.get("title") or service_id,
+        "branch": branch,
+        "ok": False,
+        "remote": "",
+        "archive": "",
+        "error": "",
+    }
+
+    append_job_log(job_id, f"service={svc['title']} image={image}")
+    append_job_log(job_id, f"target={registry}/{org}/{image}:*")
+
+    ok, detail = sync_repo(job_id, svc, branch)
+    if not ok:
+        result["error"] = detail
+        append_job_log(job_id, f"ERROR {detail}")
+        return result
+
+    git = git_bin()
+    code, head = run_cmd([git, "-C", detail, "rev-parse", "--short=7", "HEAD"], timeout=30)
+    git_hash = head if code == 0 else "0000000"
+
+    local_ref, tag = find_local_image_by_git_hash(image, git_hash)
+    if local_ref and tag:
+        append_job_log(
+            job_id,
+            f"optimize: reuse existing image {local_ref} (same git {git_hash}, skip rebuild)",
+        )
+    else:
+        if not build_from_source(job_id, svc, git_hash):
+            result["error"] = "build failed"
+            return result
+        local_ref, tag = resolve_local_image(job_id, svc)
+        by_hash_ref, by_hash_tag = find_local_image_by_git_hash(image, git_hash)
+        if by_hash_ref and by_hash_tag:
+            local_ref, tag = by_hash_ref, by_hash_tag
+    if not local_ref or not tag:
+        result["error"] = "no image/tar after build"
+        return result
+
+    remote = f"{registry}/{org}/{image}:{tag}"
+    append_job_log(job_id, f"docker tag {local_ref} -> {remote}")
+    code, out = docker_cmd("tag", local_ref, remote, timeout=60)
+    if code != 0:
+        append_job_log(job_id, out)
+        result["error"] = "docker tag failed"
+        return result
+
+    push_attempts = 4
+    code, out = 1, ""
+    for attempt in range(1, push_attempts + 1):
+        append_job_log(job_id, f"docker push {remote} (try {attempt}/{push_attempts})")
+        code, out = docker_cmd("push", remote, timeout=3600)
+        for line in (out or "").splitlines()[-40:]:
+            append_job_log(job_id, line)
+        if code == 0:
+            break
+        text = (out or "").lower()
+        retryable = any(
+            x in text
+            for x in (
+                "timeout",
+                "temporarily unavailable",
+                "connection reset",
+                "connection refused",
+                "tls handshake",
+                "i/o timeout",
+                "network is unreachable",
+                "request canceled",
+            )
+        )
+        if not retryable or attempt >= push_attempts:
+            break
+        wait_s = min(30, 5 * attempt)
+        append_job_log(job_id, f"push network error; retry in {wait_s}s…")
+        time.sleep(wait_s)
+    if code != 0:
+        result["remote"] = remote
+        result["error"] = "docker push failed"
+        if "authenticate" in (out or "").lower() or "denied" in (out or "").lower():
+            append_job_log(
+                job_id,
+                "ERROR: SWR 鉴权失败。请重新复制华为云临时登录指令到页面后再推送；并确认组织 public_ai 有推送权限",
+            )
+        else:
+            append_job_log(
+                job_id,
+                "ERROR: docker push failed（多为到 SWR 的网络超时）。镜像已在服务器构建完成，可重新登录 SWR 后再点一次推送。",
+            )
+        docker_cmd("rmi", remote, timeout=60)
+        return result
+
+    ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
+    if not ok_arc:
+        result["remote"] = remote
+        if CFG.get("archive_required"):
+            result["error"] = "local archive failed"
+            append_job_log(
+                job_id,
+                "ERROR: SWR 已推送成功，但本地归档镜像包失败。"
+                f"请检查目录权限：{CFG.get('archive_root')}",
+            )
+            docker_cmd("rmi", remote, timeout=60)
+            return result
+        append_job_log(job_id, f"WARN: local archive failed (ignored): {arc_path}")
+
+    docker_cmd("rmi", remote, timeout=60)
+    result["ok"] = True
+    result["remote"] = remote
+    result["archive"] = arc_path or ""
+    append_job_log(job_id, f"OK {remote}")
+    if arc_path:
+        append_job_log(job_id, f"OK archive {arc_path}")
+    return result
+
+
+def run_push_job(
+    job_id: str,
+    items: list[dict[str, str]],
     login_command: str = "",
 ) -> None:
+    """Push one or more services; batch jobs share one archive timestamp directory."""
     try:
-        services = {s["id"]: s for s in load_services()}
-        svc = services.get(service_id)
-        if not svc:
-            set_job(job_id, status="failed", error=f"unknown service: {service_id}")
+        catalog = {s["id"]: s for s in load_services()}
+        resolved: list[tuple[dict[str, Any], str]] = []
+        for item in items:
+            sid = (item.get("service_id") or "").strip()
+            svc = catalog.get(sid)
+            if not svc:
+                set_job(job_id, status="failed", error=f"unknown service: {sid or '?'}")
+                append_job_log(job_id, f"ERROR unknown service: {sid or '?'}")
+                return
+            br = (item.get("branch") or svc.get("default_branch") or "main").strip()
+            resolved.append((svc, br))
+
+        if not resolved:
+            set_job(job_id, status="failed", error="no services selected")
             return
-        branch = (branch or svc.get("default_branch") or "main").strip()
-        image = svc["image"]
-        registry, org = CFG["swr_registry"], CFG["swr_org"]
-        append_job_log(job_id, f"service={svc['title']} image={image}")
-        append_job_log(job_id, f"target={registry}/{org}/{image}:*")
 
-        # Shared-server mode: one person's docker login is reused by others until the temp token expires.
-        # Fresh command from the page always re-logins (and refreshes the shared credential).
-        cmd = (login_command or "").strip()
-        if cmd:
-            append_job_log(job_id, "SWR login from page credentials…")
-            ok_login, out_login = do_login(cmd)
-            append_job_log(job_id, (out_login or "")[-800:])
-            if not ok_login:
-                set_job(job_id, status="failed", error="SWR login failed")
-                append_job_log(job_id, "ERROR: paste a valid Huawei SWR temporary login command")
-                return
-        else:
-            append_job_log(job_id, "reusing shared SWR login on this server…")
-            if not check_login():
-                set_job(job_id, status="failed", error="not logged in to SWR")
-                append_job_log(
-                    job_id,
-                    "ERROR: 服务器上尚无有效 SWR 登录（或已过期）。请任一人在页面粘贴 docker login 并登录后再推送。",
-                )
-                return
-            append_job_log(job_id, "shared SWR login still valid")
+        labels = ", ".join(f"{svc['id']}@{br}" for svc, br in resolved)
+        append_job_log(job_id, f"batch size={len(resolved)}: {labels}")
+        set_job(
+            job_id,
+            service_id=",".join(svc["id"] for svc, _ in resolved),
+            branch=",".join(br for _, br in resolved),
+        )
 
-        ok, detail = sync_repo(job_id, svc, branch)
-        if not ok:
-            set_job(job_id, status="failed", error=detail)
-            append_job_log(job_id, f"ERROR {detail}")
+        if not ensure_swr_login(job_id, login_command):
             return
 
         ok_ps, detail_ps = ensure_public_service(job_id)
@@ -1059,113 +1228,77 @@ def push_service(
             append_job_log(job_id, f"ERROR {detail_ps}")
             return
 
-        git = git_bin()
-        code, head = run_cmd([git, "-C", detail, "rev-parse", "--short=7", "HEAD"], timeout=30)
-        git_hash = head if code == 0 else "0000000"
-
-        local_ref, tag = find_local_image_by_git_hash(image, git_hash)
-        if local_ref and tag:
-            append_job_log(
-                job_id,
-                f"optimize: reuse existing image {local_ref} (same git {git_hash}, skip rebuild)",
-            )
-        else:
-            if not build_from_source(job_id, svc, git_hash):
-                set_job(job_id, status="failed", error="build failed")
-                return
-            local_ref, tag = resolve_local_image(job_id, svc)
-            # Prefer exact git-hash tag if resolve picked something else
-            by_hash_ref, by_hash_tag = find_local_image_by_git_hash(image, git_hash)
-            if by_hash_ref and by_hash_tag:
-                local_ref, tag = by_hash_ref, by_hash_tag
-        if not local_ref or not tag:
-            set_job(job_id, status="failed", error="no image/tar after build")
-            return
-
-        remote = f"{registry}/{org}/{image}:{tag}"
-        append_job_log(job_id, f"docker tag {local_ref} -> {remote}")
-        code, out = docker_cmd("tag", local_ref, remote, timeout=60)
-        if code != 0:
-            append_job_log(job_id, out)
-            set_job(job_id, status="failed", error="docker tag failed")
-            return
-
-        # SWR sometimes times out waiting for headers; retry a few times before failing.
-        push_attempts = 4
-        code, out = 1, ""
-        for attempt in range(1, push_attempts + 1):
-            append_job_log(job_id, f"docker push {remote} (try {attempt}/{push_attempts})")
-            code, out = docker_cmd("push", remote, timeout=3600)
-            for line in (out or "").splitlines()[-40:]:
-                append_job_log(job_id, line)
-            if code == 0:
-                break
-            text = (out or "").lower()
-            retryable = any(
-                x in text
-                for x in (
-                    "timeout",
-                    "temporarily unavailable",
-                    "connection reset",
-                    "connection refused",
-                    "tls handshake",
-                    "i/o timeout",
-                    "network is unreachable",
-                    "request canceled",
-                )
-            )
-            if not retryable or attempt >= push_attempts:
-                break
-            wait_s = min(30, 5 * attempt)
-            append_job_log(job_id, f"push network error; retry in {wait_s}s…")
-            time.sleep(wait_s)
-        if code != 0:
-            set_job(job_id, status="failed", error="docker push failed", remote=remote)
-            if "authenticate" in (out or "").lower() or "denied" in (out or "").lower():
-                append_job_log(
-                    job_id,
-                    "ERROR: SWR 鉴权失败。请重新复制华为云临时登录指令到页面后再推送；并确认组织 public_ai 有推送权限",
-                )
+        archive_dir: Path | None = None
+        if CFG.get("archive_enabled"):
+            try:
+                archive_dir = make_archive_dir()
+            except OSError as e:
+                if CFG.get("archive_required"):
+                    set_job(job_id, status="failed", error=f"cannot create archive dir: {e}")
+                    append_job_log(job_id, f"ERROR cannot create archive dir: {e}")
+                    return
+                append_job_log(job_id, f"WARN: cannot create archive dir: {e}")
             else:
-                append_job_log(
-                    job_id,
-                    "ERROR: docker push failed（多为到 SWR 的网络超时）。镜像已在服务器构建完成，可重新登录 SWR 后再点一次推送。",
-                )
-            return
+                append_job_log(job_id, f"shared archive dir={archive_dir}")
+                set_job(job_id, archive_dir=str(archive_dir))
 
-        # Also archive the image tar under local nginx html/images (timestamped dir).
-        ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag)
-        if not ok_arc:
-            if CFG.get("archive_required"):
-                set_job(
-                    job_id,
-                    status="failed",
-                    error="local archive failed",
-                    remote=remote,
-                )
-                append_job_log(
-                    job_id,
-                    "ERROR: SWR 已推送成功，但本地归档镜像包失败。"
-                    f"请检查目录权限：{CFG.get('archive_root')}",
-                )
-                docker_cmd("rmi", remote, timeout=60)
-                return
-            append_job_log(job_id, f"WARN: local archive failed (ignored): {arc_path}")
+        results: list[dict[str, Any]] = []
+        total = len(resolved)
+        for idx, (svc, br) in enumerate(resolved, 1):
+            append_job_log(job_id, f"===== [{idx}/{total}] {svc['id']} @ {br} =====")
+            set_job(job_id, current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
+            result = push_one_service(job_id, svc, br, archive_dir)
+            results.append(result)
+            set_job(job_id, results=results)
 
-        docker_cmd("rmi", remote, timeout=60)
-        set_job(
-            job_id,
-            status="ok",
-            remote=remote,
-            branch=branch,
-            archive=arc_path or "",
-        )
-        append_job_log(job_id, f"OK {remote}")
-        if arc_path:
-            append_job_log(job_id, f"OK archive {arc_path}")
+        ok_n = sum(1 for r in results if r.get("ok"))
+        fail_n = total - ok_n
+        remotes = [r["remote"] for r in results if r.get("remote")]
+        archives = [r["archive"] for r in results if r.get("archive")]
+        archive_summary = str(archive_dir) if archive_dir else (archives[0] if archives else "")
+        if fail_n == 0:
+            set_job(
+                job_id,
+                status="ok",
+                remote="; ".join(remotes),
+                archive=archive_summary,
+                results=results,
+            )
+            append_job_log(job_id, f"BATCH OK {ok_n}/{total}")
+            if archive_dir:
+                append_job_log(job_id, f"BATCH archive dir {archive_dir}")
+        else:
+            errs = "; ".join(
+                f"{r['service_id']}:{r.get('error') or 'failed'}" for r in results if not r.get("ok")
+            )
+            set_job(
+                job_id,
+                status="failed",
+                error=f"{fail_n}/{total} failed: {errs}",
+                remote="; ".join(remotes),
+                archive=archive_summary,
+                results=results,
+            )
+            append_job_log(job_id, f"BATCH DONE with failures ok={ok_n} fail={fail_n}")
+            if archive_dir:
+                append_job_log(job_id, f"BATCH archive dir {archive_dir} (partial ok kept)")
     except Exception as e:  # noqa: BLE001
         set_job(job_id, status="failed", error=str(e))
         append_job_log(job_id, f"ERROR {e}")
+
+
+def push_service(
+    job_id: str,
+    service_id: str,
+    branch: str,
+    login_command: str = "",
+) -> None:
+    """Back-compat wrapper for a single service push."""
+    run_push_job(
+        job_id,
+        [{"service_id": service_id, "branch": branch}],
+        login_command=login_command,
+    )
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1290,7 +1423,19 @@ class Handler(SimpleHTTPRequestHandler):
                 if job:
                     payload = {
                         k: job.get(k)
-                        for k in ("id", "service_id", "branch", "status", "error", "remote")
+                        for k in (
+                            "id",
+                            "service_id",
+                            "branch",
+                            "status",
+                            "error",
+                            "remote",
+                            "archive",
+                            "archive_dir",
+                            "results",
+                            "progress",
+                            "current",
+                        )
                     }
                     # Prefer live memory log; also refresh from file if empty
                     payload["log"] = list(job["log"])
@@ -1341,11 +1486,32 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/push":
-            service_id = (data.get("service_id") or "").strip()
-            branch = (data.get("branch") or "main").strip()
             login_command = (data.get("login_command") or "").strip()
-            if not service_id:
-                self._json(400, {"error": "service_id required"})
+            raw_items = data.get("items")
+            items: list[dict[str, str]] = []
+            if isinstance(raw_items, list) and raw_items:
+                for it in raw_items:
+                    if not isinstance(it, dict):
+                        continue
+                    sid = (it.get("service_id") or "").strip()
+                    if not sid:
+                        continue
+                    items.append(
+                        {
+                            "service_id": sid,
+                            "branch": (it.get("branch") or "main").strip() or "main",
+                        }
+                    )
+            else:
+                service_id = (data.get("service_id") or "").strip()
+                branch = (data.get("branch") or "main").strip() or "main"
+                if service_id:
+                    items = [{"service_id": service_id, "branch": branch}]
+            if not items:
+                self._json(400, {"error": "service_id or items[] required"})
+                return
+            if len(items) > 32:
+                self._json(400, {"error": "too many services (max 32)"})
                 return
             docker = check_docker()
             if not docker["ok"]:
@@ -1353,25 +1519,41 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             job_id = uuid.uuid4().hex[:12]
             log_file = LOG_DIR / f"job-{job_id}.log"
+            ids = ",".join(it["service_id"] for it in items)
+            branches = ",".join(it["branch"] for it in items)
             with _jobs_lock:
                 _jobs[job_id] = {
                     "id": job_id,
-                    "service_id": service_id,
-                    "branch": branch,
+                    "service_id": ids,
+                    "branch": branches,
                     "status": "running",
                     "error": None,
                     "remote": None,
+                    "archive": None,
+                    "archive_dir": None,
+                    "results": [],
                     "log": [],
                     "log_file": str(log_file),
                 }
             persist_job_meta(job_id)
-            append_job_log(job_id, f"job start service={service_id} branch={branch}")
+            append_job_log(
+                job_id,
+                f"job start services={len(items)} [{ids}] branches=[{branches}]",
+            )
             threading.Thread(
-                target=push_service,
-                args=(job_id, service_id, branch, login_command),
+                target=run_push_job,
+                args=(job_id, items, login_command),
                 daemon=True,
             ).start()
-            self._json(200, {"job_id": job_id, "branch": branch})
+            self._json(
+                200,
+                {
+                    "job_id": job_id,
+                    "count": len(items),
+                    "items": items,
+                    "branch": branches,
+                },
+            )
             return
 
         self._json(404, {"error": "not found"})
