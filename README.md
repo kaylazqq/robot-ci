@@ -1,11 +1,11 @@
-﻿# SWR 一键推送
+# SWR 一键推送
 
 ## 发给别人（本机 Windows）
 
 只要这些文件，或发 `dist\swr-push-helper-*.zip`：
 
 ```
-start.bat  stop.bat  server.py  services.json  test-plans.json  test-suites/  test_runner.py  web/  README.md
+start.bat  stop.bat  server.py  services.json  test-plans.json  test-suites/  test_runner.py  web/  README.md  deploy-linux.sh  config.example.json
 ```
 
 ## 部署到 Linux 服务器（推荐给多人共用）
@@ -33,6 +33,26 @@ bash deploy-linux.sh
 
 - 能访问该网页
 - 华为云 SWR 临时登录指令 + `public_ai` 推送权限
+
+## 本地归档（nginx）
+
+SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按构建时间建子目录：
+
+```
+/usr/share/nginx/html/images/YYYYMMDDHHMMSS/<image>_<tag>.tar
+```
+
+可通过 nginx 直接下载，例如：`http://服务器IP/images/YYYYMMDDHHMMSS/<image>_<tag>.tar`
+
+`config.json` 相关项：
+
+```json
+{
+  "archive_enabled": true,
+  "archive_required": true,
+  "archive_root": "/usr/share/nginx/html/images"
+}
+```
 
 ## 安全提醒
 

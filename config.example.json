@@ -1,0 +1,15 @@
+{
+  "host": "127.0.0.1",
+  "port": 18888,
+  "allow_remote": false,
+  "swr_registry": "swr.cn-southwest-2.myhuaweicloud.com",
+  "swr_org": "public_ai",
+  "workspace_root": "",
+  "github_use_ssh": true,
+  "github_ssh_key": "",
+  "github_token": "",
+  "build_timeout_sec": 7200,
+  "archive_enabled": true,
+  "archive_required": true,
+  "archive_root": "/usr/share/nginx/html/images"
+}

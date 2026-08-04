@@ -30,21 +30,122 @@ function showJob(msg, logText) {
   const log = $("jobLog");
   if (meta) meta.textContent = msg;
   if (log && logText !== undefined) log.textContent = logText;
+  renderTestResult(null);
   const panel = $("logsPanel");
   if (panel) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
-function testSummaryText(job) {
-  if (!job || !job.test_status) return "";
-  const s = job.test_summary || {};
-  const parts = [
-    "测试=" + job.test_status,
-    "总计=" + (s.total || 0),
-    "通过=" + (s.passed || 0),
-    "失败=" + (s.failed || 0),
-    "错误=" + (s.errors || 0),
-  ];
-  return " · " + parts.join(" / ");
+function formatDuration(ms) {
+  const value = Number(ms || 0);
+  if (value < 1000) return value + " ms";
+  return (value / 1000).toFixed(value >= 10000 ? 0 : 1) + " s";
+}
+
+function isQuietDependencyLog(line) {
+  const text = String(line || "").replace(/^\[[^\]]+\]\s*/, "").trim().toLowerCase();
+  return (
+    text.startsWith("requirement already satisfied:") ||
+    text.startsWith("collecting ") ||
+    text.startsWith("downloading ") ||
+    text.startsWith("using cached ") ||
+    text.startsWith("building wheels for collected packages") ||
+    text.startsWith("building wheel for ") ||
+    text.startsWith("installing collected packages:") ||
+    text.startsWith("successfully installed ") ||
+    text.startsWith("looking in indexes:") ||
+    text.startsWith("processing ") ||
+    text.startsWith("defaulting to user installation")
+  );
+}
+
+function displayJobLog(lines) {
+  let quietCount = 0;
+  let summaryCount = 0;
+  const visible = [];
+  for (const line of lines || []) {
+    if (String(line).includes("@@TEST_SUMMARY@@")) {
+      summaryCount += 1;
+    } else if (isQuietDependencyLog(line)) {
+      quietCount += 1;
+    } else {
+      visible.push(line);
+    }
+  }
+  if (quietCount) {
+    visible.push("[页面已折叠 " + quietCount + " 条依赖安装日志；完整原始日志仍保存在服务器作业日志文件中]");
+  }
+  if (summaryCount) {
+    visible.push("[原始测试汇总已折叠，详细结果见上方测试结果表]");
+  }
+  return visible.join("\n") || "(暂无日志)";
+}
+
+function renderTestResult(job) {
+  const root = $("testResult");
+  if (!root) return;
+  if (!job || !job.test_status) {
+    root.hidden = true;
+    root.replaceChildren();
+    return;
+  }
+  const summary = job.test_summary || {};
+  const isOk = job.test_status === "passed" || job.test_status === "not_configured";
+  const commands = Array.isArray(job.test_commands) ? job.test_commands : [];
+  const failures = Array.isArray(job.test_failures) ? job.test_failures : [];
+  root.hidden = false;
+  root.replaceChildren();
+
+  const head = document.createElement("div");
+  head.className = "test-result-head";
+  const title = document.createElement("strong");
+  title.textContent = "测试结果：" + (isOk ? "通过" : "未通过");
+  title.className = "test-status " + (isOk ? "ok" : "bad");
+  const overview = document.createElement("span");
+  overview.className = "test-result-summary";
+  overview.textContent = "总用例 " + (summary.total || 0) + " · 通过 " + (summary.passed || 0) + " · 失败 " + (summary.failed || 0) + " · 错误 " + (summary.errors || 0) + " · 总耗时 " + formatDuration(summary.duration_ms);
+  head.append(title, overview);
+  root.appendChild(head);
+
+  if (commands.length) {
+    const table = document.createElement("table");
+    table.className = "test-table";
+    const thead = document.createElement("thead");
+    const header = document.createElement("tr");
+    ["执行脚本", "结果", "耗时"].forEach((label) => {
+      const th = document.createElement("th");
+      th.textContent = label;
+      header.appendChild(th);
+    });
+    thead.appendChild(header);
+    table.appendChild(thead);
+    const body = document.createElement("tbody");
+    commands.forEach((command) => {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = command.name || "测试脚本";
+      const status = document.createElement("td");
+      const passed = Number(command.exit_code) === 0;
+      status.textContent = passed ? "通过" : "失败（退出码 " + command.exit_code + "）";
+      status.className = "test-status " + (passed ? "ok" : "bad");
+      const duration = document.createElement("td");
+      duration.textContent = formatDuration(command.duration_ms);
+      row.append(name, status, duration);
+      body.appendChild(row);
+    });
+    table.appendChild(body);
+    root.appendChild(table);
+  }
+
+  if (failures.length) {
+    const list = document.createElement("ul");
+    list.className = "test-failures";
+    failures.slice(0, 10).forEach((failure) => {
+      const item = document.createElement("li");
+      item.textContent = (failure.name || "测试失败") + "：" + (failure.detail || "请查看完整作业日志");
+      list.appendChild(item);
+    });
+    root.appendChild(list);
+  }
 }
 
 async function refreshHealth() {
@@ -228,14 +329,14 @@ async function pollJob(jobId, title, branch) {
     pollFails = 0;
     const logEl = $("jobLog");
     if (logEl) {
-      logEl.textContent = (job.log || []).join("\n") || "(暂无日志)";
+      logEl.textContent = displayJobLog(job.log || []);
       logEl.scrollTop = logEl.scrollHeight;
     }
+    renderTestResult(job);
     const br = job.branch || branch;
-    const testText = testSummaryText(job);
     if (job.status === "running" || job.status === "unknown") {
       const stage = job.stage ? " · " + job.stage : "";
-      $("jobMeta").textContent = title + " @ " + br + " · 进行中" + stage + testText;
+      $("jobMeta").textContent = title + " @ " + br + " · 进行中" + stage;
       return;
     }
     if (pollTimer) clearInterval(pollTimer);
@@ -244,9 +345,9 @@ async function pollJob(jobId, title, branch) {
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
     if (job.status === "ok") {
-      $("jobMeta").textContent = title + " @ " + br + " · 成功 · " + (job.remote || "") + testText;
+      $("jobMeta").textContent = title + " @ " + br + " · 成功 · " + (job.remote || "");
     } else {
-      $("jobMeta").textContent = title + " @ " + br + " · 失败 · " + (job.error || "") + testText;
+      $("jobMeta").textContent = title + " @ " + br + " · 失败 · " + (job.error || "");
     }
   } catch (e) {
     pollFails += 1;

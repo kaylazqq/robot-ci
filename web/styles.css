@@ -180,6 +180,24 @@ textarea { resize: vertical; }
 }
 .log.mini { min-height: 72px; max-height: 140px; margin-top: 0.7rem; }
 
+.test-result {
+  margin: 0 0 0.85rem;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: rgba(0, 0, 0, 0.16);
+}
+.test-result-head { display: flex; align-items: baseline; gap: 0.7rem; flex-wrap: wrap; }
+.test-result-head strong { font-size: 0.9rem; }
+.test-result-summary { color: var(--muted); font-size: 0.8rem; }
+.test-table { width: 100%; border-collapse: collapse; margin-top: 0.6rem; font-size: 0.8rem; }
+.test-table th, .test-table td { padding: 0.42rem 0.5rem; text-align: left; border-top: 1px solid var(--line); }
+.test-table th { color: var(--muted); font-weight: 600; }
+.test-status { font-weight: 600; }
+.test-status.ok { color: var(--ok); }
+.test-status.bad { color: var(--danger); }
+.test-failures { margin: 0.65rem 0 0; padding-left: 1.15rem; color: var(--danger); font-family: var(--mono); font-size: 0.76rem; }
+
 .foot {
   padding: 0 1.75rem 1.5rem;
   color: var(--muted);

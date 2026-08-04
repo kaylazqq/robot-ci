@@ -55,9 +55,12 @@ def persist_job_meta(job_id: str) -> None:
                 "stage",
                 "error",
                 "remote",
+                "archive",
                 "commit_sha",
                 "test_status",
                 "test_summary",
+                "test_commands",
+                "test_failures",
                 "test_report",
             )
         }
@@ -96,10 +99,13 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "status": meta.get("status") or "unknown",
         "error": meta.get("error"),
         "remote": meta.get("remote"),
+        "archive": meta.get("archive"),
         "stage": meta.get("stage"),
         "commit_sha": meta.get("commit_sha"),
         "test_status": meta.get("test_status"),
         "test_summary": meta.get("test_summary"),
+        "test_commands": meta.get("test_commands"),
+        "test_failures": meta.get("test_failures"),
         "test_report": meta.get("test_report"),
         "log": log_lines,
     }
@@ -151,6 +157,26 @@ def load_config() -> dict[str, Any]:
     else:
         cfg["github_use_ssh"] = bool(ssh_key)
     cfg["helper_root"] = str(ROOT)
+
+    # Optional: archive image tar locally for nginx static download.
+    archive_root = (
+        cfg.get("archive_root")
+        or os.environ.get("SWR_ARCHIVE_ROOT")
+        or "/usr/share/nginx/html/images"
+    ).strip()
+    if "archive_enabled" in cfg:
+        archive_enabled = bool(cfg.get("archive_enabled"))
+    else:
+        env_en = (os.environ.get("SWR_ARCHIVE_ENABLED") or "").strip().lower()
+        archive_enabled = env_en in ("1", "true", "yes") if env_en else True
+    if "archive_required" in cfg:
+        archive_required = bool(cfg.get("archive_required"))
+    else:
+        env_req = (os.environ.get("SWR_ARCHIVE_REQUIRED") or "").strip().lower()
+        archive_required = env_req in ("1", "true", "yes") if env_req else True
+    cfg["archive_root"] = archive_root.rstrip("/") or "/usr/share/nginx/html/images"
+    cfg["archive_enabled"] = archive_enabled
+    cfg["archive_required"] = archive_required
     return cfg
 
 
@@ -988,6 +1014,54 @@ def parse_tag_from_tar(tar_path: Path, image: str) -> str:
     return parts[1] if len(parts) == 2 else stem
 
 
+def archive_image_locally(
+    job_id: str,
+    local_ref: str,
+    image: str,
+    tag: str,
+) -> tuple[bool, str]:
+    """docker save image tar under archive_root/YYYYMMDDHHMMSS/ for nginx download."""
+    if not CFG.get("archive_enabled"):
+        append_job_log(job_id, "local archive skipped (disabled)")
+        return True, ""
+
+    base = (CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/")
+    ts = time.strftime("%Y%m%d%H%M%S")
+    out_dir = Path(base) / ts
+    safe_tag = re.sub(r"[^\w.\-]+", "_", tag)
+    tar_name = f"{image}_{safe_tag}.tar"
+    out_file = out_dir / tar_name
+
+    append_job_log(job_id, f"archive: docker save {local_ref} → {out_file}")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        msg = f"cannot create archive dir {out_dir}: {e}"
+        append_job_log(job_id, f"ERROR: {msg}")
+        return False, msg
+
+    # Save via docker host path (WSL-aware).
+    code, out = docker_cmd("save", "-o", host_path(out_file), local_ref, timeout=3600)
+    for line in (out or "").splitlines()[-40:]:
+        append_job_log(job_id, line)
+    if code != 0:
+        return False, (out or "docker save failed")[-500:]
+
+    # docker save creates 0600 files; nginx worker needs world-read to serve them.
+    try:
+        out_dir.chmod(0o755)
+        out_file.chmod(0o644)
+    except OSError as e:
+        append_job_log(job_id, f"WARN: chmod archive for nginx: {e}")
+
+    try:
+        size = out_file.stat().st_size
+        append_job_log(job_id, f"archive OK {out_file} ({size} bytes)")
+    except OSError:
+        append_job_log(job_id, f"archive OK {out_file}")
+    return True, str(out_file)
+
+
 def resolve_local_image(job_id: str, svc: dict[str, Any]) -> tuple[str | None, str | None]:
     image = svc["image"]
     tar_path = find_latest_tar(svc)
@@ -1095,6 +1169,8 @@ def push_service(
                 key: test_result.get(key, 0)
                 for key in ("total", "passed", "failed", "errors", "duration_ms")
             },
+            test_commands=test_result.get("commands") or [],
+            test_failures=test_result.get("failures") or [],
             test_report=str(LOG_DIR / f"job-{job_id}-test.json"),
         )
 
@@ -1169,9 +1245,37 @@ def push_service(
                 )
             return
 
+        # Also archive the image tar under local nginx html/images (timestamped dir).
+        ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag)
+        if not ok_arc:
+            if CFG.get("archive_required"):
+                set_job(
+                    job_id,
+                    status="failed",
+                    error="local archive failed",
+                    remote=remote,
+                )
+                append_job_log(
+                    job_id,
+                    "ERROR: SWR 已推送成功，但本地归档镜像包失败。"
+                    f"请检查目录权限：{CFG.get('archive_root')}",
+                )
+                docker_cmd("rmi", remote, timeout=60)
+                return
+            append_job_log(job_id, f"WARN: local archive failed (ignored): {arc_path}")
+
         docker_cmd("rmi", remote, timeout=60)
-        set_job(job_id, status="ok", stage="done", remote=remote, branch=branch)
+        set_job(
+            job_id,
+            status="ok",
+            stage="done",
+            remote=remote,
+            branch=branch,
+            archive=arc_path or "",
+        )
         append_job_log(job_id, f"OK {remote}")
+        if arc_path:
+            append_job_log(job_id, f"OK archive {arc_path}")
     except Exception as e:  # noqa: BLE001
         set_job(job_id, status="failed", error=str(e))
         append_job_log(job_id, f"ERROR {e}")
@@ -1250,6 +1354,8 @@ class Handler(SimpleHTTPRequestHandler):
                     ),
                     "github_use_ssh": bool(CFG.get("github_use_ssh")),
                     "allow_remote": bool(CFG.get("allow_remote")),
+                    "archive_enabled": bool(CFG.get("archive_enabled")),
+                    "archive_root": (CFG.get("archive_root") or "").strip(),
                 },
             )
             return
@@ -1305,9 +1411,12 @@ class Handler(SimpleHTTPRequestHandler):
                             "stage",
                             "error",
                             "remote",
+                            "archive",
                             "commit_sha",
                             "test_status",
                             "test_summary",
+                            "test_commands",
+                            "test_failures",
                             "test_report",
                         )
                     }
@@ -1381,9 +1490,12 @@ class Handler(SimpleHTTPRequestHandler):
                     "stage": "syncing",
                     "error": None,
                     "remote": None,
+                    "archive": None,
                     "commit_sha": None,
                     "test_status": None,
                     "test_summary": None,
+                    "test_commands": [],
+                    "test_failures": [],
                     "test_report": None,
                     "log": [],
                     "log_file": str(log_file),
