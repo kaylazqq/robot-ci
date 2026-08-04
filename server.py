@@ -61,6 +61,7 @@ def persist_job_meta(job_id: str) -> None:
                 "test_summary",
                 "test_commands",
                 "test_failures",
+                "test_cases",
                 "test_report",
             )
         }
@@ -106,6 +107,7 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "test_summary": meta.get("test_summary"),
         "test_commands": meta.get("test_commands"),
         "test_failures": meta.get("test_failures"),
+        "test_cases": meta.get("test_cases"),
         "test_report": meta.get("test_report"),
         "log": log_lines,
     }
@@ -1167,10 +1169,11 @@ def push_service(
             test_status=test_result.get("status"),
             test_summary={
                 key: test_result.get(key, 0)
-                for key in ("total", "passed", "failed", "errors", "duration_ms")
+                for key in ("total", "passed", "failed", "errors", "skipped", "duration_ms")
             },
             test_commands=test_result.get("commands") or [],
             test_failures=test_result.get("failures") or [],
+            test_cases=test_result.get("test_cases") or [],
             test_report=str(LOG_DIR / f"job-{job_id}-test.json"),
         )
 
@@ -1417,6 +1420,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "test_summary",
                             "test_commands",
                             "test_failures",
+                            "test_cases",
                             "test_report",
                         )
                     }
@@ -1496,6 +1500,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "test_summary": None,
                     "test_commands": [],
                     "test_failures": [],
+                    "test_cases": [],
                     "test_report": None,
                     "log": [],
                     "log_file": str(log_file),

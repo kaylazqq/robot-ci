@@ -59,23 +59,15 @@ function isQuietDependencyLog(line) {
 }
 
 function displayJobLog(lines) {
-  let quietCount = 0;
-  let summaryCount = 0;
   const visible = [];
   for (const line of lines || []) {
     if (String(line).includes("@@TEST_SUMMARY@@")) {
-      summaryCount += 1;
+      continue;
     } else if (isQuietDependencyLog(line)) {
-      quietCount += 1;
+      continue;
     } else {
       visible.push(line);
     }
-  }
-  if (quietCount) {
-    visible.push("[页面已折叠 " + quietCount + " 条依赖安装日志；完整原始日志仍保存在服务器作业日志文件中]");
-  }
-  if (summaryCount) {
-    visible.push("[原始测试汇总已折叠，详细结果见上方测试结果表]");
   }
   return visible.join("\n") || "(暂无日志)";
 }
@@ -92,6 +84,7 @@ function renderTestResult(job) {
   const isOk = job.test_status === "passed";
   const overallLabel = isOk ? "通过" : job.test_status === "not_configured" ? "未配置" : "未通过";
   const commands = Array.isArray(job.test_commands) ? job.test_commands : [];
+  const cases = Array.isArray(job.test_cases) ? job.test_cases : [];
   const failures = Array.isArray(job.test_failures) ? job.test_failures : [];
   root.hidden = false;
   root.replaceChildren();
@@ -103,16 +96,17 @@ function renderTestResult(job) {
   title.className = "test-status " + (isOk ? "ok" : "bad");
   const overview = document.createElement("span");
   overview.className = "test-result-summary";
-  overview.textContent = "总用例 " + (summary.total || 0) + " · 通过 " + (summary.passed || 0) + " · 失败 " + (summary.failed || 0) + " · 错误 " + (summary.errors || 0) + " · 总耗时 " + formatDuration(summary.duration_ms);
+  overview.textContent = "总用例 " + (summary.total || 0) + " · 通过 " + (summary.passed || 0) + " · 失败 " + (summary.failed || 0) + " · 错误 " + (summary.errors || 0) + " · 跳过 " + (summary.skipped || 0) + " · 总耗时 " + formatDuration(summary.duration_ms);
   head.append(title, overview);
   root.appendChild(head);
 
-  if (commands.length) {
+  const rows = cases.length ? cases : commands;
+  if (rows.length) {
     const table = document.createElement("table");
     table.className = "test-table";
     const thead = document.createElement("thead");
     const header = document.createElement("tr");
-    ["执行脚本", "结果", "耗时"].forEach((label) => {
+    [cases.length ? "测试用例" : "执行脚本", "结果", "耗时"].forEach((label) => {
       const th = document.createElement("th");
       th.textContent = label;
       header.appendChild(th);
@@ -120,16 +114,18 @@ function renderTestResult(job) {
     thead.appendChild(header);
     table.appendChild(thead);
     const body = document.createElement("tbody");
-    commands.forEach((command) => {
+    rows.forEach((command) => {
       const row = document.createElement("tr");
       const name = document.createElement("td");
       name.textContent = command.name || "测试脚本";
       const status = document.createElement("td");
-      const passed = Number(command.exit_code) === 0;
-      status.textContent = passed ? "通过" : "失败（退出码 " + command.exit_code + "）";
-      status.className = "test-status " + (passed ? "ok" : "bad");
+      const caseStatus = command.status;
+      const passed = caseStatus ? caseStatus === "passed" : Number(command.exit_code) === 0;
+      const skipped = caseStatus === "skipped";
+      status.textContent = skipped ? "跳过" : passed ? "通过" : caseStatus === "error" ? "错误" : "失败";
+      status.className = "test-status " + (passed ? "ok" : skipped ? "" : "bad");
       const duration = document.createElement("td");
-      duration.textContent = formatDuration(command.duration_ms);
+      duration.textContent = command.duration_ms == null ? "—" : formatDuration(command.duration_ms);
       row.append(name, status, duration);
       body.appendChild(row);
     });

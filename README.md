@@ -5,7 +5,7 @@
 只要这些文件，或发 `dist\swr-push-helper-*.zip`：
 
 ```
-start.bat  stop.bat  server.py  services.json  test-plans.json  test-suites/  test_runner.py  web/  README.md  deploy-linux.sh  config.example.json
+start.bat  stop.bat  server.py  services.json  test-plans.json  test-suites/  test_runner.py  unittest_case_runner.py  shell_case_runner.py  web/  README.md  deploy-linux.sh  config.example.json
 ```
 
 ## 部署到 Linux 服务器（推荐给多人共用）

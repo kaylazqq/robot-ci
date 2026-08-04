@@ -24,9 +24,11 @@ def empty_summary(service_id: str, plan_name: str, plan_version: int) -> dict[st
         "passed": 0,
         "failed": 0,
         "errors": 0,
+        "skipped": 0,
         "duration_ms": 0,
         "failures": [],
         "commands": [],
+        "test_cases": [],
     }
 
 
@@ -34,9 +36,27 @@ def failure(name: str, detail: str) -> dict[str, str]:
     return {"name": name, "detail": (detail or "test command failed").strip()[:1000]}
 
 
-def parse_go_json(path: Path, command_name: str, output: str) -> tuple[int, int, list[dict[str, str]]]:
+def test_case(name: str, status: str, duration_ms: int | None = None, detail: str = "") -> dict[str, Any]:
+    item: dict[str, Any] = {"name": name, "status": status, "duration_ms": duration_ms}
+    if detail:
+        item["detail"] = detail.strip()[:1000]
+    return item
+
+
+def failure_cases(cases: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        failure(str(item.get("name") or "test case"), str(item.get("detail") or item.get("status") or "test failed"))
+        for item in cases
+        if item.get("status") in {"failed", "error"}
+    ]
+
+
+def parse_go_json(
+    path: Path, command_name: str, output: str
+) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
     states: dict[tuple[str, str], str] = {}
     details: dict[tuple[str, str], str] = {}
+    durations: dict[tuple[str, str], int | None] = {}
     if path.is_file():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
@@ -46,38 +66,57 @@ def parse_go_json(path: Path, command_name: str, output: str) -> tuple[int, int,
             test = event.get("Test")
             package = event.get("Package") or "package"
             action = event.get("Action")
-            if test and action in {"pass", "fail"}:
+            if test and action in {"pass", "fail", "skip"}:
                 key = (package, test)
-                states[key] = action
+                states[key] = {"pass": "passed", "fail": "failed", "skip": "skipped"}[action]
+                elapsed = event.get("Elapsed")
+                durations[key] = int(float(elapsed) * 1000) if isinstance(elapsed, (int, float)) else None
                 if event.get("Output"):
                     details[key] = str(event["Output"])
-    total = len(states)
-    failed = [failure(f"{package}.{test}", details.get((package, test), output)) for (package, test), state in states.items() if state == "fail"]
-    if total == 0 and output:
-        return 1, 0, [failure(command_name, output)]
-    return total, total - len(failed), failed
+    cases = [
+        test_case(f"{package}.{test}", state, durations.get((package, test)), details.get((package, test), output if state == "failed" else ""))
+        for (package, test), state in states.items()
+    ]
+    if not cases and output:
+        cases = [test_case(command_name, "failed", None, output)]
+    return len(cases), sum(item["status"] == "passed" for item in cases), sum(item["status"] == "failed" for item in cases), failure_cases(cases), cases
 
 
-def parse_junit(path: Path, command_name: str, output: str) -> tuple[int, int, list[dict[str, str]]]:
+def parse_junit(
+    path: Path, command_name: str, output: str
+) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
     if not path.is_file():
-        return 1, 0, [failure(command_name, output or "JUnit report was not produced")]
+        cases = [test_case(command_name, "error", None, output or "JUnit report was not produced")]
+        return 1, 0, 0, failure_cases(cases), cases
     try:
         root = ET.parse(path).getroot()
     except ET.ParseError as exc:
-        return 1, 0, [failure(command_name, f"invalid JUnit XML: {exc}")]
+        cases = [test_case(command_name, "error", None, f"invalid JUnit XML: {exc}")]
+        return 1, 0, 0, failure_cases(cases), cases
     cases = root.findall(".//testcase")
-    failed: list[dict[str, str]] = []
+    parsed: list[dict[str, Any]] = []
     for case in cases:
+        label = ".".join(part for part in (case.get("classname"), case.get("name")) if part) or command_name
+        try:
+            duration_ms = int(float(case.get("time") or 0) * 1000)
+        except ValueError:
+            duration_ms = None
         problem = case.find("failure")
+        status = "failed" if problem is not None else "passed"
         if problem is None:
             problem = case.find("error")
-        if problem is not None:
-            label = ".".join(part for part in (case.get("classname"), case.get("name")) if part)
-            failed.append(failure(label or command_name, (problem.text or problem.get("message") or "test failed")))
-    return len(cases), len(cases) - len(failed), failed
+            if problem is not None:
+                status = "error"
+        if problem is None and case.find("skipped") is not None:
+            status = "skipped"
+        detail = (problem.text or problem.get("message") or "test failed") if problem is not None else ""
+        parsed.append(test_case(label, status, duration_ms, detail))
+    return len(parsed), sum(item["status"] == "passed" for item in parsed), sum(item["status"] == "failed" for item in parsed), failure_cases(parsed), parsed
 
 
-def parse_unittest(command_name: str, output: str) -> tuple[int, int, list[dict[str, str]]]:
+def parse_unittest(
+    command_name: str, output: str
+) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
     match = re.search(r"Ran\s+(\d+)\s+tests?", output)
     total = int(match.group(1)) if match else 1
     failures = []
@@ -85,16 +124,46 @@ def parse_unittest(command_name: str, output: str) -> tuple[int, int, list[dict[
         failures.append(failure(match.group(1), "unittest failure; see job log"))
     if not failures and "FAILED" in output:
         failures.append(failure(command_name, output))
-    return total, max(0, total - len(failures)), failures
+    cases = [test_case(command_name, "failed" if failures else "passed", None, failures[0]["detail"] if failures else "")]
+    return total, max(0, total - len(failures)), len(failures), failures, cases
 
 
-def parse_shell(command_name: str, code: int, output: str) -> tuple[int, int, list[dict[str, str]]]:
-    return (1, 1, []) if code == 0 else (1, 0, [failure(command_name, output)])
+def parse_shell(
+    command_name: str, code: int, output: str, duration_ms: int
+) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
+    cases = [test_case(command_name, "passed" if code == 0 else "failed", duration_ms, "" if code == 0 else output)]
+    return 1, int(code == 0), int(code != 0), failure_cases(cases), cases
+
+
+def parse_case_json(
+    path: Path, command_name: str, output: str
+) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
+    if not path.is_file():
+        cases = [test_case(command_name, "error", None, output or "test case report was not produced")]
+        return 1, 0, 0, failure_cases(cases), cases
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        cases = [item for item in data.get("cases", []) if isinstance(item, dict)]
+    except (OSError, json.JSONDecodeError) as exc:
+        cases = [test_case(command_name, "error", None, f"invalid test case report: {exc}")]
+    if not cases:
+        cases = [test_case(command_name, "error", None, "test case report has no cases")]
+    for item in cases:
+        item.setdefault("name", command_name)
+        item.setdefault("status", "error")
+        item.setdefault("duration_ms", None)
+    return len(cases), sum(item["status"] == "passed" for item in cases), sum(item["status"] == "failed" for item in cases), failure_cases(cases), cases
 
 
 def run_command(command: dict[str, Any], repo_dir: Path, report_dir: Path) -> tuple[int, str, int]:
     env = os.environ.copy()
-    env.update({"REPO_DIR": str(repo_dir), "REPORT_DIR": str(report_dir)})
+    env.update(
+        {
+            "REPO_DIR": str(repo_dir),
+            "REPORT_DIR": str(report_dir),
+            "TEST_RUNNER_ROOT": str(Path(__file__).resolve().parent),
+        }
+    )
     started = time.monotonic()
     print(f"$ {command['command']}", flush=True)
     try:
@@ -169,17 +238,19 @@ def main() -> int:
         code, output, elapsed = run_command(command, args.repo, args.report_dir)
         parser_name = command.get("parser") or "shell"
         if parser_name == "go-json":
-            total, passed, failures = parse_go_json(args.report_dir / command["report"], name, output)
+            total, passed, failed, failures, cases = parse_go_json(args.report_dir / command["report"], name, output)
         elif parser_name == "junit":
-            total, passed, failures = parse_junit(args.report_dir / command["report"], name, output)
+            total, passed, failed, failures, cases = parse_junit(args.report_dir / command["report"], name, output)
+        elif parser_name == "case-json":
+            total, passed, failed, failures, cases = parse_case_json(args.report_dir / command["report"], name, output)
         elif parser_name == "unittest":
-            total, passed, failures = parse_unittest(name, output)
+            total, passed, failed, failures, cases = parse_unittest(name, output)
         else:
-            total, passed, failures = parse_shell(name, code, output)
+            total, passed, failed, failures, cases = parse_shell(name, code, output, elapsed)
         if code != 0 and not failures:
-            failures = [failure(name, output or f"exit={code}")]
-            total = max(total, 1)
-            passed = max(0, total - 1)
+            cases = [test_case(name, "failed", elapsed, output or f"exit={code}")]
+            failures = failure_cases(cases)
+            total, passed, failed = 1, 0, 1
         # A well-formed report is authoritative too: some wrappers collect
         # failures and still return zero.  Do not present those as passed.
         if failures and summary["status"] == "passed":
@@ -194,9 +265,14 @@ def main() -> int:
             summary["status"] = "failed"
         summary["total"] += total
         summary["passed"] += passed
-        summary["failed"] += len(failures)
-        summary["commands"].append({"name": name, "exit_code": code, "duration_ms": elapsed})
+        summary["failed"] += failed
+        summary["errors"] += sum(item.get("status") == "error" for item in cases)
+        summary["skipped"] += sum(item.get("status") == "skipped" for item in cases)
+        summary["commands"].append({"name": name, "exit_code": code, "duration_ms": elapsed, "total": total})
         summary["failures"].extend(failures)
+        for case in cases:
+            case["command"] = name
+        summary["test_cases"].extend(cases)
     summary["duration_ms"] = int((time.monotonic() - started) * 1000)
     (args.report_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("@@TEST_SUMMARY@@ " + json.dumps(summary, ensure_ascii=False), flush=True)
