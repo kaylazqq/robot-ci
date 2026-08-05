@@ -262,7 +262,12 @@ def parse_case_json(
 
 def build_test_environment(repo_dir: Path, report_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
-    home = env.get("HOME") or str(Path.home())
+    home = env.get("HOME") or env.get("USERPROFILE")
+    if not home:
+        try:
+            home = str(Path.home())
+        except RuntimeError:
+            home = str(Path(__file__).resolve().parent / ".runtime-home")
     cache_root = Path(
         env.get("SWR_TEST_CACHE_ROOT") or Path(home) / ".cache" / "robot-ci-tests"
     ).expanduser().resolve()
