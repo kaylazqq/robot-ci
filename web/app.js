@@ -4,9 +4,8 @@ let pollTimer = null;
 let busy = false;
 let pollFails = 0;
 const branchCache = {};
-let testCasePage = 1;
-let testCaseJobId = "";
-let testCasePageSize = 10;
+let testResultJobId = "";
+const testTableState = new Map();
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -115,26 +114,16 @@ function shortCaseName(name) {
   return parts.length > 2 ? parts.slice(-2).join(".") : value;
 }
 
-function renderTestResult(job) {
-  const root = $("testResult");
-  if (!root) return;
-  if (!job || !job.test_status) {
-    root.hidden = true;
-    root.replaceChildren();
-    return;
-  }
-  const summary = job.test_summary || {};
-  const isOk = job.test_status === "passed";
-  const overallLabel = isOk ? "通过" : job.test_status === "not_configured" ? "未配置" : "未通过";
-  const commands = Array.isArray(job.test_commands) ? job.test_commands : [];
-  const cases = Array.isArray(job.test_cases) ? job.test_cases : [];
-  const failures = Array.isArray(job.test_failures) ? job.test_failures : [];
-  if (job.id !== testCaseJobId) {
-    testCaseJobId = job.id || "";
-    testCasePage = 1;
-  }
-  root.hidden = false;
-  root.replaceChildren();
+function renderTestRun(root, run, stateKey, rerender) {
+  const summary = run.summary || {};
+  const testStatus = run.status || "error";
+  const isOk = testStatus === "passed";
+  const overallLabel = isOk ? "通过" : testStatus === "not_configured" ? "未配置" : "未通过";
+  const commands = Array.isArray(run.commands) ? run.commands : [];
+  const cases = Array.isArray(run.test_cases) ? run.test_cases : [];
+  const failures = Array.isArray(run.failures) ? run.failures : [];
+  const state = testTableState.get(stateKey) || { page: 1, pageSize: 10 };
+  testTableState.set(stateKey, state);
 
   const head = document.createElement("div");
   head.className = "test-result-head";
@@ -176,10 +165,10 @@ function renderTestResult(job) {
         .map(({ item }) => item)
     : sourceRows;
   if (rows.length) {
-    const pageSize = testCasePageSize;
+    const pageSize = state.pageSize;
     const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
-    testCasePage = Math.min(testCasePage, pageCount);
-    const start = (testCasePage - 1) * pageSize;
+    state.page = Math.min(state.page, pageCount);
+    const start = (state.page - 1) * pageSize;
     const pageRows = rows.slice(start, start + pageSize);
     const table = document.createElement("table");
     table.className = "test-table";
@@ -244,29 +233,29 @@ function renderTestResult(job) {
         const option = document.createElement("option");
         option.value = String(size);
         option.textContent = String(size);
-        option.selected = size === testCasePageSize;
+        option.selected = size === state.pageSize;
         sizeSelect.appendChild(option);
       });
       sizeSelect.addEventListener("change", () => {
-        testCasePageSize = Number(sizeSelect.value) || 10;
-        testCasePage = 1;
-        renderTestResult(job);
+        state.pageSize = Number(sizeSelect.value) || 10;
+        state.page = 1;
+        rerender();
       });
       sizeControl.append(sizeSelect, " 条");
       const previous = document.createElement("button");
       previous.type = "button";
       previous.className = "btn ghost";
       previous.textContent = "上一页";
-      previous.disabled = testCasePage <= 1;
-      previous.addEventListener("click", () => { testCasePage -= 1; renderTestResult(job); });
+      previous.disabled = state.page <= 1;
+      previous.addEventListener("click", () => { state.page -= 1; rerender(); });
       const position = document.createElement("span");
-      position.textContent = "第 " + testCasePage + " / " + pageCount + " 页（" + rows.length + " 条用例）";
+      position.textContent = "第 " + state.page + " / " + pageCount + " 页（" + rows.length + " 条用例）";
       const next = document.createElement("button");
       next.type = "button";
       next.className = "btn ghost";
       next.textContent = "下一页";
-      next.disabled = testCasePage >= pageCount;
-      next.addEventListener("click", () => { testCasePage += 1; renderTestResult(job); });
+      next.disabled = state.page >= pageCount;
+      next.addEventListener("click", () => { state.page += 1; rerender(); });
       pager.append(sizeControl, previous, position, next);
       root.appendChild(pager);
     }
@@ -282,6 +271,54 @@ function renderTestResult(job) {
     });
     root.appendChild(list);
   }
+}
+
+function renderTestResult(job) {
+  const root = $("testResult");
+  if (!root) return;
+  const runs = job && Array.isArray(job.test_runs) && job.test_runs.length
+    ? job.test_runs
+    : job && job.test_status
+      ? [{
+          service_id: job.service_id,
+          branch: job.branch,
+          commit_sha: job.commit_sha,
+          status: job.test_status,
+          summary: job.test_summary || {},
+          commands: job.test_commands || [],
+          failures: job.test_failures || [],
+          test_cases: job.test_cases || [],
+        }]
+      : [];
+  if (!job || !runs.length) {
+    root.hidden = true;
+    root.classList.remove("test-result-list");
+    root.replaceChildren();
+    return;
+  }
+  if ((job.id || "") !== testResultJobId) {
+    testResultJobId = job.id || "";
+    testTableState.clear();
+  }
+
+  const isBatch = runs.length > 1 || String(job.service_id || "").includes(",");
+  root.hidden = false;
+  root.classList.toggle("test-result-list", isBatch);
+  root.replaceChildren();
+  runs.forEach((run, index) => {
+    const serviceId = run.service_id || "service-" + (index + 1);
+    const target = isBatch ? document.createElement("section") : root;
+    if (isBatch) {
+      target.className = "test-result-card";
+      const serviceHead = document.createElement("div");
+      serviceHead.className = "test-service-head";
+      serviceHead.textContent = (run.title || serviceId) + (run.branch ? " @ " + run.branch : "");
+      target.appendChild(serviceHead);
+      root.appendChild(target);
+    }
+    const stateKey = (job.id || "job") + ":" + serviceId;
+    renderTestRun(target, run, stateKey, () => renderTestResult(job));
+  });
 }
 
 async function refreshHealth() {
@@ -387,10 +424,47 @@ async function loadBranches(serviceId, selectEl, defaultBranch) {
   }
 }
 
+function selectedItems() {
+  const items = [];
+  document.querySelectorAll(".row-svc").forEach((row) => {
+    const cb = row.querySelector('[data-act="pick"]');
+    if (!cb || !cb.checked) return;
+    const id = row.getAttribute("data-id");
+    const title = row.getAttribute("data-title") || id;
+    const select = row.querySelector("[data-branch]");
+    const branch = ((select && select.value) || row.getAttribute("data-default-branch") || "main").trim();
+    items.push({ service_id: id, branch, title });
+  });
+  return items;
+}
+
+function updateBatchUi() {
+  const items = selectedItems();
+  const btn = $("btnBatch");
+  const count = $("selCount");
+  if (count) count.textContent = String(items.length);
+  if (btn) {
+    btn.disabled = busy || items.length === 0;
+    btn.textContent = items.length ? "构建所选 (" + items.length + ")" : "构建所选";
+  }
+  const all = $("chkAll");
+  if (all) {
+    const boxes = Array.from(document.querySelectorAll('[data-act="pick"]'));
+    const checked = boxes.filter((b) => b.checked).length;
+    all.checked = boxes.length > 0 && checked === boxes.length;
+    all.indeterminate = checked > 0 && checked < boxes.length;
+  }
+}
+
 function setButtonsDisabled(disabled) {
   document.querySelectorAll('[data-act="run"]').forEach((btn) => {
     btn.disabled = !!disabled;
   });
+  document.querySelectorAll('[data-act="pick"]').forEach((cb) => {
+    cb.disabled = !!disabled;
+  });
+  if ($("chkAll")) $("chkAll").disabled = !!disabled;
+  if ($("btnBatch")) $("btnBatch").disabled = !!disabled || selectedItems().length === 0;
 }
 
 async function refreshServices() {
@@ -400,7 +474,11 @@ async function refreshServices() {
   for (const s of data.services) {
     const row = document.createElement("div");
     row.className = "row-svc";
+    row.setAttribute("data-id", s.id);
+    row.setAttribute("data-title", s.title || s.id);
+    row.setAttribute("data-default-branch", s.default_branch || "main");
     row.innerHTML =
+      '<label class="svc-pick"><input type="checkbox" data-act="pick" /></label>' +
       "<div>" +
       '<div class="svc-title"></div>' +
       '<div class="svc-meta"></div>' +
@@ -412,54 +490,63 @@ async function refreshServices() {
     const select = row.querySelector("[data-branch]");
     fillBranchSelect(select, [s.default_branch || "main"], s.default_branch || "main");
     setTimeout(() => loadBranches(s.id, select, s.default_branch), 30);
+    row.querySelector('[data-act="pick"]').addEventListener("change", updateBatchUi);
     const btn = row.querySelector('[data-act="run"]');
     btn.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
       const branch = (select.value || s.default_branch || "main").trim();
-      pushOne(s.id, s.title, branch, btn);
+      pushItems([{ service_id: s.id, branch, title: s.title }], btn);
     });
     root.appendChild(row);
   }
+  updateBatchUi();
   if (busy) setButtonsDisabled(true);
 }
 
-async function pushOne(serviceId, title, branch, btn) {
+async function pushItems(items, btn) {
   if (busy) {
     showJob("已有任务进行中，请等待完成");
+    return;
+  }
+  if (!items || !items.length) {
+    showJob("请先勾选要构建的微服务");
     return;
   }
   busy = true;
   setButtonsDisabled(true);
   if (btn) btn.textContent = "进行中…";
-  showJob(title + " @ " + branch + " · 已提交，正在启动…", "正在请求 /api/push …\n");
+  const summary =
+    items.length === 1
+      ? items[0].title + " @ " + items[0].branch
+      : items.length + " 个服务";
+  showJob(summary + " · 已提交，正在启动…", "正在请求 /api/push …\n");
   try {
     const loginCmd = (($("loginCmd") && $("loginCmd").value) || "").trim();
-    // loginCmd may be empty: server reuses shared SWR login if still valid.
     const resp = await api("/api/push", {
       method: "POST",
       body: JSON.stringify({
-        service_id: serviceId,
-        branch: branch,
+        items: items.map((it) => ({ service_id: it.service_id, branch: it.branch })),
         login_command: loginCmd,
       }),
     });
     const jobId = resp.job_id;
     pollFails = 0;
-    showJob(title + " @ " + branch + " · job " + jobId, "job_id=" + jobId + "\n开始轮询日志…\n");
+    showJob(summary + " · job " + jobId, "job_id=" + jobId + "\n开始轮询日志…\n");
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => pollJob(jobId, title, branch), 1500);
-    await pollJob(jobId, title, branch);
+    pollTimer = setInterval(() => pollJob(jobId, summary), 1500);
+    await pollJob(jobId, summary);
   } catch (e) {
     const msg = (e.data && (e.data.detail || e.data.error)) || e.message;
-    showJob(title + " · 失败", String(msg));
+    showJob(summary + " · 失败", String(msg));
     busy = false;
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
+    updateBatchUi();
   }
 }
 
-async function pollJob(jobId, title, branch) {
+async function pollJob(jobId, summary) {
   try {
     const job = await api("/api/jobs/" + jobId);
     pollFails = 0;
@@ -469,10 +556,11 @@ async function pollJob(jobId, title, branch) {
       logEl.scrollTop = logEl.scrollHeight;
     }
     renderTestResult(job);
-    const br = job.branch || branch;
+    const progress = job.progress ? " · " + job.progress : "";
+    const current = job.current ? " · " + job.current : "";
+    const stage = job.stage ? " · " + job.stage : "";
     if (job.status === "running" || job.status === "unknown") {
-      const stage = job.stage ? " · " + job.stage : "";
-      $("jobMeta").textContent = title + " @ " + br + " · 进行中" + stage;
+      $("jobMeta").textContent = summary + " · 进行中" + progress + current + stage;
       return;
     }
     if (pollTimer) clearInterval(pollTimer);
@@ -480,18 +568,26 @@ async function pollJob(jobId, title, branch) {
     busy = false;
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
+    updateBatchUi();
+    const archiveHint = job.archive_dir || job.archive || "";
     if (job.status === "ok") {
-      $("jobMeta").textContent = title + " @ " + br + " · 成功 · " + (job.remote || "");
+      $("jobMeta").textContent =
+        summary +
+        " · 成功" +
+        (archiveHint ? " · 归档 " + archiveHint : "") +
+        (job.remote ? " · " + job.remote : "");
     } else {
-      $("jobMeta").textContent = title + " @ " + br + " · 失败 · " + (job.error || "");
+      $("jobMeta").textContent =
+        summary +
+        " · 失败 · " +
+        (job.error || "") +
+        (archiveHint ? " · 归档 " + archiveHint : "");
     }
   } catch (e) {
     pollFails += 1;
-    // Keep polling through transient network blips (Failed to fetch / timeouts)
     if (pollFails < 80) {
       if ($("jobMeta")) {
-        $("jobMeta").textContent =
-          title + " @ " + branch + " · 网络抖动，重连中 (" + pollFails + ")";
+        $("jobMeta").textContent = summary + " · 网络抖动，重连中 (" + pollFails + ")";
       }
       return;
     }
@@ -499,6 +595,7 @@ async function pollJob(jobId, title, branch) {
     pollTimer = null;
     busy = false;
     setButtonsDisabled(false);
+    updateBatchUi();
     showJob("轮询失败", e.message || String(e));
   }
 }
@@ -517,11 +614,44 @@ bind("btnSaveToken", () =>
     $("tokenStatus").style.color = "var(--danger)";
   })
 );
+bind("btnBatch", () => {
+  const items = selectedItems();
+  pushItems(items, $("btnBatch"));
+});
+
+const chkAll = $("chkAll");
+if (chkAll) {
+  chkAll.addEventListener("change", () => {
+    const on = !!chkAll.checked;
+    document.querySelectorAll('[data-act="pick"]').forEach((cb) => {
+      cb.checked = on;
+    });
+    updateBatchUi();
+  });
+}
 
 (async function boot() {
   try {
     await Promise.all([refreshHealth(), refreshServices()]);
-    showJob("就绪", "可直接构建推送；若失败提示未登录，点「检查登录」或重新登录 SWR。");
+
+    // Auto-recover live running job after page refresh
+    try {
+      const running = await api("/api/running-job");
+      if (running && running.id && running.status === "running") {
+        const summary = running.service_id || "任务";
+        showJob(summary + " · job " + running.id, (running.log || []).join("\n") || "(正在重新连接…)");
+        if (pollTimer) clearInterval(pollTimer);
+        busy = true;
+        setButtonsDisabled(true);
+        pollTimer = setInterval(() => pollJob(running.id, summary), 1500);
+        return;
+      }
+    } catch (_) { /* ignore – backend may not have the endpoint yet */ }
+
+    showJob(
+      "就绪",
+      "可勾选多个微服务后点「构建所选」；同一次任务归档到同一时间戳目录。\n也可点单行「构建并推送」。"
+    );
   } catch (e) {
     $("serviceTable").innerHTML = '<p class="hint">无法连接助手，请先运行 start.bat</p>';
     showJob("助手未连接", String(e.message || e));
