@@ -103,8 +103,18 @@ function displayJobLog(lines) {
   return visible.join("\n") || "(暂无日志)";
 }
 
+function decodeUnicodeEscapes(value) {
+  return String(value || "").replace(/(?:\\u[0-9a-fA-F]{4})+/g, (sequence) => {
+    try {
+      return JSON.parse('"' + sequence + '"');
+    } catch (_) {
+      return sequence;
+    }
+  });
+}
+
 function shortCaseName(name) {
-  const value = String(name || "");
+  const value = decodeUnicodeEscapes(name);
   if (value.startsWith("Test") || value.startsWith("test_")) return value;
   if (value.startsWith("github.com/")) {
     const testMarker = value.indexOf(".Test");

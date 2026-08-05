@@ -15,6 +15,20 @@ from pathlib import Path
 from typing import Any
 
 
+UNICODE_ESCAPE_SEQUENCE = re.compile(r"(?:\\u[0-9a-fA-F]{4})+")
+
+
+def decode_unicode_escapes(value: str) -> str:
+    """Decode JSON-style Unicode sequences without touching normal Unicode text."""
+    def replace(match: re.Match[str]) -> str:
+        try:
+            return str(json.loads('"' + match.group(0) + '"'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return match.group(0)
+
+    return UNICODE_ESCAPE_SEQUENCE.sub(replace, value)
+
+
 def empty_summary(service_id: str, plan_name: str, plan_version: int) -> dict[str, Any]:
     return {
         "service_id": service_id,
@@ -184,6 +198,7 @@ def parse_junit(
     for case in cases:
         source_file, class_name = _python_case_location(repo_dir, case.get("classname") or "")
         label = ".".join(part for part in (class_name, case.get("name")) if part) or command_name
+        label = decode_unicode_escapes(label)
         try:
             duration_ms = round(float(case.get("time") or 0) * 1000, 3)
         except ValueError:
@@ -245,8 +260,25 @@ def parse_case_json(
     return len(cases), sum(item["status"] == "passed" for item in cases), sum(item["status"] == "failed" for item in cases), failure_cases(cases), cases
 
 
-def run_command(command: dict[str, Any], repo_dir: Path, report_dir: Path) -> tuple[int, str, int]:
+def build_test_environment(repo_dir: Path, report_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
+    home = env.get("HOME") or str(Path.home())
+    cache_root = Path(
+        env.get("SWR_TEST_CACHE_ROOT") or Path(home) / ".cache" / "robot-ci-tests"
+    ).expanduser().resolve()
+    defaults = {
+        "HOME": home,
+        "XDG_CACHE_HOME": str(Path(home) / ".cache"),
+        "GOCACHE": str(cache_root / "go-build"),
+        "GOMODCACHE": str(cache_root / "go-mod"),
+        "GOPATH": str(cache_root / "go-path"),
+        "PIP_CACHE_DIR": str(cache_root / "pip"),
+    }
+    for name, value in defaults.items():
+        if not env.get(name):
+            env[name] = value
+    for name in ("GOCACHE", "GOMODCACHE", "GOPATH", "PIP_CACHE_DIR"):
+        Path(env[name]).mkdir(parents=True, exist_ok=True)
     env.update(
         {
             "REPO_DIR": str(repo_dir),
@@ -254,6 +286,11 @@ def run_command(command: dict[str, Any], repo_dir: Path, report_dir: Path) -> tu
             "TEST_RUNNER_ROOT": str(Path(__file__).resolve().parent),
         }
     )
+    return env
+
+
+def run_command(command: dict[str, Any], repo_dir: Path, report_dir: Path) -> tuple[int, str, int]:
+    env = build_test_environment(repo_dir, report_dir)
     started = time.monotonic()
     print(f"$ {command['command']}", flush=True)
     try:

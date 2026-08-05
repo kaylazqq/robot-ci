@@ -29,6 +29,8 @@ bash deploy-linux.sh
 
 批量构建时，每个所选微服务都按“拉取代码 → 执行该服务 UT/DT → 构建 → 推送 → 归档”的顺序独立执行。页面按微服务显示独立的测试结果卡片和分页表格，单个服务测试失败不会阻止该服务或后续服务继续构建。
 
+测试运行器会在宿主机持久复用 `~/.cache/robot-ci-tests` 下的 Go build/module、GOPATH 和 pip 下载缓存。即使 systemd 未设置 `HOME`、`GOCACHE`、`GOMODCACHE` 或 `GOPATH`，运行器也会自动补齐并创建目录；可用 `SWR_TEST_CACHE_ROOT` 指定其他缓存根目录。
+
 所有服务的业务范围、测试根目录和新增用例约定集中记录在 `test-suites/README.md` 与 `test-suites/catalog.json`。测试代码保留在各服务仓库，与业务代码同版本提交；部署工具只维护安全的执行白名单。
 
 ## 对方电脑 / 使用方需要

@@ -1,7 +1,9 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import test_runner
 
@@ -56,6 +58,41 @@ class TestResultParsing(unittest.TestCase):
             self.assertEqual(cases[0]["name"], "test_health")
             self.assertEqual(cases[0]["file"], "tests/test_api.py")
             self.assertEqual(cases[0]["detail"], "requires PostgreSQL")
+
+    def test_junit_parser_decodes_unicode_parameter_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            report = repo / "pytest.xml"
+            report.write_text(
+                '<testsuite><testcase classname="tests.test_content_safety" '
+                'name="test_static[\\u4e2d\\u6587]" time="0" /></testsuite>',
+                encoding="utf-8",
+            )
+
+            _total, _passed, _failed, _failures, cases = test_runner.parse_junit(
+                report, "pytest", "", repo
+            )
+
+            self.assertEqual(cases[0]["name"], "tests.test_content_safety.test_static[中文]")
+
+    def test_build_test_environment_supplies_persistent_go_and_pip_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_root = root / "shared-cache"
+            with patch.dict(
+                os.environ,
+                {"PATH": os.environ.get("PATH", ""), "SWR_TEST_CACHE_ROOT": str(cache_root)},
+                clear=True,
+            ):
+                env = test_runner.build_test_environment(root, root / "reports")
+
+            self.assertTrue(env["HOME"])
+            self.assertEqual(env["GOCACHE"], str(cache_root / "go-build"))
+            self.assertEqual(env["GOMODCACHE"], str(cache_root / "go-mod"))
+            self.assertEqual(env["GOPATH"], str(cache_root / "go-path"))
+            self.assertEqual(env["PIP_CACHE_DIR"], str(cache_root / "pip"))
+            for name in ("GOCACHE", "GOMODCACHE", "GOPATH", "PIP_CACHE_DIR"):
+                self.assertTrue(Path(env[name]).is_dir())
 
 
 if __name__ == "__main__":
