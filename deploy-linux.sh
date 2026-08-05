@@ -45,6 +45,12 @@ for i in 1 2 3 4 5; do
 done
 docker info >/dev/null
 
+PYTHON_BIN="$(command -v python3.11 || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "ERROR: python3.11 is required; run install-python-311.sh first" >&2
+  exit 1
+fi
+
 echo "==> GitHub SSH key"
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
@@ -112,7 +118,7 @@ Wants=docker.service
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-ExecStart=/usr/bin/python3 ${APP_DIR}/server.py
+ExecStart=${PYTHON_BIN} ${APP_DIR}/server.py
 Restart=on-failure
 RestartSec=3
 Environment=SWR_ALLOW_REMOTE=1

@@ -229,7 +229,7 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
         append_job_log(job_id, f"tests start service={service_id} sha={commit_sha}")
         command = " ".join(
             (
-                "python3",
+                "python3.11",
                 shlex.quote(host_path(TEST_RUNNER_PATH)),
                 "--plans",
                 shlex.quote(host_path(TEST_PLANS_PATH)),
