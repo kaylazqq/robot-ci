@@ -1,11 +1,22 @@
 
 const $ = (id) => document.getElementById(id);
 let pollTimer = null;
-let busy = false;
+let activeProbeTimer = null;
+let lastJobExpiryTimer = null;
+let busy = true;
 let pollFails = 0;
+let pollGeneration = 0;
+let activeJobId = "";
+let liveLogLines = [];
+let logCursor = 0;
+let testRevision = -1;
+let cachedTestRuns = [];
 const branchCache = {};
 let testResultJobId = "";
 const testTableState = new Map();
+const LAST_JOB_KEY = "robotCiLastJob";
+const LEGACY_ACTIVE_JOB_KEY = "robotCiActiveJob";
+const LAST_JOB_TTL_MS = 10 * 60 * 1000;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -16,6 +27,7 @@ async function api(path, opts = {}) {
   if (!res.ok) {
     const err = new Error(data.error || data.detail || data.message || res.statusText);
     err.data = data;
+    err.status = res.status;
     throw err;
   }
   return data;
@@ -514,6 +526,122 @@ async function refreshServices() {
   if (busy) setButtonsDisabled(true);
 }
 
+function rememberLastJob(jobId, summary) {
+  try {
+    const observedAt = Date.now();
+    localStorage.setItem(LAST_JOB_KEY, JSON.stringify({ id: jobId, summary, observed_at: observedAt }));
+    localStorage.removeItem(LEGACY_ACTIVE_JOB_KEY);
+    scheduleLastJobExpiry(jobId, observedAt, LAST_JOB_TTL_MS);
+  } catch (_) { /* storage may be disabled */ }
+}
+
+function clearStoredLastJob() {
+  try {
+    localStorage.removeItem(LAST_JOB_KEY);
+    localStorage.removeItem(LEGACY_ACTIVE_JOB_KEY);
+  } catch (_) { /* storage may be disabled */ }
+}
+
+function scheduleLastJobExpiry(jobId, observedAt, delay) {
+  if (lastJobExpiryTimer) clearTimeout(lastJobExpiryTimer);
+  lastJobExpiryTimer = setTimeout(() => {
+    lastJobExpiryTimer = null;
+    try {
+      const current = JSON.parse(localStorage.getItem(LAST_JOB_KEY) || "null");
+      if (current && current.id === jobId && Number(current.observed_at) === observedAt) {
+        clearStoredLastJob();
+      }
+    } catch (_) {
+      clearStoredLastJob();
+    }
+  }, Math.max(0, delay));
+}
+
+function rememberedLastJob() {
+  try {
+    const raw = localStorage.getItem(LAST_JOB_KEY) || localStorage.getItem(LEGACY_ACTIVE_JOB_KEY);
+    const value = JSON.parse(raw || "null");
+    const observedAt = Number(value && value.observed_at);
+    const age = Date.now() - observedAt;
+    if (!value || !value.id || !observedAt || age < 0 || age >= LAST_JOB_TTL_MS) {
+      clearStoredLastJob();
+      return null;
+    }
+    scheduleLastJobExpiry(value.id, observedAt, LAST_JOB_TTL_MS - age);
+    return value;
+  } catch (_) {
+    clearStoredLastJob();
+    return null;
+  }
+}
+
+function stopPolling() {
+  pollGeneration += 1;
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+}
+
+function stopActiveProbe() {
+  if (activeProbeTimer) clearTimeout(activeProbeTimer);
+  activeProbeTimer = null;
+}
+
+function resetJobView() {
+  liveLogLines = [];
+  logCursor = 0;
+  testRevision = -1;
+  cachedTestRuns = [];
+  pollFails = 0;
+}
+
+function scheduleActiveProbe(delay = 1500) {
+  stopActiveProbe();
+  if (busy || activeJobId) return;
+  activeProbeTimer = setTimeout(async () => {
+    activeProbeTimer = null;
+    if (busy || activeJobId) return;
+    try {
+      const running = await api("/api/running-job");
+      if (running && running.id && running.status === "running") {
+        startPolling(running.id, running.service_id || "任务");
+        return;
+      }
+    } catch (_) { /* the server still enforces the lock if a build is submitted */ }
+    scheduleActiveProbe();
+  }, delay);
+}
+
+function startPolling(jobId, summary) {
+  stopActiveProbe();
+  stopPolling();
+  const generation = pollGeneration;
+  activeJobId = jobId;
+  resetJobView();
+  busy = true;
+  setButtonsDisabled(true);
+  rememberLastJob(jobId, summary);
+  showJob(summary + " · job " + jobId, "Connecting to active job…");
+
+  const tick = async () => {
+    const keepPolling = await pollJob(jobId, summary, generation, true);
+    if (keepPolling && generation === pollGeneration) {
+      pollTimer = setTimeout(tick, 1500);
+    }
+  };
+  tick();
+}
+
+async function restoreLastJob(saved) {
+  if (!saved || !saved.id || busy || activeJobId) return;
+  stopPolling();
+  const generation = pollGeneration;
+  resetJobView();
+  const summary = saved.summary || "最近任务";
+  showJob(summary + " · 恢复最近任务…", "Loading saved job…");
+  const stillRunning = await pollJob(saved.id, summary, generation);
+  if (stillRunning && generation === pollGeneration) startPolling(saved.id, summary);
+}
+
 async function pushItems(items, btn) {
   if (busy) {
     showJob("已有任务进行中，请等待完成");
@@ -524,6 +652,7 @@ async function pushItems(items, btn) {
     return;
   }
   busy = true;
+  stopActiveProbe();
   setButtonsDisabled(true);
   if (btn) btn.textContent = "进行中…";
   const summary =
@@ -540,41 +669,58 @@ async function pushItems(items, btn) {
         login_command: loginCmd,
       }),
     });
-    const jobId = resp.job_id;
-    pollFails = 0;
-    showJob(summary + " · job " + jobId, "job_id=" + jobId + "\n开始轮询日志…\n");
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => pollJob(jobId, summary), 1500);
-    await pollJob(jobId, summary);
+    startPolling(resp.job_id, summary);
   } catch (e) {
+    const active = e.data && e.data.active_job;
+    const activeJob = (active && active.id) || (e.data && e.data.active_job_id);
+    if (e.status === 409 && activeJob) {
+      const activeSummary = (active && active.service_id) || "当前任务";
+      startPolling(activeJob, activeSummary);
+      return;
+    }
     const msg = (e.data && (e.data.detail || e.data.error)) || e.message;
     showJob(summary + " · 失败", String(msg));
     busy = false;
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
     updateBatchUi();
+    scheduleActiveProbe();
   }
 }
 
-async function pollJob(jobId, summary) {
+async function pollJob(jobId, summary, generation = pollGeneration, trackRecent = false) {
   try {
-    const job = await api("/api/jobs/" + jobId);
+    const query = new URLSearchParams({
+      compact: "1",
+      view: "ui",
+      log_after: String(logCursor),
+      test_revision: String(testRevision),
+    });
+    const job = await api("/api/jobs/" + jobId + "?" + query.toString());
+    if (generation !== pollGeneration) return false;
+    if (trackRecent) rememberLastJob(jobId, summary);
     pollFails = 0;
+    if (Array.isArray(job.log) && job.log.length) liveLogLines.push(...job.log);
+    logCursor = Number.isFinite(Number(job.log_cursor)) ? Number(job.log_cursor) : liveLogLines.length;
+    if (Array.isArray(job.test_runs)) cachedTestRuns = job.test_runs;
+    if (Number.isFinite(Number(job.test_revision))) testRevision = Number(job.test_revision);
+
+    const renderJob = { ...job, test_runs: cachedTestRuns };
     const logEl = $("jobLog");
     if (logEl) {
-      logEl.textContent = displayJobLog(job.log || []);
+      logEl.textContent = displayJobLog(liveLogLines);
       logEl.scrollTop = logEl.scrollHeight;
     }
-    renderTestResult(job);
+    renderTestResult(renderJob);
     const progress = job.progress ? " · " + job.progress : "";
     const current = job.current ? " · " + job.current : "";
     const stage = job.stage ? " · " + job.stage : "";
     if (job.status === "running" || job.status === "unknown") {
       $("jobMeta").textContent = summary + " · 进行中" + progress + current + stage;
-      return;
+      return true;
     }
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = null;
+
+    activeJobId = "";
     busy = false;
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
@@ -593,20 +739,24 @@ async function pollJob(jobId, summary) {
         (job.error || "") +
         (archiveHint ? " · 归档 " + archiveHint : "");
     }
+    scheduleActiveProbe();
+    return false;
   } catch (e) {
+    if (generation !== pollGeneration) return false;
     pollFails += 1;
     if (pollFails < 80) {
       if ($("jobMeta")) {
         $("jobMeta").textContent = summary + " · 网络抖动，重连中 (" + pollFails + ")";
       }
-      return;
+      return true;
     }
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = null;
+    activeJobId = "";
     busy = false;
     setButtonsDisabled(false);
     updateBatchUi();
     showJob("轮询失败", e.message || String(e));
+    scheduleActiveProbe();
+    return false;
   }
 }
 
@@ -641,22 +791,36 @@ if (chkAll) {
 }
 
 (async function boot() {
+  busy = true;
+  setButtonsDisabled(true);
+  showJob("Checking active jobs…", "Connecting to server…");
   try {
-    await Promise.all([refreshHealth(), refreshServices()]);
-
-    // Auto-recover live running job after page refresh
+    const pageReady = Promise.all([refreshHealth(), refreshServices()]);
+    let running;
     try {
-      const running = await api("/api/running-job");
-      if (running && running.id && running.status === "running") {
-        const summary = running.service_id || "任务";
-        showJob(summary + " · job " + running.id, (running.log || []).join("\n") || "(正在重新连接…)");
-        if (pollTimer) clearInterval(pollTimer);
-        busy = true;
-        setButtonsDisabled(true);
-        pollTimer = setInterval(() => pollJob(running.id, summary), 1500);
-        return;
-      }
-    } catch (_) { /* ignore – backend may not have the endpoint yet */ }
+      running = await api("/api/running-job");
+    } catch (e) {
+      await pageReady;
+      showJob("Unable to check active jobs", String(e.message || e));
+      return;
+    }
+    await pageReady;
+
+    if (running && running.id && running.status === "running") {
+      startPolling(running.id, running.service_id || "任务");
+      return;
+    }
+
+    busy = false;
+    setButtonsDisabled(false);
+    updateBatchUi();
+    scheduleActiveProbe();
+
+    const saved = rememberedLastJob();
+    if (saved) {
+      restoreLastJob(saved);
+      return;
+    }
 
     showJob(
       "就绪",

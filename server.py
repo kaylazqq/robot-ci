@@ -11,11 +11,12 @@ import subprocess
 import threading
 import time
 import uuid
+from copy import deepcopy
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
@@ -34,6 +35,144 @@ _login_lock = threading.Lock()
 _login_probe_cache: tuple[float, bool] | None = None  # (ts, ok)
 _token_cache: str | None = None
 _docker_cache: tuple[float, dict[str, Any]] | None = None
+
+JOB_PUBLIC_FIELDS = (
+    "id",
+    "service_id",
+    "branch",
+    "status",
+    "stage",
+    "error",
+    "remote",
+    "archive",
+    "archive_dir",
+    "results",
+    "progress",
+    "current",
+    "commit_sha",
+    "test_status",
+    "test_summary",
+    "test_commands",
+    "test_failures",
+    "test_cases",
+    "test_report",
+    "test_runs",
+)
+
+JOB_COMPACT_FIELDS = (
+    "id",
+    "service_id",
+    "branch",
+    "status",
+    "stage",
+    "error",
+    "remote",
+    "archive",
+    "archive_dir",
+    "results",
+    "progress",
+    "current",
+    "commit_sha",
+    "test_status",
+    "test_summary",
+    "test_report",
+)
+
+
+def _running_job_locked() -> dict[str, Any] | None:
+    for job in _jobs.values():
+        if job.get("status") == "running":
+            return job
+    return None
+
+
+def active_job_summary() -> dict[str, Any] | None:
+    """Return a lightweight snapshot without holding the lock during HTTP writes."""
+    with _jobs_lock:
+        job = _running_job_locked()
+        if not job:
+            return None
+        return deepcopy({key: job.get(key) for key in JOB_COMPACT_FIELDS})
+
+
+def register_job_if_idle(job: dict[str, Any]) -> dict[str, Any] | None:
+    """Atomically register a job, or return the already-running job summary."""
+    with _jobs_lock:
+        active = _running_job_locked()
+        if active:
+            return deepcopy({key: active.get(key) for key in JOB_COMPACT_FIELDS})
+        _jobs[str(job["id"])] = job
+    return None
+
+
+def _quiet_dependency_log(line: str) -> bool:
+    text = re.sub(r"^\[[^\]]+\]\s*", "", str(line or "")).strip().lower()
+    return text.startswith(
+        (
+            "requirement already satisfied:",
+            "collecting ",
+            "downloading ",
+            "using cached ",
+            "building wheels for collected packages",
+            "building wheel for ",
+            "installing collected packages:",
+            "successfully installed ",
+            "looking in indexes:",
+            "processing ",
+            "defaulting to user installation",
+        )
+    )
+
+
+def _append_ui_log(job: dict[str, Any], text: str) -> None:
+    plain = re.sub(r"^\[[^\]]+\]\s*", "", str(text or "")).strip()
+    if plain.startswith("tests start "):
+        job["_ui_test_running"] = True
+        job.setdefault("ui_log", []).append(text)
+        return
+    if plain.startswith(("@@TEST_STEP@@ ", "@@TEST_ERROR@@ ")):
+        job.setdefault("ui_log", []).append(text)
+        return
+    if plain.startswith("TEST summary "):
+        job["_ui_test_running"] = False
+        return
+    if "@@TEST_SUMMARY@@" in text or job.get("_ui_test_running"):
+        return
+    if _quiet_dependency_log(text):
+        return
+    job.setdefault("ui_log", []).append(text)
+
+
+def filter_ui_log(lines: list[str]) -> list[str]:
+    state: dict[str, Any] = {"ui_log": [], "_ui_test_running": False}
+    for line in lines:
+        _append_ui_log(state, line)
+    return list(state["ui_log"])
+
+
+def job_payload(
+    job: dict[str, Any],
+    *,
+    compact: bool = False,
+    view_ui: bool = False,
+    log_after: int = 0,
+    test_revision: int = -1,
+) -> dict[str, Any]:
+    fields = JOB_COMPACT_FIELDS if compact else JOB_PUBLIC_FIELDS
+    payload = deepcopy({key: job.get(key) for key in fields})
+    if view_ui and "ui_log" in job:
+        selected_log = list(job.get("ui_log") or [])
+    else:
+        raw_log = list(job.get("log") or [])
+        selected_log = filter_ui_log(raw_log) if view_ui else raw_log
+    cursor = max(0, min(int(log_after or 0), len(selected_log))) if compact else 0
+    payload["log"] = selected_log[cursor:]
+    payload["log_cursor"] = len(selected_log)
+    revision = len(job.get("test_runs") or [])
+    payload["test_revision"] = revision
+    if compact and test_revision != revision:
+        payload["test_runs"] = deepcopy(job.get("test_runs") or [])
+    return payload
 
 
 def job_meta_path(job_id: str) -> Path:
@@ -387,6 +526,7 @@ def append_job_log(job_id: str, line: str) -> None:
         if not job:
             return
         job["log"].append(text)
+        _append_ui_log(job, text)
         Path(job["log_file"]).open("a", encoding="utf-8").write(text + "\n")
 
 
@@ -1525,7 +1665,9 @@ class Handler(SimpleHTTPRequestHandler):
                 pass
 
     def _do_GET(self) -> None:
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         if path == "/api/login/status":
             # Instant: no docker info / no SWR network round-trip.
             self._json(
@@ -1606,79 +1748,53 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path.startswith("/api/jobs/"):
             job_id = path[len("/api/jobs/") :].strip("/")
+            compact = (query.get("compact") or [""])[0].lower() in ("1", "true", "yes")
+            view_ui = (query.get("view") or [""])[0].lower() == "ui"
+            try:
+                log_after = max(0, int((query.get("log_after") or ["0"])[0]))
+            except ValueError:
+                log_after = 0
+            try:
+                test_revision = int((query.get("test_revision") or ["-1"])[0])
+            except ValueError:
+                test_revision = -1
+            payload = None
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job:
-                    payload = {
-                        k: job.get(k)
-                        for k in (
-                            "id",
-                            "service_id",
-                            "branch",
-                            "status",
-                            "stage",
-                            "error",
-                            "remote",
-                            "archive",
-                            "archive_dir",
-                            "results",
-                            "progress",
-                            "current",
-                            "commit_sha",
-                            "test_status",
-                            "test_summary",
-                            "test_commands",
-                            "test_failures",
-                            "test_cases",
-                            "test_report",
-                            "test_runs",
-                        )
-                    }
-                    # Prefer live memory log; also refresh from file if empty
-                    payload["log"] = list(job["log"])
-                    self._json(200, payload)
-                    return
+                    payload = job_payload(
+                        job,
+                        compact=compact,
+                        view_ui=view_ui,
+                        log_after=log_after,
+                        test_revision=test_revision,
+                    )
+            if payload is not None:
+                self._json(200, payload)
+                return
             disk = load_job_from_disk(job_id)
             if disk:
-                self._json(200, disk)
+                self._json(
+                    200,
+                    job_payload(
+                        disk,
+                        compact=compact,
+                        view_ui=view_ui,
+                        log_after=log_after,
+                        test_revision=test_revision,
+                    ) if compact or view_ui else disk,
+                )
                 return
             self._json(404, {"error": "job not found"})
             return
 
-        # Return the single running (in-memory) job so the frontend can
-        # auto-recover polling after a page refresh.
+        # Lightweight global active-job discovery. Detailed logs are fetched
+        # incrementally from /api/jobs/<id> after the page attaches.
         if path == "/api/running-job":
-            with _jobs_lock:
-                for jid, j in _jobs.items():
-                    if j.get("status") == "running":
-                        payload = {
-                            k: j.get(k)
-                            for k in (
-                                "id",
-                                "service_id",
-                                "branch",
-                                "status",
-                                "stage",
-                                "error",
-                                "remote",
-                                "archive",
-                                "archive_dir",
-                                "results",
-                                "progress",
-                                "current",
-                                "commit_sha",
-                                "test_status",
-                                "test_summary",
-                                "test_commands",
-                                "test_failures",
-                                "test_cases",
-                                "test_report",
-                                "test_runs",
-                            )
-                        }
-                        payload["log"] = list(j["log"])
-                        self._json(200, payload)
-                        return
+            payload = active_job_summary()
+            if payload:
+                self._json(200, payload)
+                return
             self._json(200, {"id": None, "status": "idle"})
             return
 
@@ -1747,6 +1863,17 @@ class Handler(SimpleHTTPRequestHandler):
             if len(items) > 32:
                 self._json(400, {"error": "too many services (max 32)"})
                 return
+            active = active_job_summary()
+            if active:
+                self._json(
+                    409,
+                    {
+                        "error": "another build is running",
+                        "active_job_id": active.get("id"),
+                        "active_job": active,
+                    },
+                )
+                return
             docker = check_docker()
             if not docker["ok"]:
                 self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
@@ -1755,31 +1882,43 @@ class Handler(SimpleHTTPRequestHandler):
             log_file = LOG_DIR / f"job-{job_id}.log"
             ids = ",".join(it["service_id"] for it in items)
             branches = ",".join(it["branch"] for it in items)
-            with _jobs_lock:
-                _jobs[job_id] = {
-                    "id": job_id,
-                    "service_id": ids,
-                    "branch": branches,
-                    "status": "running",
-                    "stage": "syncing",
-                    "error": None,
-                    "remote": None,
-                    "archive": None,
-                    "commit_sha": None,
-                    "test_status": None,
-                    "test_summary": None,
-                    "test_commands": [],
-                    "test_failures": [],
-                    "test_cases": [],
-                    "test_report": None,
-                    "archive_dir": None,
-                    "results": [],
-                    "progress": None,
-                    "current": None,
-                    "test_runs": [],
-                    "log": [],
-                    "log_file": str(log_file),
-                }
+            new_job = {
+                "id": job_id,
+                "service_id": ids,
+                "branch": branches,
+                "status": "running",
+                "stage": "syncing",
+                "error": None,
+                "remote": None,
+                "archive": None,
+                "commit_sha": None,
+                "test_status": None,
+                "test_summary": None,
+                "test_commands": [],
+                "test_failures": [],
+                "test_cases": [],
+                "test_report": None,
+                "archive_dir": None,
+                "results": [],
+                "progress": None,
+                "current": None,
+                "test_runs": [],
+                "log": [],
+                "ui_log": [],
+                "_ui_test_running": False,
+                "log_file": str(log_file),
+            }
+            active = register_job_if_idle(new_job)
+            if active:
+                self._json(
+                    409,
+                    {
+                        "error": "another build is running",
+                        "active_job_id": active.get("id"),
+                        "active_job": active,
+                    },
+                )
+                return
             persist_job_meta(job_id)
             append_job_log(
                 job_id,
