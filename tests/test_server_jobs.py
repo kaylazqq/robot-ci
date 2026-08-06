@@ -135,7 +135,9 @@ class JobPayloadTests(unittest.TestCase):
         self.assertNotIn(raw[1], visible)
         self.assertNotIn(raw[4], visible)
         self.assertNotIn(raw[6], visible)
-        self.assertNotIn(raw[7], visible)
+        # The browser needs this non-rendered marker to leave test filtering
+        # mode before showing build, push, and archive logs.
+        self.assertIn(raw[7], visible)
 
 
 class JobEndpointTests(unittest.TestCase):

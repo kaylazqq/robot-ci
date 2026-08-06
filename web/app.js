@@ -98,6 +98,13 @@ function displayJobLog(lines) {
       testRunning = false;
       continue;
     }
+    if (plain.startsWith("Tests completed ")) {
+      // Also accept the user-facing completion line as a boundary. This keeps
+      // old in-memory jobs readable even if their internal summary was filtered.
+      testRunning = false;
+      visible.push(text);
+      continue;
+    }
     if (text.includes("@@TEST_SUMMARY@@")) {
       continue;
     }

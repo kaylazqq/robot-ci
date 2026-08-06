@@ -135,6 +135,9 @@ def _append_ui_log(job: dict[str, Any], text: str) -> None:
         return
     if plain.startswith("TEST summary "):
         job["_ui_test_running"] = False
+        # Keep the internal boundary in the incremental stream. The browser
+        # consumes it to leave test-output filtering mode, but does not render it.
+        job.setdefault("ui_log", []).append(text)
         return
     if "@@TEST_SUMMARY@@" in text or job.get("_ui_test_running"):
         return
