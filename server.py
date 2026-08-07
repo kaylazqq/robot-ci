@@ -1085,7 +1085,7 @@ def mattermost_package_matches(git_hash: str) -> bool:
 
 
 def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None, str | None]:
-    """Reuse local/<image>:*_<git_hash> when re-pushing the same commit."""
+    """Pick newest local/<image>:*_<git_hash> after a fresh build (tag is YYYYMMDDHHMM_<hash>)."""
     if not image or not git_hash or git_hash.startswith("0000"):
         return None, None
     code, out = docker_cmd(
@@ -1098,14 +1098,19 @@ def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None,
     if code != 0:
         return None, None
     suffix = f"_{git_hash}"
+    matches: list[tuple[str, str]] = []
     for ln in (out or "").splitlines():
         ref = ln.strip()
         if not ref or ":" not in ref or ref.endswith(":none"):
             continue
         tag = ref.split(":", 1)[-1]
         if tag.endswith(suffix):
-            return ref, tag
-    return None, None
+            matches.append((ref, tag))
+    if not matches:
+        return None, None
+    # Prefer highest timestamp prefix so we push the image just built, not an older same-commit tag.
+    matches.sort(key=lambda item: item[1], reverse=True)
+    return matches[0]
 
 
 def build_from_source(job_id: str, svc: dict[str, Any], git_hash: str) -> bool:
@@ -1417,20 +1422,14 @@ def push_one_service(
     result["test_summary"] = test_summary
     set_job(job_id, stage="building")
 
-    local_ref, tag = find_local_image_by_git_hash(image, git_hash)
-    if local_ref and tag:
-        append_job_log(
-            job_id,
-            f"optimize: reuse existing image {local_ref} (same git {git_hash}, skip rebuild)",
-        )
-    else:
-        if not build_from_source(job_id, svc, git_hash):
-            result["error"] = "build failed"
-            return result
-        local_ref, tag = resolve_local_image(job_id, svc)
-        by_hash_ref, by_hash_tag = find_local_image_by_git_hash(image, git_hash)
-        if by_hash_ref and by_hash_tag:
-            local_ref, tag = by_hash_ref, by_hash_tag
+    # Always rebuild; never reuse a previous local image for the same git hash.
+    if not build_from_source(job_id, svc, git_hash):
+        result["error"] = "build failed"
+        return result
+    local_ref, tag = resolve_local_image(job_id, svc)
+    by_hash_ref, by_hash_tag = find_local_image_by_git_hash(image, git_hash)
+    if by_hash_ref and by_hash_tag:
+        local_ref, tag = by_hash_ref, by_hash_tag
     if not local_ref or not tag:
         result["error"] = "no image/tar after build"
         return result
