@@ -27,7 +27,11 @@ bash deploy-linux.sh
 
 工具会在拉取服务代码后执行 `test-plans.json` 中受控的 UT/DT 测试，并在任务日志和页面显示总用例、通过、失败和错误数及失败用例摘要。第一阶段测试不阻断镜像构建或 SWR 推送；数据库、Redis、Temporal 等外部依赖测试不在测试计划中执行。
 
-批量构建时，每个所选微服务都按“拉取代码 → 执行该服务 UT/DT → 构建 → 推送 → 归档”的顺序独立执行。页面按微服务显示独立的测试结果卡片和分页表格，单个服务测试失败不会阻止该服务或后续服务继续构建。
+批量构建时，每个所选微服务都按“拉取代码 → 执行该服务 UT/DT → 构建 → 推送 → 归档”的顺序独立执行。页面按微服务显示独立的测试结果卡片和分页表格，单个服务测试失败不会阻止该服务或后续服务继续构建。SWR 登录检测会向仓库发起真实 manifest 探测；仅明确确认登录有效时才开始需要推送的任务，鉴权失败后立即停止后续 SWR 操作。
+
+`multica-server` 构建前必须在页面填写 Daemon 版本，格式为 `vMAJOR.MINOR.PATCH`，例如 `v1.2.3`。前后端使用同一规则校验；工具不修改微服务配置文件，而是通过 `DAEMON_RELEASE_VERSION` 调用仓库的 `./deploy.sh build-cce`，由微服务构建脚本把对应版本写入镜像内的 release manifest。最近一次成功提交构建的合法版本会保存在服务器 `logs/last-daemon-version.json` 并对所有浏览器回填；浏览器本地值只作为服务器状态不可用时的兜底。
+
+`multica-fleet` 来自独立仓库 `censong574-spec/multica-fleet`，属于仅归档服务，不登录或推送 SWR。工具调用仓库的 `./deploy.sh pack`，在同一归档目录生成包含 Fleet、OpenCode、Hermes 三个镜像的单个 tar，以及 `multica-fleet.env` 和已固化本次 tag 的 `deploy-multica-fleet.sh`。
 
 测试运行器会在宿主机持久复用 `~/.cache/robot-ci-tests` 下的 Go build/module、GOPATH 和 pip 下载缓存。即使 systemd 未设置 `HOME`、`GOCACHE`、`GOMODCACHE` 或 `GOPATH`，运行器也会自动补齐并创建目录；可用 `SWR_TEST_CACHE_ROOT` 指定其他缓存根目录。
 
@@ -47,6 +51,8 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 ```
 
 页面支持勾选多个微服务一次构建；同一任务里的镜像会归档到**同一个**时间戳目录。
+
+每个微服务的分支选择框后提供独立刷新按钮。页面初始化最多并发加载 3 个仓库的分支，后端只缓存成功结果 60 秒；手动刷新会绕过前后端缓存并重新读取该仓库的最新分支。查询失败只在对应微服务行提示，失败结果不会缓存，也不会再把回退的 `main` 伪装成完整分支列表。GitHub API 备用查询支持分页。
 
 ## 多人并发与页面刷新
 

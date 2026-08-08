@@ -1,6 +1,8 @@
 import json
 import threading
+import tempfile
 import unittest
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -140,6 +142,159 @@ class JobPayloadTests(unittest.TestCase):
         self.assertIn(raw[7], visible)
 
 
+class SwrLoginProbeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.saved_cache = server._login_probe_cache
+        self.saved_login = server._login_ok
+
+    def tearDown(self) -> None:
+        server._login_probe_cache = self.saved_cache
+        server._login_ok = self.saved_login
+
+    @patch.object(server, "docker_cmd", return_value=(1, "manifest unknown"))
+    def test_precise_missing_manifest_means_authenticated(self, docker_cmd) -> None:
+        with patch.object(server, "docker_config_has_swr_auth", return_value=True):
+            self.assertTrue(server.check_login(force=True))
+        remote = docker_cmd.call_args.args[2]
+        self.assertIn("robot-ci-auth-probe-does-not-exist", remote)
+        self.assertNotIn("_", remote.rsplit("/", 1)[-1])
+
+    @patch.object(server, "docker_cmd", return_value=(1, "dial tcp: i/o timeout"))
+    def test_ambiguous_network_failure_is_not_login_success(self, _docker_cmd) -> None:
+        with patch.object(server, "docker_config_has_swr_auth", return_value=True):
+            self.assertFalse(server.check_login(force=True))
+
+    @patch.object(server, "docker_cmd", return_value=(1, "unauthorized: authentication required"))
+    def test_authentication_failure_is_rejected(self, _docker_cmd) -> None:
+        with patch.object(server, "docker_config_has_swr_auth", return_value=True):
+            self.assertFalse(server.check_login(force=True))
+
+    @patch.object(server, "docker_config_has_swr_auth", return_value=False)
+    @patch.object(server, "docker_cmd")
+    def test_missing_local_credentials_skips_registry_probe(self, docker_cmd, _has_auth) -> None:
+        self.assertFalse(server.check_login(force=True))
+        docker_cmd.assert_not_called()
+
+
+class BranchLookupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with server._branch_cache_lock:
+            server._branch_cache.clear()
+
+    def tearDown(self) -> None:
+        with server._branch_cache_lock:
+            server._branch_cache.clear()
+
+    @patch.object(server, "gh_token", return_value="")
+    @patch.object(server, "run_cmd", return_value=(0, ""))
+    def test_empty_ssh_result_is_an_error_not_a_fake_main_branch(self, _run_cmd, _token) -> None:
+        ok, detail = server.list_branches_api("owner/repo", force=True)
+        self.assertFalse(ok)
+        self.assertIn("no branch refs", detail)
+
+    @patch.object(
+        server,
+        "run_cmd",
+        return_value=(0, "a refs/heads/main\nb refs/heads/feature/test\n"),
+    )
+    def test_success_is_cached_and_force_bypasses_cache(self, run_cmd) -> None:
+        with patch.dict(server.CFG, {"github_use_ssh": True, "github_ssh_key": __file__}):
+            first = server.list_branches_api("owner/repo")
+            second = server.list_branches_api("owner/repo")
+            refreshed = server.list_branches_api("owner/repo", force=True)
+        self.assertEqual((True, ["feature/test", "main"]), first)
+        self.assertEqual(first, second)
+        self.assertEqual(first, refreshed)
+        self.assertEqual(2, run_cmd.call_count)
+
+    @patch.object(server, "gh_token", return_value="token")
+    @patch.object(server, "urlopen")
+    def test_github_api_fetches_more_than_one_page(self, urlopen, _token) -> None:
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        urlopen.side_effect = [
+            Response([{"name": f"branch-{index:03d}"} for index in range(100)]),
+            Response([{"name": "branch-100"}]),
+        ]
+        with patch.dict(server.CFG, {"github_use_ssh": False, "github_ssh_key": ""}):
+            ok, branches = server.list_branches_api("owner/repo", force=True)
+        self.assertTrue(ok)
+        self.assertEqual(101, len(branches))
+        self.assertEqual(2, urlopen.call_count)
+
+
+class BuildCommandTests(unittest.TestCase):
+    def test_failure_summary_prefers_actionable_error(self) -> None:
+        detail = server.summarize_command_failure(
+            ["Step 8/10", "ERROR: fetch-lfs.sh missing cache", "build exited"],
+            "build failed",
+        )
+        self.assertEqual("ERROR: fetch-lfs.sh missing cache", detail)
+
+    @patch.object(server, "run_stream", return_value=0)
+    def test_multica_server_passes_valid_version_to_build_cce(self, run_stream) -> None:
+        svc = {
+            "id": "multica-server",
+            "image": "multica-server",
+            "repo": "rollingfruit/multica-aiwelink",
+            "build_action": "build-cce",
+            "requires_version": True,
+        }
+        ok, detail = server.build_from_source("no-job", svc, "abcdef1", "v1.2.3")
+        self.assertTrue(ok, detail)
+        command = " ".join(run_stream.call_args.args[1])
+        self.assertIn("DAEMON_RELEASE_VERSION=v1.2.3", command)
+        self.assertIn("bash ./deploy.sh build-cce", command)
+
+    @patch.object(server, "run_stream")
+    def test_multica_server_rejects_invalid_version_before_shell(self, run_stream) -> None:
+        svc = {"id": "multica-server", "requires_version": True}
+        ok, detail = server.build_from_source("no-job", svc, "abcdef1", "latest")
+        self.assertFalse(ok)
+        self.assertIn("invalid daemon version", detail)
+        run_stream.assert_not_called()
+
+    @patch.object(server, "run_stream", return_value=0)
+    def test_fleet_pack_receives_archive_directory_and_no_push_action(self, run_stream) -> None:
+        svc = {
+            "id": "multica-fleet",
+            "image": "multica-fleet",
+            "repo": "censong574-spec/multica-fleet",
+            "build_action": "pack",
+            "bundle_archive": True,
+        }
+        ok, detail = server.build_from_source(
+            "no-job", svc, "abcdef1", archive_dir=server.Path("/tmp/fleet-output")
+        )
+        self.assertTrue(ok, detail)
+        command = " ".join(run_stream.call_args.args[1])
+        self.assertRegex(command, r"FLEET_OUTPUT_DIR=\S*[/\\]tmp[/\\]fleet-output")
+        self.assertIn("INCLUDE_RUNTIME_IMAGES=1", command)
+        self.assertIn("bash ./deploy.sh pack", command)
+
+
+class DaemonVersionStateTests(unittest.TestCase):
+    def test_server_state_round_trip_and_format_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = server.Path(tmp) / "last-daemon-version.json"
+            with patch.object(server, "LAST_DAEMON_VERSION_PATH", state_path):
+                self.assertEqual("", server.load_last_daemon_version())
+                self.assertFalse(server.save_last_daemon_version("1.2.3"))
+                self.assertTrue(server.save_last_daemon_version("v1.2.3"))
+                self.assertEqual("v1.2.3", server.load_last_daemon_version())
+
+
 class JobEndpointTests(unittest.TestCase):
     def setUp(self) -> None:
         with server._jobs_lock:
@@ -181,6 +336,52 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual(409, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual("active-job", payload["active_job_id"])
+
+    def test_multica_server_version_is_validated_before_build(self) -> None:
+        request = Request(
+            self.base_url + "/api/push",
+            data=json.dumps(
+                {"items": [{"service_id": "multica-server", "branch": "main", "version": "1.2.3"}]}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with patch.object(server, "save_last_daemon_version") as save_version:
+            with self.assertRaises(HTTPError) as raised:
+                self.opener.open(request, timeout=2)
+            save_version.assert_not_called()
+        self.assertEqual(400, raised.exception.code)
+        payload = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertIn("vMAJOR.MINOR.PATCH", payload["error"])
+
+    def test_services_expose_version_and_archive_capabilities(self) -> None:
+        with self.opener.open(self.base_url + "/api/services", timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        services = {item["id"]: item for item in payload["services"]}
+        self.assertTrue(services["multica-server"]["requires_version"])
+        self.assertEqual("v1.2.3", services["multica-server"]["version_example"])
+        self.assertIn("last_version", services["multica-server"])
+        self.assertTrue(services["multica-fleet"]["archive_only"])
+        self.assertEqual("censong574-spec/multica-fleet", services["multica-fleet"]["repo"])
+
+    @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
+    def test_branch_lookup_failure_is_explicit_service_error(self, lookup) -> None:
+        with self.assertRaises(HTTPError) as raised:
+            self.opener.open(self.base_url + "/api/services/memory-service/branches", timeout=2)
+        self.assertEqual(503, raised.exception.code)
+        payload = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual("branch lookup failed", payload["error"])
+        self.assertEqual("SSH timeout", payload["detail"])
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=False)
+
+    @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
+    def test_branch_retry_forces_backend_refresh(self, lookup) -> None:
+        with self.opener.open(
+            self.base_url + "/api/services/memory-service/branches?refresh=1", timeout=2
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(["main", "feature/latest"], payload["branches"])
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
 
 
 if __name__ == "__main__":

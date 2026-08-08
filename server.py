@@ -26,6 +26,7 @@ CONFIG_PATH = ROOT / "config.json"
 SERVICES_PATH = ROOT / "services.json"
 TEST_PLANS_PATH = ROOT / "test-plans.json"
 TEST_RUNNER_PATH = ROOT / "test_runner.py"
+LAST_DAEMON_VERSION_PATH = LOG_DIR / "last-daemon-version.json"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _jobs: dict[str, dict[str, Any]] = {}
@@ -35,6 +36,40 @@ _login_lock = threading.Lock()
 _login_probe_cache: tuple[float, bool] | None = None  # (ts, ok)
 _token_cache: str | None = None
 _docker_cache: tuple[float, dict[str, Any]] | None = None
+_daemon_version_lock = threading.Lock()
+_branch_cache: dict[str, tuple[float, list[str]]] = {}
+_branch_cache_lock = threading.Lock()
+
+DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+
+
+def load_last_daemon_version() -> str:
+    with _daemon_version_lock:
+        try:
+            payload = json.loads(LAST_DAEMON_VERSION_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return ""
+    value = str(payload.get("version") or "").strip() if isinstance(payload, dict) else ""
+    return value if DAEMON_VERSION_RE.fullmatch(value) else ""
+
+
+def save_last_daemon_version(version: str) -> bool:
+    value = (version or "").strip()
+    if not DAEMON_VERSION_RE.fullmatch(value):
+        return False
+    payload = {"version": value, "updated_at": int(time.time())}
+    temporary = LAST_DAEMON_VERSION_PATH.with_suffix(".json.tmp")
+    try:
+        with _daemon_version_lock:
+            LAST_DAEMON_VERSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(LAST_DAEMON_VERSION_PATH)
+        return True
+    except OSError:
+        return False
 
 JOB_PUBLIC_FIELDS = (
     "id",
@@ -816,24 +851,37 @@ def check_login(force: bool = False) -> bool:
             _login_ok = ok
         return ok
 
-    remote = f"{CFG['swr_registry']}/{CFG['swr_org']}/___probe_does_not_exist___"
+    if not docker_config_has_swr_auth():
+        with _login_lock:
+            _login_ok = False
+            _login_probe_cache = (now, False)
+        return False
+
+    remote = f"{CFG['swr_registry']}/{CFG['swr_org']}/robot-ci-auth-probe-does-not-exist"
     code, out = docker_cmd("manifest", "inspect", remote, timeout=12)
     text = (out or "").lower()
-    # Missing image is fine; only auth failures mean not logged in.
+    # A valid, authenticated registry request for this deliberately absent image
+    # returns a precise manifest/name-missing response. Everything else fails
+    # closed so a network/configuration error is never reported as logged in.
     if "unauthorized" in text or "authentication required" in text or "denied" in text:
         ok = False
-    elif code == 0 or "manifest unknown" in text or "not found" in text or "no such" in text:
+    elif code == 0 or any(
+        marker in text for marker in ("manifest unknown", "name unknown", "no such manifest")
+    ):
         ok = True
-    elif not docker_config_has_swr_auth():
-        ok = False
     else:
-        # Ambiguous network error but local auth exists — keep previous optimism for UI;
-        # push will surface real failures.
-        ok = True
+        ok = False
     with _login_lock:
         _login_ok = ok
         _login_probe_cache = (now, ok)
     return ok
+
+
+def mark_swr_login_invalid() -> None:
+    global _login_ok, _login_probe_cache
+    with _login_lock:
+        _login_ok = False
+        _login_probe_cache = (time.time(), False)
 
 
 def run_stream(
@@ -841,6 +889,7 @@ def run_stream(
     args: list[str],
     timeout: int = 7200,
     env: dict[str, str] | None = None,
+    output_tail: list[str] | None = None,
 ) -> int:
     shown = [re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", a) for a in args]
     append_job_log(job_id, "$ " + " ".join(shown))
@@ -865,7 +914,11 @@ def run_stream(
     def _reader() -> None:
         try:
             for line in p.stdout:
-                append_job_log(job_id, re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", line.rstrip("\n")))
+                clean = re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", line.rstrip("\n"))
+                append_job_log(job_id, clean)
+                if output_tail is not None:
+                    output_tail.append(clean)
+                    del output_tail[:-80]
         except Exception:
             pass
         finally:
@@ -882,38 +935,79 @@ def run_stream(
     return p.wait() or 0
 
 
-def list_branches_api(repo: str) -> tuple[bool, list[str] | str]:
+def summarize_command_failure(lines: list[str], fallback: str) -> str:
+    cleaned = [re.sub(r"\s+", " ", line).strip() for line in lines if line.strip()]
+    preferred = (
+        "error:", "failed", "failure", "denied", "unauthorized", "not found",
+        "no such", "missing", "cannot", "could not", "exit status",
+    )
+    for line in reversed(cleaned):
+        lower = line.lower()
+        if any(token in lower for token in preferred):
+            return line[-500:]
+    return (cleaned[-1][-500:] if cleaned else fallback)
+
+
+def _cache_branches(repo: str, names: list[str]) -> list[str]:
+    unique = sorted({name.strip() for name in names if name and name.strip()})
+    if unique:
+        with _branch_cache_lock:
+            _branch_cache[repo] = (time.time(), unique)
+    return unique
+
+
+def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] | str]:
     if not repo:
         return False, "missing repo"
+
+    if not force:
+        with _branch_cache_lock:
+            cached = _branch_cache.get(repo)
+        if cached and time.time() - cached[0] < 60:
+            return True, list(cached[1])
 
     # 1) SSH ls-remote (preferred on shared server)
     if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
         ssh_url = f"git@github.com:{repo}.git"
-        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=120, env=git_env())
+        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=30, env=git_env())
         if code == 0:
             names = []
             for line in out.splitlines():
                 parts = line.split()
                 if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
                     names.append(parts[1][len("refs/heads/") :])
-            return True, names
-        ssh_err = re.sub(r"x-access-token:[^@\s]+@", "***@", out)[-500:]
+            names = _cache_branches(repo, names)
+            if names:
+                return True, names
+            ssh_err = "git ls-remote returned no branch refs"
+        else:
+            ssh_err = re.sub(r"x-access-token:[^@\s]+@", "***@", out)[-500:]
     else:
         ssh_err = "ssh not configured"
 
     # 2) GitHub API with token
     token = gh_token()
     if token:
-        url = f"https://api.github.com/repos/{repo}/branches?per_page=100"
-        req = Request(url)
-        req.add_header("Accept", "application/vnd.github+json")
-        req.add_header("Authorization", f"Bearer {token}")
         try:
-            with urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            return True, [b["name"] for b in data if b.get("name")]
+            names: list[str] = []
+            for page in range(1, 11):
+                url = f"https://api.github.com/repos/{repo}/branches?per_page=100&page={page}"
+                req = Request(url)
+                req.add_header("Accept", "application/vnd.github+json")
+                req.add_header("Authorization", f"Bearer {token}")
+                with urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(data, list):
+                    raise ValueError("GitHub branches response is not a list")
+                names.extend(str(branch.get("name") or "") for branch in data if isinstance(branch, dict))
+                if len(data) < 100:
+                    break
+            names = _cache_branches(repo, names)
+            if names:
+                return True, names
+            return False, f"SSH: {ssh_err}; GitHub API returned no branches"
         except Exception as e:  # noqa: BLE001
-            return False, str(e)
+            return False, f"SSH: {ssh_err}; GitHub API: {e}"
 
     return (
         False,
@@ -1113,7 +1207,13 @@ def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None,
     return matches[0]
 
 
-def build_from_source(job_id: str, svc: dict[str, Any], git_hash: str) -> bool:
+def build_from_source(
+    job_id: str,
+    svc: dict[str, Any],
+    git_hash: str,
+    version: str = "",
+    archive_dir: Path | None = None,
+) -> tuple[bool, str]:
     src = repo_dir(svc)
     shell_src = host_path(src)
     ps_dir = host_path(public_service_dir())
@@ -1131,24 +1231,43 @@ def build_from_source(job_id: str, svc: dict[str, Any], git_hash: str) -> bool:
             f"mattermost optimize: SKIP_PACKAGE=1 (package already built for {git_hash})",
         )
 
+    action = str(svc.get("build_action") or "").strip()
+    if svc.get("requires_version"):
+        if not DAEMON_VERSION_RE.fullmatch(version):
+            return False, f"invalid daemon version: {version or '(missing)'}"
+        extra_env += f"DAEMON_RELEASE_VERSION={shlex.quote(version)} "
+        append_job_log(job_id, f"daemon release version={version}")
+    if svc.get("bundle_archive"):
+        if archive_dir is None:
+            return False, "archive directory is required for Fleet bundle"
+        extra_env += (
+            f"FLEET_OUTPUT_DIR={shlex.quote(host_path(archive_dir))} "
+            f"FLEET_GIT_HASH={shlex.quote(git_hash)} INCLUDE_RUNTIME_IMAGES=1 "
+        )
+        append_job_log(job_id, "Fleet bundle: control image + OpenCode + Hermes; SWR push disabled")
+
+    deploy_args = f" {shlex.quote(action)}" if action else ""
+
     bash = (
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
         "find . -maxdepth 3 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
         f"export CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
-        "if [[ -f ./deploy.sh ]]; then bash ./deploy.sh; "
+        f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
         "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
         "else echo 'ERROR: no deploy.sh'; exit 1; fi"
     )
+    output_tail: list[str] = []
     code = run_stream(
         job_id,
         bash_lc(bash),
         timeout=int(CFG.get("build_timeout_sec") or 7200),
+        output_tail=output_tail,
     )
     if code != 0:
         append_job_log(job_id, f"ERROR build exit={code}")
-        return False
+        return False, summarize_command_failure(output_tail, f"build exited with code {code}")
     append_job_log(job_id, "build finished")
     if svc.get("id") == "mattermost" and git_hash and not git_hash.startswith("0000"):
         try:
@@ -1158,7 +1277,7 @@ def build_from_source(job_id: str, svc: dict[str, Any], git_hash: str) -> bool:
             append_job_log(job_id, f"mattermost package marker -> {git_hash}")
         except OSError as e:
             append_job_log(job_id, f"WARN: could not write package marker: {e}")
-    return True
+    return True, ""
 
 
 def find_latest_tar(svc: dict[str, Any]) -> Path | None:
@@ -1346,10 +1465,14 @@ def ensure_swr_login(job_id: str, login_command: str = "") -> bool:
             set_job(job_id, status="failed", error="SWR login failed")
             append_job_log(job_id, "ERROR: paste a valid Huawei SWR temporary login command")
             return False
+        if not check_login(force=True):
+            set_job(job_id, status="failed", error="SWR login verification failed")
+            append_job_log(job_id, "ERROR: SWR login command succeeded locally but registry verification failed")
+            return False
         return True
 
     append_job_log(job_id, "reusing shared SWR login on this server…")
-    if not check_login():
+    if not check_login(force=True):
         set_job(job_id, status="failed", error="not logged in to SWR")
         append_job_log(
             job_id,
@@ -1365,6 +1488,7 @@ def push_one_service(
     svc: dict[str, Any],
     branch: str,
     archive_dir: Path | None,
+    version: str = "",
 ) -> dict[str, Any]:
     """Build/push/archive one service. Does not set final job status."""
     service_id = svc["id"]
@@ -1381,9 +1505,14 @@ def push_one_service(
         "error": "",
         "test_status": None,
         "test_summary": None,
+        "version": version,
+        "error_code": "",
     }
     append_job_log(job_id, f"service={svc['title']} image={image}")
-    append_job_log(job_id, f"target={registry}/{org}/{image}:*")
+    if svc.get("archive_only"):
+        append_job_log(job_id, "target=local Fleet deployment bundle (SWR push skipped)")
+    else:
+        append_job_log(job_id, f"target={registry}/{org}/{image}:*")
 
     # Keep checkout after the job so failed builds can be inspected on disk.
     # The next build for this service wipes it in sync_repo() before re-cloning.
@@ -1423,8 +1552,36 @@ def push_one_service(
     set_job(job_id, stage="building")
 
     # Always rebuild; never reuse a previous local image for the same git hash.
-    if not build_from_source(job_id, svc, git_hash):
-        result["error"] = "build failed"
+    built, build_error = build_from_source(job_id, svc, git_hash, version, archive_dir)
+    if not built:
+        result["error"] = build_error or "build failed"
+        append_job_log(job_id, f"FAILED service={service_id} stage=building reason={result['error']}")
+        return result
+
+    if svc.get("bundle_archive"):
+        if archive_dir is None:
+            result["error"] = "Fleet archive directory was not created"
+            return result
+        bundles = sorted(
+            archive_dir.glob("multica-fleet_bundle_*.tar"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        bundle = bundles[0] if bundles else None
+        required = (
+            archive_dir / "multica-fleet.env",
+            archive_dir / "deploy-multica-fleet.sh",
+        )
+        if bundle is None or any(not path.is_file() for path in required):
+            result["error"] = "Fleet bundle or deployment files were not generated"
+            append_job_log(job_id, f"FAILED service={service_id} stage=archiving reason={result['error']}")
+            return result
+        result["ok"] = True
+        result["remote"] = "archive-only"
+        result["archive"] = str(bundle)
+        append_job_log(job_id, f"OK archive-only {bundle} (SWR push skipped)")
+        append_job_log(job_id, f"OK deployment env {required[0]}")
+        append_job_log(job_id, f"OK deployment script {required[1]}")
         return result
     local_ref, tag = resolve_local_image(job_id, svc)
     by_hash_ref, by_hash_tag = find_local_image_by_git_hash(image, git_hash)
@@ -1473,8 +1630,17 @@ def push_one_service(
         time.sleep(wait_s)
     if code != 0:
         result["remote"] = remote
-        result["error"] = "docker push failed"
-        if "authenticate" in (out or "").lower() or "denied" in (out or "").lower():
+        result["error"] = summarize_command_failure(
+            (out or "").splitlines(),
+            "docker push failed",
+        )
+        auth_failed = any(
+            token in (out or "").lower()
+            for token in ("authenticate", "authentication required", "unauthorized", "denied")
+        )
+        if auth_failed:
+            result["error_code"] = "swr_auth_failed"
+            mark_swr_login_invalid()
             append_job_log(
                 job_id,
                 "ERROR: SWR 鉴权失败。请重新复制华为云临时登录指令到页面后再推送；并确认组织 public_ai 有推送权限",
@@ -1522,7 +1688,7 @@ def run_push_job(
     """Push one or more services; batch jobs share one archive timestamp directory."""
     try:
         catalog = {s["id"]: s for s in load_services()}
-        resolved: list[tuple[dict[str, Any], str]] = []
+        resolved: list[tuple[dict[str, Any], str, str]] = []
         for item in items:
             sid = (item.get("service_id") or "").strip()
             svc = catalog.get(sid)
@@ -1531,35 +1697,47 @@ def run_push_job(
                 append_job_log(job_id, f"ERROR unknown service: {sid or '?'}")
                 return
             br = (item.get("branch") or svc.get("default_branch") or "main").strip()
-            resolved.append((svc, br))
+            version = (item.get("version") or "").strip()
+            resolved.append((svc, br, version))
 
         if not resolved:
             set_job(job_id, status="failed", error="no services selected")
             return
 
-        labels = ", ".join(f"{svc['id']}@{br}" for svc, br in resolved)
+        labels = ", ".join(
+            f"{svc['id']}@{br}" + (f"[{version}]" if version else "")
+            for svc, br, version in resolved
+        )
         append_job_log(job_id, f"batch size={len(resolved)}: {labels}")
         set_job(
             job_id,
-            service_id=",".join(svc["id"] for svc, _ in resolved),
-            branch=",".join(br for _, br in resolved),
+            service_id=",".join(svc["id"] for svc, _, _ in resolved),
+            branch=",".join(br for _, br, _ in resolved),
         )
 
-        if not ensure_swr_login(job_id, login_command):
+        needs_swr = any(not svc.get("archive_only") for svc, _, _ in resolved)
+        if needs_swr and not ensure_swr_login(job_id, login_command):
             return
+        if not needs_swr:
+            append_job_log(job_id, "SWR login skipped: all selected services are archive-only")
 
-        ok_ps, detail_ps = ensure_public_service(job_id)
-        if not ok_ps:
-            set_job(job_id, status="failed", error=detail_ps)
-            append_job_log(job_id, f"ERROR {detail_ps}")
-            return
+        if any(not svc.get("skip_public_service") for svc, _, _ in resolved):
+            ok_ps, detail_ps = ensure_public_service(job_id)
+            if not ok_ps:
+                set_job(job_id, status="failed", error=detail_ps)
+                append_job_log(job_id, f"ERROR {detail_ps}")
+                return
+        else:
+            append_job_log(job_id, "shared public-service skipped: not required by selected services")
 
         archive_dir: Path | None = None
-        if CFG.get("archive_enabled"):
+        bundle_required = any(svc.get("bundle_archive") for svc, _, _ in resolved)
+        needs_archive_dir = bool(CFG.get("archive_enabled")) or bundle_required
+        if needs_archive_dir:
             try:
                 archive_dir = make_archive_dir(job_id)
             except OSError as e:
-                if CFG.get("archive_required"):
+                if CFG.get("archive_required") or bundle_required:
                     set_job(job_id, status="failed", error=f"cannot create archive dir: {e}")
                     append_job_log(job_id, f"ERROR cannot create archive dir: {e}")
                     return
@@ -1570,12 +1748,35 @@ def run_push_job(
 
         results: list[dict[str, Any]] = []
         total = len(resolved)
-        for idx, (svc, br) in enumerate(resolved, 1):
+        for idx, (svc, br, version) in enumerate(resolved, 1):
             append_job_log(job_id, f"===== [{idx}/{total}] {svc['id']} @ {br} =====")
             set_job(job_id, stage="syncing", current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
-            result = push_one_service(job_id, svc, br, archive_dir)
+            result = push_one_service(job_id, svc, br, archive_dir, version)
             results.append(result)
             set_job(job_id, results=results)
+            if result.get("error_code") == "swr_auth_failed":
+                append_job_log(job_id, "SWR authentication failed; stopping remaining SWR operations")
+                for pending_svc, pending_br, pending_version in resolved[idx:]:
+                    pending = {
+                        "service_id": pending_svc["id"],
+                        "title": pending_svc.get("title") or pending_svc["id"],
+                        "branch": pending_br,
+                        "version": pending_version,
+                        "ok": False,
+                        "remote": "",
+                        "archive": "",
+                        "error": "not attempted: SWR authentication failed",
+                        "error_code": "swr_auth_failed",
+                        "test_status": None,
+                        "test_summary": None,
+                    }
+                    results.append(pending)
+                    append_job_log(
+                        job_id,
+                        f"FAILED service={pending_svc['id']} reason={pending['error']}",
+                    )
+                set_job(job_id, results=results)
+                break
 
         ok_n = sum(1 for r in results if r.get("ok"))
         fail_n = total - ok_n
@@ -1609,7 +1810,12 @@ def run_push_job(
                 archive=archive_summary,
                 results=results,
             )
-            append_job_log(job_id, f"BATCH DONE with failures ok={ok_n} fail={fail_n}")
+            for failed in (r for r in results if not r.get("ok")):
+                append_job_log(
+                    job_id,
+                    f"FAILED service={failed['service_id']} reason={failed.get('error') or 'failed'}",
+                )
+            append_job_log(job_id, f"BATCH DONE with failures ok={ok_n} fail={fail_n} errors=[{errs}]")
             if archive_dir:
                 append_job_log(job_id, f"BATCH archive dir {archive_dir} (partial ok kept)")
     except Exception as e:  # noqa: BLE001
@@ -1724,6 +1930,11 @@ class Handler(SimpleHTTPRequestHandler):
                         "github": public_github_url(svc.get("github") or (f"https://github.com/{repo_full_name(svc)}.git")),
                         "default_branch": svc.get("default_branch") or "main",
                         "cloned": (repo_dir(svc) / ".git").is_dir(),
+                        "requires_version": bool(svc.get("requires_version")),
+                        "version_label": svc.get("version_label") or "Version",
+                        "version_example": svc.get("version_example") or "v1.2.3",
+                        "archive_only": bool(svc.get("archive_only")),
+                        "last_version": load_last_daemon_version() if svc.get("requires_version") else "",
                     }
                 )
             self._json(200, {"services": items, "registry": CFG["swr_registry"], "org": CFG["swr_org"]})
@@ -1736,10 +1947,18 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(404, {"error": "unknown service"})
                 return
             repo = repo_full_name(svc)
-            ok, result = list_branches_api(repo)
+            force_refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
+            ok, result = list_branches_api(repo, force=force_refresh)
             default = svc.get("default_branch") or "main"
             if not ok:
-                self._json(200, {"branches": [default], "default_branch": default, "warning": str(result)})
+                self._json(
+                    503,
+                    {
+                        "error": "branch lookup failed",
+                        "detail": str(result),
+                        "default_branch": default,
+                    },
+                )
                 return
             branches = list(result)
             if default in branches:
@@ -1852,19 +2071,43 @@ class Handler(SimpleHTTPRequestHandler):
                         {
                             "service_id": sid,
                             "branch": (it.get("branch") or "main").strip() or "main",
+                            "version": (it.get("version") or "").strip(),
                         }
                     )
             else:
                 service_id = (data.get("service_id") or "").strip()
                 branch = (data.get("branch") or "main").strip() or "main"
                 if service_id:
-                    items = [{"service_id": service_id, "branch": branch}]
+                    items = [
+                        {
+                            "service_id": service_id,
+                            "branch": branch,
+                            "version": (data.get("version") or "").strip(),
+                        }
+                    ]
             if not items:
                 self._json(400, {"error": "service_id or items[] required"})
                 return
             if len(items) > 32:
                 self._json(400, {"error": "too many services (max 32)"})
                 return
+            catalog = {svc["id"]: svc for svc in load_services()}
+            for item in items:
+                svc = catalog.get(item["service_id"])
+                if not svc:
+                    self._json(400, {"error": f"unknown service: {item['service_id']}"})
+                    return
+                if svc.get("requires_version") and not DAEMON_VERSION_RE.fullmatch(item.get("version") or ""):
+                    self._json(
+                        400,
+                        {
+                            "error": (
+                                f"{item['service_id']} version is required and must match vMAJOR.MINOR.PATCH "
+                                "(example: v1.2.3)"
+                            )
+                        },
+                    )
+                    return
             active = active_job_summary()
             if active:
                 self._json(
@@ -1921,6 +2164,10 @@ class Handler(SimpleHTTPRequestHandler):
                     },
                 )
                 return
+            for item in items:
+                if catalog[item["service_id"]].get("requires_version"):
+                    if not save_last_daemon_version(item.get("version") or ""):
+                        append_job_log(job_id, "WARN: could not persist the last Daemon version on server")
             persist_job_meta(job_id)
             append_job_log(
                 job_id,

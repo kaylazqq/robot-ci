@@ -12,11 +12,30 @@ let logCursor = 0;
 let testRevision = -1;
 let cachedTestRuns = [];
 const branchCache = {};
+const BRANCH_LOAD_LIMIT = 3;
+let branchLoadsActive = 0;
+const branchLoadQueue = [];
 let testResultJobId = "";
 const testTableState = new Map();
 const LAST_JOB_KEY = "robotCiLastJob";
 const LEGACY_ACTIVE_JOB_KEY = "robotCiActiveJob";
 const LAST_JOB_TTL_MS = 10 * 60 * 1000;
+const DAEMON_VERSION_KEY = "robotCiDaemonVersion";
+const DAEMON_VERSION_PATTERN = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
+
+function rememberedDaemonVersion() {
+  try {
+    const value = (localStorage.getItem(DAEMON_VERSION_KEY) || "").trim();
+    return DAEMON_VERSION_PATTERN.test(value) ? value : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function rememberDaemonVersion(value) {
+  if (!DAEMON_VERSION_PATTERN.test(value || "")) return;
+  try { localStorage.setItem(DAEMON_VERSION_KEY, value); } catch (_) { /* storage may be disabled */ }
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -438,18 +457,69 @@ function fillBranchSelect(selectEl, branches, defaultBranch) {
   selectEl.disabled = false;
 }
 
-async function loadBranches(serviceId, selectEl, defaultBranch) {
-  if (branchCache[serviceId] && branchCache[serviceId].loaded) {
-    fillBranchSelect(selectEl, branchCache[serviceId].branches, defaultBranch);
+function runQueuedBranchLoads() {
+  while (branchLoadsActive < BRANCH_LOAD_LIMIT && branchLoadQueue.length) {
+    const queued = branchLoadQueue.shift();
+    branchLoadsActive += 1;
+    Promise.resolve()
+      .then(queued.task)
+      .then(queued.resolve, queued.reject)
+      .finally(() => {
+        branchLoadsActive -= 1;
+        runQueuedBranchLoads();
+      });
+  }
+}
+
+function queueBranchLoad(task, priority = false) {
+  return new Promise((resolve, reject) => {
+    const queued = {task, resolve, reject};
+    if (priority) branchLoadQueue.unshift(queued);
+    else branchLoadQueue.push(queued);
+    runQueuedBranchLoads();
+  });
+}
+
+function setBranchLoadState(row, state, message = "") {
+  const status = row && row.querySelector("[data-branch-status]");
+  const retry = row && row.querySelector("[data-branch-retry]");
+  if (status) {
+    status.textContent = message;
+    status.className = "branch-status" + (state ? " " + state : "");
+    if (state !== "error") status.removeAttribute("title");
+  }
+  if (retry) {
+    retry.disabled = busy || state === "loading";
+    retry.classList.toggle("loading", state === "loading");
+  }
+}
+
+async function loadBranches(serviceId, selectEl, defaultBranch, force = false) {
+  const row = selectEl.closest(".row-svc");
+  if (!force && branchCache[serviceId] && branchCache[serviceId].loaded) {
+    const cached = branchCache[serviceId].branches;
+    fillBranchSelect(selectEl, cached, defaultBranch);
+    setBranchLoadState(row, "ok", "已加载 " + cached.length + " 个分支");
     return;
   }
   selectEl.disabled = true;
+  setBranchLoadState(row, "loading", force ? "正在重新加载…" : "正在加载分支…");
   try {
-    const data = await api("/api/services/" + encodeURIComponent(serviceId) + "/branches");
+    const suffix = force ? "?refresh=1" : "";
+    const data = await queueBranchLoad(
+      () => api("/api/services/" + encodeURIComponent(serviceId) + "/branches" + suffix),
+      force
+    );
     branchCache[serviceId] = { loaded: true, branches: data.branches || [] };
     fillBranchSelect(selectEl, data.branches || [], data.default_branch || defaultBranch);
+    setBranchLoadState(row, "ok", "已更新 " + (data.branches || []).length + " 个分支");
   } catch (e) {
     fillBranchSelect(selectEl, [defaultBranch || "main"], defaultBranch || "main");
+    delete branchCache[serviceId];
+    const detail = (e.data && (e.data.detail || e.data.error)) || e.message || "未知错误";
+    setBranchLoadState(row, "error", "分支加载失败，当前仅保留默认 " + (defaultBranch || "main"));
+    const status = row && row.querySelector("[data-branch-status]");
+    if (status) status.title = String(detail);
   }
 }
 
@@ -462,7 +532,9 @@ function selectedItems() {
     const title = row.getAttribute("data-title") || id;
     const select = row.querySelector("[data-branch]");
     const branch = ((select && select.value) || row.getAttribute("data-default-branch") || "main").trim();
-    items.push({ service_id: id, branch, title });
+    const versionInput = row.querySelector("[data-version]");
+    const version = ((versionInput && versionInput.value) || "").trim();
+    items.push({ service_id: id, branch, title, version, requires_version: !!versionInput });
   });
   return items;
 }
@@ -492,6 +564,12 @@ function setButtonsDisabled(disabled) {
   document.querySelectorAll('[data-act="pick"]').forEach((cb) => {
     cb.disabled = !!disabled;
   });
+  document.querySelectorAll("[data-version]").forEach((input) => {
+    input.disabled = !!disabled;
+  });
+  document.querySelectorAll("[data-branch-retry]").forEach((button) => {
+    button.disabled = !!disabled || button.classList.contains("loading");
+  });
   if ($("chkAll")) $("chkAll").disabled = !!disabled;
   if ($("btnBatch")) $("btnBatch").disabled = !!disabled || selectedItems().length === 0;
 }
@@ -506,26 +584,63 @@ async function refreshServices() {
     row.setAttribute("data-id", s.id);
     row.setAttribute("data-title", s.title || s.id);
     row.setAttribute("data-default-branch", s.default_branch || "main");
+    const versionField = s.requires_version
+      ? '<label class="version-label">' +
+        '<span></span><input class="input version-input" data-version required ' +
+        'pattern="v[0-9]+\\.[0-9]+\\.[0-9]+" placeholder="' + (s.version_example || "v1.2.3") + '" />' +
+        '</label><div class="version-hint">Daemon版本变化时需要修改版本号，无变化时可不修改</div>'
+      : "";
+    const runLabel = s.archive_only ? "构建并归档" : "构建并推送";
     row.innerHTML =
       '<label class="svc-pick"><input type="checkbox" data-act="pick" /></label>' +
       "<div>" +
       '<div class="svc-title"></div>' +
       '<div class="svc-meta"></div>' +
+      '<div class="branch-row">' +
       '<label class="branch-label">分支 <select class="input branch-select" data-branch></select></label>' +
+      '<button type="button" class="branch-retry" data-branch-retry title="重新拉取该微服务的最新分支" aria-label="重新拉取该微服务的最新分支">↻</button>' +
+      '<span class="branch-status" data-branch-status></span>' +
+      '</div>' +
+      versionField +
       "</div>" +
-      '<div class="svc-actions"><button type="button" class="btn primary" data-act="run">构建并推送</button></div>';
+      '<div class="svc-actions"><button type="button" class="btn primary" data-act="run"></button></div>';
     row.querySelector(".svc-title").textContent = s.title;
-    row.querySelector(".svc-meta").textContent = s.repo || s.github || "";
+    row.querySelector(".svc-meta").textContent = (s.repo || s.github || "") + (s.archive_only ? " · 仅生成归档，不推送 SWR" : "");
+    const versionLabel = row.querySelector(".version-label span");
+    if (versionLabel) versionLabel.textContent = (s.version_label || "Version") + "（例如 " + (s.version_example || "v1.2.3") + "）";
+    const versionInput = row.querySelector("[data-version]");
+    if (versionInput) {
+      versionInput.value = s.last_version || rememberedDaemonVersion();
+      rememberDaemonVersion(versionInput.value);
+      versionInput.addEventListener("input", () => {
+        versionInput.setCustomValidity("");
+        rememberDaemonVersion(versionInput.value.trim());
+      });
+    }
     const select = row.querySelector("[data-branch]");
     fillBranchSelect(select, [s.default_branch || "main"], s.default_branch || "main");
+    row.querySelector("[data-branch-retry]").addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      loadBranches(s.id, select, s.default_branch, true);
+    });
     setTimeout(() => loadBranches(s.id, select, s.default_branch), 30);
     row.querySelector('[data-act="pick"]').addEventListener("change", updateBatchUi);
     const btn = row.querySelector('[data-act="run"]');
+    btn.textContent = runLabel;
+    btn.dataset.defaultLabel = runLabel;
     btn.addEventListener("click", (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
       const branch = (select.value || s.default_branch || "main").trim();
-      pushItems([{ service_id: s.id, branch, title: s.title }], btn);
+      const versionInput = row.querySelector("[data-version]");
+      pushItems([{
+        service_id: s.id,
+        branch,
+        title: s.title,
+        version: ((versionInput && versionInput.value) || "").trim(),
+        requires_version: !!versionInput,
+      }], btn);
     });
     root.appendChild(row);
   }
@@ -658,6 +773,19 @@ async function pushItems(items, btn) {
     showJob("请先勾选要构建的微服务");
     return;
   }
+  const invalidVersion = items.find((item) => item.requires_version && !DAEMON_VERSION_PATTERN.test(item.version || ""));
+  if (invalidVersion) {
+    showJob(
+      invalidVersion.title + " · 版本格式错误",
+      "Version is required and must match vMAJOR.MINOR.PATCH, for example v1.2.3"
+    );
+    const row = document.querySelector('.row-svc[data-id="' + invalidVersion.service_id + '"]');
+    const input = row && row.querySelector("[data-version]");
+    if (input) { input.focus(); input.setCustomValidity("请输入类似 v1.2.3 的版本号"); input.reportValidity(); }
+    return;
+  }
+  items.filter((item) => item.requires_version).forEach((item) => rememberDaemonVersion(item.version));
+  document.querySelectorAll("[data-version]").forEach((input) => input.setCustomValidity(""));
   busy = true;
   stopActiveProbe();
   setButtonsDisabled(true);
@@ -672,7 +800,7 @@ async function pushItems(items, btn) {
     const resp = await api("/api/push", {
       method: "POST",
       body: JSON.stringify({
-        items: items.map((it) => ({ service_id: it.service_id, branch: it.branch })),
+        items: items.map((it) => ({ service_id: it.service_id, branch: it.branch, version: it.version || "" })),
         login_command: loginCmd,
       }),
     });
@@ -689,7 +817,7 @@ async function pushItems(items, btn) {
     showJob(summary + " · 失败", String(msg));
     busy = false;
     setButtonsDisabled(false);
-    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
+    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = b.dataset.defaultLabel || "构建并推送"));
     updateBatchUi();
     scheduleActiveProbe();
   }
@@ -730,7 +858,7 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
     activeJobId = "";
     busy = false;
     setButtonsDisabled(false);
-    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = "构建并推送"));
+    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = b.dataset.defaultLabel || "构建并推送"));
     updateBatchUi();
     const archiveHint = job.archive_dir || job.archive || "";
     if (job.status === "ok") {
