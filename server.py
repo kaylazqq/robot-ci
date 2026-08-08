@@ -791,16 +791,12 @@ def restore_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
 
 
 def finalize_fleet_bundle_artifacts(job_id: str, bundle: Path) -> bool:
-    """Make Fleet downloads nginx-readable and remove build-only metadata."""
+    """Make the Fleet bundle and checksum nginx-readable without altering metadata."""
     try:
         bundle.chmod(0o644)
         checksum = Path(str(bundle) + ".sha256")
         if checksum.is_file():
             checksum.chmod(0o644)
-        metadata = Path(str(bundle) + ".meta")
-        if metadata.is_file():
-            metadata.unlink()
-            append_job_log(job_id, f"removed build-only Fleet metadata: {metadata.name}")
     except OSError as exc:
         append_job_log(job_id, f"ERROR: Fleet archive permissions could not be finalized: {exc}")
         return False

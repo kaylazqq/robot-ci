@@ -340,7 +340,7 @@ class FleetRuntimeCacheTests(unittest.TestCase):
 
 
 class FleetBundleArtifactTests(unittest.TestCase):
-    def test_bundle_is_downloadable_meta_is_removed_and_checksum_is_kept(self) -> None:
+    def test_bundle_is_downloadable_and_auxiliary_files_are_kept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bundle = server.Path(tmp) / "multica-fleet_bundle_test.tar"
             bundle.write_bytes(b"bundle")
@@ -354,7 +354,7 @@ class FleetBundleArtifactTests(unittest.TestCase):
                 self.assertTrue(server.finalize_fleet_bundle_artifacts("no-job", bundle))
 
             self.assertEqual([call(bundle, 0o644), call(checksum, 0o644)], chmod.call_args_list)
-            self.assertFalse(metadata.exists())
+            self.assertTrue(metadata.is_file())
             self.assertTrue(checksum.is_file())
 
 
