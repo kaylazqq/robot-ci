@@ -62,6 +62,8 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 每次构建开始时会先删除该服务旧的 workspace 再重新 `git clone`（避免历史产物堆积）。构建结束后保留本次 checkout，方便失败时上机排查；下次构建同一服务时再删掉重来。磁盘紧张时会自动清理 `/usr/share/nginx/html/images` 下较旧的时间戳归档目录（默认保留最近 3 个）。
 
+`multica-fleet` 是例外的缓存优化场景：工具仍会重新克隆源码，但会把 Fleet 生成的 `.build-source.sha256` 和 `.build-image-ids` 保存到 `<workspace_root>/.robot-ci-cache/multica-fleet/runtime-images/`，并在新 checkout 中恢复。Fleet 构建脚本只有在新源码指纹一致、两个 Runtime Docker 镜像仍存在且 Image ID 一致时才跳过 OpenCode/Hermes 重建；源码、Dockerfile、依赖或本地镜像发生变化时会自动重新构建。三镜像合并归档仍会在每次任务中重新生成，因此不会复用或误发旧归档。工具会把最终 tar 权限统一设为 `0644` 供 nginx 下载，删除仅供仓库自身上传流程使用的 `.meta`；保留 `.sha256`，供离线部署脚本校验大文件下载完整性。
+
 可通过 nginx 直接下载，例如：`http://服务器IP/images/YYYYMMDDHHMMSS/<image>_<tag>.tar`
 
 `config.json` 相关项：

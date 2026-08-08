@@ -41,6 +41,10 @@ _branch_cache: dict[str, tuple[float, list[str]]] = {}
 _branch_cache_lock = threading.Lock()
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+FLEET_RUNTIME_CACHE_MARKERS = (".build-source.sha256", ".build-image-ids")
+FLEET_IMAGE_ID_LINE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/:+-]*\tsha256:[0-9a-fA-F]{64}$"
+)
 
 
 def load_last_daemon_version() -> str:
@@ -711,6 +715,99 @@ def repo_dir(svc: dict[str, Any]) -> Path:
     return Path(CFG["workspace_root"]) / clone_dir_name(svc)
 
 
+def fleet_runtime_cache_dir() -> Path:
+    """Persistent Fleet cache metadata that survives fresh workspace clones."""
+    return Path(CFG["workspace_root"]) / ".robot-ci-cache" / "multica-fleet" / "runtime-images"
+
+
+def _validated_fleet_cache_marker(path: Path, marker: str) -> str | None:
+    """Read only the two small, strictly formatted cache markers Fleet produces."""
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+            return None
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+    if marker == ".build-source.sha256":
+        value = text.strip()
+        return value + "\n" if re.fullmatch(r"[0-9a-fA-F]{64}", value) else None
+    if marker == ".build-image-ids":
+        lines = [line.strip("\r") for line in text.splitlines() if line.strip()]
+        if len(lines) != 2 or any(not FLEET_IMAGE_ID_LINE_RE.fullmatch(line) for line in lines):
+            return None
+        return "\n".join(lines) + "\n"
+    return None
+
+
+def persist_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
+    """Persist validated Fleet cache markers outside the disposable checkout."""
+    source_dir = workspace / "deploy" / "runtime-images"
+    contents: dict[str, str] = {}
+    for marker in FLEET_RUNTIME_CACHE_MARKERS:
+        content = _validated_fleet_cache_marker(source_dir / marker, marker)
+        if content is None:
+            return False
+        contents[marker] = content
+
+    cache_dir = fleet_runtime_cache_dir()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for marker, content in contents.items():
+            target = cache_dir / marker
+            temporary = target.with_name(target.name + ".tmp")
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(target)
+    except OSError as exc:
+        append_job_log(job_id, f"WARN: Fleet runtime cache metadata could not be saved: {exc}")
+        return False
+    append_job_log(job_id, f"Fleet runtime cache metadata saved: {cache_dir}")
+    return True
+
+
+def restore_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
+    """Restore validated metadata; Fleet still verifies source hash and live image IDs."""
+    cache_dir = fleet_runtime_cache_dir()
+    contents: dict[str, str] = {}
+    for marker in FLEET_RUNTIME_CACHE_MARKERS:
+        content = _validated_fleet_cache_marker(cache_dir / marker, marker)
+        if content is None:
+            return False
+        contents[marker] = content
+
+    target_dir = workspace / "deploy" / "runtime-images"
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for marker, content in contents.items():
+            (target_dir / marker).write_text(content, encoding="utf-8")
+    except OSError as exc:
+        append_job_log(job_id, f"WARN: Fleet runtime cache metadata could not be restored: {exc}")
+        return False
+    append_job_log(
+        job_id,
+        "Fleet runtime cache metadata restored; source fingerprint and Docker image IDs will be verified",
+    )
+    return True
+
+
+def finalize_fleet_bundle_artifacts(job_id: str, bundle: Path) -> bool:
+    """Make Fleet downloads nginx-readable and remove build-only metadata."""
+    try:
+        bundle.chmod(0o644)
+        checksum = Path(str(bundle) + ".sha256")
+        if checksum.is_file():
+            checksum.chmod(0o644)
+        metadata = Path(str(bundle) + ".meta")
+        if metadata.is_file():
+            metadata.unlink()
+            append_job_log(job_id, f"removed build-only Fleet metadata: {metadata.name}")
+    except OSError as exc:
+        append_job_log(job_id, f"ERROR: Fleet archive permissions could not be finalized: {exc}")
+        return False
+    append_job_log(job_id, f"Fleet archive download permissions set: {bundle.name} mode=0644")
+    return True
+
+
 def check_docker(force: bool = False) -> dict[str, Any]:
     """Probe Docker via `docker info` (native Linux or WSL). Cached ~45s."""
     global _docker_cache
@@ -1052,7 +1149,13 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     append_job_log(job_id, f"branch={branch}")
     append_job_log(job_id, f"workspace={dest}")
 
-    # Always wipe previous checkout (including leftover runtime-images) then fresh clone.
+    # Preserve only Fleet's validated cache metadata outside the disposable checkout.
+    # The Fleet script independently verifies both the new source fingerprint and
+    # the live Docker image IDs before it skips either Runtime image build.
+    if svc.get("id") == "multica-fleet":
+        persist_fleet_runtime_cache(job_id, dest)
+
+    # Always wipe previous checkout (including build outputs) then fresh clone.
     wipe_workspace_dir(job_id, dest, label=f"workspace {svc.get('id') or dest.name}")
 
     append_job_log(job_id, "git clone…")
@@ -1090,6 +1193,8 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
     if not (dest / "deploy.sh").is_file() and not (dest / "build-image.sh").is_file():
         return False, "missing deploy.sh/build-image.sh"
+    if svc.get("id") == "multica-fleet":
+        restore_fleet_runtime_cache(job_id, dest)
     code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
     append_job_log(job_id, f"HEAD={head if code == 0 else '?'} @ {branch}")
     return True, str(dest)
@@ -1558,6 +1663,9 @@ def push_one_service(
         append_job_log(job_id, f"FAILED service={service_id} stage=building reason={result['error']}")
         return result
 
+    if svc.get("id") == "multica-fleet":
+        persist_fleet_runtime_cache(job_id, repo_dir(svc))
+
     if svc.get("bundle_archive"):
         if archive_dir is None:
             result["error"] = "Fleet archive directory was not created"
@@ -1574,6 +1682,10 @@ def push_one_service(
         )
         if bundle is None or any(not path.is_file() for path in required):
             result["error"] = "Fleet bundle or deployment files were not generated"
+            append_job_log(job_id, f"FAILED service={service_id} stage=archiving reason={result['error']}")
+            return result
+        if not finalize_fleet_bundle_artifacts(job_id, bundle):
+            result["error"] = "Fleet archive permissions could not be finalized"
             append_job_log(job_id, f"FAILED service={service_id} stage=archiving reason={result['error']}")
             return result
         result["ok"] = True

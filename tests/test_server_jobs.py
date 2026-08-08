@@ -2,7 +2,7 @@ import json
 import threading
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
@@ -282,6 +282,80 @@ class BuildCommandTests(unittest.TestCase):
         self.assertRegex(command, r"FLEET_OUTPUT_DIR=\S*[/\\]tmp[/\\]fleet-output")
         self.assertIn("INCLUDE_RUNTIME_IMAGES=1", command)
         self.assertIn("bash ./deploy.sh pack", command)
+
+
+class FleetRuntimeCacheTests(unittest.TestCase):
+    @staticmethod
+    def write_valid_markers(workspace: server.Path, fingerprint: str = "a" * 64) -> None:
+        marker_dir = workspace / "deploy" / "runtime-images"
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        (marker_dir / ".build-source.sha256").write_text(fingerprint + "\n", encoding="utf-8")
+        (marker_dir / ".build-image-ids").write_text(
+            "multica-cloud-opencode:demo\tsha256:" + "b" * 64 + "\n"
+            "multica-cloud-hermes:demo\tsha256:" + "c" * 64 + "\n",
+            encoding="utf-8",
+        )
+
+    def test_markers_survive_disposable_workspace_and_are_restored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_root = server.Path(tmp)
+            workspace = workspace_root / "multica-fleet"
+            self.write_valid_markers(workspace)
+            with patch.dict(server.CFG, {"workspace_root": str(workspace_root)}):
+                self.assertTrue(server.persist_fleet_runtime_cache("no-job", workspace))
+                cache_dir = server.fleet_runtime_cache_dir()
+                self.assertNotEqual(workspace, cache_dir.parent)
+
+                server.shutil.rmtree(workspace)
+                workspace.mkdir()
+                self.assertTrue(server.restore_fleet_runtime_cache("no-job", workspace))
+
+            restored = workspace / "deploy" / "runtime-images"
+            self.assertEqual("a" * 64, (restored / ".build-source.sha256").read_text().strip())
+            image_ids = (restored / ".build-image-ids").read_text(encoding="utf-8")
+            self.assertIn("multica-cloud-opencode:demo\tsha256:", image_ids)
+            self.assertIn("multica-cloud-hermes:demo\tsha256:", image_ids)
+
+    def test_invalid_or_partial_metadata_never_replaces_good_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_root = server.Path(tmp)
+            workspace = workspace_root / "multica-fleet"
+            self.write_valid_markers(workspace)
+            with patch.dict(server.CFG, {"workspace_root": str(workspace_root)}):
+                self.assertTrue(server.persist_fleet_runtime_cache("no-job", workspace))
+                cached_fingerprint = (
+                    server.fleet_runtime_cache_dir() / ".build-source.sha256"
+                ).read_text(encoding="utf-8")
+
+                (workspace / "deploy" / "runtime-images" / ".build-image-ids").write_text(
+                    "not trusted metadata\n", encoding="utf-8"
+                )
+                self.assertFalse(server.persist_fleet_runtime_cache("no-job", workspace))
+                self.assertEqual(
+                    cached_fingerprint,
+                    (server.fleet_runtime_cache_dir() / ".build-source.sha256").read_text(
+                        encoding="utf-8"
+                    ),
+                )
+
+
+class FleetBundleArtifactTests(unittest.TestCase):
+    def test_bundle_is_downloadable_meta_is_removed_and_checksum_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = server.Path(tmp) / "multica-fleet_bundle_test.tar"
+            bundle.write_bytes(b"bundle")
+            bundle.chmod(0o600)
+            metadata = server.Path(str(bundle) + ".meta")
+            metadata.write_text("FLEET_IMAGE=local/test\n", encoding="utf-8")
+            checksum = server.Path(str(bundle) + ".sha256")
+            checksum.write_text("0" * 64 + "  " + bundle.name + "\n", encoding="utf-8")
+
+            with patch.object(server.Path, "chmod", autospec=True) as chmod:
+                self.assertTrue(server.finalize_fleet_bundle_artifacts("no-job", bundle))
+
+            self.assertEqual([call(bundle, 0o644), call(checksum, 0o644)], chmod.call_args_list)
+            self.assertFalse(metadata.exists())
+            self.assertTrue(checksum.is_file())
 
 
 class DaemonVersionStateTests(unittest.TestCase):
