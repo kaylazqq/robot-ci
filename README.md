@@ -81,3 +81,97 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 - 不要把账号密码发到聊天或写进仓库
 - 服务器上的 `config.json` 含 Token，权限应为 `600`
 - 聊天里暴露过的密码请立刻修改
+
+## GM Agent 镜像构建与部署
+
+构建页面中的 `gmagent` 服务对应：
+
+- 仓库：`https://github.com/adshhzy/gmagent.git`
+- 默认分支：`codex/cloud-im-orchestration`
+- 本地镜像：`local/gmagent:<YYMMDDHHMM>_<short-sha>`
+- SWR 镜像：`<swr_registry>/<swr_org>/gmagent:<YYMMDDHHMM>_<short-sha>`
+- 本地归档：`<archive_root>/<YYYYMMDDHHMMSS>/gmagent_<tag>.tar`
+
+构建机只需要 CI/推送变量，不需要任何 GM Agent 运行凭据：
+
+- `SWR_GITHUB_TOKEN` 或 `GITHUB_TOKEN`：拉取私有 GitHub 仓库时使用。
+- `SWR_GITHUB_SSH_KEY`：使用 SSH 拉取时的私钥路径，可替代 GitHub Token。
+- `SWR_ARCHIVE_ROOT`、`SWR_ARCHIVE_ENABLED`、`SWR_ARCHIVE_REQUIRED`：控制镜像归档。
+- SWR 登录使用页面提交的华为云临时 `docker login` 命令；凭据只进入构建机的 Docker credential store，不写入仓库或镜像。
+- `CCE_GIT_HASH`、`CCE_SKIP_EXPORT`、`CCE_UPLOAD` 等由 robot-ci 注入，不应作为容器运行变量。
+
+robot-ci 在启动构建进程前会移除 `GM_*`、模型供应商、数据库、S3、Mattermost、MemoryService 和 Multica 等运行变量，防止宿主机上已有的运行凭据意外成为构建输入。GM Agent 的 Dockerfile 不接收运行时 secret build arguments。
+
+### Kubernetes 运行时配置
+
+建议把非敏感配置写入 Deployment 的 `env`，把凭据写入独立 Kubernetes Secret，并用 `envFrom.secretRef` 或 `secretKeyRef` 注入。最低生产配置：
+
+```text
+GM_AGENT_ENVIRONMENT=production
+GM_AGENT_ORCHESTRATION_ENABLED=1
+GM_AGENT_ORCHESTRATION_TOKEN=<与 Semantic Schedule 一致的内部 Bearer Token>
+GM_AGENT_DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<database>?sslmode=require
+GM_AGENT_MODEL=<provider-qualified-model>
+GM_AGENT_AVAILABLE_MODELS=<允许使用的模型列表>
+GM_AGENT_AUTO_CREATE_SCHEMA=1
+GM_AGENT_EMBEDDED_WORKERS=1
+GM_AGENT_TIMEZONE=Asia/Shanghai
+GM_AGENT_TASK_FORMATION_POLICY=auto_authorized
+GM_AGENT_FALLBACK_TO_MOCK=0
+GM_AGENT_LOG_PAYLOAD_MODE=metadata
+GM_EXPLICIT_MENTION_MODEL_FAILURE_POLICY=execute_minimal
+```
+
+按模型供应商至少配置一组 Secret：
+
+- DeepSeek：`DEEPSEEK_API_KEY`，可选 `DEEPSEEK_BASE_URL`。
+- ModelArts：`MODELARTS_API_KEY`（也接受 `HUAWEI_MODELARTS_API_KEY`）、`MODELARTS_BASE_URL`，可选 `MODELARTS_API_MODE`。
+- OpenAI：`OPENAI_API_KEY`。
+- 百炼：`DASHSCOPE_API_KEY` 或 `BAILIAN_API_KEY`，可选 `BAILIAN_BASE_URL`。
+
+模型容灾还可配置：
+
+```text
+GM_AGENT_MODEL_FAILOVER_ENABLED=1
+GM_AGENT_INTENT_FALLBACK_MODELS=<provider:model,provider:model>
+GM_AGENT_MODEL_ATTEMPT_TIMEOUT_SECONDS=30
+GM_AGENT_MODEL_TOTAL_TIMEOUT_SECONDS=60
+GM_AGENT_MODEL_CIRCUIT_FAIL_THRESHOLD=3
+GM_AGENT_MODEL_CIRCUIT_COOLDOWN_SECONDS=30
+```
+
+与现有 IM 栈集成时，Semantic Schedule 需要配置：
+
+```text
+SEMENTIC_GMAGENT_SERVER=http://127.0.0.1:3030
+SEMENTIC_GMAGENT_AUTH_TOKEN=<与 GM_AGENT_ORCHESTRATION_TOKEN 相同>
+```
+
+如果 GM Agent 不是 sidecar，应把 `SEMENTIC_GMAGENT_SERVER` 改为对应 Kubernetes Service 地址。Token 必须通过 Secret 注入，不能写进 Deployment YAML、镜像或 ConfigMap。
+
+### 端口与挂载
+
+- `3030/TCP`：GM Agent HTTP API 和 `/healthz`。
+- `3040/TCP`：可选任务执行 Dispatcher；未启用时不需要暴露。
+- `/var/log/gmagent`：建议挂载持久日志目录；需要动态观测决策日志时设置 `GM_AGENT_DECISION_LOG=/var/log/gmagent/decision.jsonl`。
+- `/app/data`：仅使用本地 SQLite 或本地任务图时挂载；分别把 `GM_AGENT_DB_PATH` 和 `GM_TASK_GRAPH_DIR` 指向该卷内路径。
+- `GM_TASK_GRAPH_DIR` 指向的目录：只有使用本地任务图文件输出时才需要持久挂载。
+
+生产环境使用 PostgreSQL 时不需要持久化镜像内 SQLite 文件，也不要同时设置 `GM_AGENT_DB_PATH`。如仅用于本地开发并选择 SQLite，则应单独挂载 `GM_AGENT_DB_PATH` 所在目录；SQLite 不适合多副本生产部署。
+
+如启用 S3/OBS 任务图存储，再通过 Secret 注入 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`，并配置 `GM_TASK_GRAPH_S3_ENDPOINT`、`GM_TASK_GRAPH_S3_REGION`、`GM_TASK_GRAPH_S3_BUCKET`、`GM_TASK_GRAPH_S3_PREFIX`。未启用对象存储时不要配置这些变量。
+
+只有启用独立 Outbox Relay 时才配置 `GM_IM_RELAY_WEBHOOK_URL` 与 Secret `GM_IM_RELAY_BEARER_TOKEN`；只有启用 Task Dispatcher 时才配置 `GM_EXECUTION_CORE_URL`、`GM_TASK_DISPATCHER_API_BASE` 等 `GM_TASK_DISPATCHER_*` 变量。API/Worker/Relay/Dispatcher 必须共用同一个 `GM_AGENT_DATABASE_URL`。
+
+### Secret 示例
+
+以下命令只展示键名；实际值必须由部署平台或受控环境变量提供：
+
+```bash
+kubectl create secret generic gmagent-runtime \
+  --from-literal=GM_AGENT_ORCHESTRATION_TOKEN="$GM_AGENT_ORCHESTRATION_TOKEN" \
+  --from-literal=GM_AGENT_DATABASE_URL="$GM_AGENT_DATABASE_URL" \
+  --from-literal=DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
+```
+
+不要把 Secret 明文、SWR 临时登录密码、GitHub PAT 或模型 API Key 提交到 robot-ci、GM Agent 仓库、构建日志和镜像归档。
