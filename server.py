@@ -647,7 +647,13 @@ def to_github_ssh_url(url: str) -> str:
     return f"git@github.com:{m.group(1)}/{m.group(2)}.git"
 
 
-def clone_url_for(url: str) -> str:
+def clone_url_for(
+    url: str, *, public_https: bool = False, prefer_token_https: bool = False
+) -> str:
+    if public_https:
+        return public_github_url(url)
+    if prefer_token_https and gh_token():
+        return auth_github_url(public_github_url(url))
     if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
         return to_github_ssh_url(url)
     if gh_token():
@@ -1132,8 +1138,20 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
 
     dest = repo_dir(svc)
     public = public_github_url(url)
-    clone_url = clone_url_for(url)
-    if clone_url.startswith("https://") and "github.com" in clone_url and not gh_token():
+    public_https = bool(svc.get("public_https"))
+    prefer_token_https = bool(svc.get("prefer_token_https"))
+    clone_url = clone_url_for(
+        url,
+        public_https=public_https,
+        prefer_token_https=prefer_token_https,
+    )
+    if (
+        clone_url.startswith("https://")
+        and "github.com" in clone_url
+        and not gh_token()
+        and not public_https
+        and not prefer_token_https
+    ):
         return (
             False,
             "私有仓需要配置 GitHub SSH 密钥（推荐）或 Token",
@@ -1360,11 +1378,39 @@ def build_from_source(
         "else echo 'ERROR: no deploy.sh'; exit 1; fi"
     )
     output_tail: list[str] = []
+    # Runtime credentials/configuration must never become implicit build inputs.
+    # Deployment injects them later via Secrets and container environment variables.
+    runtime_prefixes = (
+        "GM_",
+        "DEEPSEEK_",
+        "MODELARTS_",
+        "HUAWEI_MODELARTS_",
+        "BAILIAN_",
+        "DASHSCOPE_",
+        "OPENAI_",
+        "AWS_",
+        "S3_",
+    )
+    runtime_exact = {
+        "DATABASE_URL",
+        "SQL_SERVER",
+        "SQL_PASSWD",
+        "MATTERMOST_SERVER",
+        "MEMORY_SERVER",
+        "MULTICA_SERVER",
+        "SEMENTIC_GMAGENT_AUTH_TOKEN",
+    }
+    build_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in runtime_exact and not key.startswith(runtime_prefixes)
+    }
     code = run_stream(
         job_id,
         bash_lc(bash),
         timeout=int(CFG.get("build_timeout_sec") or 7200),
         output_tail=output_tail,
+        env=build_env,
     )
     if code != 0:
         append_job_log(job_id, f"ERROR build exit={code}")
