@@ -1497,25 +1497,6 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
         return True, str(dest)
 
 
-def mattermost_package_marker() -> Path:
-    return Path("/opt/ai/mattermost/.swr_helper_git_hash")
-
-
-def mattermost_package_matches(git_hash: str) -> bool:
-    """True if /opt/ai/mattermost was packaged for this exact git short hash."""
-    if not git_hash or git_hash.startswith("0000"):
-        return False
-    mm = Path("/opt/ai/mattermost")
-    bin_ok = (mm / "mattermost" / "bin" / "mattermost").is_file() or (
-        mm / "bin" / "mattermost"
-    ).is_file()
-    marker = mattermost_package_marker()
-    try:
-        return bin_ok and marker.is_file() and marker.read_text(encoding="utf-8").strip() == git_hash
-    except OSError:
-        return False
-
-
 def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None, str | None]:
     """Pick newest local/<image>:*_<git_hash> after a fresh build (tag is YYYYMMDDHHMM_<hash>)."""
     if not image or not git_hash or git_hash.startswith("0000"):
@@ -1558,16 +1539,9 @@ def build_from_source(
     where = "WSL" if use_wsl() else "host"
     append_job_log(job_id, f"build on {where}: {src}")
 
-    # Helper-only speedups (do not edit microservice source):
-    # - CCE_SKIP_EXPORT=1: skip multi-hundred-MB docker save tar (we push from local image)
-    # - mattermost SKIP_PACKAGE=1: skip webpack/go when package for this commit already exists
+    # Helper-only: CCE_SKIP_EXPORT=1 skips multi-hundred-MB docker save tar (we push from local image).
+    # Never set SKIP_PACKAGE / MATTERMOST_FORCE_BUILD — packaging always runs from the checkout.
     extra_env = "CCE_SKIP_EXPORT=1 "
-    if svc.get("id") == "mattermost" and mattermost_package_matches(git_hash):
-        extra_env += "SKIP_PACKAGE=1 "
-        append_job_log(
-            job_id,
-            f"mattermost optimize: SKIP_PACKAGE=1 (package already built for {git_hash})",
-        )
 
     action = str(svc.get("build_action") or "").strip()
     if svc.get("requires_version"):
@@ -1590,6 +1564,8 @@ def build_from_source(
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
         "find . -maxdepth 3 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
+        # Never inherit package-skip switches from the helper process environment.
+        "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD; "
         f"export CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
         f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
@@ -1622,7 +1598,9 @@ def build_from_source(
     build_env = {
         key: value
         for key, value in os.environ.items()
-        if key not in runtime_exact and not key.startswith(runtime_prefixes)
+        if key not in runtime_exact
+        and key not in {"SKIP_PACKAGE", "MATTERMOST_FORCE_BUILD"}
+        and not key.startswith(runtime_prefixes)
     }
     code = run_stream(
         job_id,
@@ -1635,14 +1613,6 @@ def build_from_source(
         append_job_log(job_id, f"ERROR build exit={code}")
         return False, summarize_command_failure(output_tail, f"build exited with code {code}")
     append_job_log(job_id, "build finished")
-    if svc.get("id") == "mattermost" and git_hash and not git_hash.startswith("0000"):
-        try:
-            marker = mattermost_package_marker()
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(git_hash + "\n", encoding="utf-8")
-            append_job_log(job_id, f"mattermost package marker -> {git_hash}")
-        except OSError as e:
-            append_job_log(job_id, f"WARN: could not write package marker: {e}")
     return True, ""
 
 
