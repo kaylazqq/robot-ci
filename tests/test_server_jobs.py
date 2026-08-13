@@ -283,6 +283,30 @@ class BuildCommandTests(unittest.TestCase):
         self.assertIn("INCLUDE_RUNTIME_IMAGES=1", command)
         self.assertIn("bash ./deploy.sh pack", command)
 
+    @patch.object(server, "run_stream", return_value=0)
+    def test_mattermost_build_never_sets_skip_package(self, run_stream) -> None:
+        svc = {
+            "id": "mattermost",
+            "image": "mattermost",
+            "repo": "rollingfruit/mattermost",
+        }
+        with patch.dict(
+            server.os.environ,
+            {"SKIP_PACKAGE": "1", "SKIP_WEBAPP_BUILD": "1", "SKIP_SERVER_BUILD": "1"},
+            clear=False,
+        ):
+            ok, detail = server.build_from_source("no-job", svc, "1dd288a")
+        self.assertTrue(ok, detail)
+        command = " ".join(run_stream.call_args.args[1])
+        self.assertNotIn("SKIP_PACKAGE=1", command)
+        self.assertNotIn("SKIP_WEBAPP_BUILD=1", command)
+        self.assertNotIn("SKIP_SERVER_BUILD=1", command)
+        self.assertIn("unset SKIP_PACKAGE", command)
+        env = run_stream.call_args.kwargs["env"]
+        self.assertNotIn("SKIP_PACKAGE", env)
+        self.assertNotIn("SKIP_WEBAPP_BUILD", env)
+        self.assertNotIn("SKIP_SERVER_BUILD", env)
+
 
 class FleetRuntimeCacheTests(unittest.TestCase):
     @staticmethod

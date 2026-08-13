@@ -1540,7 +1540,6 @@ def build_from_source(
     append_job_log(job_id, f"build on {where}: {src}")
 
     # Helper-only: CCE_SKIP_EXPORT=1 skips multi-hundred-MB docker save tar (we push from local image).
-    # Never set SKIP_PACKAGE / MATTERMOST_FORCE_BUILD — packaging always runs from the checkout.
     extra_env = "CCE_SKIP_EXPORT=1 "
 
     action = str(svc.get("build_action") or "").strip()
@@ -1564,8 +1563,7 @@ def build_from_source(
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
         "find . -maxdepth 3 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
-        # Never inherit package-skip switches from the helper process environment.
-        "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD; "
+        "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD SKIP_WEBAPP_BUILD SKIP_SERVER_BUILD FORCE_WEBAPP_BUILD FORCE_REBUILD; "
         f"export CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
         f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
@@ -1599,7 +1597,14 @@ def build_from_source(
         key: value
         for key, value in os.environ.items()
         if key not in runtime_exact
-        and key not in {"SKIP_PACKAGE", "MATTERMOST_FORCE_BUILD"}
+        and key not in {
+            "SKIP_PACKAGE",
+            "MATTERMOST_FORCE_BUILD",
+            "SKIP_WEBAPP_BUILD",
+            "SKIP_SERVER_BUILD",
+            "FORCE_WEBAPP_BUILD",
+            "FORCE_REBUILD",
+        }
         and not key.startswith(runtime_prefixes)
     }
     code = run_stream(
