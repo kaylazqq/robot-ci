@@ -19,9 +19,95 @@ let testResultJobId = "";
 const testTableState = new Map();
 const LAST_JOB_KEY = "robotCiLastJob";
 const LEGACY_ACTIVE_JOB_KEY = "robotCiActiveJob";
+const MY_JOBS_KEY = "robotCiMyJobs";
+const CLIENT_ID_KEY = "robotCiClientId";
 const LAST_JOB_TTL_MS = 10 * 60 * 1000;
 const DAEMON_VERSION_KEY = "robotCiDaemonVersion";
 const DAEMON_VERSION_PATTERN = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
+let myJobs = [];
+let submitting = false;
+
+function clientId() {
+  try {
+    let id = localStorage.getItem(CLIENT_ID_KEY) || "";
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) {
+      id =
+        (crypto.randomUUID && crypto.randomUUID().replace(/-/g, "")) ||
+        ("c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
+      localStorage.setItem(CLIENT_ID_KEY, id);
+    }
+    return id;
+  } catch (_) {
+    return "anon" + Date.now().toString(36);
+  }
+}
+
+function loadMyJobs() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(MY_JOBS_KEY) || "[]");
+    myJobs = Array.isArray(raw) ? raw.filter((j) => j && j.id) : [];
+  } catch (_) {
+    myJobs = [];
+  }
+}
+
+function saveMyJobs() {
+  try {
+    localStorage.setItem(MY_JOBS_KEY, JSON.stringify(myJobs.slice(0, 20)));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function upsertMyJob(jobId, summary, status) {
+  if (!jobId) return;
+  const existing = myJobs.find((j) => j.id === jobId);
+  if (existing) {
+    existing.summary = summary || existing.summary;
+    if (status) existing.status = status;
+    existing.observed_at = Date.now();
+  } else {
+    myJobs.unshift({
+      id: jobId,
+      summary: summary || jobId,
+      status: status || "running",
+      observed_at: Date.now(),
+    });
+  }
+  myJobs = myJobs.slice(0, 20);
+  saveMyJobs();
+  renderJobSwitcher();
+}
+
+function renderJobSwitcher() {
+  const root = $("jobSwitcher");
+  if (!root) return;
+  if (!myJobs.length) {
+    root.hidden = true;
+    root.innerHTML = "";
+    return;
+  }
+  root.hidden = false;
+  root.innerHTML = myJobs
+    .map((job) => {
+      const active = job.id === activeJobId ? " active" : "";
+      const done = job.status && job.status !== "running" ? " done" : "";
+      const label = (job.summary || job.id) + (job.status === "running" ? "" : " · " + (job.status || ""));
+      return (
+        `<button type="button" class="job-chip${active}${done}" data-job="${esc(job.id)}" title="${esc(job.id)}">` +
+        esc(label) +
+        "</button>"
+      );
+    })
+    .join("");
+  root.querySelectorAll("[data-job]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-job");
+      const job = myJobs.find((j) => j.id === id);
+      if (id) startPolling(id, (job && job.summary) || id);
+    });
+  });
+}
 
 function rememberedDaemonVersion() {
   try {
@@ -65,7 +151,92 @@ function showJob(msg, logText) {
   if (log && logText !== undefined) log.textContent = logText;
   renderTestResult(null);
   const panel = $("logsPanel");
-  if (panel) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  if (panel && getMainView() === "services") {
+    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
+function getMainView() {
+  return ($("mainLayout") && $("mainLayout").dataset.view) || "services";
+}
+
+function setMainView(view) {
+  const next = view === "artifacts" ? "artifacts" : "services";
+  const layout = $("mainLayout");
+  if (layout) layout.dataset.view = next;
+  const servicesPane = $("viewServices");
+  const artifactsPane = $("viewArtifacts");
+  if (servicesPane) servicesPane.hidden = next !== "services";
+  if (artifactsPane) artifactsPane.hidden = next !== "artifacts";
+  document.querySelectorAll(".view-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.view === next);
+  });
+  if (next === "artifacts") {
+    refreshArtifacts().catch(() => {});
+  }
+  try {
+    localStorage.setItem("robotCiMainView", next);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function shortSha(sha) {
+  const value = String(sha || "").trim();
+  return value ? value.slice(0, 7) : "—";
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch])
+  );
+}
+
+function renderArtifacts(items) {
+  const body = $("artifactsBody");
+  if (!body) return;
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="7" class="hint">暂无产物；成功构建后会出现在这里。</td></tr>';
+    return;
+  }
+  body.innerHTML = rows
+    .map((item) => {
+      const imageName = item.remote && item.remote !== "archive-only"
+        ? item.remote
+        : item.image_ref || ((item.image || "") + (item.tag ? ":" + item.tag : ""));
+      const pkg = item.package_name || (item.archive ? String(item.archive).split(/[/\\]/).pop() : "—");
+      const link = item.download_url
+        ? `<a href="${esc(item.download_url)}" target="_blank" rel="noopener">下载</a>`
+        : "—";
+      return (
+        "<tr>" +
+        `<td class="mono">${esc(item.created_at || "—")}</td>` +
+        `<td>${esc(item.title || item.service_id || "—")}</td>` +
+        `<td class="mono">${esc(item.branch || "—")}</td>` +
+        `<td class="mono" title="${esc(item.commit_sha || "")}">${esc(shortSha(item.commit_sha))}</td>` +
+        `<td class="mono">${esc(imageName || "—")}</td>` +
+        `<td class="mono">${esc(pkg)}</td>` +
+        `<td>${link}</td>` +
+        "</tr>"
+      );
+    })
+    .join("");
+}
+
+async function refreshArtifacts() {
+  try {
+    const data = await api("/api/artifacts?limit=100");
+    renderArtifacts(data.artifacts || []);
+  } catch (e) {
+    const body = $("artifactsBody");
+    if (body) {
+      body.innerHTML =
+        '<tr><td colspan="7" class="hint" style="color:var(--danger)">产物列表加载失败：' +
+        String(e.message || e) +
+        "</td></tr>";
+    }
+  }
 }
 
 function formatDuration(ms) {
@@ -489,7 +660,7 @@ function setBranchLoadState(row, state, message = "") {
     if (state !== "error") status.removeAttribute("title");
   }
   if (retry) {
-    retry.disabled = busy || state === "loading";
+    retry.disabled = submitting || state === "loading";
     retry.classList.toggle("loading", state === "loading");
   }
 }
@@ -545,7 +716,7 @@ function updateBatchUi() {
   const count = $("selCount");
   if (count) count.textContent = String(items.length);
   if (btn) {
-    btn.disabled = busy || items.length === 0;
+    btn.disabled = submitting || items.length === 0;
     btn.textContent = items.length ? "构建所选 (" + items.length + ")" : "构建所选";
   }
   const all = $("chkAll");
@@ -645,7 +816,7 @@ async function refreshServices() {
     root.appendChild(row);
   }
   updateBatchUi();
-  if (busy) setButtonsDisabled(true);
+  if (submitting) setButtonsDisabled(true);
 }
 
 function rememberLastJob(jobId, summary) {
@@ -718,17 +889,23 @@ function resetJobView() {
 
 function scheduleActiveProbe(delay = 1500) {
   stopActiveProbe();
-  if (busy || activeJobId) return;
+  // Only watch THIS browser's jobs; never steal another person's build stream.
   activeProbeTimer = setTimeout(async () => {
     activeProbeTimer = null;
-    if (busy || activeJobId) return;
     try {
-      const running = await api("/api/running-job");
-      if (running && running.id && running.status === "running") {
-        startPolling(running.id, running.service_id || "任务");
-        return;
+      const data = await api("/api/running-jobs?client_id=" + encodeURIComponent(clientId()));
+      const jobs = (data && data.jobs) || [];
+      jobs.forEach((job) => upsertMyJob(job.id, job.service_id || "任务", job.status || "running"));
+      if (!activeJobId) {
+        const first = jobs[0];
+        if (first && first.id) {
+          startPolling(first.id, first.service_id || "任务");
+          return;
+        }
       }
-    } catch (_) { /* the server still enforces the lock if a build is submitted */ }
+    } catch (_) {
+      /* ignore transient probe failures */
+    }
     scheduleActiveProbe();
   }, delay);
 }
@@ -740,9 +917,13 @@ function startPolling(jobId, summary) {
   activeJobId = jobId;
   resetJobView();
   busy = true;
-  setButtonsDisabled(true);
+  // Concurrent: keep build buttons usable so this page can start another job.
+  setButtonsDisabled(false);
+  updateBatchUi();
+  upsertMyJob(jobId, summary, "running");
   rememberLastJob(jobId, summary);
   showJob(summary + " · job " + jobId, "Connecting to active job…");
+  renderJobSwitcher();
 
   const tick = async () => {
     const keepPolling = await pollJob(jobId, summary, generation, true);
@@ -754,7 +935,7 @@ function startPolling(jobId, summary) {
 }
 
 async function restoreLastJob(saved) {
-  if (!saved || !saved.id || busy || activeJobId) return;
+  if (!saved || !saved.id || activeJobId) return;
   stopPolling();
   const generation = pollGeneration;
   resetJobView();
@@ -765,8 +946,8 @@ async function restoreLastJob(saved) {
 }
 
 async function pushItems(items, btn) {
-  if (busy) {
-    showJob("已有任务进行中，请等待完成");
+  if (submitting) {
+    showJob("正在提交上一个请求，请稍候");
     return;
   }
   if (!items || !items.length) {
@@ -786,10 +967,9 @@ async function pushItems(items, btn) {
   }
   items.filter((item) => item.requires_version).forEach((item) => rememberDaemonVersion(item.version));
   document.querySelectorAll("[data-version]").forEach((input) => input.setCustomValidity(""));
-  busy = true;
+  submitting = true;
   stopActiveProbe();
-  setButtonsDisabled(true);
-  if (btn) btn.textContent = "进行中…";
+  if (btn) btn.textContent = "提交中…";
   const summary =
     items.length === 1
       ? items[0].title + " @ " + items[0].branch
@@ -800,26 +980,22 @@ async function pushItems(items, btn) {
     const resp = await api("/api/push", {
       method: "POST",
       body: JSON.stringify({
+        client_id: clientId(),
         items: items.map((it) => ({ service_id: it.service_id, branch: it.branch, version: it.version || "" })),
         login_command: loginCmd,
       }),
     });
     startPolling(resp.job_id, summary);
   } catch (e) {
-    const active = e.data && e.data.active_job;
-    const activeJob = (active && active.id) || (e.data && e.data.active_job_id);
-    if (e.status === 409 && activeJob) {
-      const activeSummary = (active && active.service_id) || "当前任务";
-      startPolling(activeJob, activeSummary);
-      return;
-    }
     const msg = (e.data && (e.data.detail || e.data.error)) || e.message;
-    showJob(summary + " · 失败", String(msg));
-    busy = false;
-    setButtonsDisabled(false);
-    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = b.dataset.defaultLabel || "构建并推送"));
-    updateBatchUi();
+    showJob(summary + " · 未能启动", String(msg));
     scheduleActiveProbe();
+  } finally {
+    submitting = false;
+    if (btn) btn.textContent = btn.dataset.defaultLabel || "构建并推送";
+    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = b.dataset.defaultLabel || "构建并推送"));
+    setButtonsDisabled(false);
+    updateBatchUi();
   }
 }
 
@@ -851,11 +1027,14 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
     const current = job.current ? " · " + job.current : "";
     const stage = job.stage ? " · " + job.stage : "";
     if (job.status === "running" || job.status === "unknown") {
+      upsertMyJob(jobId, summary, "running");
       $("jobMeta").textContent = summary + " · 进行中" + progress + current + stage;
       return true;
     }
 
-    activeJobId = "";
+    const finalStatus = job.status === "ok" ? "ok" : "failed";
+    upsertMyJob(jobId, summary, finalStatus);
+    if (activeJobId === jobId) activeJobId = "";
     busy = false;
     setButtonsDisabled(false);
     document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = b.dataset.defaultLabel || "构建并推送"));
@@ -867,12 +1046,20 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
         " · 成功" +
         (archiveHint ? " · 归档 " + archiveHint : "") +
         (job.remote ? " · " + job.remote : "");
+      refreshArtifacts();
     } else {
       $("jobMeta").textContent =
         summary +
         " · 失败 · " +
         (job.error || "") +
         (archiveHint ? " · 归档 " + archiveHint : "");
+    }
+    renderJobSwitcher();
+    // Prefer next running job owned by this browser.
+    const next = myJobs.find((j) => j.status === "running" && j.id !== jobId);
+    if (next) {
+      startPolling(next.id, next.summary || next.id);
+      return false;
     }
     scheduleActiveProbe();
     return false;
@@ -885,7 +1072,7 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
       }
       return true;
     }
-    activeJobId = "";
+    if (activeJobId === jobId) activeJobId = "";
     busy = false;
     setButtonsDisabled(false);
     updateBatchUi();
@@ -913,6 +1100,13 @@ bind("btnBatch", () => {
   const items = selectedItems();
   pushItems(items, $("btnBatch"));
 });
+bind("btnRefreshArtifacts", () => {
+  refreshArtifacts().catch(() => {});
+});
+
+document.querySelectorAll(".view-tab").forEach((btn) => {
+  btn.addEventListener("click", () => setMainView(btn.dataset.view || "services"));
+});
 
 const chkAll = $("chkAll");
 if (chkAll) {
@@ -928,12 +1122,22 @@ if (chkAll) {
 (async function boot() {
   busy = true;
   setButtonsDisabled(true);
+  loadMyJobs();
+  renderJobSwitcher();
+  let rememberedView = "services";
+  try {
+    rememberedView = localStorage.getItem("robotCiMainView") || "services";
+  } catch (_) {
+    rememberedView = "services";
+  }
+  setMainView(rememberedView);
   showJob("Checking active jobs…", "Connecting to server…");
   try {
-    const pageReady = Promise.all([refreshHealth(), refreshServices()]);
-    let running;
+    const pageReady = Promise.all([refreshHealth(), refreshServices(), refreshArtifacts()]);
+    let mine = [];
     try {
-      running = await api("/api/running-job");
+      const data = await api("/api/running-jobs?client_id=" + encodeURIComponent(clientId()));
+      mine = (data && data.jobs) || [];
     } catch (e) {
       await pageReady;
       showJob("Unable to check active jobs", String(e.message || e));
@@ -941,8 +1145,9 @@ if (chkAll) {
     }
     await pageReady;
 
-    if (running && running.id && running.status === "running") {
-      startPolling(running.id, running.service_id || "任务");
+    mine.forEach((job) => upsertMyJob(job.id, job.service_id || "任务", "running"));
+    if (mine.length) {
+      startPolling(mine[0].id, mine[0].service_id || "任务");
       return;
     }
 
@@ -959,7 +1164,7 @@ if (chkAll) {
 
     showJob(
       "就绪",
-      "可勾选多个微服务后点「构建所选」；同一次任务归档到同一时间戳目录。\n也可点单行「构建并推送」。"
+      "可同时发起多个构建（不同微服务）。刷新后只恢复本浏览器的任务日志。\n可勾选多个微服务后点「构建所选」，或点单行「构建并推送」。"
     );
   } catch (e) {
     $("serviceTable").innerHTML = '<p class="hint">无法连接助手，请先运行 start.bat</p>';

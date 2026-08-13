@@ -11,5 +11,6 @@
   "build_timeout_sec": 7200,
   "archive_enabled": true,
   "archive_required": true,
-  "archive_root": "/usr/share/nginx/html/images"
+  "archive_root": "/usr/share/nginx/html/images",
+  "max_concurrent_jobs": 3
 }

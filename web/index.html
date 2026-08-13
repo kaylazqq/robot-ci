@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SWR Push Helper</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=20260805a" />
+  <link rel="stylesheet" href="/styles.css?v=20260813c" />
 </head>
 <body>
   <div class="bg"></div>
@@ -14,7 +14,7 @@
       <span class="mark">SWR</span>
       <div>
         <h1>一键推送助手</h1>
-        <p class="sub">登录 SWR → 选分支 → 构建并推送</p>
+        <p class="sub">登录 SWR → 选分支 → 构建并推送 · 产物可查</p>
       </div>
     </div>
     <div class="status-pills">
@@ -23,7 +23,7 @@
     </div>
   </header>
 
-  <main class="layout">
+  <main class="layout" id="mainLayout" data-view="services">
     <section class="panel setup">
       <h2>使用前</h2>
       <ol class="steps">
@@ -50,17 +50,48 @@
       <p class="hint" id="tokenStatus">—</p>
     </section>
 
-    <section class="panel list">
-      <div class="list-head">
-        <h2>微服务</h2>
-        <p class="hint">从 GitHub 拉取分支，本机 Docker 构建后推到 SWR；多选时 tar 归档到同一目录。</p>
+    <section class="panel workspace" id="workspacePanel">
+      <nav class="view-tabs" aria-label="主功能">
+        <button type="button" class="view-tab active" data-view="services" id="tabServices">微服务</button>
+        <button type="button" class="view-tab" data-view="artifacts" id="tabArtifacts">产物管理</button>
+      </nav>
+
+      <div class="view-pane" id="viewServices">
+        <div class="list-head">
+          <p class="hint">从 GitHub 拉取分支，本机 Docker 构建后推到 SWR；多选时 tar 归档到同一目录。</p>
+        </div>
+        <div class="batch-bar">
+          <label class="svc-pick-all"><input type="checkbox" id="chkAll" /> 全选</label>
+          <span class="hint">已选 <strong id="selCount">0</strong> 个</span>
+          <button type="button" class="btn primary" id="btnBatch" disabled>构建所选</button>
+        </div>
+        <div id="serviceTable" class="table"></div>
       </div>
-      <div class="batch-bar">
-        <label class="svc-pick-all"><input type="checkbox" id="chkAll" /> 全选</label>
-        <span class="hint">已选 <strong id="selCount">0</strong> 个</span>
-        <button type="button" class="btn primary" id="btnBatch" disabled>构建所选</button>
+
+      <div class="view-pane" id="viewArtifacts" hidden>
+        <div class="list-head artifacts-head">
+          <p class="hint">本助手部署后成功构建的记录（时间 / 微服务 / 分支 / 镜像名 / 包文件）</p>
+          <button type="button" class="btn ghost" id="btnRefreshArtifacts">刷新</button>
+        </div>
+        <div class="art-table-wrap">
+          <table class="art-table" id="artifactsTable">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>微服务</th>
+                <th>分支</th>
+                <th>Commit</th>
+                <th>镜像名</th>
+                <th>包文件</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="artifactsBody">
+              <tr><td colspan="7" class="hint">暂无产物；成功构建后会出现在这里。</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div>
-      <div id="serviceTable" class="table"></div>
     </section>
 
     <section class="panel logs" id="logsPanel">
@@ -68,12 +99,13 @@
         <h2>任务日志</h2>
         <span class="hint" id="jobMeta">尚无任务</span>
       </div>
+      <div class="job-switcher" id="jobSwitcher" hidden></div>
       <section class="test-result" id="testResult" hidden aria-live="polite"></section>
-      <pre class="log" id="jobLog">点击「构建并推送」后，这里会显示 clone / build / push 日志。</pre>
+      <pre class="log" id="jobLog">点击「构建并推送」后，这里会显示 clone / build / push 日志。不同浏览器互不影响；刷新后只恢复本页自己的任务。</pre>
     </section>
   </main>
 
   <footer class="foot" id="footNote">SWR 临时密码只用于本机 Docker 登录 · 不写入业务仓库</footer>
-  <script src="/app.js?v=20260806c"></script>
+  <script src="/app.js?v=20260813c"></script>
 </body>
 </html>

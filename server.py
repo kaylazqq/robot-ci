@@ -39,6 +39,10 @@ _docker_cache: tuple[float, dict[str, Any]] | None = None
 _daemon_version_lock = threading.Lock()
 _branch_cache: dict[str, tuple[float, list[str]]] = {}
 _branch_cache_lock = threading.Lock()
+_artifacts_lock = threading.Lock()
+_public_service_lock = threading.Lock()
+ARTIFACTS_MAX_ENTRIES = 500
+CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 FLEET_RUNTIME_CACHE_MARKERS = (".build-source.sha256", ".build-image-ids")
@@ -77,7 +81,9 @@ def save_last_daemon_version(version: str) -> bool:
 
 JOB_PUBLIC_FIELDS = (
     "id",
+    "client_id",
     "service_id",
+    "service_ids",
     "branch",
     "status",
     "stage",
@@ -100,7 +106,9 @@ JOB_PUBLIC_FIELDS = (
 
 JOB_COMPACT_FIELDS = (
     "id",
+    "client_id",
     "service_id",
+    "service_ids",
     "branch",
     "status",
     "stage",
@@ -118,30 +126,116 @@ JOB_COMPACT_FIELDS = (
 )
 
 
+def _job_service_ids(job: dict[str, Any]) -> list[str]:
+    raw = job.get("service_ids")
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    text = str(job.get("service_id") or "")
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _running_jobs_locked() -> list[dict[str, Any]]:
+    return [job for job in _jobs.values() if job.get("status") == "running"]
+
+
 def _running_job_locked() -> dict[str, Any] | None:
-    for job in _jobs.values():
-        if job.get("status") == "running":
-            return job
-    return None
+    running = _running_jobs_locked()
+    return running[0] if running else None
 
 
-def active_job_summary() -> dict[str, Any] | None:
-    """Return a lightweight snapshot without holding the lock during HTTP writes."""
+def _normalize_client_id(value: Any) -> str:
+    text = str(value or "").strip()
+    if CLIENT_ID_RE.fullmatch(text):
+        return text
+    return ""
+
+
+def max_concurrent_jobs() -> int:
+    try:
+        return max(1, min(int(CFG.get("max_concurrent_jobs") or 3), 16))
+    except (TypeError, ValueError):
+        return 3
+
+
+def active_job_summary(client_id: str = "") -> dict[str, Any] | None:
+    """Return one running job. Prefer the caller's client_id when provided."""
+    want = _normalize_client_id(client_id)
     with _jobs_lock:
-        job = _running_job_locked()
-        if not job:
+        running = _running_jobs_locked()
+        if not running:
             return None
-        return deepcopy({key: job.get(key) for key in JOB_COMPACT_FIELDS})
+        if want:
+            mine = [job for job in running if _normalize_client_id(job.get("client_id")) == want]
+            if mine:
+                return deepcopy({key: mine[0].get(key) for key in JOB_COMPACT_FIELDS})
+            return None
+        return deepcopy({key: running[0].get(key) for key in JOB_COMPACT_FIELDS})
+
+
+def list_running_job_summaries(client_id: str = "") -> list[dict[str, Any]]:
+    want = _normalize_client_id(client_id)
+    with _jobs_lock:
+        running = _running_jobs_locked()
+        if want:
+            running = [job for job in running if _normalize_client_id(job.get("client_id")) == want]
+        return [deepcopy({key: job.get(key) for key in JOB_COMPACT_FIELDS}) for job in running]
+
+
+def register_concurrent_job(job: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Register a job for concurrent execution.
+    Returns an error payload when capacity/service conflicts block start.
+    """
+    requested = set(_job_service_ids(job))
+    with _jobs_lock:
+        running = _running_jobs_locked()
+        limit = max_concurrent_jobs()
+        if len(running) >= limit:
+            return {
+                "error": f"已有 {len(running)} 个任务在跑，达到并发上限 {limit}",
+                "error_code": "concurrency_limit",
+                "active_jobs": [
+                    deepcopy({key: item.get(key) for key in JOB_COMPACT_FIELDS}) for item in running
+                ],
+            }
+        busy: set[str] = set()
+        owners: dict[str, str] = {}
+        for item in running:
+            for sid in _job_service_ids(item):
+                busy.add(sid)
+                owners[sid] = str(item.get("id") or "")
+        overlap = sorted(requested & busy)
+        if overlap:
+            return {
+                "error": "以下微服务正在被其他任务构建，请稍后再试: " + ", ".join(overlap),
+                "error_code": "service_busy",
+                "busy_services": overlap,
+                "active_job_id": owners.get(overlap[0]),
+            }
+        _jobs[str(job["id"])] = job
+    return None
 
 
 def register_job_if_idle(job: dict[str, Any]) -> dict[str, Any] | None:
-    """Atomically register a job, or return the already-running job summary."""
-    with _jobs_lock:
-        active = _running_job_locked()
-        if active:
-            return deepcopy({key: active.get(key) for key in JOB_COMPACT_FIELDS})
-        _jobs[str(job["id"])] = job
-    return None
+    """Back-compat wrapper: register or return conflict shaped like an active job."""
+    err = register_concurrent_job(job)
+    if not err:
+        return None
+    active_jobs = err.get("active_jobs") or []
+    if active_jobs:
+        return active_jobs[0]
+    aid = err.get("active_job_id")
+    if aid:
+        with _jobs_lock:
+            job0 = _jobs.get(str(aid))
+            if job0:
+                return deepcopy({key: job0.get(key) for key in JOB_COMPACT_FIELDS})
+    return {
+        "id": None,
+        "status": "running",
+        "error": err.get("error"),
+        "service_id": ",".join(err.get("busy_services") or []),
+    }
 
 
 def _quiet_dependency_log(line: str) -> bool:
@@ -221,6 +315,101 @@ def job_meta_path(job_id: str) -> Path:
     return LOG_DIR / f"job-{job_id}.json"
 
 
+def artifacts_log_path() -> Path:
+    return LOG_DIR / "artifacts.jsonl"
+
+
+def archive_root_path() -> Path:
+    return Path(CFG.get("archive_root") or "/usr/share/nginx/html/images").expanduser()
+
+
+def resolve_archive_file(rel_or_abs: str) -> Path | None:
+    """Resolve a downloadable archive path that must stay under archive_root."""
+    raw = (rel_or_abs or "").strip().replace("\\", "/")
+    if not raw or "\x00" in raw:
+        return None
+    root = archive_root_path().resolve()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        target = candidate
+    else:
+        # Allow "20260813.../svc_tag.tar" or accidental leading "images/"
+        rel = raw.lstrip("/")
+        if rel.startswith("images/"):
+            rel = rel[len("images/") :]
+        target = root / rel
+    try:
+        resolved = target.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def public_archive_url(archive_path: str) -> str:
+    """Download URL served by this helper on :18888 (not nginx :80)."""
+    resolved = resolve_archive_file(archive_path)
+    if resolved is None:
+        return ""
+    try:
+        rel = resolved.relative_to(archive_root_path().resolve()).as_posix()
+    except (OSError, ValueError):
+        return ""
+    return f"/api/artifacts/download?file={quote(rel, safe='/')}"
+
+
+def record_build_artifact(entry: dict[str, Any]) -> None:
+    """Append one build artifact record (forward-only; no historical backfill)."""
+    path = artifacts_log_path()
+    line = json.dumps(entry, ensure_ascii=False)
+    with _artifacts_lock:
+        try:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            # Keep file bounded so the UI stays fast after many builds.
+            text = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if len(text) > ARTIFACTS_MAX_ENTRIES:
+                path.write_text(
+                    "\n".join(text[-ARTIFACTS_MAX_ENTRIES:]) + "\n",
+                    encoding="utf-8",
+                )
+        except OSError:
+            pass
+
+
+def list_build_artifacts(limit: int = 100) -> list[dict[str, Any]]:
+    path = artifacts_log_path()
+    if not path.is_file():
+        return []
+    limit = max(1, min(int(limit or 100), ARTIFACTS_MAX_ENTRIES))
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            # Recompute helper download URL so old rows keep working after the
+            # switch away from nginx :80 /images links.
+            archive = str(item.get("archive") or "")
+            url = public_archive_url(archive) if archive else ""
+            if url:
+                item = {**item, "download_url": url}
+            out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def persist_job_meta(job_id: str) -> None:
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -230,7 +419,9 @@ def persist_job_meta(job_id: str) -> None:
             k: job.get(k)
             for k in (
                 "id",
+                "client_id",
                 "service_id",
+                "service_ids",
                 "branch",
                 "status",
                 "stage",
@@ -281,7 +472,9 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
             pass
     return {
         "id": job_id,
+        "client_id": meta.get("client_id") or "",
         "service_id": meta.get("service_id"),
+        "service_ids": meta.get("service_ids") or _job_service_ids(meta),
         "branch": meta.get("branch"),
         "status": meta.get("status") or "unknown",
         "error": meta.get("error"),
@@ -370,6 +563,10 @@ def load_config() -> dict[str, Any]:
     cfg["archive_root"] = archive_root.rstrip("/") or "/usr/share/nginx/html/images"
     cfg["archive_enabled"] = archive_enabled
     cfg["archive_required"] = archive_required
+    try:
+        cfg["max_concurrent_jobs"] = max(1, min(int(cfg.get("max_concurrent_jobs") or 3), 16))
+    except (TypeError, ValueError):
+        cfg["max_concurrent_jobs"] = 3
     return cfg
 
 
@@ -1225,57 +1422,79 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
     ../public-service/windows-deploy/lib/source-rrd.sh.
     Helper clones only the service repo, so keep a shared public-service checkout
     next to it (does not modify service source trees).
+
+    Concurrent jobs share this checkout: update in place under a lock, never wipe
+    an existing tree (wiping would break other in-flight builds).
     """
-    dest = public_service_dir()
-    branch = (CFG.get("public_service_branch") or "main").strip() or "main"
-    url = (CFG.get("public_service_github") or "https://github.com/rollingfruit/public-service.git").strip()
-    public = public_github_url(url)
-    clone_url = clone_url_for(url)
-    genv = git_env()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    append_job_log(job_id, f"ensure shared public-service → {dest} @ {branch}")
+    with _public_service_lock:
+        dest = public_service_dir()
+        branch = (CFG.get("public_service_branch") or "main").strip() or "main"
+        url = (CFG.get("public_service_github") or "https://github.com/rollingfruit/public-service.git").strip()
+        public = public_github_url(url)
+        clone_url = clone_url_for(url)
+        genv = git_env()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        append_job_log(job_id, f"ensure shared public-service → {dest} @ {branch}")
 
-    # Fresh clone each job so public-service helpers cannot accumulate junk either.
-    wipe_workspace_dir(job_id, dest, label="public-service")
-    append_job_log(job_id, "git clone public-service…")
-    code = run_stream(
-        job_id,
-        git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
-        timeout=1800,
-        env=genv,
-    )
-    if code != 0:
-        wipe_workspace_dir(job_id, dest, label="failed public-service clone")
-        code = run_stream(
-            job_id,
-            git_args("clone", "--depth", "1", clone_url, str(dest)),
-            timeout=1800,
-            env=genv,
-        )
-        if code != 0:
-            return False, "git clone public-service failed"
-        run_stream(
-            job_id,
-            git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
-            timeout=600,
-            env=genv,
-        )
-        code = run_stream(
-            job_id,
-            git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
-            timeout=120,
-            env=genv,
-        )
-        if code != 0:
-            return False, f"checkout public-service {branch} failed"
+        if (dest / ".git").is_dir():
+            append_job_log(job_id, "public-service exists; fetch/update (no wipe, safe for concurrency)")
+            run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", clone_url), timeout=30, env=genv)
+            code = run_stream(
+                job_id,
+                git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
+                timeout=600,
+                env=genv,
+            )
+            if code != 0:
+                return False, "git fetch public-service failed"
+            code = run_stream(
+                job_id,
+                git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
+                timeout=120,
+                env=genv,
+            )
+            if code != 0:
+                return False, f"checkout public-service {branch} failed"
+        else:
+            append_job_log(job_id, "git clone public-service…")
+            code = run_stream(
+                job_id,
+                git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
+                timeout=1800,
+                env=genv,
+            )
+            if code != 0:
+                wipe_workspace_dir(job_id, dest, label="failed public-service clone")
+                code = run_stream(
+                    job_id,
+                    git_args("clone", "--depth", "1", clone_url, str(dest)),
+                    timeout=1800,
+                    env=genv,
+                )
+                if code != 0:
+                    return False, "git clone public-service failed"
+                run_stream(
+                    job_id,
+                    git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
+                    timeout=600,
+                    env=genv,
+                )
+                code = run_stream(
+                    job_id,
+                    git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
+                    timeout=120,
+                    env=genv,
+                )
+                if code != 0:
+                    return False, f"checkout public-service {branch} failed"
 
-    run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
-    rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
-    if not rrd.is_file():
-        return False, f"missing {rrd}"
-    code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
-    append_job_log(job_id, f"public-service HEAD={head if code == 0 else '?'} @ {branch}")
-    return True, str(dest)
+        run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
+        rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
+        if not rrd.is_file():
+            return False, f"missing {rrd}"
+        code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
+        append_job_log(job_id, f"public-service HEAD={head if code == 0 else '?'} @ {branch}")
+        return True, str(dest)
 
 
 def mattermost_package_marker() -> Path:
@@ -1654,6 +1873,13 @@ def push_one_service(
         "test_summary": None,
         "version": version,
         "error_code": "",
+        "image": image,
+        "tag": "",
+        "commit_sha": "",
+        "created_at": "",
+        "package_name": "",
+        "download_url": "",
+        "job_id": job_id,
     }
     append_job_log(job_id, f"service={svc['title']} image={image}")
     if svc.get("archive_only"):
@@ -1673,6 +1899,7 @@ def push_one_service(
     code, head = run_cmd([git, "-C", detail, "rev-parse", "HEAD"], timeout=30)
     commit_sha = head if code == 0 else "0000000000000000000000000000000000000000"
     git_hash = commit_sha[:7]
+    result["commit_sha"] = commit_sha
 
     set_job(job_id, stage="testing", current=f"{service_id}@{branch}", commit_sha=commit_sha)
     test_result = run_tests_nonblocking(job_id, service_id, Path(detail), commit_sha)
@@ -1733,6 +1960,27 @@ def push_one_service(
         result["ok"] = True
         result["remote"] = "archive-only"
         result["archive"] = str(bundle)
+        result["tag"] = parse_tag_from_tar(bundle, image) or bundle.name
+        result["package_name"] = bundle.name
+        result["download_url"] = public_archive_url(str(bundle))
+        result["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        record_build_artifact(
+            {
+                "created_at": result["created_at"],
+                "job_id": job_id,
+                "service_id": service_id,
+                "title": result["title"],
+                "branch": branch,
+                "commit_sha": commit_sha,
+                "image": image,
+                "tag": result["tag"],
+                "image_ref": f"local/{image}:{result['tag']}",
+                "remote": "archive-only",
+                "package_name": result["package_name"],
+                "archive": result["archive"],
+                "download_url": result["download_url"],
+            }
+        )
         append_job_log(job_id, f"OK archive-only {bundle} (SWR push skipped)")
         append_job_log(job_id, f"OK deployment env {required[0]}")
         append_job_log(job_id, f"OK deployment script {required[1]}")
@@ -1828,6 +2076,27 @@ def push_one_service(
     result["ok"] = True
     result["remote"] = remote
     result["archive"] = arc_path or ""
+    result["tag"] = tag or ""
+    result["package_name"] = Path(arc_path).name if arc_path else ""
+    result["download_url"] = public_archive_url(arc_path or "")
+    result["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    record_build_artifact(
+        {
+            "created_at": result["created_at"],
+            "job_id": job_id,
+            "service_id": service_id,
+            "title": result["title"],
+            "branch": branch,
+            "commit_sha": commit_sha,
+            "image": image,
+            "tag": result["tag"],
+            "image_ref": f"local/{image}:{result['tag']}" if result["tag"] else f"local/{image}",
+            "remote": remote,
+            "package_name": result["package_name"],
+            "archive": result["archive"],
+            "download_url": result["download_url"],
+        }
+    )
     append_job_log(job_id, f"OK {remote}")
     if arc_path:
         append_job_log(job_id, f"OK archive {arc_path}")
@@ -2068,6 +2337,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "allow_remote": bool(CFG.get("allow_remote")),
                     "archive_enabled": bool(CFG.get("archive_enabled")),
                     "archive_root": (CFG.get("archive_root") or "").strip(),
+                    "max_concurrent_jobs": max_concurrent_jobs(),
                 },
             )
             return
@@ -2092,6 +2362,48 @@ class Handler(SimpleHTTPRequestHandler):
                     }
                 )
             self._json(200, {"services": items, "registry": CFG["swr_registry"], "org": CFG["swr_org"]})
+            return
+
+        if path == "/api/artifacts":
+            try:
+                limit = int((query.get("limit") or ["100"])[0])
+            except (TypeError, ValueError):
+                limit = 100
+            self._json(
+                200,
+                {
+                    "artifacts": list_build_artifacts(limit=limit),
+                    "archive_root": (CFG.get("archive_root") or "").strip(),
+                    "download_via": "helper",
+                },
+            )
+            return
+
+        if path == "/api/artifacts/download":
+            rel = (query.get("file") or [""])[0]
+            target = resolve_archive_file(rel)
+            if target is None:
+                self._json(404, {"error": "archive not found"})
+                return
+            try:
+                size = target.stat().st_size
+            except OSError:
+                self._json(404, {"error": "archive not readable"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{target.name}"',
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                with target.open("rb") as fh:
+                    shutil.copyfileobj(fh, self.wfile, length=1024 * 1024)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
 
         m = re.fullmatch(r"/api/services/([^/]+)/branches", path)
@@ -2163,14 +2475,27 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(404, {"error": "job not found"})
             return
 
-        # Lightweight global active-job discovery. Detailed logs are fetched
-        # incrementally from /api/jobs/<id> after the page attaches.
+        # Active-job discovery. Prefer client_id so each browser only sees its jobs.
         if path == "/api/running-job":
-            payload = active_job_summary()
+            client_id = _normalize_client_id((query.get("client_id") or [""])[0])
+            payload = active_job_summary(client_id=client_id)
             if payload:
                 self._json(200, payload)
                 return
-            self._json(200, {"id": None, "status": "idle"})
+            self._json(200, {"id": None, "status": "idle", "client_id": client_id or None})
+            return
+
+        if path == "/api/running-jobs":
+            client_id = _normalize_client_id((query.get("client_id") or [""])[0])
+            jobs = list_running_job_summaries(client_id=client_id)
+            self._json(
+                200,
+                {
+                    "jobs": jobs,
+                    "client_id": client_id or None,
+                    "max_concurrent_jobs": max_concurrent_jobs(),
+                },
+            )
             return
 
         if path in ("/", "/index.html"):
@@ -2262,17 +2587,7 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                     )
                     return
-            active = active_job_summary()
-            if active:
-                self._json(
-                    409,
-                    {
-                        "error": "another build is running",
-                        "active_job_id": active.get("id"),
-                        "active_job": active,
-                    },
-                )
-                return
+            client_id = _normalize_client_id(data.get("client_id"))
             docker = check_docker()
             if not docker["ok"]:
                 self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
@@ -2280,10 +2595,13 @@ class Handler(SimpleHTTPRequestHandler):
             job_id = uuid.uuid4().hex[:12]
             log_file = LOG_DIR / f"job-{job_id}.log"
             ids = ",".join(it["service_id"] for it in items)
+            service_ids = [it["service_id"] for it in items]
             branches = ",".join(it["branch"] for it in items)
             new_job = {
                 "id": job_id,
+                "client_id": client_id,
                 "service_id": ids,
+                "service_ids": service_ids,
                 "branch": branches,
                 "status": "running",
                 "stage": "syncing",
@@ -2307,16 +2625,9 @@ class Handler(SimpleHTTPRequestHandler):
                 "_ui_test_running": False,
                 "log_file": str(log_file),
             }
-            active = register_job_if_idle(new_job)
-            if active:
-                self._json(
-                    409,
-                    {
-                        "error": "another build is running",
-                        "active_job_id": active.get("id"),
-                        "active_job": active,
-                    },
-                )
+            conflict = register_concurrent_job(new_job)
+            if conflict:
+                self._json(409, conflict)
                 return
             for item in items:
                 if catalog[item["service_id"]].get("requires_version"):
@@ -2325,7 +2636,7 @@ class Handler(SimpleHTTPRequestHandler):
             persist_job_meta(job_id)
             append_job_log(
                 job_id,
-                f"job start services={len(items)} [{ids}] branches=[{branches}]",
+                f"job start services={len(items)} [{ids}] branches=[{branches}] client={client_id or '-'}",
             )
             threading.Thread(
                 target=run_push_job,
@@ -2336,6 +2647,7 @@ class Handler(SimpleHTTPRequestHandler):
                 200,
                 {
                     "job_id": job_id,
+                    "client_id": client_id or None,
                     "count": len(items),
                     "items": items,
                     "branch": branches,
