@@ -5,6 +5,7 @@
   {"id": "memory-service", "title": "memory-service", "image": "memory-service", "repo": "rollingfruit/CellMem", "github": "https://github.com/rollingfruit/CellMem.git", "default_branch": "main", "tar_prefix": "memory-service_"},
   {"id": "agentlink", "title": "agentlink", "image": "agentlink", "repo": "rollingfruit/AgentLink", "github": "https://github.com/rollingfruit/AgentLink.git", "default_branch": "main", "tar_prefix": "agentlink_"},
   {"id": "cloud-space", "title": "cloud-space", "image": "cloud-space", "repo": "censong574-spec/cloud-space", "github": "https://github.com/censong574-spec/cloud-space.git", "default_branch": "main", "tar_prefix": "cloud-space_"},
+  {"id": "rag-service", "title": "rag-service", "image": "rag-service", "repo": "censong574-spec/rag-service", "github": "https://github.com/censong574-spec/rag-service.git", "default_branch": "main", "tar_prefix": "rag-service_"},
 
   {"id": "plugin-market", "title": "plugin-market", "image": "plugin-market", "repo": "rollingfruit/plugin-market", "github": "https://github.com/rollingfruit/plugin-market.git", "default_branch": "main", "tar_prefix": "plugin-market_"},
   {"id": "semantic-schedule", "title": "semantic-schedule", "image": "semantic-schedule", "repo": "rollingfruit/semantic-schedule", "github": "https://github.com/rollingfruit/semantic-schedule.git", "default_branch": "main", "tar_prefix": "semantic-schedule_"},
