@@ -12,5 +12,5 @@
   "archive_enabled": true,
   "archive_required": true,
   "archive_root": "/usr/share/nginx/html/images",
-  "max_concurrent_jobs": 3
+  "max_concurrent_jobs": 5
 }

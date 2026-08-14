@@ -155,9 +155,9 @@ def _normalize_client_id(value: Any) -> str:
 
 def max_concurrent_jobs() -> int:
     try:
-        return max(1, min(int(CFG.get("max_concurrent_jobs") or 3), 16))
+        return max(1, min(int(CFG.get("max_concurrent_jobs") or 5), 16))
     except (TypeError, ValueError):
-        return 3
+        return 5
 
 
 def active_job_summary(client_id: str = "") -> dict[str, Any] | None:
@@ -615,9 +615,9 @@ def load_config() -> dict[str, Any]:
     cfg["archive_enabled"] = archive_enabled
     cfg["archive_required"] = archive_required
     try:
-        cfg["max_concurrent_jobs"] = max(1, min(int(cfg.get("max_concurrent_jobs") or 3), 16))
+        cfg["max_concurrent_jobs"] = max(1, min(int(cfg.get("max_concurrent_jobs") or 5), 16))
     except (TypeError, ValueError):
-        cfg["max_concurrent_jobs"] = 3
+        cfg["max_concurrent_jobs"] = 5
     return cfg
 
 

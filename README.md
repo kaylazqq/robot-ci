@@ -56,7 +56,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 ## 多人并发与页面刷新
 
-服务器最多同时跑 `max_concurrent_jobs` 个构建任务（默认 3）。**同一微服务也可以并发**：每个任务 clone 到独立目录 `<workspace_root>/<仓库名>--<job_id>`，避免互相 `rmtree` 对方的 checkout。`public-service` 仍是共享旁路目录（加锁更新、不删除），好让 `deploy.sh` 继续用 `../public-service`。达到并发上限时新请求返回 `409`。
+服务器最多同时跑 `max_concurrent_jobs` 个构建任务（默认 5）。**同一微服务也可以并发**：每个任务 clone 到独立目录 `<workspace_root>/<仓库名>--<job_id>`，避免互相 `rmtree` 对方的 checkout。`public-service` 仍是共享旁路目录（加锁更新、不删除），好让 `deploy.sh` 继续用 `../public-service`。达到并发上限时新请求返回 `409`。
 
 页面按游标增量读取运行中日志，避免大日志重复传输和慢请求乱序覆盖。浏览器只在本地保存 10 分钟“最近查看的 job ID”，用于规避刷新时任务恰好完成造成的日志和测试表格回显丢失；加载历史结果不会延长有效期。已完成的 job ID 不占用锁。新任务开始时会清掉该服务已结束任务留下的 `--<job_id>` 目录。
 
