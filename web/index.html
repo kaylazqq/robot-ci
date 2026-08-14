@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SWR Push Helper</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=20260813c" />
+  <link rel="stylesheet" href="/styles.css?v=20260814a" />
 </head>
 <body>
   <div class="bg"></div>
@@ -29,7 +29,7 @@
       <ol class="steps">
         <li>任一人粘贴华为云临时 <code>docker login</code> 并登录（服务器共享；不确定时点「检查登录」）</li>
         <li>勾选一个或多个微服务、选分支，点「构建所选」（也可点单行「构建并推送」）</li>
-        <li>多服务同一次任务归档到同一时间戳目录；日志实时输出</li>
+        <li>可同时跑多个任务（含同一微服务）；达到并发上限前不必排队。多服务同一次任务归档到同一目录</li>
       </ol>
       <p class="hint">目标仓库：<code id="targetRepo">—</code></p>
 
@@ -70,7 +70,7 @@
 
       <div class="view-pane" id="viewArtifacts" hidden>
         <div class="list-head artifacts-head">
-          <p class="hint">本助手部署后成功构建的记录（时间 / 微服务 / 分支 / 镜像名 / 包文件）</p>
+          <p class="hint">本助手部署后成功构建的记录（时间 / 微服务 / 分支 / 镜像名 / 包文件）。历史包被磁盘清理后会显示为已失效。</p>
           <button type="button" class="btn ghost" id="btnRefreshArtifacts">刷新</button>
         </div>
         <div class="art-table-wrap">
@@ -91,6 +91,7 @@
             </tbody>
           </table>
         </div>
+        <div class="test-pager" id="artifactsPager" hidden></div>
       </div>
     </section>
 
@@ -106,6 +107,6 @@
   </main>
 
   <footer class="foot" id="footNote">SWR 临时密码只用于本机 Docker 登录 · 不写入业务仓库</footer>
-  <script src="/app.js?v=20260813c"></script>
+  <script src="/app.js?v=20260814a"></script>
 </body>
 </html>

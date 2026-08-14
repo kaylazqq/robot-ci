@@ -17,6 +17,7 @@ let branchLoadsActive = 0;
 const branchLoadQueue = [];
 let testResultJobId = "";
 const testTableState = new Map();
+const artifactsPager = { page: 1, pageSize: 20 };
 const LAST_JOB_KEY = "robotCiLastJob";
 const LEGACY_ACTIVE_JOB_KEY = "robotCiActiveJob";
 const MY_JOBS_KEY = "robotCiMyJobs";
@@ -192,25 +193,29 @@ function esc(value) {
   );
 }
 
-function renderArtifacts(items) {
+function renderArtifacts(items, meta) {
   const body = $("artifactsBody");
   if (!body) return;
   const rows = Array.isArray(items) ? items : [];
   if (!rows.length) {
     body.innerHTML = '<tr><td colspan="7" class="hint">暂无产物；成功构建后会出现在这里。</td></tr>';
+    renderArtifactsPager(meta || { total: 0, page: 1, page_count: 1, page_size: artifactsPager.pageSize });
     return;
   }
   body.innerHTML = rows
     .map((item) => {
+      const expired = item.expired || item.available === false;
       const imageName = item.remote && item.remote !== "archive-only"
         ? item.remote
         : item.image_ref || ((item.image || "") + (item.tag ? ":" + item.tag : ""));
       const pkg = item.package_name || (item.archive ? String(item.archive).split(/[/\\]/).pop() : "—");
-      const link = item.download_url
-        ? `<a href="${esc(item.download_url)}" target="_blank" rel="noopener">下载</a>`
-        : "—";
+      const link = expired
+        ? '<span class="art-expired">已失效</span>'
+        : item.download_url
+          ? `<a href="${esc(item.download_url)}" target="_blank" rel="noopener">下载</a>`
+          : '<span class="art-expired">已失效</span>';
       return (
-        "<tr>" +
+        `<tr${expired ? ' class="expired"' : ""}>` +
         `<td class="mono">${esc(item.created_at || "—")}</td>` +
         `<td>${esc(item.title || item.service_id || "—")}</td>` +
         `<td class="mono">${esc(item.branch || "—")}</td>` +
@@ -222,12 +227,74 @@ function renderArtifacts(items) {
       );
     })
     .join("");
+  renderArtifactsPager(meta);
+}
+
+function renderArtifactsPager(meta) {
+  const pager = $("artifactsPager");
+  if (!pager) return;
+  const total = Number((meta && meta.total) || 0);
+  const pageCount = Math.max(1, Number((meta && meta.page_count) || 1));
+  const pageSize = Number((meta && meta.page_size) || artifactsPager.pageSize) || 20;
+  artifactsPager.page = Math.min(Math.max(1, Number((meta && meta.page) || artifactsPager.page) || 1), pageCount);
+  artifactsPager.pageSize = pageSize;
+  if (!total) {
+    pager.hidden = true;
+    pager.innerHTML = "";
+    return;
+  }
+  pager.hidden = false;
+  pager.innerHTML = "";
+  const sizeControl = document.createElement("label");
+  sizeControl.className = "test-page-size";
+  sizeControl.append("每页 ");
+  const sizeSelect = document.createElement("select");
+  [10, 20, 50, 100].forEach((size) => {
+    const option = document.createElement("option");
+    option.value = String(size);
+    option.textContent = String(size);
+    option.selected = size === pageSize;
+    sizeSelect.appendChild(option);
+  });
+  sizeSelect.addEventListener("change", () => {
+    artifactsPager.pageSize = Number(sizeSelect.value) || 20;
+    artifactsPager.page = 1;
+    refreshArtifacts().catch(() => {});
+  });
+  sizeControl.append(sizeSelect, " 条");
+  const previous = document.createElement("button");
+  previous.type = "button";
+  previous.className = "btn ghost";
+  previous.textContent = "上一页";
+  previous.disabled = artifactsPager.page <= 1;
+  previous.addEventListener("click", () => {
+    artifactsPager.page -= 1;
+    refreshArtifacts().catch(() => {});
+  });
+  const position = document.createElement("span");
+  const expired = Number((meta && meta.expired_count) || 0);
+  position.textContent =
+    "第 " + artifactsPager.page + " / " + pageCount + " 页（" + total + " 条" +
+    (expired ? "，已失效 " + expired : "") + "）";
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "btn ghost";
+  next.textContent = "下一页";
+  next.disabled = artifactsPager.page >= pageCount;
+  next.addEventListener("click", () => {
+    artifactsPager.page += 1;
+    refreshArtifacts().catch(() => {});
+  });
+  pager.append(sizeControl, previous, position, next);
 }
 
 async function refreshArtifacts() {
   try {
-    const data = await api("/api/artifacts?limit=100");
-    renderArtifacts(data.artifacts || []);
+    const data = await api(
+      "/api/artifacts?page=" + encodeURIComponent(String(artifactsPager.page)) +
+      "&page_size=" + encodeURIComponent(String(artifactsPager.pageSize))
+    );
+    renderArtifacts(data.artifacts || [], data);
   } catch (e) {
     const body = $("artifactsBody");
     if (body) {
@@ -235,6 +302,11 @@ async function refreshArtifacts() {
         '<tr><td colspan="7" class="hint" style="color:var(--danger)">产物列表加载失败：' +
         String(e.message || e) +
         "</td></tr>";
+    }
+    const pager = $("artifactsPager");
+    if (pager) {
+      pager.hidden = true;
+      pager.innerHTML = "";
     }
   }
 }

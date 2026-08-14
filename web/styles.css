@@ -157,6 +157,9 @@ h1 { margin: 0; font-size: 1.35rem; font-weight: 700; }
 .art-table .mono { word-break: break-all; }
 .art-table a { color: var(--accent-dim); text-decoration: none; }
 .art-table a:hover { color: var(--accent); text-decoration: underline; }
+.art-table tr.expired td { color: var(--muted); }
+.art-expired { color: var(--muted); }
+#artifactsPager { margin-top: 0.7rem; }
 
 .job-switcher {
   display: flex;

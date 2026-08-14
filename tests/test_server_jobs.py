@@ -45,7 +45,7 @@ class JobCoordinationTests(unittest.TestCase):
             server._jobs.clear()
             server._jobs.update(self.saved_jobs)
 
-    def test_only_one_concurrent_job_is_registered(self) -> None:
+    def test_concurrent_jobs_are_capped_not_serialized_per_service(self) -> None:
         barrier = threading.Barrier(8)
         outcomes: list[tuple[str, dict | None]] = []
 
@@ -61,9 +61,18 @@ class JobCoordinationTests(unittest.TestCase):
             thread.join()
 
         accepted = [job_id for job_id, active in outcomes if active is None]
-        self.assertEqual(1, len(accepted))
-        self.assertEqual(1, len(server._jobs))
-        self.assertEqual(accepted[0], server.active_job_summary()["id"])
+        limit = server.max_concurrent_jobs()
+        self.assertEqual(limit, len(accepted))
+        self.assertEqual(limit, len(server._jobs))
+        self.assertIn(server.active_job_summary()["id"], accepted)
+
+    def test_same_service_can_run_two_jobs_under_the_cap(self) -> None:
+        first = make_job("job-a")
+        second = make_job("job-b")
+        self.assertIsNone(server.register_job_if_idle(first))
+        self.assertIsNone(server.register_job_if_idle(second))
+        ids = {item["id"] for item in server.list_running_job_summaries()}
+        self.assertEqual({"job-a", "job-b"}, ids)
 
     def test_completed_saved_job_does_not_block_the_next_job(self) -> None:
         first = make_job("first-job")
@@ -86,6 +95,59 @@ class JobCoordinationTests(unittest.TestCase):
         self.assertNotIn("ui_log", summary)
         self.assertNotIn("test_cases", summary)
         self.assertNotIn("test_runs", summary)
+
+
+class JobWorkspaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with server._jobs_lock:
+            self.saved_jobs = dict(server._jobs)
+            server._jobs.clear()
+
+    def tearDown(self) -> None:
+        with server._jobs_lock:
+            server._jobs.clear()
+            server._jobs.update(self.saved_jobs)
+
+    def test_repo_dir_is_isolated_per_job(self) -> None:
+        svc = {
+            "id": "memory-service",
+            "repo": "rollingfruit/CellMem",
+            "github": "https://github.com/rollingfruit/CellMem.git",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(server.CFG, {"workspace_root": tmp}):
+                left = server.repo_dir(svc, "aaa111bbb222")
+                right = server.repo_dir(svc, "ccc333ddd444")
+                self.assertNotEqual(left, right)
+                self.assertEqual(left.parent, right.parent)
+                self.assertTrue(left.name.endswith("--aaa111bbb222"))
+                self.assertTrue(right.name.endswith("--ccc333ddd444"))
+                self.assertEqual(left.parent, server.public_service_dir().parent)
+
+    def test_gc_keeps_running_job_workspace_and_drops_idle_ones(self) -> None:
+        svc = {
+            "id": "memory-service",
+            "repo": "rollingfruit/CellMem",
+            "github": "https://github.com/rollingfruit/CellMem.git",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = server.Path(tmp)
+            with patch.dict(server.CFG, {"workspace_root": tmp}):
+                live = server.repo_dir(svc, "livejob00aaaa")
+                idle = server.repo_dir(svc, "idlejob00bbbb")
+                legacy = root / server.clone_dir_name(svc)
+                live.mkdir()
+                idle.mkdir()
+                legacy.mkdir()
+                (live / "keep.txt").write_text("live", encoding="utf-8")
+                (idle / "gone.txt").write_text("idle", encoding="utf-8")
+                job = make_job("livejob00aaaa")
+                self.assertIsNone(server.register_job_if_idle(job))
+                with patch.object(server, "append_job_log"):
+                    server.gc_idle_clone_dirs("livejob00aaaa", svc)
+                self.assertTrue(live.is_dir())
+                self.assertFalse(idle.exists())
+                self.assertFalse(legacy.exists())
 
 
 class JobPayloadTests(unittest.TestCase):
@@ -412,7 +474,7 @@ class JobEndpointTests(unittest.TestCase):
             server._jobs.clear()
             server._jobs.update(self.saved_jobs)
 
-    def test_running_endpoint_is_lightweight_and_push_is_globally_locked(self) -> None:
+    def test_running_endpoint_is_lightweight_and_push_hits_concurrency_limit(self) -> None:
         job = make_job("active-job")
         job["log"] = ["large raw log"]
         self.assertIsNone(server.register_job_if_idle(job))
@@ -423,17 +485,23 @@ class JobEndpointTests(unittest.TestCase):
         self.assertNotIn("log", active)
         self.assertNotIn("test_runs", active)
 
+        for index in range(1, server.max_concurrent_jobs()):
+            extra = make_job(f"active-job-{index}")
+            self.assertIsNone(server.register_job_if_idle(extra))
+
         request = Request(
             self.base_url + "/api/push",
             data=json.dumps({"items": [{"service_id": "memory-service", "branch": "main"}]}).encode(),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with self.assertRaises(HTTPError) as raised:
-            self.opener.open(request, timeout=2)
+        with patch.object(server, "check_docker", return_value={"ok": True, "detail": ""}):
+            with self.assertRaises(HTTPError) as raised:
+                self.opener.open(request, timeout=2)
         self.assertEqual(409, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
-        self.assertEqual("active-job", payload["active_job_id"])
+        self.assertEqual("concurrency_limit", payload["error_code"])
+        self.assertEqual(server.max_concurrent_jobs(), len(payload["active_jobs"]))
 
     def test_multica_server_version_is_validated_before_build(self) -> None:
         request = Request(
@@ -480,6 +548,121 @@ class JobEndpointTests(unittest.TestCase):
             payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(["main", "feature/latest"], payload["branches"])
         lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
+
+
+class DiskPruneAndArtifactTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = server.Path(self.tmp.name)
+        self.archive_root = root / "images"
+        self.archive_root.mkdir()
+        self.log_dir = root / "logs"
+        self.log_dir.mkdir()
+        self.cfg = patch.dict(server.CFG, {"archive_root": str(self.archive_root)})
+        self.log = patch.object(server, "LOG_DIR", self.log_dir)
+        self.job_log = patch.object(server, "append_job_log")
+        self.cfg.start()
+        self.log.start()
+        self.job_log.start()
+
+    def tearDown(self) -> None:
+        self.job_log.stop()
+        self.log.stop()
+        self.cfg.stop()
+        self.tmp.cleanup()
+
+    def _disk(self, used: int, total: int = 1000):
+        return type("usage", (), {"total": total, "used": used, "free": total - used})()
+
+    def _stamp_dir(self, name: str, filename: str = "pkg.tar") -> server.Path:
+        folder = self.archive_root / name
+        folder.mkdir()
+        payload = folder / filename
+        payload.write_bytes(b"tar")
+        return payload
+
+    def test_prune_skips_when_usage_below_80_percent(self) -> None:
+        for name in ("20260801000000", "20260802000000", "20260803000000", "20260804000000"):
+            self._stamp_dir(name)
+        with patch.object(server.shutil, "disk_usage", return_value=self._disk(700)):
+            server.prune_nginx_archives("job-1")
+        remaining = sorted(p.name for p in self.archive_root.iterdir())
+        self.assertEqual(
+            ["20260801000000", "20260802000000", "20260803000000", "20260804000000"],
+            remaining,
+        )
+
+    def test_prune_deletes_oldest_until_usage_drops(self) -> None:
+        for name in ("20260801000000", "20260802000000", "20260803000000", "20260804000000"):
+            self._stamp_dir(name)
+
+        def fake_usage(_path):
+            count = len(list(self.archive_root.iterdir()))
+            used = 900 if count >= 4 else 700
+            return self._disk(used)
+
+        with patch.object(server.shutil, "disk_usage", side_effect=fake_usage):
+            server.prune_nginx_archives("job-1")
+        remaining = sorted(p.name for p in self.archive_root.iterdir())
+        self.assertEqual(["20260802000000", "20260803000000", "20260804000000"], remaining)
+
+    def test_missing_archive_is_expired_and_paginated(self) -> None:
+        kept = self._stamp_dir("20260804000000", "new.tar")
+        gone = self.archive_root / "20260801000000" / "old.tar"
+        server.record_build_artifact(
+            {
+                "created_at": "2026-08-01 10:00:00",
+                "service_id": "old-svc",
+                "title": "old",
+                "archive": str(gone),
+                "package_name": "old.tar",
+            }
+        )
+        server.record_build_artifact(
+            {
+                "created_at": "2026-08-04 10:00:00",
+                "service_id": "new-svc",
+                "title": "new",
+                "archive": str(kept),
+                "package_name": "new.tar",
+            }
+        )
+        page = server.list_build_artifacts(page=1, page_size=1)
+        self.assertEqual(2, page["total"])
+        self.assertEqual(2, page["page_count"])
+        self.assertEqual(1, page["expired_count"])
+        self.assertEqual("new-svc", page["artifacts"][0]["service_id"])
+        self.assertFalse(page["artifacts"][0]["expired"])
+        self.assertTrue(page["artifacts"][0]["download_url"])
+
+        page2 = server.list_build_artifacts(page=2, page_size=1)
+        self.assertEqual("old-svc", page2["artifacts"][0]["service_id"])
+        self.assertTrue(page2["artifacts"][0]["expired"])
+        self.assertEqual("", page2["artifacts"][0]["download_url"])
+
+    def test_prune_expires_artifact_records(self) -> None:
+        old = self._stamp_dir("20260801000000", "old.tar")
+        new = self._stamp_dir("20260804000000", "new.tar")
+        extra = self._stamp_dir("20260802000000", "mid.tar")
+        server.record_build_artifact(
+            {"created_at": "a", "service_id": "old-svc", "archive": str(old), "package_name": "old.tar"}
+        )
+        server.record_build_artifact(
+            {"created_at": "b", "service_id": "mid-svc", "archive": str(extra), "package_name": "mid.tar"}
+        )
+        server.record_build_artifact(
+            {"created_at": "c", "service_id": "new-svc", "archive": str(new), "package_name": "new.tar"}
+        )
+        with patch.object(server.shutil, "disk_usage", return_value=self._disk(900)):
+            server.prune_nginx_archives("job-1", keep_latest=3, min_keep=1)
+        page = server.list_build_artifacts(page=1, page_size=10)
+        by_id = {item["service_id"]: item for item in page["artifacts"]}
+        self.assertTrue(by_id["old-svc"]["expired"])
+        self.assertTrue(by_id["mid-svc"]["expired"])
+        self.assertFalse(by_id["new-svc"]["expired"])
+        self.assertEqual(2, page["expired_count"])
+        self.assertTrue((self.archive_root / "20260804000000").is_dir())
+        self.assertFalse((self.archive_root / "20260801000000").exists())
 
 
 if __name__ == "__main__":

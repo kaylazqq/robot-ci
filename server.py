@@ -41,7 +41,10 @@ _branch_cache: dict[str, tuple[float, list[str]]] = {}
 _branch_cache_lock = threading.Lock()
 _artifacts_lock = threading.Lock()
 _public_service_lock = threading.Lock()
+_fleet_cache_lock = threading.Lock()
 ARTIFACTS_MAX_ENTRIES = 500
+ARTIFACTS_DEFAULT_PAGE_SIZE = 20
+DISK_USAGE_PRUNE_RATIO = 0.80
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
@@ -184,9 +187,9 @@ def list_running_job_summaries(client_id: str = "") -> list[dict[str, Any]]:
 def register_concurrent_job(job: dict[str, Any]) -> dict[str, Any] | None:
     """
     Register a job for concurrent execution.
-    Returns an error payload when capacity/service conflicts block start.
+    Same microservice may run twice: each job clones into its own workspace.
+    Returns an error payload when the global job cap is reached.
     """
-    requested = set(_job_service_ids(job))
     with _jobs_lock:
         running = _running_jobs_locked()
         limit = max_concurrent_jobs()
@@ -197,20 +200,6 @@ def register_concurrent_job(job: dict[str, Any]) -> dict[str, Any] | None:
                 "active_jobs": [
                     deepcopy({key: item.get(key) for key in JOB_COMPACT_FIELDS}) for item in running
                 ],
-            }
-        busy: set[str] = set()
-        owners: dict[str, str] = {}
-        for item in running:
-            for sid in _job_service_ids(item):
-                busy.add(sid)
-                owners[sid] = str(item.get("id") or "")
-        overlap = sorted(requested & busy)
-        if overlap:
-            return {
-                "error": "以下微服务正在被其他任务构建，请稍后再试: " + ", ".join(overlap),
-                "error_code": "service_busy",
-                "busy_services": overlap,
-                "active_job_id": owners.get(overlap[0]),
             }
         _jobs[str(job["id"])] = job
     return None
@@ -360,6 +349,34 @@ def public_archive_url(archive_path: str) -> str:
     return f"/api/artifacts/download?file={quote(rel, safe='/')}"
 
 
+def _parse_artifact_entries(text: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def annotate_artifact_entry(item: dict[str, Any]) -> dict[str, Any]:
+    """Mark a row expired when its archive file is gone (prune or manual delete)."""
+    archive = str(item.get("archive") or "")
+    url = public_archive_url(archive) if archive else ""
+    available = bool(url)
+    return {
+        **item,
+        "available": available,
+        "expired": not available,
+        "download_url": url,
+    }
+
+
 def record_build_artifact(entry: dict[str, Any]) -> None:
     """Append one build artifact record (forward-only; no historical backfill)."""
     path = artifacts_log_path()
@@ -379,35 +396,69 @@ def record_build_artifact(entry: dict[str, Any]) -> None:
             pass
 
 
-def list_build_artifacts(limit: int = 100) -> list[dict[str, Any]]:
+def sync_artifact_availability() -> int:
+    """Persist expired flags after archive files disappear. Returns newly expired count."""
     path = artifacts_log_path()
-    if not path.is_file():
-        return []
-    limit = max(1, min(int(limit or 100), ARTIFACTS_MAX_ENTRIES))
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
-    out: list[dict[str, Any]] = []
-    for line in reversed(lines):
-        line = line.strip()
-        if not line:
-            continue
+    with _artifacts_lock:
+        if not path.is_file():
+            return 0
         try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(item, dict):
-            # Recompute helper download URL so old rows keep working after the
-            # switch away from nginx :80 /images links.
-            archive = str(item.get("archive") or "")
-            url = public_archive_url(archive) if archive else ""
-            if url:
-                item = {**item, "download_url": url}
-            out.append(item)
-        if len(out) >= limit:
-            break
-    return out
+            entries = _parse_artifact_entries(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return 0
+        newly_expired = 0
+        updated: list[dict[str, Any]] = []
+        for item in entries:
+            annotated = annotate_artifact_entry(item)
+            if annotated["expired"] and not item.get("expired"):
+                newly_expired += 1
+            persisted = {
+                **item,
+                "available": annotated["available"],
+                "expired": annotated["expired"],
+                "download_url": annotated["download_url"],
+            }
+            updated.append(persisted)
+        try:
+            path.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in updated[-ARTIFACTS_MAX_ENTRIES:]),
+                encoding="utf-8",
+            )
+        except OSError:
+            return 0
+        return newly_expired
+
+
+def list_build_artifacts(page: int = 1, page_size: int = ARTIFACTS_DEFAULT_PAGE_SIZE) -> dict[str, Any]:
+    path = artifacts_log_path()
+    entries: list[dict[str, Any]] = []
+    if path.is_file():
+        try:
+            entries = _parse_artifact_entries(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            entries = []
+    annotated = [annotate_artifact_entry(item) for item in reversed(entries)]
+    total = len(annotated)
+    try:
+        size = int(page_size or ARTIFACTS_DEFAULT_PAGE_SIZE)
+    except (TypeError, ValueError):
+        size = ARTIFACTS_DEFAULT_PAGE_SIZE
+    size = max(1, min(size, ARTIFACTS_MAX_ENTRIES))
+    page_count = max(1, (total + size - 1) // size) if total else 1
+    try:
+        current = int(page or 1)
+    except (TypeError, ValueError):
+        current = 1
+    current = max(1, min(current, page_count))
+    start = (current - 1) * size
+    return {
+        "artifacts": annotated[start : start + size],
+        "total": total,
+        "page": current,
+        "page_size": size,
+        "page_count": page_count,
+        "expired_count": sum(1 for item in annotated if item.get("expired")),
+    }
 
 
 def persist_job_meta(job_id: str) -> None:
@@ -914,8 +965,68 @@ def clone_dir_name(svc: dict[str, Any]) -> str:
     return re.sub(r"[^\w.\-]+", "_", name)
 
 
-def repo_dir(svc: dict[str, Any]) -> Path:
-    return Path(CFG["workspace_root"]) / clone_dir_name(svc)
+def job_workspace_suffix(job_id: str | None) -> str:
+    safe = re.sub(r"[^0-9a-fA-F]+", "", str(job_id or ""))
+    return (safe[:32] or "job") if job_id else ""
+
+
+def repo_dir(svc: dict[str, Any], job_id: str | None = None) -> Path:
+    """Per-job checkout: <workspace_root>/<repo>--<job_id>.
+
+    Sibling of shared public-service so deploy.sh `../public-service` still works.
+    """
+    root = Path(CFG["workspace_root"])
+    name = clone_dir_name(svc)
+    suffix = job_workspace_suffix(job_id)
+    return root / (f"{name}--{suffix}" if suffix else name)
+
+
+def existing_clone_dirs(svc: dict[str, Any]) -> list[Path]:
+    root = Path(CFG["workspace_root"])
+    if not root.is_dir():
+        return []
+    name = clone_dir_name(svc)
+    found: list[Path] = []
+    leftover = root / name
+    if leftover.is_dir():
+        found.append(leftover)
+    prefix = f"{name}--"
+    try:
+        stamped = [
+            path
+            for path in root.iterdir()
+            if path.is_dir() and path.name.startswith(prefix)
+        ]
+    except OSError:
+        stamped = []
+    found.extend(sorted(stamped, key=lambda path: path.stat().st_mtime, reverse=True))
+    return found
+
+
+def gc_idle_clone_dirs(job_id: str, svc: dict[str, Any]) -> None:
+    """Remove finished per-job checkouts; keep dirs belonging to still-running jobs."""
+    root = Path(CFG["workspace_root"])
+    if not root.is_dir():
+        return
+    name = clone_dir_name(svc)
+    prefix = f"{name}--"
+    keep = {job_workspace_suffix(job_id)}
+    with _jobs_lock:
+        keep.update(job_workspace_suffix(str(item.get("id") or "")) for item in _running_jobs_locked())
+    keep.discard("")
+    leftover = root / name
+    if leftover.exists():
+        wipe_workspace_dir(job_id, leftover, label=f"legacy workspace {name}")
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return
+    for path in children:
+        if not path.is_dir() or not path.name.startswith(prefix):
+            continue
+        if path.name[len(prefix) :] in keep:
+            continue
+        wipe_workspace_dir(job_id, path, label=f"idle workspace {path.name}")
 
 
 def fleet_runtime_cache_dir() -> Path:
@@ -955,12 +1066,13 @@ def persist_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
 
     cache_dir = fleet_runtime_cache_dir()
     try:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        for marker, content in contents.items():
-            target = cache_dir / marker
-            temporary = target.with_name(target.name + ".tmp")
-            temporary.write_text(content, encoding="utf-8")
-            temporary.replace(target)
+        with _fleet_cache_lock:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            for marker, content in contents.items():
+                target = cache_dir / marker
+                temporary = target.with_name(target.name + ".tmp")
+                temporary.write_text(content, encoding="utf-8")
+                temporary.replace(target)
     except OSError as exc:
         append_job_log(job_id, f"WARN: Fleet runtime cache metadata could not be saved: {exc}")
         return False
@@ -972,11 +1084,12 @@ def restore_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
     """Restore validated metadata; Fleet still verifies source hash and live image IDs."""
     cache_dir = fleet_runtime_cache_dir()
     contents: dict[str, str] = {}
-    for marker in FLEET_RUNTIME_CACHE_MARKERS:
-        content = _validated_fleet_cache_marker(cache_dir / marker, marker)
-        if content is None:
-            return False
-        contents[marker] = content
+    with _fleet_cache_lock:
+        for marker in FLEET_RUNTIME_CACHE_MARKERS:
+            content = _validated_fleet_cache_marker(cache_dir / marker, marker)
+            if content is None:
+                return False
+            contents[marker] = content
 
     target_dir = workspace / "deploy" / "runtime-images"
     try:
@@ -1333,7 +1446,7 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     if not re.match(r"^[\w./\-]+$", branch or ""):
         return False, f"invalid branch: {branch!r}"
 
-    dest = repo_dir(svc)
+    dest = repo_dir(svc, job_id)
     public = public_github_url(url)
     public_https = bool(svc.get("public_https"))
     prefer_token_https = bool(svc.get("prefer_token_https"))
@@ -1360,13 +1473,15 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     append_job_log(job_id, f"branch={branch}")
     append_job_log(job_id, f"workspace={dest}")
 
-    # Preserve only Fleet's validated cache metadata outside the disposable checkout.
-    # The Fleet script independently verifies both the new source fingerprint and
-    # the live Docker image IDs before it skips either Runtime image build.
+    # Harvest Fleet markers from a previous checkout before GC deletes it.
     if svc.get("id") == "multica-fleet":
-        persist_fleet_runtime_cache(job_id, dest)
+        for candidate in existing_clone_dirs(svc):
+            if persist_fleet_runtime_cache(job_id, candidate):
+                break
 
-    # Always wipe previous checkout (including build outputs) then fresh clone.
+    gc_idle_clone_dirs(job_id, svc)
+
+    # Always wipe this job's checkout (including build outputs) then fresh clone.
     wipe_workspace_dir(job_id, dest, label=f"workspace {svc.get('id') or dest.name}")
 
     append_job_log(job_id, "git clone…")
@@ -1533,7 +1648,7 @@ def build_from_source(
     version: str = "",
     archive_dir: Path | None = None,
 ) -> tuple[bool, str]:
-    src = repo_dir(svc)
+    src = repo_dir(svc, job_id)
     shell_src = host_path(src)
     ps_dir = host_path(public_service_dir())
     where = "WSL" if use_wsl() else "host"
@@ -1621,8 +1736,8 @@ def build_from_source(
     return True, ""
 
 
-def find_latest_tar(svc: dict[str, Any]) -> Path | None:
-    export_dir = repo_dir(svc) / "runtime-images" / "cce-export"
+def find_latest_tar(svc: dict[str, Any], workspace: Path | None = None) -> Path | None:
+    export_dir = (workspace or repo_dir(svc)) / "runtime-images" / "cce-export"
     if not export_dir.is_dir():
         return None
     cands = sorted(export_dir.glob(f"{svc['tar_prefix']}*.tar"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1638,59 +1753,110 @@ def parse_tag_from_tar(tar_path: Path, image: str) -> str:
     return parts[1] if len(parts) == 2 else stem
 
 
-def disk_free_bytes(path: Path | str) -> int | None:
+def disk_usage_ratio(path: Path | str) -> tuple[float, int, int] | None:
+    """Return (used/total, total_bytes, free_bytes), or None if unreadable."""
     try:
-        return shutil.disk_usage(str(path)).free
+        usage = shutil.disk_usage(str(path))
     except OSError:
         return None
+    if usage.total <= 0:
+        return None
+    return usage.used / usage.total, usage.total, usage.free
 
 
-def prune_nginx_archives(job_id: str, keep_latest: int = 3, min_free_gb: float = 8.0) -> None:
-    """Delete oldest timestamp dirs under archive_root when free space is low."""
+def archive_timestamp_dirs(base: Path) -> list[Path]:
+    return sorted(
+        [
+            p
+            for p in base.iterdir()
+            if p.is_dir() and re.fullmatch(r"\d{8,14}(?:-[0-9a-fA-F]{8,32})?", p.name)
+        ],
+        key=lambda p: p.name,
+    )
+
+
+def prune_nginx_archives(
+    job_id: str,
+    keep_latest: int = 3,
+    min_keep: int = 1,
+    max_usage_ratio: float = DISK_USAGE_PRUNE_RATIO,
+) -> None:
+    """Delete oldest timestamp dirs when disk usage reaches 80%.
+
+    Prefers keeping `keep_latest` dirs. If usage is still over the ratio,
+    continues until under the ratio or only `min_keep` newest dir remains.
+    Removed files make matching artifact-management rows expired.
+    """
     base = Path((CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/") or ".")
     try:
         base.mkdir(parents=True, exist_ok=True)
     except OSError:
         return
-    free = disk_free_bytes(base)
-    if free is None:
+    stats = disk_usage_ratio(base)
+    if stats is None:
         return
-    min_free = int(min_free_gb * 1024**3)
-    if free >= min_free:
+    ratio, total, free = stats
+    if ratio < max_usage_ratio:
         return
 
-    dirs = sorted(
-        [p for p in base.iterdir() if p.is_dir() and re.fullmatch(r"\d{8,14}", p.name)],
-        key=lambda p: p.name,
-    )
-    if len(dirs) <= keep_latest:
+    floor = max(1, int(min_keep))
+    dirs = archive_timestamp_dirs(base)
+    if len(dirs) <= floor:
         append_job_log(
             job_id,
-            f"WARN: disk free={free // (1024**2)}MB < {min_free_gb:.0f}GB but only "
-            f"{len(dirs)} archive dir(s) (keep_latest={keep_latest})",
+            f"WARN: disk usage={ratio:.0%} >= {max_usage_ratio:.0%} but only "
+            f"{len(dirs)} archive dir(s) (min_keep={floor})",
         )
         return
 
     append_job_log(
         job_id,
-        f"disk free={free // (1024**2)}MB < {min_free_gb:.0f}GB; pruning old nginx archives…",
+        f"disk usage={ratio:.0%} >= {max_usage_ratio:.0%} "
+        f"(free={free // (1024**2)}MB / total={total // (1024**2)}MB); "
+        "pruning old nginx archives…",
     )
-    for old in dirs[: max(0, len(dirs) - keep_latest)]:
-        append_job_log(job_id, f"remove old archive dir: {old}")
-        shutil.rmtree(old, ignore_errors=True)
-        free = disk_free_bytes(base)
-        if free is not None and free >= min_free:
+    removed = False
+    while True:
+        dirs = archive_timestamp_dirs(base)
+        if len(dirs) <= floor:
             break
-    free2 = disk_free_bytes(base)
-    if free2 is not None:
-        append_job_log(job_id, f"disk free after prune: {free2 // (1024**2)}MB")
+        stats = disk_usage_ratio(base)
+        if stats is None:
+            break
+        ratio, total, free = stats
+        if ratio < max_usage_ratio:
+            break
+        old = dirs[0]
+        if len(dirs) <= keep_latest:
+            append_job_log(
+                job_id,
+                f"still {ratio:.0%} used; remove extra archive {old.name} "
+                f"(below keep_latest={keep_latest})",
+            )
+        else:
+            append_job_log(job_id, f"remove old archive dir: {old}")
+        shutil.rmtree(old, ignore_errors=True)
+        removed = True
+    if removed:
+        expired = sync_artifact_availability()
+        if expired:
+            append_job_log(job_id, f"expired {expired} artifact record(s) after prune")
+        stats = disk_usage_ratio(base)
+        if stats is not None:
+            ratio, total, free = stats
+            append_job_log(
+                job_id,
+                f"disk after prune: usage={ratio:.0%} free={free // (1024**2)}MB",
+            )
 
 
 def make_archive_dir(job_id: str | None = None) -> Path:
     base = (CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/")
     if job_id:
         prune_nginx_archives(job_id)
-    out_dir = Path(base) / time.strftime("%Y%m%d%H%M%S")
+    stamp = time.strftime("%Y%m%d%H%M%S")
+    suffix = job_workspace_suffix(job_id)
+    out_dir = Path(base) / (f"{stamp}-{suffix}" if suffix else stamp)
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         out_dir.chmod(0o755)
@@ -1754,9 +1920,13 @@ def archive_image_locally(
     return True, str(out_file)
 
 
-def resolve_local_image(job_id: str, svc: dict[str, Any]) -> tuple[str | None, str | None]:
+def resolve_local_image(
+    job_id: str,
+    svc: dict[str, Any],
+    workspace: Path | None = None,
+) -> tuple[str | None, str | None]:
     image = svc["image"]
-    tar_path = find_latest_tar(svc)
+    tar_path = find_latest_tar(svc, workspace)
     if tar_path:
         tag = parse_tag_from_tar(tar_path, image)
         local_ref = f"local/{image}:{tag}"
@@ -1908,7 +2078,7 @@ def push_one_service(
         return result
 
     if svc.get("id") == "multica-fleet":
-        persist_fleet_runtime_cache(job_id, repo_dir(svc))
+        persist_fleet_runtime_cache(job_id, Path(detail))
 
     if svc.get("bundle_archive"):
         if archive_dir is None:
@@ -1960,7 +2130,7 @@ def push_one_service(
         append_job_log(job_id, f"OK deployment env {required[0]}")
         append_job_log(job_id, f"OK deployment script {required[1]}")
         return result
-    local_ref, tag = resolve_local_image(job_id, svc)
+    local_ref, tag = resolve_local_image(job_id, svc, Path(detail))
     by_hash_ref, by_hash_tag = find_local_image_by_git_hash(image, git_hash)
     if by_hash_ref and by_hash_tag:
         local_ref, tag = by_hash_ref, by_hash_tag
@@ -2340,18 +2510,21 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/artifacts":
-            try:
-                limit = int((query.get("limit") or ["100"])[0])
-            except (TypeError, ValueError):
-                limit = 100
-            self._json(
-                200,
-                {
-                    "artifacts": list_build_artifacts(limit=limit),
-                    "archive_root": (CFG.get("archive_root") or "").strip(),
-                    "download_via": "helper",
-                },
-            )
+            def _query_int(name: str, default: int) -> int:
+                try:
+                    return int((query.get(name) or [str(default)])[0])
+                except (TypeError, ValueError):
+                    return default
+
+            page = _query_int("page", 1)
+            if "page_size" in query:
+                page_size = _query_int("page_size", ARTIFACTS_DEFAULT_PAGE_SIZE)
+            else:
+                page_size = _query_int("limit", ARTIFACTS_DEFAULT_PAGE_SIZE)
+            payload = list_build_artifacts(page=page, page_size=page_size)
+            payload["archive_root"] = (CFG.get("archive_root") or "").strip()
+            payload["download_via"] = "helper"
+            self._json(200, payload)
             return
 
         if path == "/api/artifacts/download":
