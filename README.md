@@ -60,7 +60,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 页面按游标增量读取运行中日志，避免大日志重复传输和慢请求乱序覆盖。浏览器只在本地保存 10 分钟“最近查看的 job ID”，用于规避刷新时任务恰好完成造成的日志和测试表格回显丢失；加载历史结果不会延长有效期。已完成的 job ID 不占用锁。新任务开始时会清掉该服务已结束任务留下的 `--<job_id>` 目录。
 
-每次构建在独立临时目录里重新 `git clone`（`<仓库名>--<job_id>`），构建结束后保留本次 checkout 方便失败排查；该服务下一次新任务开始时再删掉已结束任务的旧目录。构建归档时会探测磁盘使用率，超过 **80%** 时自动清理 `/usr/share/nginx/html/images` 下较旧的时间戳归档目录（优先保留最近 3 个；若仍高于 80% 则继续删到只剩最新 1 个）。被删掉的包在「产物管理」里会显示为已失效。
+每次构建在独立临时目录里重新 `git clone`（`<仓库名>--<job_id>`），构建结束后保留本次 checkout 方便失败排查；该服务下一次新任务开始时再删掉已结束任务的旧目录。Go/Python/npm 编译临时文件走 `/home/ci`（`TMPDIR`/`GOTMPDIR`），不写 1.8G 的 `/tmp` tmpfs。SWR 推送并归档成功后只删除本次业务镜像（`local/<image>:<tag>` 和对应 SWR tag），不跑 `docker image prune`，基础镜像和 `local/ai-go-toolchain` 会保留。构建归档时会探测磁盘使用率，超过 **80%** 时自动清理 `/usr/share/nginx/html/images` 下较旧的时间戳归档目录（优先保留最近 3 个；若仍高于 80% 则继续删到只剩最新 1 个）。被删掉的包在「产物管理」里会显示为已失效。
 
 `multica-fleet` 是例外的缓存优化场景：工具仍会重新克隆源码，但会把 Fleet 生成的 `.build-source.sha256` 和 `.build-image-ids` 保存到 `<workspace_root>/.robot-ci-cache/multica-fleet/runtime-images/`，并在新 checkout 中恢复。Fleet 构建脚本只有在新源码指纹一致、两个 Runtime Docker 镜像仍存在且 Image ID 一致时才跳过 OpenCode/Hermes 重建；源码、Dockerfile、依赖或本地镜像发生变化时会自动重新构建。三镜像合并归档仍会在每次任务中重新生成，因此不会复用或误发旧归档。工具会把最终 tar 权限统一设为 `0644` 供 nginx 下载，并原样保留 Fleet 生成的 `.meta` 和 `.sha256`；离线部署脚本使用 `.sha256` 校验大文件下载完整性。
 
@@ -72,7 +72,8 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 {
   "archive_enabled": true,
   "archive_required": true,
-  "archive_root": "/usr/share/nginx/html/images"
+  "archive_root": "/usr/share/nginx/html/images",
+  "ci_tmp_root": "/home/ci"
 }
 ```
 

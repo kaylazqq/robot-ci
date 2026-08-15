@@ -284,6 +284,11 @@ def build_test_environment(repo_dir: Path, report_dir: Path) -> dict[str, str]:
             env[name] = value
     for name in ("GOCACHE", "GOMODCACHE", "GOPATH", "PIP_CACHE_DIR"):
         Path(env[name]).mkdir(parents=True, exist_ok=True)
+    tmp_root = env.get("TMPDIR") or env.get("SWR_CI_TMP") or env.get("GOTMPDIR")
+    if tmp_root:
+        for key in ("TMPDIR", "TMP", "TEMP", "GOTMPDIR", "DOCKER_TMPDIR", "NPM_CONFIG_TMP"):
+            env.setdefault(key, tmp_root)
+        Path(tmp_root).mkdir(parents=True, exist_ok=True)
     env.update(
         {
             "REPO_DIR": str(repo_dir),

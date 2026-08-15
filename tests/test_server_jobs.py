@@ -665,5 +665,42 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertFalse((self.archive_root / "20260801000000").exists())
 
 
+class BusinessImageAndTmpTests(unittest.TestCase):
+    def test_protected_base_images_are_not_removed(self) -> None:
+        self.assertTrue(server.is_protected_base_image("local/ai-go-toolchain:1.26.4"))
+        self.assertTrue(server.is_protected_base_image("archive-only"))
+        self.assertFalse(server.is_protected_base_image("local/temporal-server:202608151143_eecea40"))
+        self.assertFalse(
+            server.is_protected_base_image(
+                "swr.cn-southwest-2.myhuaweicloud.com/public_ai/temporal-server:tag"
+            )
+        )
+
+    @patch.object(server, "docker_cmd", return_value=(0, ""))
+    @patch.object(server, "append_job_log")
+    def test_remove_business_images_skips_toolchain(self, _log, docker_cmd) -> None:
+        server.remove_business_images(
+            "job-1",
+            "local/temporal-server:tag",
+            "local/ai-go-toolchain:1.26.4",
+            "local/temporal-server:tag",
+        )
+        docker_cmd.assert_called_once_with("rmi", "-f", "local/temporal-server:tag", timeout=60)
+
+    @patch.object(server, "run_stream", return_value=0)
+    def test_build_from_source_points_scratch_at_ci_tmp(self, run_stream) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = server.Path(temporary) / "ci-tmp"
+            svc = {"id": "temporal", "image": "temporal-server", "repo": "rollingfruit/aiwelink-temporal"}
+            with patch.dict(server.CFG, {"ci_tmp_root": str(root)}):
+                ok, detail = server.build_from_source("no-job", svc, "eecea40")
+            self.assertTrue(ok, detail)
+            env = run_stream.call_args.kwargs["env"]
+            self.assertEqual(env["TMPDIR"], str(root))
+            self.assertEqual(env["GOTMPDIR"], str(root))
+            self.assertEqual(env["DOCKER_TMPDIR"], str(root))
+            self.assertTrue(root.is_dir())
+
+
 if __name__ == "__main__":
     unittest.main()

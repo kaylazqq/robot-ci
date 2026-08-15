@@ -45,6 +45,8 @@ _fleet_cache_lock = threading.Lock()
 ARTIFACTS_MAX_ENTRIES = 500
 ARTIFACTS_DEFAULT_PAGE_SIZE = 20
 DISK_USAGE_PRUNE_RATIO = 0.80
+CI_TMP_DEFAULT = "/home/ci"
+PROTECTED_LOCAL_IMAGES = ("local/ai-go-toolchain",)
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
@@ -618,6 +620,10 @@ def load_config() -> dict[str, Any]:
         cfg["max_concurrent_jobs"] = max(1, min(int(cfg.get("max_concurrent_jobs") or 5), 16))
     except (TypeError, ValueError):
         cfg["max_concurrent_jobs"] = 5
+    ci_tmp = (cfg.get("ci_tmp_root") or os.environ.get("SWR_CI_TMP") or "").strip()
+    if not ci_tmp:
+        ci_tmp = CI_TMP_DEFAULT if os.name != "nt" else (os.environ.get("TEMP") or os.environ.get("TMP") or ".")
+    cfg["ci_tmp_root"] = str(Path(ci_tmp).expanduser())
     return cfg
 
 
@@ -635,10 +641,54 @@ def save_config_value(key: str, value: Any) -> None:
 CFG = load_config()
 
 
+def ci_tmp_root() -> Path:
+    return Path(str(CFG.get("ci_tmp_root") or CI_TMP_DEFAULT))
+
+
+def apply_ci_tmp_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Point Go/Python/npm/docker scratch files at /home/ci instead of tiny /tmp."""
+    target = os.environ if env is None else env
+    root = ci_tmp_root()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    root_s = str(root)
+    for key in ("TMPDIR", "TMP", "TEMP", "GOTMPDIR", "DOCKER_TMPDIR", "NPM_CONFIG_TMP"):
+        target[key] = root_s
+    return target
+
+
+def is_protected_base_image(ref: str) -> bool:
+    name = (ref or "").strip()
+    if not name or name == "archive-only":
+        return True
+    return any(name == prefix or name.startswith(prefix + ":") for prefix in PROTECTED_LOCAL_IMAGES)
+
+
+def remove_business_images(job_id: str, *refs: str) -> None:
+    """Delete this job's compiled service images only. Never docker image prune."""
+    seen: set[str] = set()
+    for ref in refs:
+        name = (ref or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        if is_protected_base_image(name):
+            append_job_log(job_id, f"keep base image {name}")
+            continue
+        append_job_log(job_id, f"remove business image {name}")
+        docker_cmd("rmi", "-f", name, timeout=60)
+
+
 def reload_cfg() -> None:
     global CFG, _token_cache
     CFG = load_config()
     _token_cache = None
+    apply_ci_tmp_env()
+
+
+apply_ci_tmp_env()
 
 
 def load_services() -> list[dict[str, Any]]:
@@ -1722,6 +1772,7 @@ def build_from_source(
         }
         and not key.startswith(runtime_prefixes)
     }
+    apply_ci_tmp_env(build_env)
     code = run_stream(
         job_id,
         bash_lc(bash),
@@ -2217,7 +2268,7 @@ def push_one_service(
             return result
         append_job_log(job_id, f"WARN: local archive failed (ignored): {arc_path}")
 
-    docker_cmd("rmi", remote, timeout=60)
+    remove_business_images(job_id, remote, local_ref)
     result["ok"] = True
     result["remote"] = remote
     result["archive"] = arc_path or ""
@@ -2822,6 +2873,8 @@ def main() -> None:
     print(f"[swr-push-helper] http://{host}:{port}/", flush=True)
     print(f"[swr-push-helper] mode: web login + GitHub branch → local build → SWR", flush=True)
     print(f"[swr-push-helper] SWR: {CFG['swr_registry']}/{CFG['swr_org']}", flush=True)
+    apply_ci_tmp_env()
+    print(f"[swr-push-helper] ci_tmp={ci_tmp_root()}", flush=True)
     print(f"[swr-push-helper] allow_remote={allow_remote}", flush=True)
     # Fast local signal for UI; full registry probe in background (don't block startup).
     fast = login_status_fast()

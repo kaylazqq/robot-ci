@@ -108,6 +108,7 @@ cfg = {
 print("wrote config.json")
 PY
 chmod 600 "$APP_DIR/config.json"
+mkdir -p /home/ci
 
 cat > /etc/systemd/system/swr-push-helper.service <<EOF
 [Unit]
@@ -122,6 +123,10 @@ ExecStart=${PYTHON_BIN} ${APP_DIR}/server.py
 Restart=on-failure
 RestartSec=3
 Environment=SWR_ALLOW_REMOTE=1
+Environment=TMPDIR=/home/ci
+Environment=GOTMPDIR=/home/ci
+Environment=DOCKER_TMPDIR=/home/ci
+Environment=SWR_CI_TMP=/home/ci
 
 [Install]
 WantedBy=multi-user.target

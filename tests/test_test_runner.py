@@ -94,6 +94,24 @@ class TestResultParsing(unittest.TestCase):
             for name in ("GOCACHE", "GOMODCACHE", "GOPATH", "PIP_CACHE_DIR"):
                 self.assertTrue(Path(env[name]).is_dir())
 
+    def test_build_test_environment_keeps_parent_tmpdir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tmp_root = root / "ci-tmp"
+            tmp_root.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": os.environ.get("PATH", ""),
+                    "TMPDIR": str(tmp_root),
+                    "SWR_TEST_CACHE_ROOT": str(root / "cache"),
+                },
+                clear=True,
+            ):
+                env = test_runner.build_test_environment(root, root / "reports")
+            self.assertEqual(env["TMPDIR"], str(tmp_root))
+            self.assertEqual(env["GOTMPDIR"], str(tmp_root))
+
 
 if __name__ == "__main__":
     unittest.main()

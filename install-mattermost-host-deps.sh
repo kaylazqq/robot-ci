@@ -74,13 +74,20 @@ node --version
 npm --version
 
 echo "==> PATH for swr-push-helper systemd"
-mkdir -p /etc/systemd/system/swr-push-helper.service.d
+mkdir -p /home/ci /etc/systemd/system/swr-push-helper.service.d
 cat >/etc/systemd/system/swr-push-helper.service.d/path.conf <<EOF
 [Service]
 Environment=PATH=/usr/local/go/bin:${NODE_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=GOPROXY=https://goproxy.cn,direct
 Environment=DOCKER_BUILDKIT=1
 Environment=BUILDKIT_PROGRESS=plain
+Environment=TMPDIR=/home/ci
+Environment=TMP=/home/ci
+Environment=TEMP=/home/ci
+Environment=GOTMPDIR=/home/ci
+Environment=DOCKER_TMPDIR=/home/ci
+Environment=NPM_CONFIG_TMP=/home/ci
+Environment=SWR_CI_TMP=/home/ci
 EOF
 systemctl daemon-reload
 systemctl restart swr-push-helper
