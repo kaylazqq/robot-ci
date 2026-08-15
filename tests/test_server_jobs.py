@@ -664,6 +664,42 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertTrue((self.archive_root / "20260804000000").is_dir())
         self.assertFalse((self.archive_root / "20260801000000").exists())
 
+    def test_reclaim_swap_removes_cache_and_ci_tmp_files(self) -> None:
+        root = server.Path(self.tmp.name)
+        cache = root / "build-cache"
+        ci_tmp = root / "ci-tmp"
+        nested = ci_tmp / "mattermost-build-cache.abc"
+        cache.mkdir()
+        nested.mkdir(parents=True)
+        (cache / "build.swap").write_bytes(b"swap-a")
+        (nested / "build.swap").write_bytes(b"swap-b")
+        (ci_tmp / "keep.txt").write_text("ok", encoding="utf-8")
+        with patch.dict(server.CFG, {"build_cache_root": str(cache), "ci_tmp_root": str(ci_tmp)}):
+            with patch.object(server, "run_cmd", return_value=(0, "")) as run_cmd:
+                removed = server.reclaim_build_swap("job-1")
+        self.assertEqual(2, removed)
+        self.assertFalse((cache / "build.swap").exists())
+        self.assertFalse((nested / "build.swap").exists())
+        self.assertTrue((ci_tmp / "keep.txt").is_file())
+        if server.os.name != "nt":
+            self.assertTrue(any(args[0][0] == "swapoff" for args, _ in run_cmd.call_args_list))
+
+    @patch.object(server, "docker_cmd", return_value=(0, "Total: 1GB"))
+    def test_reclaim_skips_builder_prune_below_80_percent(self, docker_cmd) -> None:
+        with patch.object(server.shutil, "disk_usage", return_value=self._disk(700)):
+            with patch.object(server, "reclaim_build_swap", return_value=0):
+                server.reclaim_ci_disk("job-1")
+        docker_cmd.assert_not_called()
+
+    @patch.object(server, "docker_cmd", return_value=(0, "Total: 32GB"))
+    def test_reclaim_prunes_builder_cache_when_still_over_80(self, docker_cmd) -> None:
+        self._stamp_dir("20260804000000")
+        with patch.object(server.shutil, "disk_usage", return_value=self._disk(960)):
+            with patch.object(server, "reclaim_build_swap", return_value=0):
+                server.reclaim_ci_disk("job-1")
+        docker_cmd.assert_called_once_with("builder", "prune", "-af", timeout=300)
+        self.assertFalse(any("image" in str(call) and "prune" in str(call) for call in docker_cmd.call_args_list))
+
 
 class BuildHistoryTests(unittest.TestCase):
     def setUp(self) -> None:

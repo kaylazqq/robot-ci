@@ -48,6 +48,8 @@ HISTORY_DEFAULT_PAGE_SIZE = 20
 HISTORY_MAX_ENTRIES = 500
 DISK_USAGE_PRUNE_RATIO = 0.80
 CI_TMP_DEFAULT = "/home/ci"
+BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
+BUILD_SWAP_NAME = "build.swap"
 PROTECTED_LOCAL_IMAGES = ("local/ai-go-toolchain",)
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -721,6 +723,10 @@ def load_config() -> dict[str, Any]:
     if not ci_tmp:
         ci_tmp = CI_TMP_DEFAULT if os.name != "nt" else (os.environ.get("TEMP") or os.environ.get("TMP") or ".")
     cfg["ci_tmp_root"] = str(Path(ci_tmp).expanduser())
+    build_cache = (cfg.get("build_cache_root") or os.environ.get("SWR_BUILD_CACHE") or "").strip()
+    if not build_cache:
+        build_cache = BUILD_CACHE_DEFAULT if os.name != "nt" else str(Path(cfg["ci_tmp_root"]) / "build-cache")
+    cfg["build_cache_root"] = str(Path(build_cache).expanduser())
     return cfg
 
 
@@ -740,6 +746,10 @@ CFG = load_config()
 
 def ci_tmp_root() -> Path:
     return Path(str(CFG.get("ci_tmp_root") or CI_TMP_DEFAULT))
+
+
+def build_cache_root() -> Path:
+    return Path(str(CFG.get("build_cache_root") or BUILD_CACHE_DEFAULT))
 
 
 def apply_ci_tmp_env(env: dict[str, str] | None = None) -> dict[str, str]:
@@ -1998,10 +2008,131 @@ def prune_nginx_archives(
             )
 
 
+def iter_build_swap_files(max_depth: int = 3) -> list[Path]:
+    """Find leftover compile swap files under build-cache and CI tmp."""
+    found: list[Path] = []
+    seen: set[str] = set()
+
+    def walk(root: Path, depth: int) -> None:
+        try:
+            if not root.exists() or root.is_symlink():
+                return
+            if root.is_file():
+                if root.name == BUILD_SWAP_NAME:
+                    key = str(root)
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(root)
+                return
+            candidate = root / BUILD_SWAP_NAME
+            if candidate.is_file() and not candidate.is_symlink():
+                key = str(candidate)
+                if key not in seen:
+                    seen.add(key)
+                    found.append(candidate)
+            if depth <= 0:
+                return
+            for child in root.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    walk(child, depth - 1)
+        except OSError:
+            return
+
+    for root in (build_cache_root(), ci_tmp_root()):
+        walk(root, max_depth)
+    return found
+
+
+def drop_build_swap_file(path: Path, job_id: str) -> bool:
+    """swapoff then delete a leftover build.swap. Never leave it mounted."""
+    if not path.is_file():
+        return False
+    if os.name != "nt":
+        code, out = run_cmd(["swapoff", str(path)], timeout=180)
+        if code != 0 and out:
+            append_job_log(job_id, f"swapoff {path}: {out.splitlines()[-1][:200]}")
+    try:
+        path.unlink()
+    except OSError as e:
+        append_job_log(job_id, f"WARN: cannot remove swap {path}: {e}")
+        return False
+    append_job_log(job_id, f"removed leftover swap {path}")
+    return True
+
+
+def reclaim_build_swap(job_id: str) -> int:
+    """Compile swap is scratch only; drop it after the job so it does not occupy disk."""
+    removed = 0
+    for path in iter_build_swap_files():
+        if drop_build_swap_file(path, job_id):
+            removed += 1
+    return removed
+
+
+def reclaim_docker_builder_cache(job_id: str) -> None:
+    """Free BuildKit layer cache. Never `docker image prune` (keeps base images)."""
+    append_job_log(job_id, "pruning docker builder cache (images kept)")
+    code, out = docker_cmd("builder", "prune", "-af", timeout=300)
+    for line in (out or "").splitlines()[-8:]:
+        append_job_log(job_id, line)
+    if code != 0:
+        append_job_log(job_id, f"WARN: docker builder prune failed: {(out or '')[-200:]}")
+
+
+def reclaim_ci_disk(
+    job_id: str,
+    keep_latest: int = 3,
+    min_keep: int = 1,
+    max_usage_ratio: float = DISK_USAGE_PRUNE_RATIO,
+) -> None:
+    """CI disk reclaim used before archive and at job end.
+
+    Always drop leftover build.swap. If usage is still >= 80%, prune nginx
+    timestamp archives, then Docker builder cache. Never docker image prune.
+    """
+    reclaim_build_swap(job_id)
+    probe = Path((CFG.get("archive_root") or "/").rstrip("/") or "/")
+    stats = disk_usage_ratio(probe)
+    if stats is None:
+        return
+    ratio, total, free = stats
+    if ratio < max_usage_ratio:
+        return
+    append_job_log(
+        job_id,
+        f"disk usage={ratio:.0%} >= {max_usage_ratio:.0%} "
+        f"(free={free // (1024**2)}MB / total={total // (1024**2)}MB); reclaiming…",
+    )
+    prune_nginx_archives(
+        job_id,
+        keep_latest=keep_latest,
+        min_keep=min_keep,
+        max_usage_ratio=max_usage_ratio,
+    )
+    stats = disk_usage_ratio(probe)
+    if stats is None:
+        return
+    ratio, total, free = stats
+    if ratio < max_usage_ratio:
+        return
+    append_job_log(
+        job_id,
+        f"disk still {ratio:.0%} after archive prune; reclaim docker builder cache",
+    )
+    reclaim_docker_builder_cache(job_id)
+    stats = disk_usage_ratio(probe)
+    if stats is not None:
+        ratio, total, free = stats
+        append_job_log(
+            job_id,
+            f"disk after reclaim: usage={ratio:.0%} free={free // (1024**2)}MB",
+        )
+
+
 def make_archive_dir(job_id: str | None = None) -> Path:
     base = (CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/")
     if job_id:
-        prune_nginx_archives(job_id)
+        reclaim_ci_disk(job_id)
     stamp = time.strftime("%Y%m%d%H%M%S")
     suffix = job_workspace_suffix(job_id)
     out_dir = Path(base) / (f"{stamp}-{suffix}" if suffix else stamp)
@@ -2350,7 +2481,7 @@ def push_one_service(
 
     # Free space before large docker save when disk is tight.
     set_job(job_id, stage="archiving")
-    prune_nginx_archives(job_id)
+    reclaim_ci_disk(job_id)
     ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
     if not ok_arc:
         result["remote"] = remote
@@ -2537,6 +2668,8 @@ def run_push_job(
     except Exception as e:  # noqa: BLE001
         set_job(job_id, status="failed", error=str(e))
         append_job_log(job_id, f"ERROR {e}")
+    finally:
+        reclaim_ci_disk(job_id)
 
 
 def push_service(
