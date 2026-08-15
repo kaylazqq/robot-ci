@@ -19,6 +19,11 @@ let testResultJobId = "";
 const testTableState = new Map();
 const artifactsPager = { page: 1, pageSize: 20 };
 const historyPager = { page: 1, pageSize: 20 };
+let historyDetailTimer = null;
+let historyDetailGen = 0;
+let historyDetailJobId = "";
+let historyLogLines = [];
+let historyLogCursor = 0;
 const LAST_JOB_KEY = "robotCiLastJob";
 const LEGACY_ACTIVE_JOB_KEY = "robotCiActiveJob";
 const MY_JOBS_KEY = "robotCiMyJobs";
@@ -132,6 +137,7 @@ function getMainView() {
 }
 
 function setMainView(view) {
+  const prev = getMainView();
   const next = view === "artifacts" || view === "history" ? view : "services";
   const layout = $("mainLayout");
   if (layout) layout.dataset.view = next;
@@ -148,7 +154,11 @@ function setMainView(view) {
     refreshArtifacts().catch(() => {});
   }
   if (next === "history") {
-    refreshHistory().catch(() => {});
+    if (prev === "history" && historyDetailJobId) {
+      closeHistoryDetail();
+    } else if (!historyDetailJobId) {
+      refreshHistory().catch(() => {});
+    }
   }
   try {
     localStorage.setItem("robotCiMainView", next);
@@ -318,12 +328,12 @@ function renderHistory(items, meta) {
       const summary = services + (item.branch ? " @ " + item.branch : "");
       return (
         "<tr>" +
-        `<td class="mono">${esc(item.created_at || "—")}</td>` +
-        `<td>${esc(services)}</td>` +
-        `<td>${esc(item.branch || "—")}</td>` +
-        `<td class="${historyStatusClass(status)}">${esc(historyStatusLabel(status))}</td>` +
-        `<td class="mono">${esc(shortSha(item.commit_sha))}</td>` +
-        `<td><button type="button" class="btn ghost" data-history-job="${esc(item.id)}" data-history-summary="${esc(summary)}">查看日志</button></td>` +
+        `<td class="hist-time">${esc(item.created_at || "—")}</td>` +
+        `<td class="hist-svc" title="${esc(services)}">${esc(services)}</td>` +
+        `<td class="hist-branch" title="${esc(item.branch || "")}">${esc(item.branch || "—")}</td>` +
+        `<td class="hist-status ${historyStatusClass(status)}">${esc(historyStatusLabel(status))}</td>` +
+        `<td class="hist-sha">${esc(shortSha(item.commit_sha))}</td>` +
+        `<td class="hist-act"><button type="button" class="btn ghost" data-history-job="${esc(item.id)}" data-history-summary="${esc(summary)}">查看日志</button></td>` +
         "</tr>"
       );
     })
@@ -332,9 +342,7 @@ function renderHistory(items, meta) {
     btn.addEventListener("click", () => {
       const id = btn.getAttribute("data-history-job");
       const summary = btn.getAttribute("data-history-summary") || id;
-      if (!id) return;
-      setMainView("services");
-      startPolling(id, summary);
+      if (id) openHistoryJob(id, summary);
     });
   });
   renderHistoryPager(meta);
@@ -393,6 +401,84 @@ function renderHistoryPager(meta) {
     refreshHistory().catch(() => {});
   });
   pager.append(sizeControl, previous, position, next);
+}
+
+function stopHistoryDetailPoll() {
+  historyDetailGen += 1;
+  if (historyDetailTimer) clearTimeout(historyDetailTimer);
+  historyDetailTimer = null;
+}
+
+function showHistoryList() {
+  stopHistoryDetailPoll();
+  historyDetailJobId = "";
+  historyLogLines = [];
+  historyLogCursor = 0;
+  const list = $("historyList");
+  const detail = $("historyDetail");
+  if (list) list.hidden = false;
+  if (detail) detail.hidden = true;
+}
+
+function closeHistoryDetail() {
+  showHistoryList();
+  refreshHistory().catch(() => {});
+}
+
+function openHistoryJob(jobId, summary) {
+  stopHistoryDetailPoll();
+  historyDetailJobId = jobId;
+  historyLogLines = [];
+  historyLogCursor = 0;
+  const list = $("historyList");
+  const detail = $("historyDetail");
+  const meta = $("historyDetailMeta");
+  const logEl = $("historyJobLog");
+  if (list) list.hidden = true;
+  if (detail) detail.hidden = false;
+  if (meta) meta.textContent = (summary || jobId) + " · 加载中…";
+  if (logEl) {
+    logEl.textContent = "正在加载这次构建的日志…";
+    logEl.scrollTop = 0;
+  }
+  const gen = historyDetailGen;
+  const tick = async () => {
+    if (gen !== historyDetailGen) return;
+    try {
+      const query = new URLSearchParams({
+        compact: "1",
+        view: "ui",
+        log_after: String(historyLogCursor),
+      });
+      const job = await api("/api/jobs/" + jobId + "?" + query.toString());
+      if (gen !== historyDetailGen) return;
+      if (Array.isArray(job.log) && job.log.length) historyLogLines.push(...job.log);
+      historyLogCursor = Number.isFinite(Number(job.log_cursor))
+        ? Number(job.log_cursor)
+        : historyLogLines.length;
+      if (logEl) {
+        logEl.textContent = displayJobLog(historyLogLines);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      if (meta) {
+        meta.textContent =
+          (summary || job.service_id || jobId) +
+          " · " +
+          historyStatusLabel(job.status) +
+          (job.progress ? " · " + job.progress : "") +
+          (job.current ? " · " + job.current : "") +
+          (job.error ? " · " + job.error : "");
+      }
+      if (job.status === "running" || job.status === "unknown") {
+        historyDetailTimer = setTimeout(tick, 1500);
+      }
+    } catch (e) {
+      if (gen !== historyDetailGen) return;
+      if (meta) meta.textContent = (summary || jobId) + " · 加载失败";
+      if (logEl) logEl.textContent = String(e.message || e);
+    }
+  };
+  tick();
 }
 
 async function refreshHistory() {
@@ -1283,6 +1369,9 @@ bind("btnRefreshArtifacts", () => {
 });
 bind("btnRefreshHistory", () => {
   refreshHistory().catch(() => {});
+});
+bind("btnHistoryBack", () => {
+  closeHistoryDetail();
 });
 
 document.querySelectorAll(".view-tab").forEach((btn) => {

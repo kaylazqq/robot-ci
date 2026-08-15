@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SWR Push Helper</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=20260815a" />
+  <link rel="stylesheet" href="/styles.css?v=20260815b" />
 </head>
 <body>
   <div class="bg"></div>
@@ -96,28 +96,47 @@
       </div>
 
       <div class="view-pane" id="viewHistory" hidden>
-        <div class="list-head artifacts-head">
-          <p class="hint">只显示本浏览器发起的构建（按 client_id）。点「查看日志」后，右侧任务日志只展开这一次任务。</p>
-          <button type="button" class="btn ghost" id="btnRefreshHistory">刷新</button>
+        <div id="historyList">
+          <div class="list-head artifacts-head">
+            <p class="hint">只显示本浏览器发起的构建。点「查看日志」在本页打开那一次的记录，可返回列表。</p>
+            <button type="button" class="btn ghost" id="btnRefreshHistory">刷新</button>
+          </div>
+          <div class="art-table-wrap">
+            <table class="art-table history-table" id="historyTable">
+              <colgroup>
+                <col class="col-time" />
+                <col class="col-svc" />
+                <col class="col-branch" />
+                <col class="col-status" />
+                <col class="col-sha" />
+                <col class="col-act" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>微服务</th>
+                  <th>分支</th>
+                  <th>状态</th>
+                  <th>Commit</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="historyBody">
+                <tr><td colspan="6" class="hint">暂无本浏览器的构建记录。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="test-pager" id="historyPager" hidden></div>
         </div>
-        <div class="art-table-wrap">
-          <table class="art-table" id="historyTable">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>微服务</th>
-                <th>分支</th>
-                <th>状态</th>
-                <th>Commit</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="historyBody">
-              <tr><td colspan="6" class="hint">暂无本浏览器的构建记录。</td></tr>
-            </tbody>
-          </table>
+        <div id="historyDetail" hidden>
+          <div class="list-head artifacts-head">
+            <div>
+              <button type="button" class="btn ghost" id="btnHistoryBack">返回构建历史</button>
+              <p class="hint" id="historyDetailMeta">—</p>
+            </div>
+          </div>
+          <pre class="log history-log" id="historyJobLog">正在加载这次构建的日志…</pre>
         </div>
-        <div class="test-pager" id="historyPager" hidden></div>
       </div>
     </section>
 
@@ -132,6 +151,6 @@
   </main>
 
   <footer class="foot" id="footNote">SWR 临时密码只用于本机 Docker 登录 · 不写入业务仓库</footer>
-  <script src="/app.js?v=20260815a"></script>
+  <script src="/app.js?v=20260815b"></script>
 </body>
 </html>

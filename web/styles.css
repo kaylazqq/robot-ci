@@ -167,6 +167,34 @@ h1 { margin: 0; font-size: 1.35rem; font-weight: 700; }
 .art-status-failed { color: var(--danger); }
 .art-status-running { color: var(--warn); }
 
+.history-table { table-layout: fixed; width: 100%; }
+.history-table .col-time { width: 12.5rem; }
+.history-table .col-svc { width: 28%; }
+.history-table .col-branch { width: 16%; }
+.history-table .col-status { width: 4.8rem; }
+.history-table .col-sha { width: 5.2rem; }
+.history-table .col-act { width: 6.2rem; }
+.history-table td.hist-time {
+  white-space: nowrap;
+  word-break: normal;
+  font-variant-numeric: tabular-nums;
+}
+.history-table td.hist-svc,
+.history-table td.hist-branch {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-table td.hist-status,
+.history-table td.hist-sha,
+.history-table td.hist-act {
+  white-space: nowrap;
+}
+.history-log {
+  min-height: 28rem;
+  max-height: calc(100vh - 16rem);
+}
+
 .job-switcher {
   display: flex;
   flex-wrap: wrap;
