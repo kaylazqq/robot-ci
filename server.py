@@ -44,6 +44,8 @@ _public_service_lock = threading.Lock()
 _fleet_cache_lock = threading.Lock()
 ARTIFACTS_MAX_ENTRIES = 500
 ARTIFACTS_DEFAULT_PAGE_SIZE = 20
+HISTORY_DEFAULT_PAGE_SIZE = 20
+HISTORY_MAX_ENTRIES = 500
 DISK_USAGE_PRUNE_RATIO = 0.80
 CI_TMP_DEFAULT = "/home/ci"
 PROTECTED_LOCAL_IMAGES = ("local/ai-go-toolchain",)
@@ -463,6 +465,99 @@ def list_build_artifacts(page: int = 1, page_size: int = ARTIFACTS_DEFAULT_PAGE_
     }
 
 
+def _history_created_at(meta: dict[str, Any], mtime: float = 0.0) -> str:
+    created = str(meta.get("created_at") or "").strip()
+    if created:
+        return created
+    if mtime > 0:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+    return ""
+
+
+def _history_row(meta: dict[str, Any], mtime: float = 0.0) -> dict[str, Any]:
+    return {
+        "id": str(meta.get("id") or ""),
+        "client_id": meta.get("client_id") or "",
+        "created_at": _history_created_at(meta, mtime),
+        "service_id": meta.get("service_id"),
+        "service_ids": meta.get("service_ids") or _job_service_ids(meta),
+        "branch": meta.get("branch"),
+        "status": meta.get("status") or "unknown",
+        "stage": meta.get("stage"),
+        "error": meta.get("error"),
+        "progress": meta.get("progress"),
+        "current": meta.get("current"),
+        "commit_sha": meta.get("commit_sha"),
+        "remote": meta.get("remote"),
+        "archive": meta.get("archive"),
+    }
+
+
+def list_build_history(
+    client_id: str = "",
+    page: int = 1,
+    page_size: int = HISTORY_DEFAULT_PAGE_SIZE,
+) -> dict[str, Any]:
+    """Paginated jobs for one browser client_id. Empty client_id returns no rows."""
+    want = _normalize_client_id(client_id)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if want:
+        with _jobs_lock:
+            for job in _jobs.values():
+                if _normalize_client_id(job.get("client_id")) != want:
+                    continue
+                job_id = str(job.get("id") or "")
+                if not job_id:
+                    continue
+                rows.append(_history_row(job))
+                seen.add(job_id)
+        for path in LOG_DIR.glob("job-*.json"):
+            match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
+            if not match:
+                continue
+            job_id = match.group(1)
+            if job_id in seen:
+                continue
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            if _normalize_client_id(meta.get("client_id")) != want:
+                continue
+            meta.setdefault("id", job_id)
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            rows.append(_history_row(meta, mtime))
+            seen.add(job_id)
+    rows.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")), reverse=True)
+    total = len(rows)
+    try:
+        size = int(page_size or HISTORY_DEFAULT_PAGE_SIZE)
+    except (TypeError, ValueError):
+        size = HISTORY_DEFAULT_PAGE_SIZE
+    size = max(1, min(size, HISTORY_MAX_ENTRIES))
+    page_count = max(1, (total + size - 1) // size) if total else 1
+    try:
+        current = int(page or 1)
+    except (TypeError, ValueError):
+        current = 1
+    current = max(1, min(current, page_count))
+    start = (current - 1) * size
+    return {
+        "jobs": rows[start : start + size],
+        "total": total,
+        "page": current,
+        "page_size": size,
+        "page_count": page_count,
+        "client_id": want or None,
+    }
+
+
 def persist_job_meta(job_id: str) -> None:
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -473,6 +568,7 @@ def persist_job_meta(job_id: str) -> None:
             for k in (
                 "id",
                 "client_id",
+                "created_at",
                 "service_id",
                 "service_ids",
                 "branch",
@@ -526,6 +622,7 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
     return {
         "id": job_id,
         "client_id": meta.get("client_id") or "",
+        "created_at": meta.get("created_at") or "",
         "service_id": meta.get("service_id"),
         "service_ids": meta.get("service_ids") or _job_service_ids(meta),
         "branch": meta.get("branch"),
@@ -2632,6 +2729,22 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(200, {"branches": branches, "default_branch": default})
             return
 
+        if path == "/api/jobs":
+            def _query_int(name: str, default: int) -> int:
+                try:
+                    return int((query.get(name) or [str(default)])[0])
+                except (TypeError, ValueError):
+                    return default
+
+            client_id = _normalize_client_id((query.get("client_id") or [""])[0])
+            page = _query_int("page", 1)
+            if "page_size" in query:
+                page_size = _query_int("page_size", HISTORY_DEFAULT_PAGE_SIZE)
+            else:
+                page_size = _query_int("limit", HISTORY_DEFAULT_PAGE_SIZE)
+            self._json(200, list_build_history(client_id=client_id, page=page, page_size=page_size))
+            return
+
         if path.startswith("/api/jobs/"):
             job_id = path[len("/api/jobs/") :].strip("/")
             compact = (query.get("compact") or [""])[0].lower() in ("1", "true", "yes")
@@ -2799,6 +2912,7 @@ class Handler(SimpleHTTPRequestHandler):
             new_job = {
                 "id": job_id,
                 "client_id": client_id,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "service_id": ids,
                 "service_ids": service_ids,
                 "branch": branches,

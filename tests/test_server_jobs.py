@@ -665,6 +665,68 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertFalse((self.archive_root / "20260801000000").exists())
 
 
+class BuildHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log_dir = server.Path(self.tmp.name)
+        self.saved_jobs = dict(server._jobs)
+        with server._jobs_lock:
+            server._jobs.clear()
+        self.log = patch.object(server, "LOG_DIR", self.log_dir)
+        self.log.start()
+
+    def tearDown(self) -> None:
+        self.log.stop()
+        with server._jobs_lock:
+            server._jobs.clear()
+            server._jobs.update(self.saved_jobs)
+        self.tmp.cleanup()
+
+    def _write_meta(self, job_id: str, client_id: str, created_at: str, service_id: str = "temporal") -> None:
+        payload = {
+            "id": job_id,
+            "client_id": client_id,
+            "created_at": created_at,
+            "service_id": service_id,
+            "service_ids": [service_id],
+            "branch": "main",
+            "status": "ok",
+        }
+        (self.log_dir / f"job-{job_id}.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def test_history_is_filtered_by_client_and_paginated(self) -> None:
+        mine = "cmsqxcxcesgairws0"
+        other = "otherclientid0001"
+        self._write_meta("aaaaaaaaaaaa", mine, "2026-08-15 10:00:00", "temporal")
+        self._write_meta("bbbbbbbbbbbb", mine, "2026-08-15 11:00:00", "agentlink")
+        self._write_meta("cccccccccccc", other, "2026-08-15 12:00:00", "mattermost")
+        empty = server.list_build_history(client_id="", page=1, page_size=10)
+        self.assertEqual(0, empty["total"])
+        self.assertEqual([], empty["jobs"])
+        page = server.list_build_history(client_id=mine, page=1, page_size=1)
+        self.assertEqual(2, page["total"])
+        self.assertEqual(2, page["page_count"])
+        self.assertEqual("bbbbbbbbbbbb", page["jobs"][0]["id"])
+        self.assertEqual("agentlink", page["jobs"][0]["service_id"])
+        page2 = server.list_build_history(client_id=mine, page=2, page_size=1)
+        self.assertEqual("aaaaaaaaaaaa", page2["jobs"][0]["id"])
+
+    def test_history_includes_in_memory_running_job(self) -> None:
+        mine = "cmsqxcxcesgairws0"
+        job = make_job("dddddddddddd")
+        job["client_id"] = mine
+        job["created_at"] = "2026-08-15 13:00:00"
+        job["service_id"] = "memory-service"
+        with server._jobs_lock:
+            server._jobs[job["id"]] = job
+        page = server.list_build_history(client_id=mine, page=1, page_size=10)
+        self.assertEqual(1, page["total"])
+        self.assertEqual("dddddddddddd", page["jobs"][0]["id"])
+        self.assertEqual("running", page["jobs"][0]["status"])
+
+
 class BusinessImageAndTmpTests(unittest.TestCase):
     def test_protected_base_images_are_not_removed(self) -> None:
         self.assertTrue(server.is_protected_base_image("local/ai-go-toolchain:1.26.4"))

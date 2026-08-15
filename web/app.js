@@ -18,6 +18,7 @@ const branchLoadQueue = [];
 let testResultJobId = "";
 const testTableState = new Map();
 const artifactsPager = { page: 1, pageSize: 20 };
+const historyPager = { page: 1, pageSize: 20 };
 const LAST_JOB_KEY = "robotCiLastJob";
 const LEGACY_ACTIVE_JOB_KEY = "robotCiActiveJob";
 const MY_JOBS_KEY = "robotCiMyJobs";
@@ -77,37 +78,6 @@ function upsertMyJob(jobId, summary, status) {
   }
   myJobs = myJobs.slice(0, 20);
   saveMyJobs();
-  renderJobSwitcher();
-}
-
-function renderJobSwitcher() {
-  const root = $("jobSwitcher");
-  if (!root) return;
-  if (!myJobs.length) {
-    root.hidden = true;
-    root.innerHTML = "";
-    return;
-  }
-  root.hidden = false;
-  root.innerHTML = myJobs
-    .map((job) => {
-      const active = job.id === activeJobId ? " active" : "";
-      const done = job.status && job.status !== "running" ? " done" : "";
-      const label = (job.summary || job.id) + (job.status === "running" ? "" : " · " + (job.status || ""));
-      return (
-        `<button type="button" class="job-chip${active}${done}" data-job="${esc(job.id)}" title="${esc(job.id)}">` +
-        esc(label) +
-        "</button>"
-      );
-    })
-    .join("");
-  root.querySelectorAll("[data-job]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-job");
-      const job = myJobs.find((j) => j.id === id);
-      if (id) startPolling(id, (job && job.summary) || id);
-    });
-  });
 }
 
 function rememberedDaemonVersion() {
@@ -162,18 +132,23 @@ function getMainView() {
 }
 
 function setMainView(view) {
-  const next = view === "artifacts" ? "artifacts" : "services";
+  const next = view === "artifacts" || view === "history" ? view : "services";
   const layout = $("mainLayout");
   if (layout) layout.dataset.view = next;
   const servicesPane = $("viewServices");
   const artifactsPane = $("viewArtifacts");
+  const historyPane = $("viewHistory");
   if (servicesPane) servicesPane.hidden = next !== "services";
   if (artifactsPane) artifactsPane.hidden = next !== "artifacts";
+  if (historyPane) historyPane.hidden = next !== "history";
   document.querySelectorAll(".view-tab").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.view === next);
   });
   if (next === "artifacts") {
     refreshArtifacts().catch(() => {});
+  }
+  if (next === "history") {
+    refreshHistory().catch(() => {});
   }
   try {
     localStorage.setItem("robotCiMainView", next);
@@ -304,6 +279,139 @@ async function refreshArtifacts() {
         "</td></tr>";
     }
     const pager = $("artifactsPager");
+    if (pager) {
+      pager.hidden = true;
+      pager.innerHTML = "";
+    }
+  }
+}
+
+function historyStatusLabel(status) {
+  if (status === "ok") return "成功";
+  if (status === "running") return "进行中";
+  if (status === "failed") return "失败";
+  return status || "—";
+}
+
+function historyStatusClass(status) {
+  if (status === "ok") return "art-status-ok";
+  if (status === "failed") return "art-status-failed";
+  if (status === "running") return "art-status-running";
+  return "";
+}
+
+function renderHistory(items, meta) {
+  const body = $("historyBody");
+  if (!body) return;
+  const rows = Array.isArray(items) ? items : [];
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="6" class="hint">暂无本浏览器的构建记录。</td></tr>';
+    renderHistoryPager(meta || { total: 0, page: 1, page_count: 1, page_size: historyPager.pageSize });
+    return;
+  }
+  body.innerHTML = rows
+    .map((item) => {
+      const status = item.status || "unknown";
+      const services = Array.isArray(item.service_ids) && item.service_ids.length
+        ? item.service_ids.join(", ")
+        : (item.service_id || "—");
+      const summary = services + (item.branch ? " @ " + item.branch : "");
+      return (
+        "<tr>" +
+        `<td class="mono">${esc(item.created_at || "—")}</td>` +
+        `<td>${esc(services)}</td>` +
+        `<td>${esc(item.branch || "—")}</td>` +
+        `<td class="${historyStatusClass(status)}">${esc(historyStatusLabel(status))}</td>` +
+        `<td class="mono">${esc(shortSha(item.commit_sha))}</td>` +
+        `<td><button type="button" class="btn ghost" data-history-job="${esc(item.id)}" data-history-summary="${esc(summary)}">查看日志</button></td>` +
+        "</tr>"
+      );
+    })
+    .join("");
+  body.querySelectorAll("[data-history-job]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-history-job");
+      const summary = btn.getAttribute("data-history-summary") || id;
+      if (!id) return;
+      setMainView("services");
+      startPolling(id, summary);
+    });
+  });
+  renderHistoryPager(meta);
+}
+
+function renderHistoryPager(meta) {
+  const pager = $("historyPager");
+  if (!pager) return;
+  const total = Number((meta && meta.total) || 0);
+  const pageCount = Math.max(1, Number((meta && meta.page_count) || 1));
+  const pageSize = Number((meta && meta.page_size) || historyPager.pageSize) || 20;
+  historyPager.page = Math.min(Math.max(1, Number((meta && meta.page) || historyPager.page) || 1), pageCount);
+  historyPager.pageSize = pageSize;
+  if (!total) {
+    pager.hidden = true;
+    pager.innerHTML = "";
+    return;
+  }
+  pager.hidden = false;
+  pager.innerHTML = "";
+  const sizeControl = document.createElement("label");
+  sizeControl.className = "test-page-size";
+  sizeControl.append("每页 ");
+  const sizeSelect = document.createElement("select");
+  [10, 20, 50, 100].forEach((size) => {
+    const option = document.createElement("option");
+    option.value = String(size);
+    option.textContent = String(size);
+    option.selected = size === pageSize;
+    sizeSelect.appendChild(option);
+  });
+  sizeSelect.addEventListener("change", () => {
+    historyPager.pageSize = Number(sizeSelect.value) || 20;
+    historyPager.page = 1;
+    refreshHistory().catch(() => {});
+  });
+  sizeControl.append(sizeSelect, " 条");
+  const previous = document.createElement("button");
+  previous.type = "button";
+  previous.className = "btn ghost";
+  previous.textContent = "上一页";
+  previous.disabled = historyPager.page <= 1;
+  previous.addEventListener("click", () => {
+    historyPager.page -= 1;
+    refreshHistory().catch(() => {});
+  });
+  const position = document.createElement("span");
+  position.textContent = "第 " + historyPager.page + " / " + pageCount + " 页（" + total + " 条）";
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "btn ghost";
+  next.textContent = "下一页";
+  next.disabled = historyPager.page >= pageCount;
+  next.addEventListener("click", () => {
+    historyPager.page += 1;
+    refreshHistory().catch(() => {});
+  });
+  pager.append(sizeControl, previous, position, next);
+}
+
+async function refreshHistory() {
+  try {
+    const data = await api(
+      "/api/jobs?client_id=" + encodeURIComponent(clientId()) +
+      "&page=" + encodeURIComponent(String(historyPager.page)) +
+      "&page_size=" + encodeURIComponent(String(historyPager.pageSize))
+    );
+    renderHistory(data.jobs || [], data);
+  } catch (e) {
+    const body = $("historyBody");
+    if (body) {
+      body.innerHTML =
+        '<tr><td colspan="6" class="hint" style="color:var(--danger)">构建历史加载失败：' +
+        String(e.message || e) +
+        "</td></tr>";
+    }
+    const pager = $("historyPager");
     if (pager) {
       pager.hidden = true;
       pager.innerHTML = "";
@@ -995,7 +1103,6 @@ function startPolling(jobId, summary) {
   upsertMyJob(jobId, summary, "running");
   rememberLastJob(jobId, summary);
   showJob(summary + " · job " + jobId, "Connecting to active job…");
-  renderJobSwitcher();
 
   const tick = async () => {
     const keepPolling = await pollJob(jobId, summary, generation, true);
@@ -1126,7 +1233,6 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
         (job.error || "") +
         (archiveHint ? " · 归档 " + archiveHint : "");
     }
-    renderJobSwitcher();
     // Prefer next running job owned by this browser.
     const next = myJobs.find((j) => j.status === "running" && j.id !== jobId);
     if (next) {
@@ -1175,6 +1281,9 @@ bind("btnBatch", () => {
 bind("btnRefreshArtifacts", () => {
   refreshArtifacts().catch(() => {});
 });
+bind("btnRefreshHistory", () => {
+  refreshHistory().catch(() => {});
+});
 
 document.querySelectorAll(".view-tab").forEach((btn) => {
   btn.addEventListener("click", () => setMainView(btn.dataset.view || "services"));
@@ -1195,7 +1304,6 @@ if (chkAll) {
   busy = true;
   setButtonsDisabled(true);
   loadMyJobs();
-  renderJobSwitcher();
   let rememberedView = "services";
   try {
     rememberedView = localStorage.getItem("robotCiMainView") || "services";
@@ -1236,7 +1344,7 @@ if (chkAll) {
 
     showJob(
       "就绪",
-      "可同时发起多个构建（不同微服务）。刷新后只恢复本浏览器的任务日志。\n可勾选多个微服务后点「构建所选」，或点单行「构建并推送」。"
+      "可同时发起多个构建。任务日志只显示当前这一次；历史记录在「构建历史」里分页查看。\n可勾选多个微服务后点「构建所选」，或点单行「构建并推送」。"
     );
   } catch (e) {
     $("serviceTable").innerHTML = '<p class="hint">无法连接助手，请先运行 start.bat</p>';
