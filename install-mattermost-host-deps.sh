@@ -3,7 +3,8 @@
 # Does not modify microservice source trees.
 set -euo pipefail
 
-GO_VERSION=1.25.9
+GO_VERSION=1.26.4
+GO_ARCHIVE_SHA256=1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad7f
 NODE_VERSION=24.11.1
 GO_ARCHIVE="go${GO_VERSION}.linux-amd64.tar.gz"
 NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.xz"
@@ -27,8 +28,11 @@ if [[ ! -x /usr/local/go/bin/go ]] || ! /usr/local/go/bin/go version 2>/dev/null
     curl -fL --retry 3 -o "$PS_DEPS/$GO_ARCHIVE" \
       "https://mirrors.aliyun.com/golang/${GO_ARCHIVE}" \
       || curl -fL --retry 3 -o "$PS_DEPS/$GO_ARCHIVE" \
+      "https://mirrors.huaweicloud.com/golang/${GO_ARCHIVE}" \
+      || curl -fL --retry 3 -o "$PS_DEPS/$GO_ARCHIVE" \
       "https://go.dev/dl/${GO_ARCHIVE}"
   fi
+  echo "${GO_ARCHIVE_SHA256}  $PS_DEPS/$GO_ARCHIVE" | sha256sum -c -
   cp -f "$PS_DEPS/$GO_ARCHIVE" "$AI_INSTALLERS/$GO_ARCHIVE"
   rm -rf /usr/local/go
   tar -C /usr/local -xzf "$PS_DEPS/$GO_ARCHIVE"
