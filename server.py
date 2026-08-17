@@ -51,6 +51,10 @@ CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
 PROTECTED_LOCAL_IMAGES = ("local/ai-go-toolchain",)
+# Mattermost compile uses a shared 8G build.swap and ~3.6G RAM; a second
+# concurrent job swapoff/OOM-kills webpack. Override via services.json
+# `max_concurrent` when needed.
+DEFAULT_SERVICE_CONCURRENCY = {"mattermost": 1}
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
@@ -143,6 +147,33 @@ def _job_service_ids(job: dict[str, Any]) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
+def service_concurrency_cap(service_id: str) -> int | None:
+    """Per-service cap. None means no extra limit beyond the global job cap."""
+    for item in load_services():
+        if item.get("id") != service_id:
+            continue
+        raw = item.get("max_concurrent")
+        if raw is None:
+            break
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            break
+        return value if value > 0 else None
+    return DEFAULT_SERVICE_CONCURRENCY.get(service_id)
+
+
+def other_job_uses_build_swap(job_id: str) -> bool:
+    """True if another running job still needs the shared compile swap."""
+    with _jobs_lock:
+        return any(
+            str(job.get("id") or "") != str(job_id)
+            and job.get("status") == "running"
+            and "mattermost" in _job_service_ids(job)
+            for job in _jobs.values()
+        )
+
+
 def _running_jobs_locked() -> list[dict[str, Any]]:
     return [job for job in _jobs.values() if job.get("status") == "running"]
 
@@ -193,9 +224,12 @@ def list_running_job_summaries(client_id: str = "") -> list[dict[str, Any]]:
 def register_concurrent_job(job: dict[str, Any]) -> dict[str, Any] | None:
     """
     Register a job for concurrent execution.
-    Same microservice may run twice: each job clones into its own workspace.
-    Returns an error payload when the global job cap is reached.
+    Same microservice may run twice except services with max_concurrent
+    (mattermost defaults to 1 because of shared build.swap / RAM).
+    Returns an error payload when the global or per-service cap is reached.
     """
+    incoming = _job_service_ids(job)
+    caps = {sid: service_concurrency_cap(sid) for sid in incoming}
     with _jobs_lock:
         running = _running_jobs_locked()
         limit = max_concurrent_jobs()
@@ -207,6 +241,22 @@ def register_concurrent_job(job: dict[str, Any]) -> dict[str, Any] | None:
                     deepcopy({key: item.get(key) for key in JOB_COMPACT_FIELDS}) for item in running
                 ],
             }
+        for service_id, cap in caps.items():
+            if not cap:
+                continue
+            same = [item for item in running if service_id in _job_service_ids(item)]
+            if len(same) >= cap:
+                return {
+                    "error": (
+                        f"{service_id} 正在编译（{len(same)}/{cap}），"
+                        "请等当前任务结束后再提交"
+                    ),
+                    "error_code": "service_busy",
+                    "service": service_id,
+                    "active_jobs": [
+                        deepcopy({key: item.get(key) for key in JOB_COMPACT_FIELDS}) for item in same
+                    ],
+                }
         _jobs[str(job["id"])] = job
     return None
 
@@ -2062,6 +2112,12 @@ def drop_build_swap_file(path: Path, job_id: str) -> bool:
 
 def reclaim_build_swap(job_id: str) -> int:
     """Compile swap is scratch only; drop it after the job so it does not occupy disk."""
+    if other_job_uses_build_swap(job_id):
+        append_job_log(
+            job_id,
+            "skipping build.swap reclaim: another mattermost job is still compiling",
+        )
+        return 0
     removed = 0
     for path in iter_build_swap_files():
         if drop_build_swap_file(path, job_id):

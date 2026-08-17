@@ -56,7 +56,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 ## 多人并发与页面刷新
 
-服务器最多同时跑 `max_concurrent_jobs` 个构建任务（默认 5）。**同一微服务也可以并发**：每个任务 clone 到独立目录 `<workspace_root>/<仓库名>--<job_id>`，避免互相 `rmtree` 对方的 checkout。`public-service` 仍是共享旁路目录（加锁更新、不删除），好让 `deploy.sh` 继续用 `../public-service`。达到并发上限时新请求返回 `409`。
+服务器最多同时跑 `max_concurrent_jobs` 个构建任务（默认 5）。**同一微服务也可以并发**（每个任务 clone 到 `<workspace_root>/<仓库名>--<job_id>`），但 **mattermost 例外：全机同时只允许 1 个**（`max_concurrent: 1`）。它和别人共用 `/opt/ai/build-cache/build.swap` 和约 3.6G 内存，两趟叠在一起会把 webpack 打死。`public-service` 仍是共享旁路目录（加锁更新、不删除），好让 `deploy.sh` 继续用 `../public-service`。达到全局或单服务并发上限时新请求返回 `409`。
 
 页面按游标增量读取运行中日志，避免大日志重复传输和慢请求乱序覆盖。任务日志只显示当前这一次构建；本浏览器（`client_id`）的历史任务在「构建历史」里分页查看，点「查看日志」再打开那一次的详情。浏览器只在本地保存 10 分钟“最近查看的 job ID”，用于规避刷新时任务恰好完成造成的日志回显丢失。已完成的 job ID 不占用锁。新任务开始时会清掉该服务已结束任务留下的 `--<job_id>` 目录。
 
@@ -64,7 +64,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 磁盘回收在创建归档目录、`docker save` 之前、以及任务结束（成功或失败）时执行：
 
-1. **始终** `swapoff` 并删除 `/opt/ai/build-cache/build.swap` 和 `/home/ci/**/build.swap`（mattermost 编译期临时交换文件，编完不应占盘）。
+1. **始终** `swapoff` 并删除 `/opt/ai/build-cache/build.swap` 和 `/home/ci/**/build.swap`（mattermost 编译期临时交换文件，编完不应占盘）。**例外**：另有 mattermost 任务仍在编译时跳过，避免把别人正在用的 swap 卸掉。
 2. 使用率超过 **80%** 时，先删 `/usr/share/nginx/html/images` 下较旧的时间戳归档（优先保留最近 3 个；仍高于 80% 则删到只剩最新 1 个）。被删掉的包在「产物管理」里会显示为已失效。
 3. 归档清完仍 ≥ 80% 时，再跑 `docker builder prune -af`，只回收 BuildKit 层缓存，不动已有镜像。
 

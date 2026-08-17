@@ -10,10 +10,11 @@ from urllib.request import ProxyHandler, Request, build_opener
 import server
 
 
-def make_job(job_id: str, status: str = "running") -> dict:
+def make_job(job_id: str, status: str = "running", service_id: str = "memory-service") -> dict:
     return {
         "id": job_id,
-        "service_id": "memory-service",
+        "service_id": service_id,
+        "service_ids": [service_id],
         "branch": "main",
         "status": status,
         "stage": "testing",
@@ -23,12 +24,12 @@ def make_job(job_id: str, status: str = "running") -> dict:
         "archive_dir": None,
         "results": [],
         "progress": "1/1",
-        "current": "memory-service",
+        "current": service_id,
         "commit_sha": "abc123",
         "test_status": "passed",
         "test_summary": {"total": 1, "passed": 1},
         "test_report": None,
-        "test_runs": [{"service_id": "memory-service", "status": "passed"}],
+        "test_runs": [{"service_id": service_id, "status": "passed"}],
         "log": [],
         "ui_log": [],
     }
@@ -73,6 +74,26 @@ class JobCoordinationTests(unittest.TestCase):
         self.assertIsNone(server.register_job_if_idle(second))
         ids = {item["id"] for item in server.list_running_job_summaries()}
         self.assertEqual({"job-a", "job-b"}, ids)
+
+    def test_mattermost_second_job_is_rejected(self) -> None:
+        first = make_job("mm-a", service_id="mattermost")
+        second = make_job("mm-b", service_id="mattermost")
+        self.assertIsNone(server.register_job_if_idle(first))
+        conflict = server.register_concurrent_job(second)
+        self.assertEqual("service_busy", conflict["error_code"])
+        self.assertEqual("mattermost", conflict["service"])
+        self.assertEqual(["mm-a"], [item["id"] for item in conflict["active_jobs"]])
+        self.assertIsNone(server._jobs.get("mm-b"))
+
+    def test_batch_including_mattermost_is_rejected_while_mattermost_runs(self) -> None:
+        self.assertIsNone(server.register_job_if_idle(make_job("mm-a", service_id="mattermost")))
+        mixed = make_job("batch-b")
+        mixed["service_id"] = "memory-service,mattermost"
+        mixed["service_ids"] = ["memory-service", "mattermost"]
+        conflict = server.register_concurrent_job(mixed)
+        self.assertEqual("service_busy", conflict["error_code"])
+        self.assertEqual("mattermost", conflict["service"])
+        self.assertIsNone(server._jobs.get("batch-b"))
 
     def test_completed_saved_job_does_not_block_the_next_job(self) -> None:
         first = make_job("first-job")
@@ -503,6 +524,23 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual("concurrency_limit", payload["error_code"])
         self.assertEqual(server.max_concurrent_jobs(), len(payload["active_jobs"]))
 
+    def test_push_hits_mattermost_service_busy(self) -> None:
+        job = make_job("mm-active", service_id="mattermost")
+        self.assertIsNone(server.register_job_if_idle(job))
+        request = Request(
+            self.base_url + "/api/push",
+            data=json.dumps({"items": [{"service_id": "mattermost", "branch": "main"}]}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with patch.object(server, "check_docker", return_value={"ok": True, "detail": ""}):
+            with self.assertRaises(HTTPError) as raised:
+                self.opener.open(request, timeout=2)
+        self.assertEqual(409, raised.exception.code)
+        payload = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual("service_busy", payload["error_code"])
+        self.assertEqual("mattermost", payload["service"])
+
     def test_multica_server_version_is_validated_before_build(self) -> None:
         request = Request(
             self.base_url + "/api/push",
@@ -683,6 +721,45 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertTrue((ci_tmp / "keep.txt").is_file())
         if server.os.name != "nt":
             self.assertTrue(any(args[0][0] == "swapoff" for args, _ in run_cmd.call_args_list))
+
+    def test_reclaim_swap_skips_when_other_mattermost_running(self) -> None:
+        with server._jobs_lock:
+            saved = dict(server._jobs)
+            server._jobs.clear()
+            server._jobs["mm-run"] = make_job("mm-run", service_id="mattermost")
+        try:
+            root = server.Path(self.tmp.name)
+            cache = root / "build-cache-busy"
+            cache.mkdir()
+            (cache / "build.swap").write_bytes(b"swap-live")
+            with patch.dict(server.CFG, {"build_cache_root": str(cache), "ci_tmp_root": str(root / "empty-ci")}):
+                removed = server.reclaim_build_swap("other-job")
+            self.assertEqual(0, removed)
+            self.assertTrue((cache / "build.swap").exists())
+        finally:
+            with server._jobs_lock:
+                server._jobs.clear()
+                server._jobs.update(saved)
+
+    def test_reclaim_swap_runs_when_finishing_job_is_the_mattermost_job(self) -> None:
+        with server._jobs_lock:
+            saved = dict(server._jobs)
+            server._jobs.clear()
+            server._jobs["mm-run"] = make_job("mm-run", service_id="mattermost")
+        try:
+            root = server.Path(self.tmp.name)
+            cache = root / "build-cache-self"
+            cache.mkdir()
+            (cache / "build.swap").write_bytes(b"swap-done")
+            with patch.dict(server.CFG, {"build_cache_root": str(cache), "ci_tmp_root": str(root / "empty-ci-self")}):
+                with patch.object(server, "run_cmd", return_value=(0, "")):
+                    removed = server.reclaim_build_swap("mm-run")
+            self.assertEqual(1, removed)
+            self.assertFalse((cache / "build.swap").exists())
+        finally:
+            with server._jobs_lock:
+                server._jobs.clear()
+                server._jobs.update(saved)
 
     @patch.object(server, "docker_cmd", return_value=(0, "Total: 1GB"))
     def test_reclaim_skips_builder_prune_below_80_percent(self, docker_cmd) -> None:
