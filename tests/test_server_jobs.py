@@ -839,6 +839,74 @@ class BuildHistoryTests(unittest.TestCase):
         self.assertEqual("dddddddddddd", page["jobs"][0]["id"])
         self.assertEqual("running", page["jobs"][0]["status"])
 
+    def test_reap_orphaned_running_jobs_marks_disk_jobs_failed(self) -> None:
+        running = {
+            "id": "eeeeeeeeeeee",
+            "client_id": "cmsqxcxcesgairws0",
+            "status": "running",
+            "stage": "building",
+            "error": None,
+        }
+        finished = {
+            "id": "ffffffffffff",
+            "client_id": "cmsqxcxcesgairws0",
+            "status": "ok",
+            "stage": "done",
+        }
+        (self.log_dir / "job-eeeeeeeeeeee.json").write_text(
+            json.dumps(running), encoding="utf-8"
+        )
+        (self.log_dir / "job-ffffffffffff.json").write_text(
+            json.dumps(finished), encoding="utf-8"
+        )
+        (self.log_dir / "job-eeeeeeeeeeee.log").write_text("still going\n", encoding="utf-8")
+        self.assertEqual(1, server.reap_orphaned_running_jobs())
+        dead = json.loads((self.log_dir / "job-eeeeeeeeeeee.json").read_text(encoding="utf-8"))
+        kept = json.loads((self.log_dir / "job-ffffffffffff.json").read_text(encoding="utf-8"))
+        self.assertEqual("failed", dead["status"])
+        self.assertEqual("interrupted", dead["stage"])
+        self.assertEqual(server.INTERRUPTED_JOB_ERROR, dead["error"])
+        self.assertEqual("ok", kept["status"])
+        log_text = (self.log_dir / "job-eeeeeeeeeeee.log").read_text(encoding="utf-8")
+        self.assertIn(server.INTERRUPTED_JOB_ERROR, log_text)
+
+    def test_prune_build_history_trims_to_50_when_over_100(self) -> None:
+        mine = "cmsqxcxcesgairws0"
+        for index in range(101):
+            job_id = f"{index:012d}"
+            payload = {
+                "id": job_id,
+                "client_id": mine,
+                "created_at": f"2026-08-01T{index:05d}",
+                "service_id": "temporal",
+                "status": "ok",
+            }
+            (self.log_dir / f"job-{job_id}.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+            (self.log_dir / f"job-{job_id}.log").write_text("log\n", encoding="utf-8")
+        removed = server.prune_build_history(mine)
+        self.assertEqual(51, removed)
+        remaining = sorted(path.stem.replace("job-", "") for path in self.log_dir.glob("job-*.json"))
+        self.assertEqual(50, len(remaining))
+        self.assertNotIn("000000000000", remaining)
+        self.assertIn("000000000100", remaining)
+
+    def test_record_build_artifact_trims_to_50_when_over_100(self) -> None:
+        path = server.artifacts_log_path()
+        for index in range(101):
+            server.record_build_artifact(
+                {
+                    "created_at": f"2026-08-01 {index:02d}:00:00",
+                    "service_id": f"svc-{index}",
+                    "archive": f"/tmp/{index}.tar",
+                }
+            )
+        entries = server._parse_artifact_entries(path.read_text(encoding="utf-8"))
+        self.assertEqual(50, len(entries))
+        self.assertEqual("svc-51", entries[0]["service_id"])
+        self.assertEqual("svc-100", entries[-1]["service_id"])
+
 
 class BusinessImageAndTmpTests(unittest.TestCase):
     def test_protected_base_images_are_not_removed(self) -> None:

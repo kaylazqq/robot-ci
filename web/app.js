@@ -31,8 +31,79 @@ const CLIENT_ID_KEY = "robotCiClientId";
 const LAST_JOB_TTL_MS = 10 * 60 * 1000;
 const DAEMON_VERSION_KEY = "robotCiDaemonVersion";
 const DAEMON_VERSION_PATTERN = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
+const LOG_FOLLOW_SLOP_PX = 48;
 let myJobs = [];
 let submitting = false;
+const liveLogFollow = newLogFollowState();
+const historyLogFollow = newLogFollowState();
+
+function newLogFollowState() {
+  return { dragging: false, follow: true, pendingText: null, flush: null };
+}
+
+function resetLogFollow(state) {
+  state.dragging = false;
+  state.follow = true;
+  state.pendingText = null;
+}
+
+function isLogNearBottom(el) {
+  if (!el) return true;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= LOG_FOLLOW_SLOP_PX;
+}
+
+function bindLogFollow(el, state) {
+  if (!el || el.dataset.logFollowBound === "1") return;
+  el.dataset.logFollowBound = "1";
+  const onDown = () => {
+    state.dragging = true;
+  };
+  const onUp = () => {
+    if (!state.dragging) return;
+    state.dragging = false;
+    state.follow = isLogNearBottom(el);
+    if (typeof state.flush === "function") state.flush();
+  };
+  el.addEventListener("pointerdown", onDown);
+  el.addEventListener("mousedown", onDown);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("mouseup", onUp);
+  window.addEventListener("pointercancel", onUp);
+  el.addEventListener("scroll", () => {
+    if (state.dragging) {
+      state.follow = false;
+      return;
+    }
+    state.follow = isLogNearBottom(el);
+  });
+}
+
+function paintLog(el, text, state) {
+  if (!el) return;
+  bindLogFollow(el, state);
+  const write = (nextText) => {
+    const keepTop = el.scrollTop;
+    const stick = state.follow && !state.dragging;
+    if (el.textContent === nextText) {
+      if (stick) el.scrollTop = el.scrollHeight;
+      return;
+    }
+    el.textContent = nextText;
+    el.scrollTop = stick ? el.scrollHeight : keepTop;
+  };
+  state.flush = () => {
+    if (state.pendingText === null) return;
+    const nextText = state.pendingText;
+    state.pendingText = null;
+    write(nextText);
+  };
+  if (state.dragging) {
+    state.pendingText = text;
+    return;
+  }
+  state.pendingText = null;
+  write(text);
+}
 
 function clientId() {
   try {
@@ -124,7 +195,11 @@ function showJob(msg, logText) {
   const meta = $("jobMeta");
   const log = $("jobLog");
   if (meta) meta.textContent = msg;
-  if (log && logText !== undefined) log.textContent = logText;
+  if (log && logText !== undefined) {
+    resetLogFollow(liveLogFollow);
+    log.textContent = logText;
+    log.scrollTop = log.scrollHeight;
+  }
   renderTestResult(null);
   const panel = $("logsPanel");
   if (panel && getMainView() === "services") {
@@ -438,6 +513,7 @@ function openHistoryJob(jobId, summary) {
   if (detail) detail.hidden = false;
   if (meta) meta.textContent = (summary || jobId) + " · 加载中…";
   if (logEl) {
+    resetLogFollow(historyLogFollow);
     logEl.textContent = "正在加载这次构建的日志…";
     logEl.scrollTop = 0;
   }
@@ -457,8 +533,7 @@ function openHistoryJob(jobId, summary) {
         ? Number(job.log_cursor)
         : historyLogLines.length;
       if (logEl) {
-        logEl.textContent = displayJobLog(historyLogLines);
-        logEl.scrollTop = logEl.scrollHeight;
+        paintLog(logEl, displayJobLog(historyLogLines), historyLogFollow);
       }
       if (meta) {
         meta.textContent =
@@ -1151,6 +1226,7 @@ function resetJobView() {
   testRevision = -1;
   cachedTestRuns = [];
   pollFails = 0;
+  resetLogFollow(liveLogFollow);
 }
 
 function scheduleActiveProbe(delay = 1500) {
@@ -1284,8 +1360,7 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
     const renderJob = { ...job, test_runs: cachedTestRuns };
     const logEl = $("jobLog");
     if (logEl) {
-      logEl.textContent = displayJobLog(liveLogLines);
-      logEl.scrollTop = logEl.scrollHeight;
+      paintLog(logEl, displayJobLog(liveLogLines), liveLogFollow);
     }
     renderTestResult(renderJob);
     const progress = job.progress ? " · " + job.progress : "";

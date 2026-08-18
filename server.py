@@ -42,10 +42,12 @@ _branch_cache_lock = threading.Lock()
 _artifacts_lock = threading.Lock()
 _public_service_lock = threading.Lock()
 _fleet_cache_lock = threading.Lock()
-ARTIFACTS_MAX_ENTRIES = 500
+ARTIFACTS_MAX_ENTRIES = 100
+ARTIFACTS_TRIM_TO = 50
 ARTIFACTS_DEFAULT_PAGE_SIZE = 20
 HISTORY_DEFAULT_PAGE_SIZE = 20
-HISTORY_MAX_ENTRIES = 500
+HISTORY_MAX_ENTRIES = 100
+HISTORY_TRIM_TO = 50
 DISK_USAGE_PRUNE_RATIO = 0.80
 CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
@@ -360,6 +362,116 @@ def job_meta_path(job_id: str) -> Path:
     return LOG_DIR / f"job-{job_id}.json"
 
 
+def delete_job_disk_files(job_id: str) -> None:
+    """Remove persisted job meta, log, and test report files."""
+    for name in (f"job-{job_id}.json", f"job-{job_id}.log"):
+        try:
+            (LOG_DIR / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    for path in LOG_DIR.glob(f"job-{job_id}-*-test.json"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _running_job_ids_for_client(client_id: str) -> set[str]:
+    want = _normalize_client_id(client_id)
+    if not want:
+        return set()
+    with _jobs_lock:
+        return {
+            str(job.get("id") or "")
+            for job in _jobs.values()
+            if _normalize_client_id(job.get("client_id")) == want and job.get("status") == "running"
+            if str(job.get("id") or "")
+        }
+
+
+def prune_build_history(client_id: str, keep_job_id: str = "") -> int:
+    """When one browser has >100 history rows, delete oldest down to 50."""
+    want = _normalize_client_id(client_id)
+    if not want:
+        return 0
+    rows: list[tuple[str, dict[str, Any], float]] = []
+    for path in LOG_DIR.glob("job-*.json"):
+        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
+        if not match:
+            continue
+        job_id = match.group(1)
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if _normalize_client_id(meta.get("client_id")) != want:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        meta.setdefault("id", job_id)
+        rows.append((job_id, meta, mtime))
+    if len(rows) <= HISTORY_MAX_ENTRIES:
+        return 0
+    rows.sort(key=lambda item: (_history_created_at(item[1], item[2]), item[0]))
+    keep_ids = {job_id for job_id, _, _ in rows[-HISTORY_TRIM_TO:]}
+    keep_ids.update(_running_job_ids_for_client(want))
+    if keep_job_id:
+        keep_ids.add(str(keep_job_id))
+    removed = 0
+    for job_id, _, _ in rows:
+        if job_id in keep_ids:
+            continue
+        delete_job_disk_files(job_id)
+        with _jobs_lock:
+            _jobs.pop(job_id, None)
+        removed += 1
+    return removed
+
+
+def prune_all_build_histories() -> int:
+    clients: set[str] = set()
+    for path in LOG_DIR.glob("job-*.json"):
+        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
+        if not match:
+            continue
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        cid = _normalize_client_id(meta.get("client_id"))
+        if cid:
+            clients.add(cid)
+    return sum(prune_build_history(client_id) for client_id in clients)
+
+
+def prune_artifacts_log() -> int:
+    path = artifacts_log_path()
+    if not path.is_file():
+        return 0
+    with _artifacts_lock:
+        try:
+            entries = _parse_artifact_entries(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return 0
+        trimmed = trim_artifact_entries(entries)
+        if len(trimmed) >= len(entries):
+            return 0
+        try:
+            path.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in trimmed),
+                encoding="utf-8",
+            )
+        except OSError:
+            return 0
+        return len(entries) - len(trimmed)
+
+
 def artifacts_log_path() -> Path:
     return LOG_DIR / "artifacts.jsonl"
 
@@ -420,6 +532,20 @@ def _parse_artifact_entries(text: str) -> list[dict[str, Any]]:
     return out
 
 
+def trim_oldest_when_over(items: list[Any], max_entries: int, trim_to: int) -> list[Any]:
+    """Keep append order; when over max_entries, drop oldest down to trim_to."""
+    if len(items) <= max_entries:
+        return items
+    keep = max(0, int(trim_to))
+    if keep <= 0:
+        return []
+    return items[-keep:]
+
+
+def trim_artifact_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return trim_oldest_when_over(entries, ARTIFACTS_MAX_ENTRIES, ARTIFACTS_TRIM_TO)
+
+
 def annotate_artifact_entry(item: dict[str, Any]) -> dict[str, Any]:
     """Mark a row expired when its archive file is gone (prune or manual delete)."""
     archive = str(item.get("archive") or "")
@@ -441,11 +567,11 @@ def record_build_artifact(entry: dict[str, Any]) -> None:
         try:
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
-            # Keep file bounded so the UI stays fast after many builds.
             text = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            if len(text) > ARTIFACTS_MAX_ENTRIES:
+            trimmed = trim_artifact_entries(_parse_artifact_entries("\n".join(text)))
+            if len(trimmed) < len(text):
                 path.write_text(
-                    "\n".join(text[-ARTIFACTS_MAX_ENTRIES:]) + "\n",
+                    "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in trimmed),
                     encoding="utf-8",
                 )
         except OSError:
@@ -475,9 +601,10 @@ def sync_artifact_availability() -> int:
                 "download_url": annotated["download_url"],
             }
             updated.append(persisted)
+        trimmed = trim_artifact_entries(updated)
         try:
             path.write_text(
-                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in updated[-ARTIFACTS_MAX_ENTRIES:]),
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in trimmed),
                 encoding="utf-8",
             )
         except OSError:
@@ -650,6 +777,10 @@ def persist_job_meta(job_id: str) -> None:
         )
     except OSError:
         pass
+    else:
+        client_id = _normalize_client_id(meta.get("client_id"))
+        if client_id:
+            prune_build_history(client_id, keep_job_id=job_id)
 
 
 def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
@@ -697,6 +828,40 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "test_runs": meta.get("test_runs") or [],
         "log": log_lines,
     }
+
+
+INTERRUPTED_JOB_ERROR = "helper restarted while this job was running"
+
+
+def reap_orphaned_running_jobs() -> int:
+    """Mark disk jobs still status=running after a helper restart as failed."""
+    marked = 0
+    for path in LOG_DIR.glob("job-*.json"):
+        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
+        if not match:
+            continue
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(meta, dict) or meta.get("status") != "running":
+            continue
+        meta["status"] = "failed"
+        meta["stage"] = "interrupted"
+        meta["error"] = INTERRUPTED_JOB_ERROR
+        try:
+            path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            continue
+        job_id = match.group(1)
+        try:
+            ts = time.strftime("%H:%M:%S")
+            with (LOG_DIR / f"job-{job_id}.log").open("a", encoding="utf-8") as fh:
+                fh.write(f"[{ts}] FAILED {INTERRUPTED_JOB_ERROR}\n")
+        except OSError:
+            pass
+        marked += 1
+    return marked
 
 
 def load_config() -> dict[str, Any]:
@@ -3179,6 +3344,16 @@ def main() -> None:
     apply_ci_tmp_env()
     print(f"[swr-push-helper] ci_tmp={ci_tmp_root()}", flush=True)
     print(f"[swr-push-helper] allow_remote={allow_remote}", flush=True)
+    reaped = reap_orphaned_running_jobs()
+    if reaped:
+        print(f"[swr-push-helper] marked {reaped} interrupted job(s) after restart", flush=True)
+    pruned_artifacts = prune_artifacts_log()
+    pruned_history = prune_all_build_histories()
+    if pruned_artifacts or pruned_history:
+        print(
+            f"[swr-push-helper] trimmed records: artifacts={pruned_artifacts} history_jobs={pruned_history}",
+            flush=True,
+        )
     # Fast local signal for UI; full registry probe in background (don't block startup).
     fast = login_status_fast()
     print(f"[swr-push-helper] shared SWR login (local)={fast}", flush=True)
