@@ -52,7 +52,12 @@ DISK_USAGE_PRUNE_RATIO = 0.80
 CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
-PROTECTED_LOCAL_IMAGES = ("local/ai-go-toolchain",)
+PROTECTED_LOCAL_IMAGES = (
+    "local/ai-go-toolchain",
+    "multica-cloud-opencode",
+    "multica-cloud-hermes",
+)
+PROTECTED_IMAGE_HOLD_PREFIX = "ci-protect-"
 # Mattermost compile uses a shared 8G build.swap and ~3.6G RAM; a second
 # concurrent job swapoff/OOM-kills webpack. Override via services.json
 # `max_concurrent` when needed.
@@ -986,6 +991,46 @@ def is_protected_base_image(ref: str) -> bool:
     if not name or name == "archive-only":
         return True
     return any(name == prefix or name.startswith(prefix + ":") for prefix in PROTECTED_LOCAL_IMAGES)
+
+
+def _protected_image_hold_name(ref: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", ref).strip("-._") or "image"
+    return f"{PROTECTED_IMAGE_HOLD_PREFIX}{slug}"[:63]
+
+
+def list_local_image_refs() -> list[str]:
+    code, out = docker_cmd("images", "--format", "{{.Repository}}:{{.Tag}}", timeout=120)
+    if code != 0:
+        return []
+    refs: list[str] = []
+    for line in (out or "").splitlines():
+        ref = line.strip()
+        if ref and "<none>" not in ref:
+            refs.append(ref)
+    return refs
+
+
+def ensure_protected_image_holds() -> None:
+    """Pin protected images with stopped containers so image prune keeps them."""
+    for ref in list_local_image_refs():
+        if not is_protected_base_image(ref):
+            continue
+        name = _protected_image_hold_name(ref)
+        code, _ = docker_cmd("inspect", "-f", "{{.Id}}", name, timeout=30)
+        if code == 0:
+            continue
+        docker_cmd("create", "--name", name, ref, "true", timeout=60)
+
+
+def reclaim_unused_docker_images(job_id: str) -> None:
+    """Remove unused Docker images. Protected toolchain / Fleet runtime images are kept."""
+    append_job_log(job_id, "pruning unused docker images (protected base images kept)")
+    ensure_protected_image_holds()
+    code, out = docker_cmd("image", "prune", "-af", timeout=300)
+    for line in (out or "").splitlines()[-8:]:
+        append_job_log(job_id, line)
+    if code != 0:
+        append_job_log(job_id, f"WARN: docker image prune failed: {(out or '')[-200:]}")
 
 
 def remove_business_images(job_id: str, *refs: str) -> None:
@@ -2291,8 +2336,8 @@ def reclaim_build_swap(job_id: str) -> int:
 
 
 def reclaim_docker_builder_cache(job_id: str) -> None:
-    """Free BuildKit layer cache. Never `docker image prune` (keeps base images)."""
-    append_job_log(job_id, "pruning docker builder cache (images kept)")
+    """Free BuildKit layer cache after unused images are dropped."""
+    append_job_log(job_id, "pruning docker builder cache")
     code, out = docker_cmd("builder", "prune", "-af", timeout=300)
     for line in (out or "").splitlines()[-8:]:
         append_job_log(job_id, line)
@@ -2309,7 +2354,7 @@ def reclaim_ci_disk(
     """CI disk reclaim used before archive and at job end.
 
     Always drop leftover build.swap. If usage is still >= 80%, prune nginx
-    timestamp archives, then Docker builder cache. Never docker image prune.
+    timestamp archives, unused Docker images, then BuildKit builder cache.
     """
     reclaim_build_swap(job_id)
     probe = Path((CFG.get("archive_root") or "/").rstrip("/") or "/")
@@ -2338,7 +2383,18 @@ def reclaim_ci_disk(
         return
     append_job_log(
         job_id,
-        f"disk still {ratio:.0%} after archive prune; reclaim docker builder cache",
+        f"disk still {ratio:.0%} after archive prune; reclaim unused docker images",
+    )
+    reclaim_unused_docker_images(job_id)
+    stats = disk_usage_ratio(probe)
+    if stats is None:
+        return
+    ratio, total, free = stats
+    if ratio < max_usage_ratio:
+        return
+    append_job_log(
+        job_id,
+        f"disk still {ratio:.0%} after image prune; reclaim docker builder cache",
     )
     reclaim_docker_builder_cache(job_id)
     stats = disk_usage_ratio(probe)

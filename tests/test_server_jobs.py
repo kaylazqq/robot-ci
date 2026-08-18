@@ -768,14 +768,22 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server.reclaim_ci_disk("job-1")
         docker_cmd.assert_not_called()
 
+    @patch.object(server, "ensure_protected_image_holds")
     @patch.object(server, "docker_cmd", return_value=(0, "Total: 32GB"))
-    def test_reclaim_prunes_builder_cache_when_still_over_80(self, docker_cmd) -> None:
+    def test_reclaim_prunes_images_then_builder_when_still_over_80(
+        self, docker_cmd, ensure_holds
+    ) -> None:
         self._stamp_dir("20260804000000")
         with patch.object(server.shutil, "disk_usage", return_value=self._disk(960)):
             with patch.object(server, "reclaim_build_swap", return_value=0):
                 server.reclaim_ci_disk("job-1")
-        docker_cmd.assert_called_once_with("builder", "prune", "-af", timeout=300)
-        self.assertFalse(any("image" in str(call) and "prune" in str(call) for call in docker_cmd.call_args_list))
+        ensure_holds.assert_called()
+        prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
+        self.assertIn(("image", "prune", "-af"), prune_args)
+        self.assertIn(("builder", "prune", "-af"), prune_args)
+        image_index = prune_args.index(("image", "prune", "-af"))
+        builder_index = prune_args.index(("builder", "prune", "-af"))
+        self.assertLess(image_index, builder_index)
 
 
 class BuildHistoryTests(unittest.TestCase):
@@ -911,6 +919,8 @@ class BuildHistoryTests(unittest.TestCase):
 class BusinessImageAndTmpTests(unittest.TestCase):
     def test_protected_base_images_are_not_removed(self) -> None:
         self.assertTrue(server.is_protected_base_image("local/ai-go-toolchain:1.26.4"))
+        self.assertTrue(server.is_protected_base_image("multica-cloud-opencode:demo"))
+        self.assertTrue(server.is_protected_base_image("multica-cloud-hermes:demo"))
         self.assertTrue(server.is_protected_base_image("archive-only"))
         self.assertFalse(server.is_protected_base_image("local/temporal-server:202608151143_eecea40"))
         self.assertFalse(
