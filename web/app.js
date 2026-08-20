@@ -1500,7 +1500,7 @@ function applyHwCloudCreds() {
   updateHwCredStatus();
   setCceControlsEnabled(true);
   const log = $("cceLog");
-  if (log) log.textContent = "凭证已启用（仅当前页面内存）。可刷新集群列表。";
+  if (log) log.textContent = "凭证已启用（SK 已从输入框清除，仍保留在页面内存）。可刷新集群列表。";
 }
 
 function requireHwCloudCreds() {
@@ -1522,6 +1522,17 @@ async function hwCcePost(path, extra) {
       ...(extra || {}),
     }),
   });
+}
+
+function formatCceError(err) {
+  let msg = String((err && err.message) || err || "unknown error");
+  const data = err && err.data;
+  if (data && data.detail) {
+    const detail =
+      typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail, null, 2);
+    msg += "\n" + detail;
+  }
+  return msg;
 }
 
 function setCceLog(text) {
@@ -1610,7 +1621,7 @@ function renderCceWorkloads(rows) {
   body.querySelectorAll(".cce-detail-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       const name = btn.getAttribute("data-name") || "";
-      loadCceWorkloadDetail(name).catch((e) => setCceLog(String(e.message || e)));
+      loadCceWorkloadDetail(name).catch((e) => setCceLog(formatCceError(e)));
     });
   });
 }
@@ -1703,10 +1714,10 @@ if (hwRegionEl) {
   });
 }
 bind("btnCceRefreshClusters", () => {
-  refreshCceClusters().catch((e) => setCceLog(String(e.message || e)));
+  refreshCceClusters().catch((e) => setCceLog(formatCceError(e)));
 });
 bind("btnCceRefreshWorkloads", () => {
-  refreshCceWorkloads().catch((e) => setCceLog(String(e.message || e)));
+  refreshCceWorkloads().catch((e) => setCceLog(formatCceError(e)));
 });
 
 window.addEventListener("beforeunload", () => {

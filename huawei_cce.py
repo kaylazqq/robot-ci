@@ -1,15 +1,13 @@
-"""Huawei Cloud CCE + Kubernetes API helpers (AK/SK → IAM token → cluster/workload APIs)."""
+"""Huawei Cloud CCE + Kubernetes API helpers (AK/SK signed requests)."""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+
+from huawei_sdk_http import HuaweiCloudHttpError, request_json
 
 IAM_ENDPOINT = "https://iam.myhuaweicloud.com"
 
-# Common Huawei Cloud regions (extend as needed).
 REGIONS: dict[str, dict[str, str]] = {
     "cn-southwest-2": {"label": "西南-贵阳一", "cce_endpoint": "cce.cn-southwest-2.myhuaweicloud.com"},
     "cn-north-4": {"label": "华北-北京四", "cce_endpoint": "cce.cn-north-4.myhuaweicloud.com"},
@@ -45,7 +43,8 @@ class HuaweiCCEError(RuntimeError):
 
 @dataclass(frozen=True)
 class AuthContext:
-    token: str
+    access_key: str
+    secret_key: str
     project_id: str
     project_name: str
     region: str
@@ -75,161 +74,46 @@ def k8s_gateway_base_url(region: str, cluster_id: str) -> str:
     return f"https://{cluster_id}.{host}"
 
 
-def _request_json(
-    method: str,
-    url: str,
-    *,
-    token: str | None = None,
-    body: dict[str, Any] | None = None,
-    timeout: int = 30,
-) -> tuple[int, dict[str, Any], dict[str, str]]:
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if token:
-        headers["X-Auth-Token"] = token
-    data = None
-    if body is not None:
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = Request(url, data=data, headers=headers, method=method.upper())
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-            payload = json.loads(raw) if raw.strip() else {}
-            hdrs = {k.lower(): v for k, v in resp.headers.items()}
-            return int(resp.status), payload if isinstance(payload, dict) else {"data": payload}, hdrs
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw) if raw.strip() else {}
-        except json.JSONDecodeError:
-            payload = {"error": raw[:500]}
-        if not isinstance(payload, dict):
-            payload = {"error": str(payload)}
-        message = (
-            str(payload.get("error_msg") or payload.get("message") or payload.get("error") or exc.reason)
-            or f"HTTP {exc.code}"
+def _friendly_iam_message(message: str, detail: Any) -> str:
+    code = ""
+    if isinstance(detail, dict):
+        code = str(detail.get("error_code") or detail.get("code") or "")
+    text = (message or "").strip()
+    if code == "APIGW.0301" or "Incorrect IAM authentication information" in text:
+        return (
+            "华为云 IAM 认证失败（AK/SK 无效或不匹配）。"
+            "请使用控制台「我的凭证 → 访问密钥」中的 AK/SK，"
+            "不是 SWR docker login 的临时用户名/密码。"
+            "若连续输错多次，请等待 5 分钟后再试。"
         )
-        raise HuaweiCCEError(message, status=int(exc.code), detail=payload) from exc
-    except json.JSONDecodeError as exc:
-        raise HuaweiCCEError("invalid JSON response from upstream", status=502) from exc
+    return text or "Huawei Cloud API error"
 
 
-def auth_token(
-    access_key: str,
-    secret_key: str,
-    *,
-    region: str,
-    project_id: str = "",
-    project_name: str = "",
-) -> AuthContext:
-    ak = (access_key or "").strip()
-    sk = (secret_key or "").strip()
-    if not ak or not sk:
-        raise HuaweiCCEError("access_key and secret_key are required", status=400)
-    region = normalize_region(region)
-
-    scope: dict[str, Any]
-    if (project_id or "").strip():
-        scope = {"project": {"id": project_id.strip()}}
-    elif (project_name or "").strip():
-        scope = {"project": {"name": project_name.strip()}}
-    else:
-        # Most tenant projects are named after the region id (e.g. cn-southwest-2).
-        scope = {"project": {"name": region}}
-
-    body = {
-        "auth": {
-            "identity": {
-                "methods": ["ak_sk"],
-                "ak_sk": {
-                    "access": {"key": ak},
-                    "secret": {"key": sk},
-                },
-            },
-            "scope": scope,
-        }
-    }
-    _status, payload, headers = _request_json(
-        "POST",
-        f"{IAM_ENDPOINT}/v3/auth/tokens",
-        body=body,
-        timeout=30,
+def _map_http_error(exc: HuaweiCloudHttpError) -> HuaweiCCEError:
+    return HuaweiCCEError(
+        _friendly_iam_message(str(exc), exc.detail),
+        status=exc.status,
+        detail=exc.detail,
     )
-    token = headers.get("x-subject-token") or headers.get("X-Subject-Token".lower())
-    if not token:
-        raise HuaweiCCEError("IAM did not return X-Subject-Token", status=502)
-
-    project = payload.get("token", {}).get("project") if isinstance(payload.get("token"), dict) else {}
-    pid = str((project or {}).get("id") or project_id or "").strip()
-    pname = str((project or {}).get("name") or project_name or region).strip()
-    if not pid:
-        raise HuaweiCCEError(
-            "could not resolve project_id; pass project_id explicitly",
-            status=400,
-            detail=payload,
-        )
-    return AuthContext(token=token, project_id=pid, project_name=pname, region=region)
 
 
-def _domain_scoped_token(access_key: str, secret_key: str, domain_id: str) -> str:
-    body = {
-        "auth": {
-            "identity": {
-                "methods": ["ak_sk"],
-                "ak_sk": {
-                    "access": {"key": access_key.strip()},
-                    "secret": {"key": secret_key.strip()},
-                },
-            },
-            "scope": {"domain": {"id": domain_id.strip()}},
-        }
-    }
-    _status, _payload, headers = _request_json("POST", f"{IAM_ENDPOINT}/v3/auth/tokens", body=body)
-    token = headers.get("x-subject-token") or ""
-    if not token:
-        raise HuaweiCCEError("IAM did not return domain-scoped token", status=502)
-    return token
+def _api(method: str, url: str, access_key: str, secret_key: str, **kwargs: Any) -> tuple[int, dict[str, Any], dict[str, str]]:
+    try:
+        return request_json(method, url, access_key, secret_key, **kwargs)
+    except HuaweiCloudHttpError as exc:
+        raise _map_http_error(exc) from exc
 
 
 def list_projects(access_key: str, secret_key: str, *, region: str) -> list[dict[str, str]]:
     region = normalize_region(region)
-    _status, payload, _headers = _request_json(
-        "POST",
-        f"{IAM_ENDPOINT}/v3/auth/tokens",
-        body={
-            "auth": {
-                "identity": {
-                    "methods": ["ak_sk"],
-                    "ak_sk": {
-                        "access": {"key": access_key.strip()},
-                        "secret": {"key": secret_key.strip()},
-                    },
-                },
-                "scope": {"project": {"name": region}},
-            }
-        },
-    )
-    token_obj = payload.get("token") if isinstance(payload.get("token"), dict) else {}
-    project = token_obj.get("project") if isinstance(token_obj.get("project"), dict) else {}
-    user = token_obj.get("user") if isinstance(token_obj.get("user"), dict) else {}
-    domain = user.get("domain") if isinstance(user.get("domain"), dict) else {}
-    domain_id = str(domain.get("id") or "").strip()
-    fallback = [
-        {
-            "id": str(project.get("id") or ""),
-            "name": str(project.get("name") or region),
-            "region": str(project.get("name") or region),
-        }
-    ]
-    if not domain_id:
-        return fallback
-
-    domain_token = _domain_scoped_token(access_key, secret_key, domain_id)
-    _status, projects_payload, _headers = _request_json(
+    _status, payload, _headers = _api(
         "GET",
-        f"{IAM_ENDPOINT}/v3/projects",
-        token=domain_token,
+        f"{IAM_ENDPOINT}/v3/projects?name={region}",
+        access_key,
+        secret_key,
+        region=region,
     )
-    items = projects_payload.get("projects") if isinstance(projects_payload.get("projects"), list) else []
+    items = payload.get("projects") if isinstance(payload.get("projects"), list) else []
     out: list[dict[str, str]] = []
     for item in items:
         if not isinstance(item, dict):
@@ -241,10 +125,41 @@ def list_projects(access_key: str, secret_key: str, *, region: str) -> list[dict
                 "region": str(item.get("name") or ""),
             }
         )
-    if not out:
-        return fallback
     out.sort(key=lambda row: row.get("name") or "")
-    return out
+    if out:
+        return out
+    return [{"id": "", "name": region, "region": region}]
+
+
+def resolve_auth_context(
+    access_key: str,
+    secret_key: str,
+    *,
+    region: str,
+    project_id: str = "",
+) -> AuthContext:
+    ak = (access_key or "").strip()
+    sk = (secret_key or "").strip()
+    if not ak or not sk:
+        raise HuaweiCCEError("access_key and secret_key are required", status=400)
+    region = normalize_region(region)
+    pid = (project_id or "").strip()
+    pname = region
+    if not pid:
+        projects = list_projects(ak, sk, region=region)
+        match = next(
+            (row for row in projects if (row.get("name") or row.get("region") or "") == region),
+            projects[0] if projects else None,
+        )
+        if match and (match.get("id") or "").strip():
+            pid = str(match["id"]).strip()
+            pname = str(match.get("name") or pname).strip()
+    if not pid:
+        raise HuaweiCCEError(
+            "could not resolve project_id; pass project_id explicitly",
+            status=400,
+        )
+    return AuthContext(access_key=ak, secret_key=sk, project_id=pid, project_name=pname, region=region)
 
 
 def list_clusters(
@@ -254,9 +169,16 @@ def list_clusters(
     region: str,
     project_id: str = "",
 ) -> dict[str, Any]:
-    ctx = auth_token(access_key, secret_key, region=region, project_id=project_id)
+    ctx = resolve_auth_context(access_key, secret_key, region=region, project_id=project_id)
     url = f"{cce_base_url(region)}/api/v3/projects/{ctx.project_id}/clusters?detail=true"
-    _status, payload, _headers = _request_json("GET", url, token=ctx.token)
+    _status, payload, _headers = _api(
+        "GET",
+        url,
+        ctx.access_key,
+        ctx.secret_key,
+        project_id=ctx.project_id,
+        region=ctx.region,
+    )
     items = payload.get("items") if isinstance(payload.get("items"), list) else []
     clusters: list[dict[str, Any]] = []
     for item in items:
@@ -346,10 +268,17 @@ def list_workloads(
     namespace: str = "default",
     kind: str = "deployments",
 ) -> dict[str, Any]:
-    ctx = auth_token(access_key, secret_key, region=region, project_id=project_id)
+    ctx = resolve_auth_context(access_key, secret_key, region=region, project_id=project_id)
     _collection, list_path = _workload_paths(kind, namespace)
     url = f"{k8s_gateway_base_url(region, cluster_id)}{list_path}"
-    _status, payload, _headers = _request_json("GET", url, token=ctx.token)
+    _status, payload, _headers = _api(
+        "GET",
+        url,
+        ctx.access_key,
+        ctx.secret_key,
+        project_id=ctx.project_id,
+        region=ctx.region,
+    )
     items = payload.get("items") if isinstance(payload.get("items"), list) else []
     workloads = [summarize_workload(kind, item, namespace=namespace) for item in items if isinstance(item, dict)]
     workloads.sort(key=lambda row: row.get("name") or "")
@@ -378,10 +307,17 @@ def get_workload_detail(
     workload_name = (name or "").strip()
     if not workload_name:
         raise HuaweiCCEError("workload name is required", status=400)
-    ctx = auth_token(access_key, secret_key, region=region, project_id=project_id)
+    ctx = resolve_auth_context(access_key, secret_key, region=region, project_id=project_id)
     _collection, detail_path = _workload_paths(kind, namespace, workload_name)
     url = f"{k8s_gateway_base_url(region, cluster_id)}{detail_path}"
-    _status, payload, _headers = _request_json("GET", url, token=ctx.token)
+    _status, payload, _headers = _api(
+        "GET",
+        url,
+        ctx.access_key,
+        ctx.secret_key,
+        project_id=ctx.project_id,
+        region=ctx.region,
+    )
     if not isinstance(payload, dict):
         raise HuaweiCCEError("unexpected workload detail payload", status=502)
     summary = summarize_workload(kind, payload, namespace=namespace)

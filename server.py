@@ -983,14 +983,21 @@ def resolve_huawei_credentials(data: dict[str, Any] | None) -> dict[str, str]:
     }
 
 
+def log_cce_api_error(path: str, code: int, message: str) -> None:
+    safe_path = (path or "").split("?", 1)[0]
+    print(f"[cce-api] {safe_path} -> {code}: {message}", flush=True)
+
+
 def json_huawei_cce_error(handler: SimpleHTTPRequestHandler, exc: Exception) -> bool:
     if isinstance(exc, huawei_cce.HuaweiCCEError):
         payload: dict[str, Any] = {"error": str(exc)}
         if exc.detail is not None:
             payload["detail"] = exc.detail
+        log_cce_api_error(handler.path, exc.status, str(exc))
         handler._json(exc.status, payload)
         return True
     if isinstance(exc, ValueError):
+        log_cce_api_error(handler.path, 400, str(exc))
         handler._json(400, {"error": str(exc)})
         return True
     return False
@@ -3389,6 +3396,7 @@ class Handler(SimpleHTTPRequestHandler):
                 creds = resolve_huawei_credentials(data)
                 cluster_id = str(data.get("cluster_id") or "").strip()
                 if not cluster_id:
+                    log_cce_api_error(self.path, 400, "cluster_id is required")
                     self._json(400, {"error": "cluster_id is required"})
                     return
                 payload = huawei_cce.list_workloads(
@@ -3412,9 +3420,11 @@ class Handler(SimpleHTTPRequestHandler):
                 cluster_id = str(data.get("cluster_id") or "").strip()
                 name = str(data.get("name") or "").strip()
                 if not cluster_id:
+                    log_cce_api_error(self.path, 400, "cluster_id is required")
                     self._json(400, {"error": "cluster_id is required"})
                     return
                 if not name:
+                    log_cce_api_error(self.path, 400, "name is required")
                     self._json(400, {"error": "name is required"})
                     return
                 payload = huawei_cce.get_workload_detail(
