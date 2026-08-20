@@ -940,6 +940,18 @@ class BusinessImageAndTmpTests(unittest.TestCase):
         )
         docker_cmd.assert_called_once_with("rmi", "-f", "local/temporal-server:tag", timeout=60)
 
+    @patch.object(server, "ensure_protected_image_holds")
+    @patch.object(server, "append_job_log")
+    @patch.object(server, "docker_cmd", return_value=(0, ""))
+    def test_reclaim_pins_keep_refs_before_image_prune(self, docker_cmd, _log, _holds) -> None:
+        local_ref = "local/config-service:202608201544_2d45dd1"
+        server.reclaim_unused_docker_images("job-1", keep_refs=(local_ref,))
+        calls = [c.args[0:4] for c in docker_cmd.call_args_list]
+        create_at = next(i for i, args in enumerate(calls) if args and args[0] == "create")
+        prune_at = next(i for i, args in enumerate(calls) if args[:2] == ("image", "prune"))
+        self.assertLess(create_at, prune_at)
+        self.assertIn(local_ref, docker_cmd.call_args_list[create_at].args)
+
     @patch.object(server, "run_stream", return_value=0)
     def test_build_from_source_points_scratch_at_ci_tmp(self, run_stream) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -58,6 +58,7 @@ PROTECTED_LOCAL_IMAGES = (
     "multica-cloud-hermes",
 )
 PROTECTED_IMAGE_HOLD_PREFIX = "ci-protect-"
+ARCHIVE_IMAGE_HOLD_PREFIX = "ci-archive-hold-"
 # Mattermost compile uses a shared 8G build.swap and ~3.6G RAM; a second
 # concurrent job swapoff/OOM-kills webpack. Override via services.json
 # `max_concurrent` when needed.
@@ -998,6 +999,39 @@ def _protected_image_hold_name(ref: str) -> str:
     return f"{PROTECTED_IMAGE_HOLD_PREFIX}{slug}"[:63]
 
 
+def _archive_image_hold_name(ref: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", ref).strip("-._") or "image"
+    return f"{ARCHIVE_IMAGE_HOLD_PREFIX}{slug}"[:63]
+
+
+def pin_images_for_prune(refs: list[str] | tuple[str, ...]) -> list[str]:
+    """Stopped containers so `docker image prune -af` cannot drop these tags."""
+    holds: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        name = (ref or "").strip()
+        if not name or name in seen or name == "archive-only":
+            continue
+        seen.add(name)
+        code, _ = docker_cmd("image", "inspect", name, timeout=30)
+        if code != 0:
+            continue
+        hold = _archive_image_hold_name(name)
+        docker_cmd("rm", "-f", hold, timeout=30)
+        code, _ = docker_cmd("create", "--name", hold, name, "true", timeout=60)
+        if code == 0:
+            holds.append(hold)
+    return holds
+
+
+def unpin_archive_image_holds(holds: list[str]) -> None:
+    for hold in holds:
+        name = (hold or "").strip()
+        if not name:
+            continue
+        docker_cmd("rm", "-f", name, timeout=30)
+
+
 def list_local_image_refs() -> list[str]:
     code, out = docker_cmd("images", "--format", "{{.Repository}}:{{.Tag}}", timeout=120)
     if code != 0:
@@ -1022,15 +1056,22 @@ def ensure_protected_image_holds() -> None:
         docker_cmd("create", "--name", name, ref, "true", timeout=60)
 
 
-def reclaim_unused_docker_images(job_id: str) -> None:
+def reclaim_unused_docker_images(job_id: str, keep_refs: list[str] | tuple[str, ...] = ()) -> None:
     """Remove unused Docker images. Protected toolchain / Fleet runtime images are kept."""
     append_job_log(job_id, "pruning unused docker images (protected base images kept)")
+    keep = [r for r in keep_refs if (r or "").strip()]
+    if keep:
+        append_job_log(job_id, "keep for archive: " + ", ".join(keep))
     ensure_protected_image_holds()
-    code, out = docker_cmd("image", "prune", "-af", timeout=300)
-    for line in (out or "").splitlines()[-8:]:
-        append_job_log(job_id, line)
-    if code != 0:
-        append_job_log(job_id, f"WARN: docker image prune failed: {(out or '')[-200:]}")
+    holds = pin_images_for_prune(keep)
+    try:
+        code, out = docker_cmd("image", "prune", "-af", timeout=300)
+        for line in (out or "").splitlines()[-8:]:
+            append_job_log(job_id, line)
+        if code != 0:
+            append_job_log(job_id, f"WARN: docker image prune failed: {(out or '')[-200:]}")
+    finally:
+        unpin_archive_image_holds(holds)
 
 
 def remove_business_images(job_id: str, *refs: str) -> None:
@@ -2350,6 +2391,7 @@ def reclaim_ci_disk(
     keep_latest: int = 3,
     min_keep: int = 1,
     max_usage_ratio: float = DISK_USAGE_PRUNE_RATIO,
+    keep_refs: list[str] | tuple[str, ...] = (),
 ) -> None:
     """CI disk reclaim used before archive and at job end.
 
@@ -2385,7 +2427,7 @@ def reclaim_ci_disk(
         job_id,
         f"disk still {ratio:.0%} after archive prune; reclaim unused docker images",
     )
-    reclaim_unused_docker_images(job_id)
+    reclaim_unused_docker_images(job_id, keep_refs=keep_refs)
     stats = disk_usage_ratio(probe)
     if stats is None:
         return
@@ -2406,10 +2448,10 @@ def reclaim_ci_disk(
         )
 
 
-def make_archive_dir(job_id: str | None = None) -> Path:
+def make_archive_dir(job_id: str | None = None, keep_refs: list[str] | tuple[str, ...] = ()) -> Path:
     base = (CFG.get("archive_root") or "/usr/share/nginx/html/images").rstrip("/")
     if job_id:
-        reclaim_ci_disk(job_id)
+        reclaim_ci_disk(job_id, keep_refs=keep_refs)
     stamp = time.strftime("%Y%m%d%H%M%S")
     suffix = job_workspace_suffix(job_id)
     out_dir = Path(base) / (f"{stamp}-{suffix}" if suffix else stamp)
@@ -2435,7 +2477,7 @@ def archive_image_locally(
 
     if out_dir is None:
         try:
-            out_dir = make_archive_dir(job_id)
+            out_dir = make_archive_dir(job_id, keep_refs=(local_ref,) if local_ref else ())
         except OSError as e:
             msg = f"cannot create archive dir: {e}"
             append_job_log(job_id, f"ERROR: {msg}")
@@ -2757,8 +2799,9 @@ def push_one_service(
         return result
 
     # Free space before large docker save when disk is tight.
+    # Pin the just-built tags so prune cannot delete them before docker save.
     set_job(job_id, stage="archiving")
-    reclaim_ci_disk(job_id)
+    reclaim_ci_disk(job_id, keep_refs=(local_ref, remote))
     ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
     if not ok_arc:
         result["remote"] = remote
@@ -2766,8 +2809,8 @@ def push_one_service(
             result["error"] = "local archive failed"
             append_job_log(
                 job_id,
-                "ERROR: SWR 已推送成功，但本地归档镜像包失败。"
-                f"请检查目录权限：{CFG.get('archive_root')}",
+                "ERROR: SWR 已推送成功，但本地归档镜像包失败："
+                f"{arc_path}。目录：{CFG.get('archive_root')}",
             )
             docker_cmd("rmi", remote, timeout=60)
             return result
