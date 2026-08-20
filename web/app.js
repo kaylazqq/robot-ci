@@ -37,6 +37,10 @@ let submitting = false;
 const liveLogFollow = newLogFollowState();
 const historyLogFollow = newLogFollowState();
 
+/** In-memory Huawei Cloud credentials for CCE APIs only (never persisted). */
+let hwCloudCreds = null;
+let cceRegionsLoaded = false;
+
 function newLogFollowState() {
   return { dragging: false, follow: true, pendingText: null, flush: null };
 }
@@ -213,15 +217,18 @@ function getMainView() {
 
 function setMainView(view) {
   const prev = getMainView();
-  const next = view === "artifacts" || view === "history" ? view : "services";
+  const next =
+    view === "artifacts" || view === "history" || view === "cce" ? view : "services";
   const layout = $("mainLayout");
   if (layout) layout.dataset.view = next;
   const servicesPane = $("viewServices");
   const artifactsPane = $("viewArtifacts");
   const historyPane = $("viewHistory");
+  const ccePane = $("viewCce");
   if (servicesPane) servicesPane.hidden = next !== "services";
   if (artifactsPane) artifactsPane.hidden = next !== "artifacts";
   if (historyPane) historyPane.hidden = next !== "history";
+  if (ccePane) ccePane.hidden = next !== "cce";
   document.querySelectorAll(".view-tab").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.view === next);
   });
@@ -234,6 +241,9 @@ function setMainView(view) {
     } else if (!historyDetailJobId) {
       refreshHistory().catch(() => {});
     }
+  }
+  if (next === "cce") {
+    initCceView().catch(() => {});
   }
   try {
     localStorage.setItem("robotCiMainView", next);
@@ -1426,6 +1436,227 @@ function bind(id, fn) {
   if (el) el.addEventListener("click", fn);
 }
 
+function updateHwCredStatus() {
+  const el = $("hwCredStatus");
+  if (!el) return;
+  if (hwCloudCreds && hwCloudCreds.access_key && hwCloudCreds.secret_key) {
+    el.textContent = "华为云凭证：已启用（仅当前页面，" + (hwCloudCreds.region || "—") + "）";
+    el.style.color = "var(--ok)";
+  } else {
+    el.textContent = "华为云凭证：未设置";
+    el.style.color = "";
+  }
+}
+
+function setCceControlsEnabled(enabled) {
+  ["btnCceRefreshClusters", "cceClusterSelect", "btnCceRefreshWorkloads"].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = !enabled;
+  });
+}
+
+function clearHwCloudCreds() {
+  hwCloudCreds = null;
+  const sk = $("hwSecretKey");
+  if (sk) sk.value = "";
+  updateHwCredStatus();
+  setCceControlsEnabled(false);
+  const clusterSelect = $("cceClusterSelect");
+  if (clusterSelect) {
+    clusterSelect.innerHTML = '<option value="">— 先刷新集群 —</option>';
+    clusterSelect.disabled = true;
+  }
+  const body = $("cceWorkloadsBody");
+  if (body) {
+    body.innerHTML = '<tr><td colspan="6" class="hint">设置凭证并选择集群后刷新负载。</td></tr>';
+  }
+  const detail = $("cceWorkloadDetail");
+  if (detail) {
+    detail.hidden = true;
+    detail.textContent = "";
+  }
+  const log = $("cceLog");
+  if (log) log.textContent = "";
+}
+
+function applyHwCloudCreds() {
+  const accessKey = ($("hwAccessKey") && $("hwAccessKey").value || "").trim();
+  const secretKey = ($("hwSecretKey") && $("hwSecretKey").value || "").trim();
+  const region = ($("hwRegion") && $("hwRegion").value || "").trim();
+  const projectId = ($("hwProjectId") && $("hwProjectId").value || "").trim();
+  if (!accessKey || !secretKey) {
+    throw new Error("请填写 Access Key 和 Secret Key");
+  }
+  if (!region) {
+    throw new Error("请选择 Region");
+  }
+  hwCloudCreds = {
+    access_key: accessKey,
+    secret_key: secretKey,
+    region,
+    project_id: projectId,
+  };
+  if ($("hwSecretKey")) $("hwSecretKey").value = "";
+  updateHwCredStatus();
+  setCceControlsEnabled(true);
+  const log = $("cceLog");
+  if (log) log.textContent = "凭证已启用（仅当前页面内存）。可刷新集群列表。";
+}
+
+function requireHwCloudCreds() {
+  if (!hwCloudCreds || !hwCloudCreds.access_key || !hwCloudCreds.secret_key) {
+    throw new Error("请先在左侧点击「启用本会话凭证」");
+  }
+  return hwCloudCreds;
+}
+
+async function hwCcePost(path, extra) {
+  const creds = requireHwCloudCreds();
+  return api(path, {
+    method: "POST",
+    body: JSON.stringify({
+      access_key: creds.access_key,
+      secret_key: creds.secret_key,
+      region: creds.region,
+      project_id: creds.project_id || "",
+      ...(extra || {}),
+    }),
+  });
+}
+
+function setCceLog(text) {
+  const el = $("cceLog");
+  if (el) el.textContent = text || "";
+}
+
+async function initCceView() {
+  const select = $("hwRegion");
+  if (!select || cceRegionsLoaded) {
+    updateHwCredStatus();
+    setCceControlsEnabled(!!hwCloudCreds);
+    return;
+  }
+  const data = await api("/api/cce/regions");
+  const regions = (data && data.regions) || [];
+  select.innerHTML = regions
+    .map(
+      (item) =>
+        `<option value="${esc(item.id)}">${esc(item.label || item.id)} (${esc(item.id)})</option>`
+    )
+    .join("");
+  if (!select.value && regions.length) {
+    const preferred = regions.find((r) => r.id === "cn-southwest-2") || regions[0];
+    select.value = preferred.id;
+  }
+  cceRegionsLoaded = true;
+  updateHwCredStatus();
+  setCceControlsEnabled(!!hwCloudCreds);
+}
+
+async function refreshCceClusters() {
+  setCceLog("正在加载集群…");
+  const data = await hwCcePost("/api/cce/clusters");
+  const clusters = (data && data.clusters) || [];
+  const select = $("cceClusterSelect");
+  if (!select) return;
+  if (!clusters.length) {
+    select.innerHTML = '<option value="">（无集群）</option>';
+    setCceLog("未找到集群。");
+    return;
+  }
+  select.innerHTML = clusters
+    .map((item) => {
+      const label = [item.name, item.status, item.version].filter(Boolean).join(" · ");
+      return `<option value="${esc(item.id)}">${esc(label || item.id)}</option>`;
+    })
+    .join("");
+  select.disabled = false;
+  setCceLog(
+    "已加载 " +
+      clusters.length +
+      " 个集群（project: " +
+      (data.project_name || data.project_id || "—") +
+      "）。"
+  );
+}
+
+function selectedCceClusterId() {
+  const select = $("cceClusterSelect");
+  return select ? String(select.value || "").trim() : "";
+}
+
+function renderCceWorkloads(rows) {
+  const body = $("cceWorkloadsBody");
+  if (!body) return;
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="6" class="hint">该命名空间下无 Deployment。</td></tr>';
+    return;
+  }
+  body.innerHTML = rows
+    .map((item) => {
+      const images = Array.isArray(item.images) ? item.images.join(", ") : "—";
+      return (
+        `<tr>` +
+        `<td class="mono">${esc(item.name || "—")}</td>` +
+        `<td>${esc(item.replicas ?? "—")}</td>` +
+        `<td>${esc(item.ready_replicas ?? "—")}</td>` +
+        `<td class="mono">${esc(images)}</td>` +
+        `<td>${esc(item.strategy || "—")}</td>` +
+        `<td><button type="button" class="btn ghost cce-detail-btn" data-name="${esc(item.name || "")}">详情</button></td>` +
+        `</tr>`
+      );
+    })
+    .join("");
+  body.querySelectorAll(".cce-detail-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const name = btn.getAttribute("data-name") || "";
+      loadCceWorkloadDetail(name).catch((e) => setCceLog(String(e.message || e)));
+    });
+  });
+}
+
+async function refreshCceWorkloads() {
+  const clusterId = selectedCceClusterId();
+  if (!clusterId) {
+    throw new Error("请先选择集群");
+  }
+  const namespace = ($("cceNamespace") && $("cceNamespace").value || "default").trim() || "default";
+  setCceLog("正在加载负载…");
+  const data = await hwCcePost("/api/cce/workloads", {
+    cluster_id: clusterId,
+    namespace,
+    kind: "deployments",
+  });
+  renderCceWorkloads((data && data.workloads) || []);
+  setCceLog("已加载 " + ((data && data.count) || 0) + " 个负载（" + namespace + "）。");
+  const detail = $("cceWorkloadDetail");
+  if (detail) {
+    detail.hidden = true;
+    detail.textContent = "";
+  }
+}
+
+async function loadCceWorkloadDetail(name) {
+  const clusterId = selectedCceClusterId();
+  if (!clusterId) {
+    throw new Error("请先选择集群");
+  }
+  const namespace = ($("cceNamespace") && $("cceNamespace").value || "default").trim() || "default";
+  setCceLog("正在加载 " + name + " 详情…");
+  const data = await hwCcePost("/api/cce/workloads/detail", {
+    cluster_id: clusterId,
+    namespace,
+    kind: "deployments",
+    name,
+  });
+  const detail = $("cceWorkloadDetail");
+  if (detail) {
+    detail.hidden = false;
+    detail.textContent = JSON.stringify(data, null, 2);
+  }
+  setCceLog("已加载负载详情：" + name);
+}
+
 bind("btnLogin", login);
 bind("btnCheckLogin", checkLogin);
 bind("btnLogout", logout);
@@ -1447,6 +1678,39 @@ bind("btnRefreshHistory", () => {
 });
 bind("btnHistoryBack", () => {
   closeHistoryDetail();
+});
+
+bind("btnHwApplyCreds", () => {
+  try {
+    applyHwCloudCreds();
+  } catch (e) {
+    updateHwCredStatus();
+    const el = $("hwCredStatus");
+    if (el) {
+      el.textContent = String(e.message || e);
+      el.style.color = "var(--danger)";
+    }
+  }
+});
+bind("btnHwClearCreds", () => clearHwCloudCreds());
+const hwRegionEl = $("hwRegion");
+if (hwRegionEl) {
+  hwRegionEl.addEventListener("change", () => {
+    if (hwCloudCreds) {
+      hwCloudCreds.region = String(hwRegionEl.value || "").trim();
+      updateHwCredStatus();
+    }
+  });
+}
+bind("btnCceRefreshClusters", () => {
+  refreshCceClusters().catch((e) => setCceLog(String(e.message || e)));
+});
+bind("btnCceRefreshWorkloads", () => {
+  refreshCceWorkloads().catch((e) => setCceLog(String(e.message || e)));
+});
+
+window.addEventListener("beforeunload", () => {
+  hwCloudCreds = null;
 });
 
 document.querySelectorAll(".view-tab").forEach((btn) => {
@@ -1475,6 +1739,7 @@ if (chkAll) {
     rememberedView = "services";
   }
   setMainView(rememberedView);
+  initCceView().catch(() => {});
   showJob("Checking active jobs…", "Connecting to server…");
   try {
     const pageReady = Promise.all([refreshHealth(), refreshServices(), refreshArtifacts()]);

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SWR Push Helper</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=20260817a" />
+  <link rel="stylesheet" href="/styles.css?v=20260820a" />
 </head>
 <body>
   <div class="bg"></div>
@@ -48,6 +48,24 @@
         <button type="button" class="btn ghost" id="btnSaveToken">保存</button>
       </div>
       <p class="hint" id="tokenStatus">—</p>
+
+      <div class="cce-session-note">
+        <h3 class="cce-session-title">华为云 AK/SK（CCE）</h3>
+        <p class="hint">仅保存在当前页面内存，刷新或关闭标签页后失效，不会写入服务器或 config.json。</p>
+        <label class="label" for="hwAccessKey">Access Key</label>
+        <input id="hwAccessKey" class="input" type="password" autocomplete="off" placeholder="AK" />
+        <label class="label" for="hwSecretKey">Secret Key</label>
+        <input id="hwSecretKey" class="input" type="password" autocomplete="off" placeholder="SK" />
+        <label class="label" for="hwRegion">Region</label>
+        <select id="hwRegion" class="input"></select>
+        <label class="label" for="hwProjectId">Project ID（可选）</label>
+        <input id="hwProjectId" class="input" type="text" autocomplete="off" placeholder="留空则按 Region 自动解析" />
+        <div class="row">
+          <button type="button" class="btn primary" id="btnHwApplyCreds">启用本会话凭证</button>
+          <button type="button" class="btn ghost" id="btnHwClearCreds">清除</button>
+        </div>
+        <p class="hint" id="hwCredStatus">华为云凭证：未设置</p>
+      </div>
     </section>
 
     <section class="panel workspace" id="workspacePanel">
@@ -55,6 +73,7 @@
         <button type="button" class="view-tab active" data-view="services" id="tabServices">微服务</button>
         <button type="button" class="view-tab" data-view="artifacts" id="tabArtifacts">产物管理</button>
         <button type="button" class="view-tab" data-view="history" id="tabHistory">构建历史</button>
+        <button type="button" class="view-tab" data-view="cce" id="tabCce">CCE 集群</button>
       </nav>
 
       <div class="view-pane" id="viewServices">
@@ -138,6 +157,43 @@
           <pre class="log history-log" id="historyJobLog">正在加载这次构建的日志…</pre>
         </div>
       </div>
+
+      <div class="view-pane" id="viewCce" hidden>
+        <div class="list-head">
+          <p class="hint">请先在左侧设置华为云 AK/SK（仅当前页面有效）。选定 Region 与集群后可查看负载列表与详情。</p>
+        </div>
+        <div class="cce-toolbar row">
+          <button type="button" class="btn ghost" id="btnCceRefreshClusters" disabled>刷新集群</button>
+          <label class="hint cce-inline-label">集群
+            <select id="cceClusterSelect" class="input" disabled>
+              <option value="">— 先刷新集群 —</option>
+            </select>
+          </label>
+          <label class="hint cce-inline-label">命名空间
+            <input id="cceNamespace" class="input" type="text" value="default" />
+          </label>
+          <button type="button" class="btn ghost" id="btnCceRefreshWorkloads" disabled>刷新负载</button>
+        </div>
+        <pre class="log mini" id="cceLog"></pre>
+        <div class="art-table-wrap">
+          <table class="art-table" id="cceWorkloadsTable">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>副本</th>
+                <th>就绪</th>
+                <th>镜像</th>
+                <th>策略</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="cceWorkloadsBody">
+              <tr><td colspan="6" class="hint">设置凭证并选择集群后刷新负载。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre class="log mini cce-detail" id="cceWorkloadDetail" hidden></pre>
+      </div>
     </section>
 
     <section class="panel logs" id="logsPanel">
@@ -151,6 +207,6 @@
   </main>
 
   <footer class="foot" id="footNote">SWR 临时密码只用于本机 Docker 登录 · 不写入业务仓库</footer>
-  <script src="/app.js?v=20260817a"></script>
+  <script src="/app.js?v=20260820a"></script>
 </body>
 </html>

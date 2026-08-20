@@ -19,6 +19,8 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+import huawei_cce
+
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
 LOG_DIR = ROOT / "logs"
@@ -948,7 +950,50 @@ def load_config() -> dict[str, Any]:
     if not build_cache:
         build_cache = BUILD_CACHE_DEFAULT if os.name != "nt" else str(Path(cfg["ci_tmp_root"]) / "build-cache")
     cfg["build_cache_root"] = str(Path(build_cache).expanduser())
+    hc = cfg.get("huawei_cloud") if isinstance(cfg.get("huawei_cloud"), dict) else {}
+    cfg["huawei_cloud"] = {
+        "access_key": (
+            (hc.get("access_key") or os.environ.get("HW_ACCESS_KEY") or os.environ.get("HUAWEICLOUD_SDK_AK") or "")
+            .strip()
+        ),
+        "secret_key": (
+            (hc.get("secret_key") or os.environ.get("HW_SECRET_KEY") or os.environ.get("HUAWEICLOUD_SDK_SK") or "")
+            .strip()
+        ),
+        "default_region": (hc.get("default_region") or "cn-southwest-2").strip() or "cn-southwest-2",
+        "project_id": (hc.get("project_id") or "").strip(),
+    }
     return cfg
+
+
+def resolve_huawei_credentials(data: dict[str, Any] | None) -> dict[str, str]:
+    body = data if isinstance(data, dict) else {}
+    hc = CFG.get("huawei_cloud") if isinstance(CFG.get("huawei_cloud"), dict) else {}
+    access_key = (body.get("access_key") or hc.get("access_key") or "").strip()
+    secret_key = (body.get("secret_key") or hc.get("secret_key") or "").strip()
+    region = (body.get("region") or hc.get("default_region") or "cn-southwest-2").strip() or "cn-southwest-2"
+    project_id = (body.get("project_id") or hc.get("project_id") or "").strip()
+    if not access_key or not secret_key:
+        raise ValueError("access_key and secret_key are required")
+    return {
+        "access_key": access_key,
+        "secret_key": secret_key,
+        "region": region,
+        "project_id": project_id,
+    }
+
+
+def json_huawei_cce_error(handler: SimpleHTTPRequestHandler, exc: Exception) -> bool:
+    if isinstance(exc, huawei_cce.HuaweiCCEError):
+        payload: dict[str, Any] = {"error": str(exc)}
+        if exc.detail is not None:
+            payload["detail"] = exc.detail
+        handler._json(exc.status, payload)
+        return True
+    if isinstance(exc, ValueError):
+        handler._json(400, {"error": str(exc)})
+        return True
+    return False
 
 
 def save_config_value(key: str, value: Any) -> None:
@@ -3058,6 +3103,16 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
 
+        if path == "/api/cce/regions":
+            regions = [{"id": rid, **meta} for rid, meta in huawei_cce.REGIONS.items()]
+            self._json(200, {"regions": regions})
+            return
+
+        if path == "/api/cce/workload-kinds":
+            kinds = [{"id": kid, **meta} for kid, meta in huawei_cce.WORKLOAD_KINDS.items()]
+            self._json(200, {"kinds": kinds})
+            return
+
         if path == "/api/health":
             schedule_docker_probe()
             logged = login_status_fast()
@@ -3298,6 +3353,84 @@ class Handler(SimpleHTTPRequestHandler):
             save_config_value("github_token", (data.get("github_token") or "").strip())
             reload_cfg()
             self._json(200, {"ok": True, "github_token_configured": bool(CFG.get("github_token"))})
+            return
+
+        if path == "/api/cce/projects":
+            try:
+                creds = resolve_huawei_credentials(data)
+                projects = huawei_cce.list_projects(
+                    creds["access_key"],
+                    creds["secret_key"],
+                    region=creds["region"],
+                )
+                self._json(200, {"region": creds["region"], "projects": projects})
+            except Exception as exc:  # noqa: BLE001
+                if not json_huawei_cce_error(self, exc):
+                    raise
+            return
+
+        if path == "/api/cce/clusters":
+            try:
+                creds = resolve_huawei_credentials(data)
+                payload = huawei_cce.list_clusters(
+                    creds["access_key"],
+                    creds["secret_key"],
+                    region=creds["region"],
+                    project_id=creds["project_id"],
+                )
+                self._json(200, payload)
+            except Exception as exc:  # noqa: BLE001
+                if not json_huawei_cce_error(self, exc):
+                    raise
+            return
+
+        if path == "/api/cce/workloads":
+            try:
+                creds = resolve_huawei_credentials(data)
+                cluster_id = str(data.get("cluster_id") or "").strip()
+                if not cluster_id:
+                    self._json(400, {"error": "cluster_id is required"})
+                    return
+                payload = huawei_cce.list_workloads(
+                    creds["access_key"],
+                    creds["secret_key"],
+                    region=creds["region"],
+                    cluster_id=cluster_id,
+                    project_id=creds["project_id"],
+                    namespace=str(data.get("namespace") or "default"),
+                    kind=str(data.get("kind") or "deployments"),
+                )
+                self._json(200, payload)
+            except Exception as exc:  # noqa: BLE001
+                if not json_huawei_cce_error(self, exc):
+                    raise
+            return
+
+        if path == "/api/cce/workloads/detail":
+            try:
+                creds = resolve_huawei_credentials(data)
+                cluster_id = str(data.get("cluster_id") or "").strip()
+                name = str(data.get("name") or "").strip()
+                if not cluster_id:
+                    self._json(400, {"error": "cluster_id is required"})
+                    return
+                if not name:
+                    self._json(400, {"error": "name is required"})
+                    return
+                payload = huawei_cce.get_workload_detail(
+                    creds["access_key"],
+                    creds["secret_key"],
+                    region=creds["region"],
+                    cluster_id=cluster_id,
+                    name=name,
+                    project_id=creds["project_id"],
+                    namespace=str(data.get("namespace") or "default"),
+                    kind=str(data.get("kind") or "deployments"),
+                )
+                self._json(200, payload)
+            except Exception as exc:  # noqa: BLE001
+                if not json_huawei_cce_error(self, exc):
+                    raise
             return
 
         if path == "/api/push":

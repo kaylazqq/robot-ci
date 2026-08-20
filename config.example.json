@@ -13,5 +13,11 @@
   "archive_required": true,
   "archive_root": "/usr/share/nginx/html/images",
   "ci_tmp_root": "/home/ci",
-  "max_concurrent_jobs": 5
+  "max_concurrent_jobs": 5,
+  "huawei_cloud": {
+    "access_key": "",
+    "secret_key": "",
+    "default_region": "cn-southwest-2",
+    "project_id": ""
+  }
 }
