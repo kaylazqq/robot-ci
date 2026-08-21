@@ -919,6 +919,9 @@ class BuildHistoryTests(unittest.TestCase):
 class BusinessImageAndTmpTests(unittest.TestCase):
     def test_protected_base_images_are_not_removed(self) -> None:
         self.assertTrue(server.is_protected_base_image("local/ai-go-toolchain:1.26.4"))
+        self.assertTrue(server.is_protected_base_image("local/ai-jdk-build:21.0.12"))
+        self.assertTrue(server.is_protected_base_image("local/ai-jdk-runtime:21.0.12"))
+        self.assertTrue(server.is_protected_base_image("local/ai-ubuntu-build:22.04"))
         self.assertTrue(server.is_protected_base_image("multica-cloud-opencode:demo"))
         self.assertTrue(server.is_protected_base_image("multica-cloud-hermes:demo"))
         self.assertTrue(server.is_protected_base_image("archive-only"))

@@ -56,6 +56,10 @@ BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
 PROTECTED_LOCAL_IMAGES = (
     "local/ai-go-toolchain",
+    "local/ai-jdk-build",
+    "local/ai-jdk-runtime",
+    "local/ai-ubuntu-build",
+    "local/ai-ubuntu-runtime",
     "multica-cloud-opencode",
     "multica-cloud-hermes",
 )
