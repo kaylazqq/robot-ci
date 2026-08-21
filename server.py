@@ -2183,13 +2183,19 @@ def build_from_source(
         append_job_log(job_id, "Fleet bundle: control image + OpenCode + Hermes; SWR push disabled")
 
     deploy_args = f" {shlex.quote(action)}" if action else ""
+    svc_build_env = svc.get("build_env") if isinstance(svc.get("build_env"), dict) else {}
+    build_env_exports = " ".join(
+        f"{key}={shlex.quote(str(value))}" for key, value in svc_build_env.items() if key and value is not None
+    )
+    if build_env_exports:
+        build_env_exports += " "
 
     bash = (
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
         "find . -maxdepth 3 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
         "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD SKIP_WEBAPP_BUILD SKIP_SERVER_BUILD FORCE_WEBAPP_BUILD FORCE_REBUILD; "
-        f"export CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
+        f"export {build_env_exports}CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
         f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
         "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
