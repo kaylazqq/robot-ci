@@ -5,6 +5,7 @@ ARG UBUNTU_APT_MIRROR=repo.huaweicloud.com
 # Official Node linux-x64 binary. Do not compile from source on Ubuntu 22.04/GCC 11.
 FROM ${BUILD_BASE_IMAGE} AS node-unpack
 ARG NODE_BINARY_ARCHIVE=deps/node-v24.18.0-linux-x64.tar.gz
+ENV PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 COPY ${NODE_BINARY_ARCHIVE} /tmp/node.tar.gz
 RUN mkdir -p /opt/node \
     && tar -xzf /tmp/node.tar.gz -C /opt/node --strip-components=1 \
