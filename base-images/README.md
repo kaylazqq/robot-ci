@@ -11,6 +11,7 @@ bash scripts/build-bases.sh ubuntu jdk
 |------|------|
 | `local/ai-ubuntu-build:22.04` / `local/ai-ubuntu-runtime:22.04` | 给现成 Ubuntu 打标签 |
 | `local/ai-jdk-build:21.0.12` / `local/ai-jdk-runtime:21.0.12` | 解压 Temurin 官方 JDK 二进制（`/opt/ai/installers` 已有则复用） |
+| `local/ai-node-build:24.18.0` / `local/ai-node-runtime:24.18.0` | 解压官方 Node linux-x64 二进制（不要在 Ubuntu 22.04 上源码编译） |
 | `local/ai-go-toolchain:1.26.5` | 镜像已存在则复用，不重编 |
 
 二进制包缓存在 `/opt/ai/installers`，不要提交 `deps/` 里的 tar。
