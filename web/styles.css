@@ -166,6 +166,17 @@ h1 { margin: 0; font-size: 1.35rem; font-weight: 700; }
 .art-status-ok { color: var(--ok); }
 .art-status-failed { color: var(--danger); }
 .art-status-running { color: var(--warn); }
+.art-status-stopped { color: var(--muted); }
+
+.job-log-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+.job-log-head h2 { margin: 0; }
+.job-log-head #jobMeta { flex: 1 1 10rem; }
+.job-log-head #btnStopJob { margin-left: auto; }
 
 .history-table { table-layout: fixed; width: 100%; }
 .history-table .col-time { width: 12.5rem; }

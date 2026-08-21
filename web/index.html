@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SWR Push Helper</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=20260820c" />
+  <link rel="stylesheet" href="/styles.css?v=20260821a" />
 </head>
 <body>
   <div class="bg"></div>
@@ -29,7 +29,7 @@
       <ol class="steps">
         <li>任一人粘贴华为云临时 <code>docker login</code> 并登录（服务器共享；不确定时点「检查登录」）</li>
         <li>勾选一个或多个微服务、选分支，点「构建所选」（也可点单行「构建并推送」）</li>
-        <li>可同时跑多个任务（含同一微服务）；达到并发上限前不必排队。多服务同一次任务归档到同一目录</li>
+        <li>可同时跑多个任务（含同一微服务）；达到并发上限前不必排队。运行中可点「停止任务」强制停掉。多服务同一次任务归档到同一目录</li>
       </ol>
       <p class="hint">目标仓库：<code id="targetRepo">—</code></p>
 
@@ -152,6 +152,7 @@
           <div class="list-head artifacts-head">
             <div>
               <button type="button" class="btn ghost" id="btnHistoryBack">返回构建历史</button>
+              <button type="button" class="btn danger" id="btnHistoryStop" hidden>停止任务</button>
               <p class="hint" id="historyDetailMeta">—</p>
             </div>
           </div>
@@ -198,9 +199,10 @@
     </section>
 
     <section class="panel logs" id="logsPanel">
-      <div class="list-head">
+      <div class="list-head job-log-head">
         <h2>任务日志</h2>
         <span class="hint" id="jobMeta">尚无任务</span>
+        <button type="button" class="btn danger" id="btnStopJob" hidden>停止任务</button>
       </div>
       <section class="test-result" id="testResult" hidden aria-live="polite"></section>
       <pre class="log" id="jobLog">点击「构建并推送」后，这里只显示本次任务的 clone / build / push 日志。历史记录在「构建历史」里分页查看。</pre>
@@ -208,6 +210,6 @@
   </main>
 
   <footer class="foot" id="footNote">SWR 临时密码只用于本机 Docker 登录 · 不写入业务仓库</footer>
-  <script src="/app.js?v=20260820d"></script>
+  <script src="/app.js?v=20260821a"></script>
 </body>
 </html>

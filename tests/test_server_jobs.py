@@ -1,6 +1,8 @@
 import json
-import threading
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import call, patch
 from http.server import ThreadingHTTPServer
@@ -42,9 +44,58 @@ class JobCoordinationTests(unittest.TestCase):
             server._jobs.clear()
 
     def tearDown(self) -> None:
+        with server._job_procs_lock:
+            server._job_procs.clear()
         with server._jobs_lock:
             server._jobs.clear()
             server._jobs.update(self.saved_jobs)
+
+    def test_request_job_stop_marks_running_job(self) -> None:
+        job = make_job("stop-job-aa")
+        self.assertIsNone(server.register_job_if_idle(job))
+        result = server.request_job_stop("stop-job-aa")
+        self.assertTrue(result["ok"])
+        self.assertEqual("stopping", result["status"])
+        with server._jobs_lock:
+            stored = server._jobs["stop-job-aa"]
+        self.assertTrue(stored["cancel_requested"])
+        self.assertEqual("stopping", stored["stage"])
+        self.assertTrue(server.request_job_stop("stop-job-aa")["ok"])
+        missing = server.request_job_stop("missing-job")
+        self.assertFalse(missing["ok"])
+        self.assertEqual(404, missing["http_status"])
+
+    def test_request_job_stop_rejects_finished_job(self) -> None:
+        job = make_job("done-job-aa", status="ok")
+        self.assertIsNone(server.register_job_if_idle(job))
+        rejected = server.request_job_stop("done-job-aa")
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(409, rejected["http_status"])
+
+    def test_run_cmd_raises_when_job_is_stopped(self) -> None:
+        job = make_job("stop-run-aa")
+        self.assertIsNone(server.register_job_if_idle(job))
+        started = threading.Event()
+        raised = []
+
+        def _run() -> None:
+            server._job_ctx.job_id = "stop-run-aa"
+            try:
+                started.set()
+                server.run_cmd([sys.executable, "-c", "import time; time.sleep(30)"], timeout=30)
+            except server.JobStopped:
+                raised.append(True)
+            finally:
+                server._job_ctx.job_id = None
+
+        worker = threading.Thread(target=_run)
+        worker.start()
+        self.assertTrue(started.wait(2))
+        time.sleep(0.4)
+        self.assertTrue(server.request_job_stop("stop-run-aa")["ok"])
+        worker.join(timeout=15)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(raised)
 
     def test_concurrent_jobs_are_capped_not_serialized_per_service(self) -> None:
         barrier = threading.Barrier(8)
@@ -491,9 +542,49 @@ class JobEndpointTests(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
         self.thread.join(timeout=2)
+        with server._job_procs_lock:
+            server._job_procs.clear()
         with server._jobs_lock:
             server._jobs.clear()
             server._jobs.update(self.saved_jobs)
+
+    def test_stop_endpoint_stops_running_job(self) -> None:
+        job = make_job("active-stop")
+        self.assertIsNone(server.register_job_if_idle(job))
+        request = Request(
+            self.base_url + "/api/jobs/active-stop/stop",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.opener.open(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual("stopping", payload["status"])
+        with server._jobs_lock:
+            self.assertTrue(server._jobs["active-stop"]["cancel_requested"])
+
+    def test_stop_endpoint_rejects_idle_and_missing_jobs(self) -> None:
+        job = make_job("done-stop", status="failed")
+        self.assertIsNone(server.register_job_if_idle(job))
+        finished = Request(
+            self.base_url + "/api/jobs/done-stop/stop",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as raised:
+            self.opener.open(finished, timeout=2)
+        self.assertEqual(409, raised.exception.code)
+        missing = Request(
+            self.base_url + "/api/jobs/deadbeefdead/stop",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as missing_err:
+            self.opener.open(missing, timeout=2)
+        self.assertEqual(404, missing_err.exception.code)
 
     def test_running_endpoint_is_lightweight_and_push_hits_concurrency_limit(self) -> None:
         job = make_job("active-job")

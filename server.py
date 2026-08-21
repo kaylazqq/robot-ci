@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -33,6 +34,16 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+_job_procs: dict[str, list[subprocess.Popen]] = {}
+_job_procs_lock = threading.Lock()
+_job_ctx = threading.local()
+STOPPED_JOB_ERROR = "stopped by user"
+
+
+class JobStopped(Exception):
+    """Raised when a running job is force-stopped."""
+
+
 _login_ok = False
 _login_lock = threading.Lock()
 _login_probe_cache: tuple[float, bool] | None = None  # (ts, ok)
@@ -1265,30 +1276,145 @@ def host_path(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/")
 
 
+def current_job_id() -> str:
+    return str(getattr(_job_ctx, "job_id", "") or "")
+
+
+def job_cancel_requested(job_id: str) -> bool:
+    if not job_id:
+        return False
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def _popen_session_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": flags} if flags else {}
+    return {"start_new_session": True}
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=15,
+            )
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def attach_job_proc(job_id: str, proc: subprocess.Popen) -> None:
+    if not job_id:
+        return
+    with _job_procs_lock:
+        _job_procs.setdefault(job_id, []).append(proc)
+
+
+def detach_job_proc(job_id: str, proc: subprocess.Popen) -> None:
+    if not job_id:
+        return
+    with _job_procs_lock:
+        procs = _job_procs.get(job_id) or []
+        if proc in procs:
+            procs.remove(proc)
+        if not procs:
+            _job_procs.pop(job_id, None)
+
+
+def kill_job_procs(job_id: str) -> int:
+    with _job_procs_lock:
+        procs = list(_job_procs.get(job_id) or [])
+    killed = 0
+    for proc in procs:
+        if proc.poll() is None:
+            _kill_process_tree(proc)
+            killed += 1
+    return killed
+
+
+def mark_job_stopped(job_id: str) -> None:
+    set_job(job_id, status="stopped", stage="done", current="", error=STOPPED_JOB_ERROR)
+    append_job_log(job_id, "STOPPED")
+
+
+def request_job_stop(job_id: str) -> dict[str, Any]:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return {"ok": False, "error": "job not found", "http_status": 404}
+        if job.get("status") != "running":
+            return {
+                "ok": False,
+                "error": f"任务已结束（{job.get('status')}）",
+                "http_status": 409,
+                "status": job.get("status"),
+            }
+        already = bool(job.get("cancel_requested"))
+        job["cancel_requested"] = True
+        job["stage"] = "stopping"
+    persist_job_meta(job_id)
+    if not already:
+        append_job_log(job_id, "STOP requested: killing current process")
+    kill_job_procs(job_id)
+    return {"ok": True, "id": job_id, "status": "stopping"}
+
+
 def run_cmd(
     args: list[str],
     timeout: int | None = 600,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
+    job_id = current_job_id()
+    if job_id and job_cancel_requested(job_id):
+        raise JobStopped()
     try:
-        p = subprocess.run(
+        proc = subprocess.Popen(
             args,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             cwd=cwd,
             env=env,
+            **_popen_session_kwargs(),
         )
-        out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
-        return p.returncode, out.strip()
-    except subprocess.TimeoutExpired as e:
-        out = ((e.stdout or "") + "\n" + (e.stderr or "")).strip()
-        return 124, out + "\nERROR: timeout"
     except FileNotFoundError:
         return 127, f"ERROR: not found: {args[0]}"
+    attach_job_proc(job_id, proc)
+    try:
+        try:
+            out, _err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            out, _err = proc.communicate(timeout=10)
+            if job_id and job_cancel_requested(job_id):
+                raise JobStopped()
+            return 124, ((out or "").strip() + "\nERROR: timeout").strip()
+        if job_id and job_cancel_requested(job_id):
+            raise JobStopped()
+        return proc.returncode, (out or "").strip()
+    finally:
+        detach_job_proc(job_id, proc)
 
 
 def run_cmd_stdin(args: list[str], stdin_text: str, timeout: int | None = 120) -> tuple[int, str]:
@@ -1331,7 +1457,9 @@ def append_job_log(job_id: str, line: str) -> None:
             return
         job["log"].append(text)
         _append_ui_log(job, text)
-        Path(job["log_file"]).open("a", encoding="utf-8").write(text + "\n")
+        log_file = job.get("log_file")
+        if log_file:
+            Path(log_file).open("a", encoding="utf-8").write(text + "\n")
 
 
 def set_job(job_id: str, **fields: Any) -> None:
@@ -1814,6 +1942,8 @@ def run_stream(
     env: dict[str, str] | None = None,
     output_tail: list[str] | None = None,
 ) -> int:
+    if job_cancel_requested(job_id):
+        raise JobStopped()
     shown = [re.sub(r"x-access-token:[^@\s]+@", "x-access-token:***@", a) for a in args]
     append_job_log(job_id, "$ " + " ".join(shown))
     try:
@@ -1825,6 +1955,7 @@ def run_stream(
             encoding="utf-8",
             errors="replace",
             env=env,
+            **_popen_session_kwargs(),
         )
     except FileNotFoundError:
         append_job_log(job_id, f"ERROR: not found: {args[0]}")
@@ -1849,13 +1980,30 @@ def run_stream(
 
     reader = threading.Thread(target=_reader, daemon=True)
     reader.start()
-    reader.join(timeout=timeout)
-    if reader.is_alive():
-        p.kill()
-        reader.join(timeout=10)
-        append_job_log(job_id, "ERROR: timeout")
-        return 124
-    return p.wait() or 0
+    attach_job_proc(job_id, p)
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            if job_cancel_requested(job_id):
+                _kill_process_tree(p)
+                reader.join(timeout=10)
+                append_job_log(job_id, "ERROR: job stopped by user")
+                raise JobStopped()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process_tree(p)
+                reader.join(timeout=10)
+                append_job_log(job_id, "ERROR: timeout")
+                return 124
+            reader.join(timeout=min(0.4, remaining))
+            if not reader.is_alive():
+                break
+        if job_cancel_requested(job_id):
+            append_job_log(job_id, "ERROR: job stopped by user")
+            raise JobStopped()
+        return p.wait() or 0
+    finally:
+        detach_job_proc(job_id, p)
 
 
 def summarize_command_failure(lines: list[str], fallback: str) -> str:
@@ -2834,7 +2982,10 @@ def push_one_service(
             break
         wait_s = min(30, 5 * attempt)
         append_job_log(job_id, f"push network error; retry in {wait_s}s…")
-        time.sleep(wait_s)
+        for _ in range(wait_s):
+            if job_cancel_requested(job_id):
+                raise JobStopped()
+            time.sleep(1)
     if code != 0:
         result["remote"] = remote
         result["error"] = summarize_command_failure(
@@ -2915,6 +3066,7 @@ def run_push_job(
     login_command: str = "",
 ) -> None:
     """Push one or more services; batch jobs share one archive timestamp directory."""
+    _job_ctx.job_id = job_id
     try:
         catalog = {s["id"]: s for s in load_services()}
         resolved: list[tuple[dict[str, Any], str, str]] = []
@@ -2978,6 +3130,8 @@ def run_push_job(
         results: list[dict[str, Any]] = []
         total = len(resolved)
         for idx, (svc, br, version) in enumerate(resolved, 1):
+            if job_cancel_requested(job_id):
+                raise JobStopped()
             append_job_log(job_id, f"===== [{idx}/{total}] {svc['id']} @ {br} =====")
             set_job(job_id, stage="syncing", current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
             result = push_one_service(job_id, svc, br, archive_dir, version)
@@ -3007,6 +3161,8 @@ def run_push_job(
                 set_job(job_id, results=results)
                 break
 
+        if job_cancel_requested(job_id):
+            raise JobStopped()
         ok_n = sum(1 for r in results if r.get("ok"))
         fail_n = total - ok_n
         remotes = [r["remote"] for r in results if r.get("remote")]
@@ -3047,10 +3203,16 @@ def run_push_job(
             append_job_log(job_id, f"BATCH DONE with failures ok={ok_n} fail={fail_n} errors=[{errs}]")
             if archive_dir:
                 append_job_log(job_id, f"BATCH archive dir {archive_dir} (partial ok kept)")
+    except JobStopped:
+        mark_job_stopped(job_id)
     except Exception as e:  # noqa: BLE001
-        set_job(job_id, status="failed", error=str(e))
-        append_job_log(job_id, f"ERROR {e}")
+        if job_cancel_requested(job_id):
+            mark_job_stopped(job_id)
+        else:
+            set_job(job_id, status="failed", error=str(e))
+            append_job_log(job_id, f"ERROR {e}")
     finally:
+        _job_ctx.job_id = None
         reclaim_ci_disk(job_id)
 
 
@@ -3453,6 +3615,15 @@ class Handler(SimpleHTTPRequestHandler):
                     raise
             return
 
+        m_stop = re.fullmatch(r"/api/jobs/([^/]+)/stop", path)
+        if m_stop:
+            result = request_job_stop(m_stop.group(1))
+            if result.get("ok"):
+                self._json(200, result)
+                return
+            self._json(int(result.get("http_status") or 400), result)
+            return
+
         if path == "/api/push":
             login_command = (data.get("login_command") or "").strip()
             raw_items = data.get("items")
@@ -3542,6 +3713,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "log": [],
                 "ui_log": [],
                 "_ui_test_running": False,
+                "cancel_requested": False,
                 "log_file": str(log_file),
             }
             conflict = register_concurrent_job(new_job)

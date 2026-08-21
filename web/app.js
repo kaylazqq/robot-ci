@@ -385,6 +385,7 @@ function historyStatusLabel(status) {
   if (status === "ok") return "成功";
   if (status === "running") return "进行中";
   if (status === "failed") return "失败";
+  if (status === "stopped") return "已停止";
   return status || "—";
 }
 
@@ -392,7 +393,34 @@ function historyStatusClass(status) {
   if (status === "ok") return "art-status-ok";
   if (status === "failed") return "art-status-failed";
   if (status === "running") return "art-status-running";
+  if (status === "stopped") return "art-status-stopped";
   return "";
+}
+
+function setStopButtonState(btn, visible, stopping) {
+  if (!btn) return;
+  btn.hidden = !visible;
+  btn.disabled = !!stopping;
+  btn.textContent = stopping ? "正在停止…" : "停止任务";
+}
+
+function setLiveStopVisible(visible, stopping) {
+  setStopButtonState($("btnStopJob"), visible, stopping);
+}
+
+async function stopRunningJob(jobId, { button, onStopping } = {}) {
+  if (!jobId) return;
+  setStopButtonState(button, true, true);
+  try {
+    await api("/api/jobs/" + jobId + "/stop", { method: "POST", body: "{}" });
+    if (typeof onStopping === "function") onStopping();
+  } catch (e) {
+    setStopButtonState(button, true, false);
+    const msg = (e.data && (e.data.detail || e.data.error)) || e.message || String(e);
+    if ($("jobMeta") && jobId === activeJobId) {
+      $("jobMeta").textContent = "停止失败 · " + msg;
+    }
+  }
 }
 
 function renderHistory(items, meta) {
@@ -418,7 +446,12 @@ function renderHistory(items, meta) {
         `<td class="hist-branch" title="${esc(item.branch || "")}">${esc(item.branch || "—")}</td>` +
         `<td class="hist-status ${historyStatusClass(status)}">${esc(historyStatusLabel(status))}</td>` +
         `<td class="hist-sha">${esc(shortSha(item.commit_sha))}</td>` +
-        `<td class="hist-act"><button type="button" class="btn ghost" data-history-job="${esc(item.id)}" data-history-summary="${esc(summary)}">查看日志</button></td>` +
+        `<td class="hist-act">` +
+        (status === "running"
+          ? `<button type="button" class="btn danger" data-history-stop="${esc(item.id)}">停止</button> `
+          : "") +
+        `<button type="button" class="btn ghost" data-history-job="${esc(item.id)}" data-history-summary="${esc(summary)}">查看日志</button>` +
+        `</td>` +
         "</tr>"
       );
     })
@@ -428,6 +461,16 @@ function renderHistory(items, meta) {
       const id = btn.getAttribute("data-history-job");
       const summary = btn.getAttribute("data-history-summary") || id;
       if (id) openHistoryJob(id, summary);
+    });
+  });
+  body.querySelectorAll("[data-history-stop]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-history-stop");
+      if (!id) return;
+      stopRunningJob(id, {
+        button: btn,
+        onStopping: () => refreshHistory().catch(() => {}),
+      });
     });
   });
   renderHistoryPager(meta);
@@ -499,6 +542,7 @@ function showHistoryList() {
   historyDetailJobId = "";
   historyLogLines = [];
   historyLogCursor = 0;
+  setStopButtonState($("btnHistoryStop"), false, false);
   const list = $("historyList");
   const detail = $("historyDetail");
   if (list) list.hidden = false;
@@ -554,7 +598,9 @@ function openHistoryJob(jobId, summary) {
           (job.current ? " · " + job.current : "") +
           (job.error ? " · " + job.error : "");
       }
-      if (job.status === "running" || job.status === "unknown") {
+      const running = job.status === "running" || job.status === "unknown";
+      setStopButtonState($("btnHistoryStop"), running, job.stage === "stopping");
+      if (running) {
         historyDetailTimer = setTimeout(tick, 1500);
       }
     } catch (e) {
@@ -1274,6 +1320,7 @@ function startPolling(jobId, summary) {
   updateBatchUi();
   upsertMyJob(jobId, summary, "running");
   rememberLastJob(jobId, summary);
+  setLiveStopVisible(true, false);
   showJob(summary + " · job " + jobId, "Connecting to active job…");
 
   const tick = async () => {
@@ -1378,12 +1425,19 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
     const stage = job.stage ? " · " + job.stage : "";
     if (job.status === "running" || job.status === "unknown") {
       upsertMyJob(jobId, summary, "running");
-      $("jobMeta").textContent = summary + " · 进行中" + progress + current + stage;
+      setLiveStopVisible(true, job.stage === "stopping");
+      $("jobMeta").textContent =
+        summary +
+        (job.stage === "stopping" ? " · 正在停止" : " · 进行中") +
+        progress +
+        current +
+        stage;
       return true;
     }
 
-    const finalStatus = job.status === "ok" ? "ok" : "failed";
+    const finalStatus = job.status === "ok" ? "ok" : job.status === "stopped" ? "stopped" : "failed";
     upsertMyJob(jobId, summary, finalStatus);
+    setLiveStopVisible(false, false);
     if (activeJobId === jobId) activeJobId = "";
     busy = false;
     setButtonsDisabled(false);
@@ -1397,6 +1451,8 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
         (archiveHint ? " · 归档 " + archiveHint : "") +
         (job.remote ? " · " + job.remote : "");
       refreshArtifacts();
+    } else if (job.status === "stopped") {
+      $("jobMeta").textContent = summary + " · 已停止";
     } else {
       $("jobMeta").textContent =
         summary +
@@ -1423,6 +1479,7 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
     }
     if (activeJobId === jobId) activeJobId = "";
     busy = false;
+    setLiveStopVisible(false, false);
     setButtonsDisabled(false);
     updateBatchUi();
     showJob("轮询失败", e.message || String(e));
@@ -1689,6 +1746,24 @@ bind("btnRefreshHistory", () => {
 });
 bind("btnHistoryBack", () => {
   closeHistoryDetail();
+});
+bind("btnStopJob", () => {
+  if (!activeJobId) return;
+  stopRunningJob(activeJobId, {
+    button: $("btnStopJob"),
+    onStopping: () => {
+      if ($("jobMeta")) $("jobMeta").textContent = "正在停止任务…";
+    },
+  });
+});
+bind("btnHistoryStop", () => {
+  if (!historyDetailJobId) return;
+  stopRunningJob(historyDetailJobId, {
+    button: $("btnHistoryStop"),
+    onStopping: () => {
+      if ($("historyDetailMeta")) $("historyDetailMeta").textContent = "正在停止任务…";
+    },
+  });
 });
 
 bind("btnHwApplyCreds", () => {
