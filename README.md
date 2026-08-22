@@ -95,7 +95,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 构建页面中的 `gmagent` 服务对应：
 
-- 仓库：`https://github.com/adshhzy/gmagent.git`
+- 仓库：`https://github.com/rollingfruit/gmagent.git`
 - 默认分支：`codex/cloud-im-orchestration`
 - 本地镜像：`local/gmagent:<YYMMDDHHMM>_<short-sha>`
 - SWR 镜像：`<swr_registry>/<swr_org>/gmagent:<YYMMDDHHMM>_<short-sha>`
