@@ -15,7 +15,8 @@ class GmAgentServiceTests(unittest.TestCase):
     def test_catalog_uses_cloud_orchestration_branch_and_image(self) -> None:
         services = json.loads((ROOT / "services.json").read_text(encoding="utf-8"))
         gmagent = next(service for service in services if service["id"] == "gmagent")
-        self.assertEqual("adshhzy/gmagent", gmagent["repo"])
+        self.assertEqual("rollingfruit/gmagent", gmagent["repo"])
+        self.assertEqual("https://github.com/rollingfruit/gmagent.git", gmagent["github"])
         self.assertEqual("codex/cloud-im-orchestration", gmagent["default_branch"])
         self.assertEqual("gmagent", gmagent["image"])
         self.assertEqual("gmagent_", gmagent["tar_prefix"])
@@ -29,11 +30,11 @@ class GmAgentServiceTests(unittest.TestCase):
         ):
             server._token_cache = "test-token"
             clone_url = server.clone_url_for(
-                "https://github.com/adshhzy/gmagent.git",
+                "https://github.com/rollingfruit/gmagent.git",
                 prefer_token_https=True,
             )
         self.assertTrue(clone_url.startswith("https://x-access-token:"))
-        self.assertTrue(clone_url.endswith("@github.com/adshhzy/gmagent.git"))
+        self.assertTrue(clone_url.endswith("@github.com/rollingfruit/gmagent.git"))
 
     def test_test_plan_is_registered(self) -> None:
         plans = json.loads((ROOT / "test-plans.json").read_text(encoding="utf-8"))
