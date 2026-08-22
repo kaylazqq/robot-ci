@@ -14,7 +14,8 @@
     "agent-governance-gw": "governance-go",
     "multica-server": "multica-go",
     "multica-fleet": "multica-fleet-go",
-    "mattermost": "mattermost-unit"
+    "mattermost": "mattermost-unit",
+    "config-service": "config-service-go"
   },
   "profiles": {
     "temporal-shell": {"commands": [{"name": "temporal shell UT/DT", "command": "python3 $TEST_RUNNER_ROOT/shell_case_runner.py --report $REPORT_DIR/shell-cases.json --pattern 'tests/unit/*.sh' --pattern 'tests/dt/*.sh'", "parser": "case-json", "report": "shell-cases.json"}]},
@@ -30,6 +31,7 @@
     "governance-go": {"commands": [{"name": "governance pure Go UT", "command": "go test -count=1 -json ./internal/governance | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json"}]},
     "multica-go": {"commands": [{"name": "multica pure Go UT", "command": "go test -count=1 -json ./pkg/redact ./pkg/taskfailure ./internal/util/secretbox | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json"}]},
     "multica-fleet-go": {"commands": [{"name": "multica-fleet pure Go UT/DT", "command": "go test -count=1 -json ./internal/fleet ./internal/runtimeinit | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json"}, {"name": "multica-fleet package artifact DT", "command": "python3 $TEST_RUNNER_ROOT/shell_case_runner.py --report $REPORT_DIR/shell-cases.json --pattern 'tests/unit/*.sh'", "parser": "case-json", "report": "shell-cases.json"}]},
-    "mattermost-unit": {"commands": [{"name": "Mattermost public API UT", "command": "cd server/public && go test -count=1 -json ./model ./plugin/... | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json", "timeout_sec": 3600}]}
+    "mattermost-unit": {"commands": [{"name": "Mattermost public API UT", "command": "cd server/public && go test -count=1 -json ./model ./plugin/... | tee $REPORT_DIR/go-test.json", "parser": "go-json", "report": "go-test.json", "timeout_sec": 3600}]},
+    "config-service-go": {"commands": [{"name": "config-service Go UT", "command": "bash scripts/ci/ut.sh", "parser": "go-json", "report": "go-test.json"}, {"name": "config-service DT", "command": "bash scripts/ci/dt.sh", "parser": "case-json", "report": "shell-cases.json"}]}
   }
 }
