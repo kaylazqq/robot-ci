@@ -2605,8 +2605,10 @@ def reclaim_ci_disk(
 ) -> None:
     """CI disk reclaim used before archive and at job end.
 
-    Always drop leftover build.swap. If usage is still >= 80%, prune nginx
-    timestamp archives, unused Docker images, then BuildKit builder cache.
+    Always drop leftover build.swap. When usage is >= 80%, prune nginx
+    timestamp archives, then always run ``docker image prune -af`` (even if
+    archives alone dropped usage below the threshold). If still >= 80% after
+    image prune, reclaim BuildKit builder cache.
     """
     reclaim_build_swap(job_id)
     probe = Path((CFG.get("archive_root") or "/").rstrip("/") or "/")
@@ -2616,6 +2618,7 @@ def reclaim_ci_disk(
     ratio, total, free = stats
     if ratio < max_usage_ratio:
         return
+    reclaim_docker_images = True
     append_job_log(
         job_id,
         f"disk usage={ratio:.0%} >= {max_usage_ratio:.0%} "
@@ -2627,17 +2630,23 @@ def reclaim_ci_disk(
         min_keep=min_keep,
         max_usage_ratio=max_usage_ratio,
     )
-    stats = disk_usage_ratio(probe)
-    if stats is None:
-        return
-    ratio, total, free = stats
-    if ratio < max_usage_ratio:
-        return
-    append_job_log(
-        job_id,
-        f"disk still {ratio:.0%} after archive prune; reclaim unused docker images",
-    )
-    reclaim_unused_docker_images(job_id, keep_refs=keep_refs)
+    if reclaim_docker_images:
+        stats = disk_usage_ratio(probe)
+        if stats is not None:
+            ratio, total, free = stats
+            if ratio < max_usage_ratio:
+                append_job_log(
+                    job_id,
+                    f"disk now {ratio:.0%} after archive prune; "
+                    "still reclaiming unused docker images",
+                )
+            else:
+                append_job_log(
+                    job_id,
+                    f"disk still {ratio:.0%} after archive prune; "
+                    "reclaim unused docker images",
+                )
+        reclaim_unused_docker_images(job_id, keep_refs=keep_refs)
     stats = disk_usage_ratio(probe)
     if stats is None:
         return

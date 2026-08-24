@@ -68,7 +68,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 1. **始终** `swapoff` 并删除 `/opt/ai/build-cache/build.swap` 和 `/home/ci/**/build.swap`（mattermost 编译期临时交换文件，编完不应占盘）。**例外**：另有 mattermost 任务仍在编译时跳过，避免把别人正在用的 swap 卸掉。
 2. 使用率超过 **80%** 时，先删 `/usr/share/nginx/html/images` 下较旧的时间戳归档（优先保留最近 3 个；仍高于 80% 则删到只剩最新 1 个）。被删掉的包在「产物管理」里会显示为已失效。
-3. 归档清完仍 ≥ 80% 时，先跑 **`docker image prune -af`** 清未用镜像（保留 `local/ai-go-toolchain`、`local/ai-jdk-*`、`local/ai-ubuntu-*` 与 Fleet OpenCode/Hermes），再跑 **`docker builder prune -af`** 回收 BuildKit 层缓存。
+3. 触发回收时（使用率曾达到 **80%**），先删较旧归档；**无论归档后是否已低于 80%**，都会跑 **`docker image prune -af`**（保留 `local/ai-go-toolchain`、`local/ai-jdk-*`、`local/ai-ubuntu-*` 与 Fleet OpenCode/Hermes）。若 image prune 后仍 ≥ 80%，再跑 **`docker builder prune -af`** 回收 BuildKit 层缓存。
 
 `multica-fleet` 是例外的缓存优化场景：工具仍会重新克隆源码，但会把 Fleet 生成的 `.build-source.sha256` 和 `.build-image-ids` 保存到 `<workspace_root>/.robot-ci-cache/multica-fleet/runtime-images/`，并在新 checkout 中恢复。Fleet 构建脚本只有在新源码指纹一致、两个 Runtime Docker 镜像仍存在且 Image ID 一致时才跳过 OpenCode/Hermes 重建；源码、Dockerfile、依赖或本地镜像发生变化时会自动重新构建。三镜像合并归档仍会在每次任务中重新生成，因此不会复用或误发旧归档。工具会把最终 tar 权限统一设为 `0644` 供 nginx 下载，并原样保留 Fleet 生成的 `.meta` 和 `.sha256`；离线部署脚本使用 `.sha256` 校验大文件下载完整性。
 

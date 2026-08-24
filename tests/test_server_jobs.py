@@ -876,6 +876,27 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         builder_index = prune_args.index(("builder", "prune", "-af"))
         self.assertLess(image_index, builder_index)
 
+    @patch.object(server, "ensure_protected_image_holds")
+    @patch.object(server, "docker_cmd", return_value=(0, "Total: 32GB"))
+    def test_reclaim_prunes_images_even_when_archives_drop_below_80(
+        self, docker_cmd, ensure_holds
+    ) -> None:
+        for name in ("20260801000000", "20260802000000", "20260803000000", "20260804000000"):
+            self._stamp_dir(name)
+
+        def fake_usage(_path):
+            count = len(list(self.archive_root.iterdir()))
+            used = 850 if count >= 4 else 700
+            return self._disk(used)
+
+        with patch.object(server.shutil, "disk_usage", side_effect=fake_usage):
+            with patch.object(server, "reclaim_build_swap", return_value=0):
+                server.reclaim_ci_disk("job-1")
+        ensure_holds.assert_called()
+        prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
+        self.assertIn(("image", "prune", "-af"), prune_args)
+        self.assertNotIn(("builder", "prune", "-af"), prune_args)
+
 
 class BuildHistoryTests(unittest.TestCase):
     def setUp(self) -> None:
