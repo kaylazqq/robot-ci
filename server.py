@@ -71,9 +71,16 @@ PROTECTED_LOCAL_IMAGES = (
     "local/ai-jdk-runtime",
     "local/ai-ubuntu-build",
     "local/ai-ubuntu-runtime",
+    "local/ai-python-build",
+    "local/ai-python-runtime",
+    "local/ai-node-build",
+    "local/ai-node-runtime",
+    "local/ai-docker-cli",
     "multica-cloud-opencode",
     "multica-cloud-hermes",
 )
+# Any local/ai-* tag is a toolchain/base image and must survive prune.
+PROTECTED_LOCAL_IMAGE_PREFIXES = ("local/ai-",)
 PROTECTED_IMAGE_HOLD_PREFIX = "ci-protect-"
 ARCHIVE_IMAGE_HOLD_PREFIX = "ci-archive-hold-"
 # Mattermost compile uses a shared 8G build.swap and ~3.6G RAM; a second
@@ -1057,6 +1064,8 @@ def apply_ci_tmp_env(env: dict[str, str] | None = None) -> dict[str, str]:
 def is_protected_base_image(ref: str) -> bool:
     name = (ref or "").strip()
     if not name or name == "archive-only":
+        return True
+    if any(name.startswith(prefix) for prefix in PROTECTED_LOCAL_IMAGE_PREFIXES):
         return True
     return any(name == prefix or name.startswith(prefix + ":") for prefix in PROTECTED_LOCAL_IMAGES)
 
