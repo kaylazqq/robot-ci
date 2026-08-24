@@ -18,6 +18,6 @@
     "multica-server": {"repository": "multica-aiwelink", "scope": "agent failure classification, secret redaction and encryption helpers", "roots": ["pkg/redact", "pkg/taskfailure", "internal/util/secretbox"], "convention": "go"},
     "multica-fleet": {"repository": "multica-fleet", "scope": "Fleet lifecycle, runtime reconciliation, daemon release installation and offline deployment bundle", "roots": ["internal/fleet", "internal/runtimeinit", "tests/unit"], "convention": "go + shell"},
     "mattermost": {"repository": "mattermost", "scope": "Mattermost server short-mode unit tests", "roots": ["server"], "excluded": ["Docker/database/browser E2E"], "convention": "make"},
-    "config-service": {"repository": "ConfigService", "scope": "config draft/publish/watch, catalog seed, logging and runtime scripts", "roots": ["internal/catalog", "internal/dbconn", "internal/httpapi", "internal/logging", "internal/store", "sdk/go", "tests/unit", "tests/dt"], "excluded": ["//go:build integration"], "convention": "go + shell"}
+    "config-service": {"repository": "ConfigService", "scope": "centralized runtime config publish, pull, rollback, ops console and structured logs", "roots": ["internal/httpapi", "internal/store", "internal/logging", "internal/dbconn", "sdk/go", "sdk/python", "tests/unit", "tests/dt"], "excluded": ["//go:build integration"], "convention": "go + shell + unittest"}
   }
 }
