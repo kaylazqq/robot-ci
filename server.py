@@ -86,7 +86,7 @@ ARCHIVE_IMAGE_HOLD_PREFIX = "ci-archive-hold-"
 # Mattermost compile uses a shared 8G build.swap and ~3.6G RAM; a second
 # concurrent job swapoff/OOM-kills webpack. Override via services.json
 # `max_concurrent` when needed.
-DEFAULT_SERVICE_CONCURRENCY = {"mattermost": 1}
+DEFAULT_SERVICE_CONCURRENCY = {"mattermost": 1, "kibana-service": 1}
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
