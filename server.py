@@ -2418,8 +2418,66 @@ def find_latest_tar(svc: dict[str, Any], workspace: Path | None = None) -> Path 
     export_dir = (workspace or repo_dir(svc)) / "runtime-images" / "cce-export"
     if not export_dir.is_dir():
         return None
-    cands = sorted(export_dir.glob(f"{svc['tar_prefix']}*.tar"), key=lambda p: p.stat().st_mtime, reverse=True)
+    prefix = svc["tar_prefix"]
+    cands = sorted(
+        [*export_dir.glob(f"{prefix}*.tar"), *export_dir.glob(f"{prefix}*.tar.gz")],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     return cands[0] if cands else None
+
+
+def find_latest_host_package(svc: dict[str, Any], workspace: Path) -> Path | None:
+    """Latest host-install tar.gz produced by services with host_package=true."""
+    export_dir = workspace / "runtime-images" / "cce-export"
+    if not export_dir.is_dir():
+        return None
+    prefix = svc["tar_prefix"]
+    cands = sorted(
+        [*export_dir.glob(f"{prefix}*.tar.gz"), *export_dir.glob(f"{prefix}*.tar")],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return cands[0] if cands else None
+
+
+def finalize_host_package_artifact(
+    job_id: str,
+    svc: dict[str, Any],
+    workspace: Path,
+    archive_dir: Path | None,
+    *,
+    branch: str,
+    commit_sha: str,
+) -> dict[str, Any] | None:
+    """Copy a host tar.gz into the nginx archive dir and return push_one_service fields."""
+    pkg = find_latest_host_package(svc, workspace)
+    if pkg is None:
+        return None
+    image = svc["image"]
+    tag = parse_tag_from_tar(pkg, image) or pkg.stem
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    archive_path = str(pkg)
+    download_url = ""
+    if archive_dir is not None:
+        dest = archive_dir / pkg.name
+        shutil.copy2(pkg, dest)
+        try:
+            archive_dir.chmod(0o755)
+            dest.chmod(0o644)
+        except OSError as e:
+            append_job_log(job_id, f"WARN: chmod host package for nginx: {e}")
+        archive_path = str(dest)
+        download_url = public_archive_url(archive_path)
+    return {
+        "ok": True,
+        "remote": "archive-only",
+        "archive": archive_path,
+        "tag": tag,
+        "package_name": pkg.name,
+        "download_url": download_url,
+        "created_at": created_at,
+    }
 
 
 def parse_tag_from_tar(tar_path: Path, image: str) -> str:
@@ -2905,6 +2963,44 @@ def push_one_service(
 
     if svc.get("id") == "multica-fleet":
         persist_fleet_runtime_cache(job_id, Path(detail))
+
+    if svc.get("host_package"):
+        if archive_dir is None:
+            result["error"] = "archive directory was not created"
+            append_job_log(job_id, f"FAILED service={service_id} stage=archiving reason={result['error']}")
+            return result
+        host_result = finalize_host_package_artifact(
+            job_id,
+            svc,
+            Path(detail),
+            archive_dir,
+            branch=branch,
+            commit_sha=commit_sha,
+        )
+        if host_result is None:
+            result["error"] = "host package tar.gz was not generated"
+            append_job_log(job_id, f"FAILED service={service_id} stage=archiving reason={result['error']}")
+            return result
+        result.update(host_result)
+        record_build_artifact(
+            {
+                "created_at": result["created_at"],
+                "job_id": job_id,
+                "service_id": service_id,
+                "title": result["title"],
+                "branch": branch,
+                "commit_sha": commit_sha,
+                "image": image,
+                "tag": result["tag"],
+                "image_ref": f"host-package:{image}:{result['tag']}",
+                "remote": "archive-only",
+                "package_name": result["package_name"],
+                "archive": result["archive"],
+                "download_url": result["download_url"],
+            }
+        )
+        append_job_log(job_id, f"OK host package {result['archive']} (SWR push skipped)")
+        return result
 
     if svc.get("bundle_archive"):
         if archive_dir is None:
