@@ -179,13 +179,73 @@ def _job_service_ids(job: dict[str, Any]) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
-PIPELINE_STEP_DEFS: tuple[tuple[str, str], ...] = (
-    ("sync", "拉代码"),
-    ("test", "单元测试"),
-    ("build", "构建镜像"),
-    ("push", "推送 SWR"),
-    ("archive", "本地归档"),
+PIPELINE_STEP_DEFS: tuple[tuple[str, str, str], ...] = (
+    ("sync", "拉代码", "git"),
+    ("test", "单元测试", "test"),
+    ("build", "构建镜像", "build"),
+    ("push", "推送 SWR", "push"),
+    ("archive", "本地归档", "archive"),
 )
+
+PIPELINE_PREPARE_DEFS: tuple[tuple[str, str, str], ...] = (
+    ("env", "Runner 环境", "Docker / 工作区"),
+    ("swr", "SWR 鉴权", "docker login"),
+    ("ps", "public-service", "共享旁路仓库"),
+    ("adir", "归档目录", "nginx 产物路径"),
+)
+
+PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
+    "env": (
+        ("docker", "Docker daemon"),
+        ("disk", "磁盘空间检查"),
+        ("slot", "并发槽位分配"),
+    ),
+    "swr": (
+        ("parse", "解析 login 指令"),
+        ("login", "docker login"),
+        ("probe", "SWR 鉴权探针"),
+    ),
+    "ps": (
+        ("lock", "旁路目录加锁"),
+        ("fetch", "fetch public-service"),
+        ("head", "HEAD 校验"),
+    ),
+    "adir": (
+        ("mkdir", "创建时间戳目录"),
+        ("perm", "目录权限"),
+        ("nginx", "nginx 映射路径"),
+    ),
+    "sync": (
+        ("clone", "Clone 仓库"),
+        ("fetch", "Fetch 远程分支"),
+        ("checkout", "Checkout 工作区"),
+        ("sha", "记录 Commit SHA"),
+    ),
+    "test": (
+        ("plan", "加载 test-plans.json"),
+        ("runner", "启动 test_runner"),
+        ("cases", "执行 UT / DT 用例"),
+        ("report", "汇总测试报告"),
+    ),
+    "build": (
+        ("deps", "准备构建依赖"),
+        ("script", "deploy.sh / build-image"),
+        ("docker", "Docker 多阶段构建"),
+        ("verify", "镜像 / 产物校验"),
+    ),
+    "push": (
+        ("tag", "docker tag"),
+        ("push", "docker push"),
+        ("retry", "失败重试 (最多 4 次)"),
+        ("verify", "SWR 推送确认"),
+    ),
+    "archive": (
+        ("reclaim", "磁盘清理 (保留当前镜像)"),
+        ("save", "docker save / tar 打包"),
+        ("publish", "写入 nginx 归档目录"),
+        ("record", "产物登记 & 下载链接"),
+    ),
+}
 
 STAGE_TO_PIPELINE_STEP = {
     "syncing": "sync",
@@ -202,11 +262,180 @@ def _service_skip_push(svc: dict[str, Any] | None) -> bool:
     return bool(svc.get("archive_only") or svc.get("host_package") or svc.get("bundle_archive"))
 
 
-def _pipeline_steps_for_service(svc: dict[str, Any] | None) -> list[tuple[str, str]]:
+def _pipeline_steps_for_service(svc: dict[str, Any] | None) -> list[tuple[str, str, str]]:
     steps = list(PIPELINE_STEP_DEFS)
     if _service_skip_push(svc):
         steps = [item for item in steps if item[0] != "push"]
     return steps
+
+
+def _spread_status_to_subtasks(status: str, count: int, *, fail_index: int | None = None) -> list[str]:
+    if count <= 0:
+        return []
+    if status in ("pending", "skipped"):
+        return [status] * count
+    if status == "done":
+        return ["done"] * count
+    if status == "warn":
+        out = ["done"] * count
+        out[-1] = "warn"
+        return out
+    if status == "failed":
+        idx = fail_index if fail_index is not None else count - 1
+        idx = max(0, min(idx, count - 1))
+        out = ["done"] * count
+        out[idx] = "failed"
+        for pos in range(idx + 1, count):
+            out[pos] = "pending"
+        return out
+    if status == "running":
+        idx = min(count - 1, max(0, count // 2))
+        out = ["pending"] * count
+        for pos in range(idx):
+            out[pos] = "done"
+        out[idx] = "running"
+        return out
+    return ["pending"] * count
+
+
+def _subtask_rows(step_id: str, status: str) -> list[dict[str, str]]:
+    defs = PIPELINE_SUBTASK_DEFS.get(step_id, ())
+    fail_index = len(defs) - 1 if status == "failed" else None
+    if step_id == "test" and status == "warn":
+        fail_index = len(defs) - 1
+    statuses = _spread_status_to_subtasks(status, len(defs), fail_index=fail_index)
+    return [
+        {"id": sub_id, "label": label, "status": statuses[idx] if idx < len(statuses) else "pending"}
+        for idx, (sub_id, label) in enumerate(defs)
+    ]
+
+
+def _step_detail(step_id: str, status: str, result: dict[str, Any] | None, job: dict[str, Any]) -> str:
+    if step_id == "sync":
+        sha = str((result or {}).get("commit_sha") or job.get("commit_sha") or "")
+        if sha and not sha.startswith("0000000"):
+            return sha[:12]
+        return "等待 clone 完成"
+    if step_id == "test":
+        test_status = str((result or {}).get("test_status") or job.get("test_status") or "")
+        summary = (result or {}).get("test_summary") or job.get("test_summary") or {}
+        if isinstance(summary, dict) and summary.get("total"):
+            return f"{summary.get('passed', 0)}/{summary.get('total')} 通过 · {test_status or '—'}"
+        return test_status or ("进行中" if status == "running" else "—")
+    if step_id == "build":
+        tag = str((result or {}).get("tag") or "")
+        if tag:
+            return tag
+        return "deploy.sh / Docker build"
+    if step_id == "push":
+        remote = str((result or {}).get("remote") or job.get("remote") or "")
+        if remote and remote != "archive-only":
+            return remote.split("/")[-1]
+        return "swr.cn-southwest-2…"
+    if step_id == "archive":
+        archive = str((result or {}).get("archive") or job.get("archive") or job.get("archive_dir") or "")
+        if archive:
+            return Path(archive).name
+        return "docker save → nginx"
+    return ""
+
+
+def _prepare_lane_for_job(
+    job: dict[str, Any],
+    service_ids: list[str],
+    catalog: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    services = [catalog[sid] for sid in service_ids if sid in catalog]
+    needs_swr = any(not svc.get("archive_only") for svc in services) if services else True
+    needs_ps = any(not svc.get("skip_public_service") for svc in services) if services else True
+    needs_archive = bool(CFG.get("archive_enabled")) or any(svc.get("bundle_archive") for svc in services)
+    job_status = str(job.get("status") or "")
+    error = str(job.get("error") or "")
+    archive_dir = str(job.get("archive_dir") or "")
+
+    rows: list[dict[str, Any]] = []
+    for step_id, label, hint in PIPELINE_PREPARE_DEFS:
+        if step_id == "env":
+            st = "done" if job_status else "pending"
+            detail = "Docker 可用 · 工作区就绪"
+        elif step_id == "swr":
+            if not needs_swr:
+                st = "skipped"
+                detail = "全部服务为仅归档"
+            elif any(token in error for token in ("SWR", "swr", "login", "鉴权", "docker login")):
+                st = "failed"
+                detail = "登录失败"
+            elif job_status in ("running", "ok", "failed", "stopped"):
+                st = "done"
+                detail = f"{CFG.get('swr_registry', 'swr')}/{CFG.get('swr_org', 'org')}"
+            else:
+                st = "pending"
+                detail = hint
+        elif step_id == "ps":
+            if not needs_ps:
+                st = "skipped"
+                detail = "所选服务不需要"
+            elif "public-service" in error:
+                st = "failed"
+                detail = "同步失败"
+            elif job_status in ("running", "ok", "failed", "stopped"):
+                st = "done"
+                detail = "共享旁路已就绪"
+            else:
+                st = "pending"
+                detail = hint
+        elif step_id == "adir":
+            if not needs_archive:
+                st = "skipped"
+                detail = "归档已禁用"
+            elif archive_dir:
+                st = "done"
+                detail = Path(archive_dir).name
+            elif job_status == "running":
+                st = "running"
+                detail = "创建目录…"
+            else:
+                st = "pending"
+                detail = hint
+        else:
+            st = "pending"
+            detail = hint
+
+        rows.append(
+            {
+                "id": step_id,
+                "label": label,
+                "hint": hint,
+                "status": st,
+                "detail": detail,
+                "subtasks": _subtask_rows(step_id, st),
+            }
+        )
+    return rows
+
+
+def _pipeline_step_rows(
+    step_defs: list[tuple[str, str, str]],
+    statuses: dict[str, str],
+    *,
+    result: dict[str, Any] | None = None,
+    job: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    job = job or {}
+    rows: list[dict[str, Any]] = []
+    for step_id, label, icon in step_defs:
+        status = statuses.get(step_id, "pending")
+        rows.append(
+            {
+                "id": step_id,
+                "label": label,
+                "icon": icon,
+                "status": status,
+                "detail": _step_detail(step_id, status, result, job),
+                "subtasks": _subtask_rows(step_id, status),
+            }
+        )
+    return rows
 
 
 def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
@@ -238,14 +467,39 @@ def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
     return "build"
 
 
-def _pipeline_step_rows(
-    step_defs: list[tuple[str, str]],
-    statuses: dict[str, str],
-) -> list[dict[str, str]]:
-    return [
-        {"id": step_id, "label": label, "status": statuses.get(step_id, "pending")}
-        for step_id, label in step_defs
-    ]
+def _pipeline_summary(steps: list[dict[str, Any]], prepare: list[dict[str, Any]]) -> dict[str, Any]:
+    all_steps = list(prepare) + list(steps)
+    total = len(all_steps)
+    counts = {"done": 0, "running": 0, "failed": 0, "pending": 0, "skipped": 0, "warn": 0}
+    for item in all_steps:
+        key = str(item.get("status") or "pending")
+        counts[key] = counts.get(key, 0) + 1
+    weighted = counts["done"] + counts["warn"] + counts["skipped"] * 0.5
+    percent = int(round((weighted / total) * 100)) if total else 0
+    return {
+        "total": total,
+        "done": counts.get("done", 0),
+        "running": counts.get("running", 0),
+        "failed": counts.get("failed", 0),
+        "pending": counts.get("pending", 0),
+        "skipped": counts.get("skipped", 0),
+        "warn": counts.get("warn", 0),
+        "percent": min(100, max(0, percent)),
+    }
+
+
+def _pipeline_artifacts(result: dict[str, Any] | None, svc: dict[str, Any] | None) -> dict[str, str]:
+    result = result or {}
+    svc = svc or {}
+    return {
+        "service_id": str(result.get("service_id") or svc.get("id") or ""),
+        "image": str(result.get("image") or svc.get("image") or ""),
+        "tag": str(result.get("tag") or ""),
+        "remote": str(result.get("remote") or ""),
+        "package_name": str(result.get("package_name") or ""),
+        "download_url": str(result.get("download_url") or ""),
+        "archive": str(result.get("archive") or ""),
+    }
 
 
 def _running_pipeline_statuses(
@@ -282,14 +536,14 @@ def _running_pipeline_statuses(
 
 def _completed_pipeline_statuses(
     result: dict[str, Any],
-    step_defs: list[tuple[str, str]],
+    step_defs: list[tuple[str, str, str]],
     *,
     skip_push: bool,
 ) -> dict[str, str]:
-    step_ids = [step_id for step_id, _ in step_defs]
+    step_ids = [step_id for step_id, _, _ in step_defs]
     statuses: dict[str, str] = {}
     if result.get("ok"):
-        for step_id, _ in step_defs:
+        for step_id, _, _ in step_defs:
             if step_id == "push" and skip_push:
                 statuses[step_id] = "skipped"
             else:
@@ -302,7 +556,7 @@ def _completed_pipeline_statuses(
     failed = _failed_pipeline_step(result, step_ids)
     failed_idx = step_ids.index(failed) if failed in step_ids else len(step_ids) - 1
     build_idx = step_ids.index("build") if "build" in step_ids else -1
-    for idx, (step_id, _) in enumerate(step_defs):
+    for idx, (step_id, _, _) in enumerate(step_defs):
         if step_id == "push" and skip_push:
             statuses[step_id] = "skipped" if failed_idx > build_idx else "pending"
             continue
@@ -357,26 +611,35 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         elif is_running and service_id == current_sid:
             statuses = _running_pipeline_statuses(
                 stage,
-                [step_id for step_id, _ in step_defs],
+                [step_id for step_id, _, _ in step_defs],
                 skip_push=skip_push,
             )
             svc_status = "running"
             focus_sid = service_id
         elif is_running and idx < current_idx:
-            statuses = {step_id: "done" for step_id, _ in step_defs}
+            statuses = {step_id: "done" for step_id, _, _ in step_defs}
             if skip_push:
                 statuses["push"] = "skipped"
             svc_status = "done"
         else:
-            statuses = {step_id: "pending" for step_id, _ in step_defs}
+            statuses = {step_id: "pending" for step_id, _, _ in step_defs}
             svc_status = "pending"
 
+        result_row = results_by_id.get(service_id)
         services_out.append(
             {
                 "service_id": service_id,
                 "title": title,
                 "status": svc_status,
-                "steps": _pipeline_step_rows(step_defs, statuses),
+                "archive_only": skip_push,
+                "image": str((svc or {}).get("image") or ""),
+                "branch": str(result_row.get("branch") if result_row else job.get("branch") or ""),
+                "steps": _pipeline_step_rows(
+                    step_defs,
+                    statuses,
+                    result=result_row,
+                    job=job,
+                ),
             }
         )
 
@@ -393,12 +656,30 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             focus_sid = str(services_out[0]["service_id"])
 
     focus = next((item for item in services_out if item["service_id"] == focus_sid), None)
+    focus_result = results_by_id.get(focus_sid or "")
+    focus_svc = catalog.get(focus_sid or "")
+    prepare = _prepare_lane_for_job(job, service_ids, catalog)
+    steps = list(focus.get("steps") or []) if focus else []
     return {
         "progress": progress_text,
         "current_service": current_sid,
         "focus_service": focus_sid,
-        "steps": list(focus.get("steps") or []) if focus else [],
+        "meta": {
+            "job_id": str(job.get("id") or ""),
+            "status": job_status,
+            "stage": stage,
+            "branch": str(job.get("branch") or ""),
+            "commit_sha": str(
+                (focus_result or {}).get("commit_sha") or job.get("commit_sha") or ""
+            ),
+            "archive_dir": str(job.get("archive_dir") or ""),
+            "service_count": len(service_ids),
+        },
+        "prepare": prepare,
+        "steps": steps,
         "services": services_out,
+        "summary": _pipeline_summary(steps, prepare),
+        "artifacts": _pipeline_artifacts(focus_result, focus_svc),
     }
 
 

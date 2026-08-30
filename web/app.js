@@ -590,7 +590,7 @@ function openHistoryJob(jobId, summary) {
       if (logEl) {
         paintLog(logEl, displayJobLog(historyLogLines), historyLogFollow);
       }
-      renderJobPipeline("historyJobPipeline", job.pipeline);
+      renderJobPipeline("historyJobPipeline", job.pipeline, job.status);
       if (meta) {
         meta.textContent =
           (summary || job.service_id || jobId) +
@@ -900,19 +900,263 @@ const PIPELINE_STATE_LABELS = {
   warn: "有告警",
 };
 
-const PIPELINE_DOT = {
-  pending: "·",
-  running: "…",
-  done: "✓",
-  failed: "×",
-  skipped: "—",
-  warn: "!",
+const PIPELINE_ICONS = {
+  git: "⎇",
+  test: "◉",
+  build: "⚙",
+  push: "↑",
+  archive: "▣",
+  env: "◫",
+  swr: "🔐",
+  ps: "⎔",
+  adir: "📁",
 };
 
-function renderJobPipeline(containerId, pipeline) {
+const PIPELINE_POST_STEPS = [
+  { id: "cleanup", label: "镜像清理", detail: "remove business images", status: "pending" },
+  { id: "index", label: "产物索引", detail: "artifacts.json 更新", status: "pending" },
+  { id: "notify", label: "状态回写", detail: "构建历史 / 下载链接", status: "pending" },
+];
+
+function pipelineJobStatusLabel(status) {
+  const map = {
+    running: "执行中",
+    ok: "成功",
+    failed: "失败",
+    stopped: "已停止",
+    unknown: "未知",
+  };
+  return map[status] || status || "—";
+}
+
+function shortSha(sha) {
+  const text = String(sha || "").trim();
+  if (!text || text.startsWith("0000000")) return "—";
+  return text.slice(0, 12);
+}
+
+function resolvePostSteps(pipeline, jobStatus) {
+  const steps = PIPELINE_POST_STEPS.map((item) => ({ ...item }));
+  if (jobStatus === "ok") {
+    steps.forEach((item) => { item.status = "done"; });
+  } else if (jobStatus === "running") {
+    const mainDone = (pipeline.steps || []).every((step) =>
+      ["done", "skipped", "warn"].includes(step.status)
+    );
+    if (mainDone) {
+      steps[0].status = "running";
+    }
+  } else if (jobStatus === "failed" || jobStatus === "stopped") {
+    steps.forEach((item) => { item.status = "skipped"; });
+  }
+  return steps;
+}
+
+function createPipelineSubtaskList(subtasks, compact) {
+  const list = document.createElement("ul");
+  list.className = "pipeline-subtasks" + (compact ? " is-compact" : "");
+  (subtasks || []).forEach((sub) => {
+    const li = document.createElement("li");
+    li.className = "pipeline-subtask is-" + (sub.status || "pending");
+    const mark = document.createElement("span");
+    mark.className = "pipeline-subtask-mark";
+    mark.textContent = PIPELINE_STATE_LABELS[sub.status] || sub.status || "·";
+    const text = document.createElement("span");
+    text.className = "pipeline-subtask-text";
+    text.textContent = sub.label || sub.id || "";
+    li.append(mark, text);
+    list.appendChild(li);
+  });
+  return list;
+}
+
+function createPipelineStepCard(step, options) {
+  const opts = options || {};
+  const status = step.status || "pending";
+  const card = document.createElement("article");
+  card.className = "pipeline-card is-" + status + (opts.compact ? " is-compact" : "");
+
+  const head = document.createElement("div");
+  head.className = "pipeline-card-head";
+  const icon = document.createElement("span");
+  icon.className = "pipeline-card-icon";
+  icon.textContent = PIPELINE_ICONS[step.icon || step.id] || String((opts.index || 0) + 1);
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "pipeline-card-title-wrap";
+  const title = document.createElement("div");
+  title.className = "pipeline-card-title";
+  title.textContent = step.label || step.id || "";
+  const state = document.createElement("div");
+  state.className = "pipeline-card-state";
+  state.textContent = PIPELINE_STATE_LABELS[status] || status;
+  titleWrap.append(title, state);
+  head.append(icon, titleWrap);
+  card.appendChild(head);
+
+  if (step.detail) {
+    const detail = document.createElement("div");
+    detail.className = "pipeline-card-detail";
+    detail.textContent = step.detail;
+    card.appendChild(detail);
+  }
+  if (step.hint && !step.detail) {
+    const hint = document.createElement("div");
+    hint.className = "pipeline-card-detail is-muted";
+    hint.textContent = step.hint;
+    card.appendChild(hint);
+  }
+  if (Array.isArray(step.subtasks) && step.subtasks.length) {
+    card.appendChild(createPipelineSubtaskList(step.subtasks, !!opts.compact));
+  }
+  return card;
+}
+
+function createPipelineMetaGrid(meta, summary) {
+  const grid = document.createElement("div");
+  grid.className = "pipeline-meta-grid";
+  const items = [
+    ["任务", meta.job_id || "—"],
+    ["状态", pipelineJobStatusLabel(meta.status)],
+    ["阶段", meta.stage || "—"],
+    ["分支", meta.branch || "—"],
+    ["Commit", shortSha(meta.commit_sha)],
+    ["微服务", String(meta.service_count || "—")],
+    ["归档目录", meta.archive_dir ? meta.archive_dir.split("/").pop() : "—"],
+    ["总进度", (summary && summary.percent != null ? summary.percent + "%" : "—")],
+  ];
+  items.forEach(([label, value]) => {
+    const cell = document.createElement("div");
+    cell.className = "pipeline-meta-cell";
+    const key = document.createElement("span");
+    key.className = "pipeline-meta-key";
+    key.textContent = label;
+    const val = document.createElement("span");
+    val.className = "pipeline-meta-val";
+    val.textContent = value;
+    val.title = value;
+    cell.append(key, val);
+    grid.appendChild(cell);
+  });
+  return grid;
+}
+
+function createPipelineProgressBar(summary) {
+  const wrap = document.createElement("div");
+  wrap.className = "pipeline-progress-wrap";
+  const bar = document.createElement("div");
+  bar.className = "pipeline-progress-bar";
+  bar.setAttribute("role", "progressbar");
+  const percent = summary && Number.isFinite(Number(summary.percent)) ? Number(summary.percent) : 0;
+  bar.setAttribute("aria-valuenow", String(percent));
+  bar.setAttribute("aria-valuemin", "0");
+  bar.setAttribute("aria-valuemax", "100");
+  const fill = document.createElement("div");
+  fill.className = "pipeline-progress-fill";
+  fill.style.width = percent + "%";
+  bar.appendChild(fill);
+  const stats = document.createElement("div");
+  stats.className = "pipeline-progress-stats";
+  if (summary) {
+    stats.textContent =
+      "完成 " + (summary.done || 0) +
+      " · 进行中 " + (summary.running || 0) +
+      " · 等待 " + (summary.pending || 0) +
+      (summary.failed ? " · 失败 " + summary.failed : "") +
+      (summary.skipped ? " · 跳过 " + summary.skipped : "");
+  }
+  wrap.append(bar, stats);
+  return wrap;
+}
+
+function createPipelineArtifactsPanel(artifacts) {
+  const panel = document.createElement("div");
+  panel.className = "pipeline-artifacts";
+  const title = document.createElement("div");
+  title.className = "pipeline-artifacts-title";
+  title.textContent = "产物信息";
+  panel.appendChild(title);
+  const grid = document.createElement("div");
+  grid.className = "pipeline-artifacts-grid";
+  const rows = [
+    ["镜像", artifacts.image || "—"],
+    ["Tag", artifacts.tag || "—"],
+    ["远程", artifacts.remote || "—"],
+    ["包文件", artifacts.package_name || "—"],
+  ];
+  rows.forEach(([label, value]) => {
+    const row = document.createElement("div");
+    row.className = "pipeline-artifact-row";
+    const key = document.createElement("span");
+    key.textContent = label;
+    const val = document.createElement("span");
+    val.className = "pipeline-artifact-val" + (value === "—" ? " is-empty" : "");
+    val.textContent = value;
+    val.title = value;
+    row.append(key, val);
+    grid.appendChild(row);
+  });
+  panel.appendChild(grid);
+  if (artifacts.download_url) {
+    const link = document.createElement("a");
+    link.className = "pipeline-artifact-link";
+    link.href = artifacts.download_url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = "打开下载链接";
+    panel.appendChild(link);
+  }
+  return panel;
+}
+
+function createPipelineLane(label, steps, options) {
+  const lane = document.createElement("section");
+  lane.className = "pipeline-lane" + (options && options.compact ? " is-compact" : "");
+  const head = document.createElement("div");
+  head.className = "pipeline-lane-head";
+  const laneLabel = document.createElement("span");
+  laneLabel.className = "pipeline-lane-label";
+  laneLabel.textContent = label;
+  head.appendChild(laneLabel);
+  if (options && options.note) {
+    const note = document.createElement("span");
+    note.className = "pipeline-lane-note";
+    note.textContent = options.note;
+    head.appendChild(note);
+  }
+  lane.appendChild(head);
+  const track = document.createElement("div");
+  track.className = "pipeline-card-track";
+  (steps || []).forEach((step, index) => {
+    track.appendChild(createPipelineStepCard(step, { compact: !!(options && options.compact), index }));
+  });
+  lane.appendChild(track);
+  return lane;
+}
+
+function createPipelineLegend() {
+  const legend = document.createElement("div");
+  legend.className = "pipeline-legend";
+  [
+    ["done", "完成"],
+    ["running", "进行中"],
+    ["pending", "等待"],
+    ["skipped", "跳过/未启用"],
+    ["warn", "告警"],
+    ["failed", "失败"],
+  ].forEach(([status, label]) => {
+    const item = document.createElement("span");
+    item.className = "pipeline-legend-item is-" + status;
+    item.textContent = label;
+    legend.appendChild(item);
+  });
+  return legend;
+}
+
+function renderJobPipeline(containerId, pipeline, jobStatus) {
   const root = $(containerId);
   if (!root) return;
-  if (!pipeline || !Array.isArray(pipeline.steps) || !pipeline.steps.length) {
+  const steps = pipeline && Array.isArray(pipeline.steps) ? pipeline.steps : [];
+  if (!pipeline || !steps.length) {
     root.hidden = true;
     root.replaceChildren();
     return;
@@ -921,6 +1165,12 @@ function renderJobPipeline(containerId, pipeline) {
   root.hidden = false;
   root.replaceChildren();
 
+  const meta = pipeline.meta || {};
+  const summary = pipeline.summary || {};
+  const status = jobStatus || meta.status || "";
+
+  const top = document.createElement("div");
+  top.className = "pipeline-top";
   const head = document.createElement("div");
   head.className = "pipeline-head";
   const title = document.createElement("p");
@@ -943,7 +1193,8 @@ function renderJobPipeline(containerId, pipeline) {
     progress.textContent = pipeline.progress;
     head.appendChild(progress);
   }
-  root.appendChild(head);
+  top.append(head, createPipelineProgressBar(summary), createPipelineMetaGrid(meta, summary));
+  root.appendChild(top);
 
   if (services.length > 1) {
     const batch = document.createElement("div");
@@ -961,32 +1212,28 @@ function renderJobPipeline(containerId, pipeline) {
     root.appendChild(batch);
   }
 
-  const track = document.createElement("div");
-  track.className = "pipeline-track";
-  pipeline.steps.forEach((step, index) => {
-    const status = step.status || "pending";
-    const node = document.createElement("div");
-    node.className = "pipeline-node is-" + status;
-    node.setAttribute("aria-label", (step.label || step.id || "step") + " " + (PIPELINE_STATE_LABELS[status] || status));
+  const body = document.createElement("div");
+  body.className = "pipeline-body";
+  const main = document.createElement("div");
+  main.className = "pipeline-main";
 
-    const dot = document.createElement("div");
-    dot.className = "pipeline-dot";
-    dot.textContent = PIPELINE_DOT[status] || String(index + 1);
-    node.appendChild(dot);
-
-    const label = document.createElement("div");
-    label.className = "pipeline-label";
-    label.textContent = step.label || step.id || "";
-    node.appendChild(label);
-
-    const state = document.createElement("div");
-    state.className = "pipeline-state";
-    state.textContent = PIPELINE_STATE_LABELS[status] || status;
-    node.appendChild(state);
-
-    track.appendChild(node);
-  });
-  root.appendChild(track);
+  if (Array.isArray(pipeline.prepare) && pipeline.prepare.length) {
+    main.appendChild(createPipelineLane("准备阶段", pipeline.prepare, {
+      compact: true,
+      note: "任务启动前的共享步骤",
+    }));
+  }
+  main.appendChild(createPipelineLane("构建阶段", steps, {
+    note: focusSvc && focusSvc.archive_only ? "仅归档 · 跳过 SWR 推送" : "Clone → Test → Build → Push → Archive",
+  }));
+  main.appendChild(createPipelineLane("收尾阶段", resolvePostSteps(pipeline, status), {
+    compact: true,
+    note: "灰色步骤为辅助流程",
+  }));
+  body.appendChild(main);
+  body.appendChild(createPipelineArtifactsPanel(pipeline.artifacts || {}));
+  root.appendChild(body);
+  root.appendChild(createPipelineLegend());
 }
 
 function renderTestResult(job) {
@@ -1520,7 +1767,7 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
       paintLog(logEl, displayJobLog(liveLogLines), liveLogFollow);
     }
     renderTestResult(renderJob);
-    renderJobPipeline("liveJobPipeline", job.pipeline);
+    renderJobPipeline("liveJobPipeline", job.pipeline, job.status);
     const progress = job.progress ? " · " + job.progress : "";
     const current = job.current ? " · " + job.current : "";
     const stage = job.stage ? " · " + job.stage : "";

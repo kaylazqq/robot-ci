@@ -317,6 +317,18 @@ class JobPipelineTests(unittest.TestCase):
         statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
         self.assertEqual("failed", statuses["sync"])
         self.assertEqual("pending", statuses["build"])
+        self.assertTrue(payload["pipeline"]["prepare"])
+        self.assertTrue(all("subtasks" in step for step in payload["pipeline"]["steps"]))
+
+    def test_pipeline_includes_meta_and_summary(self) -> None:
+        job = make_job("pipe-meta")
+        job["id"] = "pipe-meta"
+        job["archive_dir"] = "/usr/share/nginx/html/images/demo-job"
+        payload = server.job_payload(job, compact=True)
+        pipeline = payload["pipeline"]
+        self.assertEqual("pipe-meta", pipeline["meta"]["job_id"])
+        self.assertIn("percent", pipeline["summary"])
+        self.assertIn("artifacts", pipeline)
 
 
 class SwrLoginProbeTests(unittest.TestCase):
