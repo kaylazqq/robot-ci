@@ -1018,9 +1018,7 @@ function createStageColumn(stage, incomingOk) {
   (stage.tasks || []).forEach((task) => {
     const row = document.createElement("div");
     row.className = "pl-task is-" + (task.status || "pending");
-    const elbow = document.createElement("span");
-    elbow.className = "pl-elbow";
-    row.append(elbow, createStatusIcon(task.status, "pl-task-icon"));
+    row.appendChild(createStatusIcon(task.status, "pl-task-icon"));
     const name = document.createElement("span");
     name.className = "pl-task-name";
     name.textContent = task.label || task.id || "";
