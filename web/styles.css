@@ -80,7 +80,7 @@ h1 { margin: 0; font-size: 1.35rem; font-weight: 700; }
     grid-template-columns: 360px 1fr;
     grid-template-areas:
       "setup workspace"
-      "setup logs";
+      "logs logs";
   }
   .setup { grid-area: setup; }
   .workspace { grid-area: workspace; }
@@ -470,10 +470,11 @@ textarea { resize: vertical; }
 .cce-detail { max-height: 18rem; overflow: auto; margin-top: 0.75rem; }
 
 .job-pipeline {
-  margin: 0 0 0.85rem;
-  padding: 1rem 1.1rem 0.85rem;
+  margin: 0 0 1rem;
+  padding: 1.15rem 1.25rem 1rem;
+  min-height: 22rem;
   border: 1px solid #2a2f2c;
-  border-radius: 6px;
+  border-radius: 8px;
   background: #161a18;
 }
 .job-pipeline[hidden] { display: none !important; }
@@ -507,18 +508,19 @@ textarea { resize: vertical; }
   display: flex;
   align-items: flex-start;
   min-width: max-content;
-  padding: 0.2rem 0.35rem 0.5rem;
+  width: 100%;
+  padding: 0.35rem 0.5rem 0.7rem;
 }
 
 .pl-col,
 .pl-end {
-  flex: 0 0 auto;
-  width: 12.5rem;
+  flex: 1 0 auto;
+  width: 16.5rem;
   display: flex;
   flex-direction: column;
   align-items: stretch;
 }
-.pl-end { width: 4.2rem; }
+.pl-end { width: 5.5rem; flex: 0 0 5.5rem; }
 
 .pl-caption {
   min-height: 3rem;
@@ -534,7 +536,7 @@ textarea { resize: vertical; }
   font-weight: 600;
   color: #e8eee9;
   line-height: 1.25;
-  max-width: 12rem;
+  max-width: 15.5rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -621,8 +623,8 @@ textarea { resize: vertical; }
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 0.28rem;
-  padding: 0.15rem 0 0.2rem;
+  gap: 0.72rem;
+  padding: 0.35rem 0 0.35rem;
 }
 .pl-tree::before {
   content: "";
@@ -642,7 +644,7 @@ textarea { resize: vertical; }
   display: grid;
   grid-template-columns: 1fr var(--pl-dot) minmax(5.5rem, 1fr);
   align-items: center;
-  min-height: 2.05rem;
+  min-height: 2.55rem;
 }
 .pl-task-icon {
   grid-column: 2;
