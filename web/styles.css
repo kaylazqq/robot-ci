@@ -469,6 +469,144 @@ textarea { resize: vertical; }
 .cce-inline-label .input { min-width: 12rem; }
 .cce-detail { max-height: 18rem; overflow: auto; margin-top: 0.75rem; }
 
+.job-pipeline {
+  margin: 0 0 0.85rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel) 88%, #000 12%);
+}
+.job-pipeline[hidden] { display: none !important; }
+.pipeline-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  margin-bottom: 0.65rem;
+}
+.pipeline-title {
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.pipeline-focus {
+  font-size: 0.88rem;
+  color: var(--text);
+}
+.pipeline-progress {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.pipeline-batch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+}
+.pipeline-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--bg1) 70%, transparent);
+}
+.pipeline-chip.is-running { border-color: var(--warn); color: var(--warn); }
+.pipeline-chip.is-ok { border-color: var(--ok); color: var(--ok); }
+.pipeline-chip.is-failed { border-color: var(--danger); color: var(--danger); }
+.pipeline-chip.is-focus {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.pipeline-track {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  overflow-x: auto;
+  padding-bottom: 0.15rem;
+}
+.pipeline-node {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 5.5rem;
+  text-align: center;
+}
+.pipeline-node:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: 0.95rem;
+  left: calc(50% + 0.95rem);
+  width: calc(100% - 1.9rem);
+  height: 2px;
+  background: var(--line);
+  z-index: 0;
+}
+.pipeline-node.is-done:not(:last-child)::after,
+.pipeline-node.is-warn:not(:last-child)::after {
+  background: color-mix(in srgb, var(--ok) 55%, var(--line));
+}
+.pipeline-node.is-running:not(:last-child)::after {
+  background: linear-gradient(90deg, var(--ok), var(--line));
+}
+.pipeline-node.is-failed:not(:last-child)::after {
+  background: linear-gradient(90deg, var(--danger), var(--line));
+}
+.pipeline-dot {
+  position: relative;
+  z-index: 1;
+  width: 1.9rem;
+  height: 1.9rem;
+  margin: 0 auto 0.45rem;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  background: var(--bg1);
+  display: grid;
+  place-items: center;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+.pipeline-node.is-done .pipeline-dot {
+  border-color: var(--ok);
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, var(--bg1));
+}
+.pipeline-node.is-running .pipeline-dot {
+  border-color: var(--warn);
+  color: var(--warn);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 18%, transparent);
+  animation: pipeline-pulse 1.4s ease-in-out infinite;
+}
+.pipeline-node.is-failed .pipeline-dot {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg1));
+}
+.pipeline-node.is-skipped .pipeline-dot {
+  border-style: dashed;
+  color: var(--muted);
+}
+.pipeline-node.is-warn .pipeline-dot {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+.pipeline-label {
+  font-size: 0.78rem;
+  line-height: 1.25;
+  color: var(--text);
+}
+.pipeline-state {
+  margin-top: 0.2rem;
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+@keyframes pipeline-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.06); }
+}
+
 .foot {
   padding: 0 1.75rem 1.5rem;
   color: var(--muted);

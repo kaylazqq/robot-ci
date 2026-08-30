@@ -542,6 +542,7 @@ function showHistoryList() {
   historyDetailJobId = "";
   historyLogLines = [];
   historyLogCursor = 0;
+  renderJobPipeline("historyJobPipeline", null);
   setStopButtonState($("btnHistoryStop"), false, false);
   const list = $("historyList");
   const detail = $("historyDetail");
@@ -589,6 +590,7 @@ function openHistoryJob(jobId, summary) {
       if (logEl) {
         paintLog(logEl, displayJobLog(historyLogLines), historyLogFollow);
       }
+      renderJobPipeline("historyJobPipeline", job.pipeline);
       if (meta) {
         meta.textContent =
           (summary || job.service_id || jobId) +
@@ -887,6 +889,104 @@ function renderTestRun(root, run, stateKey, rerender) {
     });
     root.appendChild(list);
   }
+}
+
+const PIPELINE_STATE_LABELS = {
+  pending: "等待",
+  running: "进行中",
+  done: "完成",
+  failed: "失败",
+  skipped: "跳过",
+  warn: "有告警",
+};
+
+const PIPELINE_DOT = {
+  pending: "·",
+  running: "…",
+  done: "✓",
+  failed: "×",
+  skipped: "—",
+  warn: "!",
+};
+
+function renderJobPipeline(containerId, pipeline) {
+  const root = $(containerId);
+  if (!root) return;
+  if (!pipeline || !Array.isArray(pipeline.steps) || !pipeline.steps.length) {
+    root.hidden = true;
+    root.replaceChildren();
+    return;
+  }
+
+  root.hidden = false;
+  root.replaceChildren();
+
+  const head = document.createElement("div");
+  head.className = "pipeline-head";
+  const title = document.createElement("p");
+  title.className = "pipeline-title";
+  title.textContent = "构建流水线";
+  head.appendChild(title);
+
+  const services = Array.isArray(pipeline.services) ? pipeline.services : [];
+  const focusId = pipeline.focus_service || pipeline.current_service || "";
+  const focusSvc = services.find((item) => item.service_id === focusId) || services[0];
+  if (focusSvc) {
+    const focus = document.createElement("span");
+    focus.className = "pipeline-focus";
+    focus.textContent = "当前：" + (focusSvc.title || focusSvc.service_id);
+    head.appendChild(focus);
+  }
+  if (pipeline.progress) {
+    const progress = document.createElement("span");
+    progress.className = "pipeline-progress";
+    progress.textContent = pipeline.progress;
+    head.appendChild(progress);
+  }
+  root.appendChild(head);
+
+  if (services.length > 1) {
+    const batch = document.createElement("div");
+    batch.className = "pipeline-batch";
+    services.forEach((item) => {
+      const chip = document.createElement("span");
+      chip.className = "pipeline-chip";
+      if (item.service_id === focusId) chip.classList.add("is-focus");
+      if (item.status === "running") chip.classList.add("is-running");
+      else if (item.status === "ok") chip.classList.add("is-ok");
+      else if (item.status === "failed") chip.classList.add("is-failed");
+      chip.textContent = item.title || item.service_id;
+      batch.appendChild(chip);
+    });
+    root.appendChild(batch);
+  }
+
+  const track = document.createElement("div");
+  track.className = "pipeline-track";
+  pipeline.steps.forEach((step, index) => {
+    const status = step.status || "pending";
+    const node = document.createElement("div");
+    node.className = "pipeline-node is-" + status;
+    node.setAttribute("aria-label", (step.label || step.id || "step") + " " + (PIPELINE_STATE_LABELS[status] || status));
+
+    const dot = document.createElement("div");
+    dot.className = "pipeline-dot";
+    dot.textContent = PIPELINE_DOT[status] || String(index + 1);
+    node.appendChild(dot);
+
+    const label = document.createElement("div");
+    label.className = "pipeline-label";
+    label.textContent = step.label || step.id || "";
+    node.appendChild(label);
+
+    const state = document.createElement("div");
+    state.className = "pipeline-state";
+    state.textContent = PIPELINE_STATE_LABELS[status] || status;
+    node.appendChild(state);
+
+    track.appendChild(node);
+  });
+  root.appendChild(track);
 }
 
 function renderTestResult(job) {
@@ -1420,6 +1520,7 @@ async function pollJob(jobId, summary, generation = pollGeneration, trackRecent 
       paintLog(logEl, displayJobLog(liveLogLines), liveLogFollow);
     }
     renderTestResult(renderJob);
+    renderJobPipeline("liveJobPipeline", job.pipeline);
     const progress = job.progress ? " · " + job.progress : "";
     const current = job.current ? " · " + job.current : "";
     const stage = job.stage ? " · " + job.stage : "";

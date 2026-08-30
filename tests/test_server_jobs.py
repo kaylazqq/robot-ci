@@ -276,6 +276,49 @@ class JobPayloadTests(unittest.TestCase):
         self.assertIn(raw[7], visible)
 
 
+class JobPipelineTests(unittest.TestCase):
+    def test_running_job_marks_active_stage(self) -> None:
+        job = make_job("pipe-run")
+        job["stage"] = "building"
+        job["current"] = "memory-service@main"
+        payload = server.job_payload(job, compact=True)
+        pipeline = payload["pipeline"]
+        self.assertEqual("memory-service", pipeline["focus_service"])
+        statuses = {step["id"]: step["status"] for step in pipeline["steps"]}
+        self.assertEqual("done", statuses["sync"])
+        self.assertEqual("done", statuses["test"])
+        self.assertEqual("running", statuses["build"])
+        self.assertEqual("pending", statuses["push"])
+
+    def test_archive_only_service_skips_push_step(self) -> None:
+        job = make_job("pipe-archive")
+        job["stage"] = "archiving"
+        job["service_id"] = "ops-router"
+        job["service_ids"] = ["ops-router"]
+        job["current"] = "ops-router@main"
+        payload = server.job_payload(job, compact=True)
+        step_ids = [step["id"] for step in payload["pipeline"]["steps"]]
+        self.assertNotIn("push", step_ids)
+        statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
+        self.assertEqual("running", statuses["archive"])
+
+    def test_failed_sync_marks_first_step_failed(self) -> None:
+        job = make_job("pipe-fail", status="failed")
+        job["stage"] = "done"
+        job["results"] = [
+            {
+                "service_id": "memory-service",
+                "ok": False,
+                "error": "git clone failed: repository not found",
+                "commit_sha": "0000000000000000000000000000000000000000",
+            }
+        ]
+        payload = server.job_payload(job, compact=True)
+        statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
+        self.assertEqual("failed", statuses["sync"])
+        self.assertEqual("pending", statuses["build"])
+
+
 class SwrLoginProbeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.saved_cache = server._login_probe_cache

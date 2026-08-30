@@ -179,6 +179,229 @@ def _job_service_ids(job: dict[str, Any]) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
+PIPELINE_STEP_DEFS: tuple[tuple[str, str], ...] = (
+    ("sync", "拉代码"),
+    ("test", "单元测试"),
+    ("build", "构建镜像"),
+    ("push", "推送 SWR"),
+    ("archive", "本地归档"),
+)
+
+STAGE_TO_PIPELINE_STEP = {
+    "syncing": "sync",
+    "testing": "test",
+    "building": "build",
+    "pushing": "push",
+    "archiving": "archive",
+}
+
+
+def _service_skip_push(svc: dict[str, Any] | None) -> bool:
+    if not svc:
+        return False
+    return bool(svc.get("archive_only") or svc.get("host_package") or svc.get("bundle_archive"))
+
+
+def _pipeline_steps_for_service(svc: dict[str, Any] | None) -> list[tuple[str, str]]:
+    steps = list(PIPELINE_STEP_DEFS)
+    if _service_skip_push(svc):
+        steps = [item for item in steps if item[0] != "push"]
+    return steps
+
+
+def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
+    err = str(result.get("error") or "").lower()
+    if any(
+        token in err
+        for token in (
+            "clone",
+            "checkout",
+            "sync",
+            "git ",
+            "deploy.sh",
+            "build-image.sh",
+            "unknown service",
+            "repo",
+            "missing deploy",
+        )
+    ):
+        return "sync"
+    if any(token in err for token in ("archive", "host package", "tar.gz", "bundle", "fleet")):
+        return "archive"
+    if "push" in step_ids and any(token in err for token in ("push", "swr", "docker login", "denied")):
+        return "push"
+    if any(token in err for token in ("build", "docker", "npm", "compile", "make", "solve")):
+        return "build"
+    commit_sha = str(result.get("commit_sha") or "")
+    if err and (not commit_sha or commit_sha.startswith("0000000")):
+        return "sync"
+    return "build"
+
+
+def _pipeline_step_rows(
+    step_defs: list[tuple[str, str]],
+    statuses: dict[str, str],
+) -> list[dict[str, str]]:
+    return [
+        {"id": step_id, "label": label, "status": statuses.get(step_id, "pending")}
+        for step_id, label in step_defs
+    ]
+
+
+def _running_pipeline_statuses(
+    stage: str,
+    step_ids: list[str],
+    *,
+    skip_push: bool,
+) -> dict[str, str]:
+    statuses: dict[str, str] = {}
+    active = STAGE_TO_PIPELINE_STEP.get(str(stage or ""))
+    if active not in step_ids:
+        active = None
+
+    build_idx = step_ids.index("build") if "build" in step_ids else -1
+    active_idx = step_ids.index(active) if active in step_ids else -1
+
+    for idx, step_id in enumerate(step_ids):
+        if step_id == "push" and skip_push:
+            if active_idx >= 0 and active_idx > build_idx:
+                statuses[step_id] = "skipped"
+            else:
+                statuses[step_id] = "pending"
+            continue
+        if active_idx < 0:
+            statuses[step_id] = "pending"
+        elif idx < active_idx:
+            statuses[step_id] = "done"
+        elif idx == active_idx:
+            statuses[step_id] = "running"
+        else:
+            statuses[step_id] = "pending"
+    return statuses
+
+
+def _completed_pipeline_statuses(
+    result: dict[str, Any],
+    step_defs: list[tuple[str, str]],
+    *,
+    skip_push: bool,
+) -> dict[str, str]:
+    step_ids = [step_id for step_id, _ in step_defs]
+    statuses: dict[str, str] = {}
+    if result.get("ok"):
+        for step_id, _ in step_defs:
+            if step_id == "push" and skip_push:
+                statuses[step_id] = "skipped"
+            else:
+                statuses[step_id] = "done"
+        test_status = str(result.get("test_status") or "")
+        if test_status and test_status not in ("passed", "not_configured"):
+            statuses["test"] = "warn"
+        return statuses
+
+    failed = _failed_pipeline_step(result, step_ids)
+    failed_idx = step_ids.index(failed) if failed in step_ids else len(step_ids) - 1
+    build_idx = step_ids.index("build") if "build" in step_ids else -1
+    for idx, (step_id, _) in enumerate(step_defs):
+        if step_id == "push" and skip_push:
+            statuses[step_id] = "skipped" if failed_idx > build_idx else "pending"
+            continue
+        if idx < failed_idx:
+            statuses[step_id] = "done"
+        elif idx == failed_idx:
+            statuses[step_id] = "failed"
+        else:
+            statuses[step_id] = "pending"
+    return statuses
+
+
+def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
+    catalog = {str(item.get("id")): item for item in load_services()}
+    service_ids = _job_service_ids(job)
+    if not service_ids:
+        fallback = str(job.get("service_id") or "").split(",")[0].strip()
+        if fallback:
+            service_ids = [fallback]
+
+    results = job.get("results") or []
+    results_by_id = {str(item.get("service_id")): item for item in results if item.get("service_id")}
+
+    current_raw = str(job.get("current") or "")
+    current_sid = current_raw.split("@", 1)[0].strip() if current_raw else ""
+
+    progress_text = str(job.get("progress") or "")
+    current_idx = 0
+    progress_match = re.match(r"(\d+)/(\d+)", progress_text)
+    if progress_match:
+        current_idx = max(0, int(progress_match.group(1)) - 1)
+
+    job_status = str(job.get("status") or "")
+    stage = str(job.get("stage") or "")
+    is_running = job_status in ("running", "unknown")
+
+    services_out: list[dict[str, Any]] = []
+    focus_sid = ""
+
+    for idx, service_id in enumerate(service_ids):
+        svc = catalog.get(service_id)
+        title = str((svc or {}).get("title") or service_id)
+        step_defs = _pipeline_steps_for_service(svc)
+        skip_push = _service_skip_push(svc)
+
+        if service_id in results_by_id:
+            result = results_by_id[service_id]
+            statuses = _completed_pipeline_statuses(result, step_defs, skip_push=skip_push)
+            svc_status = "ok" if result.get("ok") else "failed"
+            if not focus_sid and svc_status == "failed":
+                focus_sid = service_id
+        elif is_running and service_id == current_sid:
+            statuses = _running_pipeline_statuses(
+                stage,
+                [step_id for step_id, _ in step_defs],
+                skip_push=skip_push,
+            )
+            svc_status = "running"
+            focus_sid = service_id
+        elif is_running and idx < current_idx:
+            statuses = {step_id: "done" for step_id, _ in step_defs}
+            if skip_push:
+                statuses["push"] = "skipped"
+            svc_status = "done"
+        else:
+            statuses = {step_id: "pending" for step_id, _ in step_defs}
+            svc_status = "pending"
+
+        services_out.append(
+            {
+                "service_id": service_id,
+                "title": title,
+                "status": svc_status,
+                "steps": _pipeline_step_rows(step_defs, statuses),
+            }
+        )
+
+    if not focus_sid:
+        failed = [item for item in services_out if item["status"] == "failed"]
+        running = [item for item in services_out if item["status"] == "running"]
+        if current_sid:
+            focus_sid = current_sid
+        elif failed:
+            focus_sid = str(failed[0]["service_id"])
+        elif running:
+            focus_sid = str(running[0]["service_id"])
+        elif services_out:
+            focus_sid = str(services_out[0]["service_id"])
+
+    focus = next((item for item in services_out if item["service_id"] == focus_sid), None)
+    return {
+        "progress": progress_text,
+        "current_service": current_sid,
+        "focus_service": focus_sid,
+        "steps": list(focus.get("steps") or []) if focus else [],
+        "services": services_out,
+    }
+
+
 def service_concurrency_cap(service_id: str) -> int | None:
     """Per-service cap. None means no extra limit beyond the global job cap."""
     for item in load_services():
@@ -385,6 +608,7 @@ def job_payload(
     payload["test_revision"] = revision
     if compact and test_revision != revision:
         payload["test_runs"] = deepcopy(job.get("test_runs") or [])
+    payload["pipeline"] = build_job_pipeline(job)
     return payload
 
 

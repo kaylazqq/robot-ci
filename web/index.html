@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SWR Push Helper</title>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=20260821a" />
+  <link rel="stylesheet" href="/styles.css?v=20260830a" />
 </head>
 <body>
   <div class="bg"></div>
@@ -156,6 +156,7 @@
               <p class="hint" id="historyDetailMeta">—</p>
             </div>
           </div>
+          <section class="job-pipeline" id="historyJobPipeline" hidden aria-label="构建流水线"></section>
           <pre class="log history-log" id="historyJobLog">正在加载这次构建的日志…</pre>
         </div>
       </div>
@@ -204,12 +205,13 @@
         <span class="hint" id="jobMeta">尚无任务</span>
         <button type="button" class="btn danger" id="btnStopJob" hidden>停止任务</button>
       </div>
+      <section class="job-pipeline" id="liveJobPipeline" hidden aria-label="构建流水线"></section>
       <section class="test-result" id="testResult" hidden aria-live="polite"></section>
       <pre class="log" id="jobLog">点击「构建并推送」后，这里只显示本次任务的 clone / build / push 日志。历史记录在「构建历史」里分页查看。</pre>
     </section>
   </main>
 
   <footer class="foot" id="footNote">SWR 临时密码只用于本机 Docker 登录 · 不写入业务仓库</footer>
-  <script src="/app.js?v=20260821a"></script>
+  <script src="/app.js?v=20260830a"></script>
 </body>
 </html>
