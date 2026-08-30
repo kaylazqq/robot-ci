@@ -2406,40 +2406,51 @@ def do_logout() -> tuple[bool, str]:
     return ok, msg
 
 
+def _swr_probe_ok(code: int, out: str) -> tuple[bool, str]:
+    text = (out or "").strip()
+    low = text.lower()
+    snippet = text.replace("\n", " ")[-240:] or f"exit={code}"
+    # Missing-image responses mean the registry accepted our credentials.
+    # Check these first: some SWR replies also contain the word "denied".
+    if code == 0 or any(
+        marker in low for marker in ("manifest unknown", "name unknown", "no such manifest")
+    ):
+        return True, snippet
+    if "unauthorized" in low or "authentication required" in low:
+        return False, snippet
+    if "denied" in low:
+        return False, snippet
+    return False, snippet
+
+
 def check_login(force: bool = False) -> bool:
     """Validate SWR auth. Uses short cache; force=True always hits registry."""
+    return check_login_detail(force=force)[0]
+
+
+def check_login_detail(force: bool = False) -> tuple[bool, str]:
+    """Like check_login, but also return the probe snippet for job logs."""
     global _login_ok, _login_probe_cache
     now = time.time()
     if not force and _login_probe_cache and now - _login_probe_cache[0] < 45:
         ok = bool(_login_probe_cache[1])
         with _login_lock:
             _login_ok = ok
-        return ok
+        return ok, "cached"
 
     if not docker_config_has_swr_auth():
         with _login_lock:
             _login_ok = False
             _login_probe_cache = (now, False)
-        return False
+        return False, "local docker config has no SWR auth"
 
     remote = f"{CFG['swr_registry']}/{CFG['swr_org']}/robot-ci-auth-probe-does-not-exist"
     code, out = docker_cmd("manifest", "inspect", remote, timeout=12)
-    text = (out or "").lower()
-    # A valid, authenticated registry request for this deliberately absent image
-    # returns a precise manifest/name-missing response. Everything else fails
-    # closed so a network/configuration error is never reported as logged in.
-    if "unauthorized" in text or "authentication required" in text or "denied" in text:
-        ok = False
-    elif code == 0 or any(
-        marker in text for marker in ("manifest unknown", "name unknown", "no such manifest")
-    ):
-        ok = True
-    else:
-        ok = False
+    ok, snippet = _swr_probe_ok(code, out)
     with _login_lock:
         _login_ok = ok
         _login_probe_cache = (now, ok)
-    return ok
+    return ok, snippet
 
 
 def mark_swr_login_invalid() -> None:
@@ -3365,18 +3376,25 @@ def ensure_swr_login(job_id: str, login_command: str = "") -> bool:
             set_job(job_id, status="failed", error="SWR login failed")
             append_job_log(job_id, "ERROR: paste a valid Huawei SWR temporary login command")
             return False
-        if not check_login(force=True):
+        ok_probe, probe_detail = check_login_detail(force=True)
+        if not ok_probe:
             set_job(job_id, status="failed", error="SWR login verification failed")
-            append_job_log(job_id, "ERROR: SWR login command succeeded locally but registry verification failed")
+            append_job_log(
+                job_id,
+                "ERROR: SWR login command succeeded locally but registry verification failed: "
+                + probe_detail,
+            )
             return False
         return True
 
     append_job_log(job_id, "reusing shared SWR login on this server…")
-    if not check_login(force=True):
+    ok_probe, probe_detail = check_login_detail(force=True)
+    if not ok_probe:
         set_job(job_id, status="failed", error="not logged in to SWR")
         append_job_log(
             job_id,
-            "ERROR: 服务器上尚无有效 SWR 登录（或已过期）。请任一人在页面粘贴 docker login 并登录后再推送。",
+            "ERROR: 服务器上尚无有效 SWR 登录（或已过期）。请任一人在页面粘贴 docker login 并登录后再推送。"
+            f" 校验: {probe_detail}",
         )
         return False
     append_job_log(job_id, "shared SWR login still valid")

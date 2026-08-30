@@ -340,6 +340,11 @@ class SwrLoginProbeTests(unittest.TestCase):
         server._login_probe_cache = self.saved_cache
         server._login_ok = self.saved_login
 
+    @patch.object(server, "docker_cmd", return_value=(1, "denied: no such manifest: demo"))
+    def test_missing_manifest_wins_over_denied_word(self, _docker_cmd) -> None:
+        with patch.object(server, "docker_config_has_swr_auth", return_value=True):
+            self.assertTrue(server.check_login(force=True))
+
     @patch.object(server, "docker_cmd", return_value=(1, "manifest unknown"))
     def test_precise_missing_manifest_means_authenticated(self, docker_cmd) -> None:
         with patch.object(server, "docker_config_has_swr_auth", return_value=True):

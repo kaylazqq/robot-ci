@@ -901,29 +901,26 @@ const PIPELINE_STATE_LABELS = {
 };
 
 const PIPELINE_POST_STEPS = [
-  { id: "cleanup", label: "镜像清理", hint: "docker rmi", status: "pending" },
-  { id: "index", label: "产物索引", hint: "artifacts", status: "pending" },
-  { id: "notify", label: "状态回写", hint: "历史记录", status: "pending" },
+  { id: "cleanup", label: "镜像清理", status: "pending" },
+  { id: "index", label: "产物索引", status: "pending" },
+  { id: "notify", label: "状态回写", status: "pending" },
 ];
-
-const PIPELINE_HINTS = {
-  env: "Docker 环境",
-  swr: "docker login",
-  ps: "public-service",
-  adir: "归档目录",
-  sync: "使用 clone 方式",
-  test: "-",
-  build: "deploy.sh / …",
-  push: "swr.cn-southwest…",
-  archive: "docker save ~",
-  cleanup: "docker rmi",
-  index: "artifacts.json",
-  notify: "构建历史",
-};
 
 function pipelineJobStatusLabel(status) {
   const map = { running: "执行中", ok: "成功", failed: "失败", stopped: "已停止", unknown: "未知" };
   return map[status] || status || "";
+}
+
+function rollupStatus(items) {
+  const list = (items || []).map((item) => item.status || "pending");
+  if (!list.length) return "pending";
+  if (list.some((s) => s === "failed")) return "failed";
+  if (list.some((s) => s === "running")) return "running";
+  if (list.some((s) => s === "warn")) return "warn";
+  if (list.every((s) => s === "skipped")) return "skipped";
+  if (list.every((s) => s === "done" || s === "skipped" || s === "warn")) return "done";
+  if (list.every((s) => s === "pending")) return "pending";
+  return "pending";
 }
 
 function resolvePostSteps(pipeline, jobStatus) {
@@ -935,87 +932,127 @@ function resolvePostSteps(pipeline, jobStatus) {
       ["done", "skipped", "warn"].includes(step.status)
     );
     if (mainDone) steps[0].status = "running";
-    else steps.forEach((item) => { item.status = "pending"; });
-  } else {
+  } else if (jobStatus === "failed" || jobStatus === "stopped") {
     steps.forEach((item) => { item.status = "skipped"; });
   }
   return steps;
 }
 
-function flattenFlowTimeline(pipeline, jobStatus) {
-  const prepare = (pipeline.prepare || []).map((step) => ({ step, group: "prepare" }));
-  const main = (pipeline.steps || []).map((step) => ({ step, group: "build" }));
-  const post = resolvePostSteps(pipeline, jobStatus).map((step) => ({ step, group: "post" }));
-  return [...prepare, ...main, ...post];
+function buildPipelineStages(pipeline, jobStatus) {
+  const stages = [];
+  if (Array.isArray(pipeline.prepare) && pipeline.prepare.length) {
+    stages.push({
+      id: "prepare",
+      label: "准备",
+      status: rollupStatus(pipeline.prepare),
+      tasks: pipeline.prepare,
+    });
+  }
+  (pipeline.steps || []).forEach((step) => {
+    stages.push({
+      id: step.id,
+      label: step.label || step.id,
+      status: step.status || "pending",
+      tasks: Array.isArray(step.subtasks) && step.subtasks.length
+        ? step.subtasks
+        : [{ id: step.id, label: step.label || step.id, status: step.status || "pending" }],
+    });
+  });
+  const post = resolvePostSteps(pipeline, jobStatus);
+  stages.push({ id: "post", label: "收尾", status: rollupStatus(post), tasks: post });
+  return stages;
 }
 
-function connectorClass(prevStatus) {
-  if (prevStatus === "done" || prevStatus === "warn") return "is-ok";
-  if (prevStatus === "failed") return "is-fail";
-  if (prevStatus === "running") return "is-run";
-  if (prevStatus === "skipped") return "is-skip";
+function railClass(status) {
+  if (status === "done" || status === "warn" || status === "running") return "is-ok";
+  if (status === "failed") return "is-fail";
   return "is-wait";
 }
 
-function stepHint(step) {
-  const raw = String(step.detail || step.hint || PIPELINE_HINTS[step.id] || "").trim();
-  if (!raw || raw === "—") return "-";
-  return raw.length > 16 ? raw.slice(0, 15) + "…" : raw;
+function createStatusIcon(status, kind) {
+  const icon = document.createElement("span");
+  icon.className = (kind || "pl-icon") + " is-" + (status || "pending");
+  if (status === "done") icon.textContent = "✓";
+  else if (status === "failed") icon.textContent = "✕";
+  else if (status === "warn") icon.textContent = "!";
+  else if (status === "skipped") icon.textContent = "–";
+  else if (status === "running") icon.textContent = "●";
+  else icon.textContent = "";
+  return icon;
 }
 
-function createDevcloudNode(step) {
-  const status = step.status || "pending";
-  const cell = document.createElement("div");
-  cell.className = "dc-node is-" + status;
+function createStageColumn(stage, incomingOk) {
+  const status = stage.status || "pending";
+  const col = document.createElement("div");
+  col.className = "pl-col is-" + status;
 
-  const icon = document.createElement("div");
-  icon.className = "dc-icon";
-  if (status === "skipped") {
-    icon.innerHTML = '<span class="dc-skip-mark"></span>';
-  } else if (status === "done" || status === "warn") {
-    icon.textContent = "✓";
-  } else if (status === "failed") {
-    icon.textContent = "✕";
-  } else {
-    icon.innerHTML = '<span class="dc-dot"></span>';
-  }
-  cell.appendChild(icon);
+  const cap = document.createElement("div");
+  cap.className = "pl-caption";
+  const title = document.createElement("div");
+  title.className = "pl-title";
+  title.textContent = stage.label || stage.id || "";
+  const dur = document.createElement("div");
+  dur.className = "pl-dur is-" + status;
+  dur.textContent = PIPELINE_STATE_LABELS[status] || status;
+  cap.append(title, dur);
+  col.appendChild(cap);
 
-  const name = document.createElement("div");
-  name.className = "dc-name";
-  name.textContent = step.label || step.id || "";
-  name.title = name.textContent;
-  cell.appendChild(name);
+  const spine = document.createElement("div");
+  spine.className = "pl-spine";
+  const left = document.createElement("div");
+  left.className = "pl-rail left " + (incomingOk ? "is-ok" : "is-wait");
+  const right = document.createElement("div");
+  right.className = "pl-rail right " + railClass(status);
+  spine.append(left, createStatusIcon(status, "pl-stage-icon"), right);
+  col.appendChild(spine);
 
-  const state = document.createElement("div");
-  state.className = "dc-state";
-  state.textContent = PIPELINE_STATE_LABELS[status] || status;
-  cell.appendChild(state);
+  const drop = document.createElement("div");
+  drop.className = "pl-drop";
+  const chev = document.createElement("div");
+  chev.className = "pl-chevron";
+  chev.textContent = "▾";
+  drop.appendChild(chev);
 
-  const hint = document.createElement("div");
-  hint.className = "dc-hint";
-  hint.textContent = status === "skipped" ? "-" : stepHint(step);
-  hint.title = step.detail || step.hint || hint.textContent;
-  cell.appendChild(hint);
-  return cell;
+  const tree = document.createElement("div");
+  tree.className = "pl-tree";
+  (stage.tasks || []).forEach((task) => {
+    const row = document.createElement("div");
+    row.className = "pl-task is-" + (task.status || "pending");
+    const elbow = document.createElement("span");
+    elbow.className = "pl-elbow";
+    row.append(elbow, createStatusIcon(task.status, "pl-task-icon"));
+    const name = document.createElement("span");
+    name.className = "pl-task-name";
+    name.textContent = task.label || task.id || "";
+    name.title = task.detail || name.textContent;
+    row.appendChild(name);
+    tree.appendChild(row);
+  });
+  drop.appendChild(tree);
+  col.appendChild(drop);
+  return col;
 }
 
-function createDevcloudLine(prevStatus) {
-  const line = document.createElement("div");
-  line.className = "dc-line " + connectorClass(prevStatus);
-  return line;
-}
-
-function createDevcloudDivider(label) {
-  const wrap = document.createElement("div");
-  wrap.className = "dc-divider";
-  const bar = document.createElement("div");
-  bar.className = "dc-divider-bar";
-  const text = document.createElement("span");
-  text.className = "dc-divider-label";
-  text.textContent = label;
-  wrap.append(bar, text);
-  return wrap;
+function createEndpoint(kind, lit) {
+  const col = document.createElement("div");
+  col.className = "pl-end is-" + kind;
+  const cap = document.createElement("div");
+  cap.className = "pl-caption";
+  const title = document.createElement("div");
+  title.className = "pl-title";
+  title.textContent = kind === "start" ? "Start" : "End";
+  cap.appendChild(title);
+  col.appendChild(cap);
+  const spine = document.createElement("div");
+  spine.className = "pl-spine";
+  const pad = document.createElement("div");
+  pad.className = "pl-rail " + (kind === "start" ? "right" : "left") + " " + (lit ? "is-ok" : "is-wait");
+  const dot = document.createElement("span");
+  dot.className = "pl-end-dot" + (lit ? " is-ok" : " is-wait");
+  if (kind === "start") spine.append(dot, pad);
+  else spine.append(pad, dot);
+  col.appendChild(spine);
+  return col;
 }
 
 function renderJobPipeline(containerId, pipeline, jobStatus) {
@@ -1032,18 +1069,17 @@ function renderJobPipeline(containerId, pipeline, jobStatus) {
   root.replaceChildren();
 
   const meta = pipeline.meta || {};
-  const summary = pipeline.summary || {};
   const status = jobStatus || meta.status || "";
-  const timeline = flattenFlowTimeline(pipeline, status);
+  const stages = buildPipelineStages(pipeline, status);
   const services = Array.isArray(pipeline.services) ? pipeline.services : [];
   const focusId = pipeline.focus_service || pipeline.current_service || "";
   const focusSvc = services.find((item) => item.service_id === focusId) || services[0];
   const artifacts = pipeline.artifacts || {};
 
   const head = document.createElement("div");
-  head.className = "dc-head";
+  head.className = "pl-head";
   const left = document.createElement("div");
-  left.className = "dc-head-left";
+  left.className = "pl-head-left";
   left.appendChild(document.createTextNode("执行流水线 "));
   const svc = document.createElement("strong");
   svc.textContent = focusSvc
@@ -1052,25 +1088,18 @@ function renderJobPipeline(containerId, pipeline, jobStatus) {
   left.appendChild(svc);
   left.appendChild(document.createTextNode(" "));
   const st = document.createElement("em");
-  st.className = "dc-job-status is-" + (status || "unknown");
+  st.className = "pl-job-status is-" + (status || "unknown");
   st.textContent = pipelineJobStatusLabel(status) || "执行中";
   left.appendChild(st);
   head.appendChild(left);
-  const bar = document.createElement("div");
-  bar.className = "dc-head-bar";
-  const fill = document.createElement("div");
-  fill.className = "dc-head-fill is-" + (status === "failed" ? "fail" : status === "ok" ? "ok" : "run");
-  fill.style.width = String(Math.max(6, Number(summary.percent) || 0)) + "%";
-  bar.appendChild(fill);
-  head.appendChild(bar);
   root.appendChild(head);
 
   if (services.length > 1) {
     const batch = document.createElement("div");
-    batch.className = "dc-batch";
+    batch.className = "pl-batch";
     services.forEach((item) => {
       const chip = document.createElement("span");
-      chip.className = "dc-batch-chip is-" + (item.status || "pending");
+      chip.className = "pl-batch-chip is-" + (item.status || "pending");
       if (item.service_id === focusId) chip.classList.add("is-focus");
       chip.textContent = item.title || item.service_id;
       batch.appendChild(chip);
@@ -1079,37 +1108,30 @@ function renderJobPipeline(containerId, pipeline, jobStatus) {
   }
 
   const scroll = document.createElement("div");
-  scroll.className = "dc-scroll";
-  const track = document.createElement("div");
-  track.className = "dc-track";
-  const groupNames = { prepare: "准备", build: "构建", post: "收尾" };
-  let lastGroup = "";
-  timeline.forEach((item, index) => {
-    if (item.group && item.group !== lastGroup) {
-      track.appendChild(createDevcloudDivider(groupNames[item.group] || item.group));
-      lastGroup = item.group;
-    }
-    track.appendChild(createDevcloudNode(item.step));
-    if (index < timeline.length - 1) {
-      track.appendChild(createDevcloudLine(item.step.status));
-    }
+  scroll.className = "pl-scroll";
+  const graph = document.createElement("div");
+  graph.className = "pl-graph";
+  graph.appendChild(createEndpoint("start", true));
+  let incomingOk = true;
+  stages.forEach((stage) => {
+    graph.appendChild(createStageColumn(stage, incomingOk));
+    incomingOk = ["done", "warn", "running"].includes(stage.status);
   });
-  scroll.appendChild(track);
+  graph.appendChild(createEndpoint("end", status === "ok"));
+  scroll.appendChild(graph);
   root.appendChild(scroll);
 
   const foot = document.createElement("div");
-  foot.className = "dc-foot";
+  foot.className = "pl-foot";
   const imageName = artifacts.image || (focusSvc && focusSvc.image) || (focusSvc && focusSvc.service_id) || "";
   foot.appendChild(document.createTextNode("镜像 "));
   const img = document.createElement("strong");
   img.textContent = imageName || "—";
   foot.appendChild(img);
-  if (artifacts.tag) {
-    foot.appendChild(document.createTextNode("  " + artifacts.tag));
-  }
+  if (artifacts.tag) foot.appendChild(document.createTextNode("  " + artifacts.tag));
   if (artifacts.download_url) {
     const link = document.createElement("a");
-    link.className = "dc-foot-link";
+    link.className = "pl-foot-link";
     link.href = artifacts.download_url;
     link.target = "_blank";
     link.rel = "noopener";
