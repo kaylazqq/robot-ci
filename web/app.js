@@ -1008,10 +1008,11 @@ function createStageColumn(stage, incomingOk) {
 
   const drop = document.createElement("div");
   drop.className = "pl-drop";
-  const chev = document.createElement("div");
-  chev.className = "pl-chevron";
-  chev.textContent = "▾";
-  drop.appendChild(chev);
+  const diamond = document.createElement("div");
+  diamond.className = "pl-diamond";
+  diamond.setAttribute("aria-hidden", "true");
+  diamond.append(document.createElement("span"), document.createElement("span"));
+  drop.appendChild(diamond);
 
   const tree = document.createElement("div");
   tree.className = "pl-tree";
