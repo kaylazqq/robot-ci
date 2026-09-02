@@ -2704,7 +2704,9 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
             return False, f"checkout {branch} failed"
 
     run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
-    if not (dest / "deploy.sh").is_file() and not (dest / "build-image.sh").is_file():
+    has_deploy = (dest / "deploy.sh").is_file() or (dest / "build-image.sh").is_file()
+    has_dockerfile = (dest / "Dockerfile").is_file()
+    if not has_deploy and not (svc.get("dockerfile_build") and has_dockerfile):
         return False, "missing deploy.sh/build-image.sh"
     if svc.get("id") == "multica-fleet":
         restore_fleet_runtime_cache(job_id, dest)
@@ -2867,6 +2869,14 @@ def build_from_source(
     if build_env_exports:
         build_env_exports += " "
 
+    image_tag = f"{time.strftime('%Y%m%d%H%M')}_{git_hash}"
+    docker_args = ""
+    if svc.get("dockerfile_build"):
+        for key, value in svc_build_env.items():
+            if key and value is not None:
+                docker_args += f" --build-arg {shlex.quote(str(key))}={shlex.quote(str(value))}"
+        append_job_log(job_id, f"dockerfile build local/{svc['image']}:{image_tag}")
+
     bash = (
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
@@ -2876,6 +2886,8 @@ def build_from_source(
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
         f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
         "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
+        f"elif [[ -f ./Dockerfile ]]; then docker build{docker_args} "
+        f"-t local/{shlex.quote(str(svc['image']))}:{shlex.quote(image_tag)} .; "
         "else echo 'ERROR: no deploy.sh'; exit 1; fi"
     )
     output_tail: list[str] = []
