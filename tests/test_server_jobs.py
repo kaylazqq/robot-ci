@@ -382,7 +382,8 @@ class BranchLookupTests(unittest.TestCase):
     @patch.object(server, "gh_token", return_value="")
     @patch.object(server, "run_cmd", return_value=(0, ""))
     def test_empty_ssh_result_is_an_error_not_a_fake_main_branch(self, _run_cmd, _token) -> None:
-        ok, detail = server.list_branches_api("owner/repo", force=True)
+        with patch.dict(server.CFG, {"github_use_ssh": True, "github_ssh_key": __file__}):
+            ok, detail = server.list_branches_api("owner/repo", force=True)
         self.assertFalse(ok)
         self.assertIn("no branch refs", detail)
 
@@ -429,6 +430,148 @@ class BranchLookupTests(unittest.TestCase):
 
 
 class BuildCommandTests(unittest.TestCase):
+    def test_host_package_discovery_supports_cid_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            output = workspace / ".cid" / "output"
+            output.mkdir(parents=True)
+            package = output / "ops-router_202609031800_abcdef1.tar.gz"
+            package.write_bytes(b"archive")
+
+            found = server.find_latest_host_package(
+                {"tar_prefix": "ops-router_"},
+                workspace,
+            )
+
+        self.assertEqual(package, found)
+
+    def test_host_package_discovery_uses_cid_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            output = workspace / ".cid" / "output"
+            output.mkdir(parents=True)
+            package = output / "custom-package.tar.gz"
+            package.write_bytes(b"archive")
+
+            found = server.find_latest_host_package(
+                {
+                    "tar_prefix": "legacy_",
+                    "package_pattern": ".cid/output/custom-*.tar.gz",
+                },
+                workspace,
+            )
+
+        self.assertEqual(package, found)
+
+    def test_report_only_test_policy_does_not_block_build(self) -> None:
+        with patch.dict(server.CFG, {"test_policy": "report_only"}):
+            self.assertFalse(server.tests_block_build({"status": "failed"}))
+            self.assertFalse(server.tests_block_build({"status": "error"}))
+
+    def test_blocking_test_policy_stops_failed_tests(self) -> None:
+        with patch.dict(server.CFG, {"test_policy": "blocking"}):
+            self.assertTrue(server.tests_block_build({"status": "failed"}))
+            self.assertFalse(server.tests_block_build({"status": "passed"}))
+
+    def test_cid_contract_does_not_require_root_build_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            (workspace / ".cid").mkdir()
+            (workspace / ".cid" / "build.yaml").write_text(
+                """version: 1
+service:
+  id: demo
+  name: Demo
+  language: shell
+  image: demo
+scripts:
+  - id: ut
+    name: Demo UT
+    type: test
+    test_type: ut
+    enabled: false
+    reason: none
+  - id: dt
+    name: Demo DT
+    type: test
+    test_type: dt
+    enabled: false
+    reason: none
+  - id: build
+    name: CID build
+    type: build
+    enabled: true
+    command: bash build/package/build.sh
+    timeout_sec: 60
+artifacts:
+  image:
+    enabled: true
+    delivery: swr
+""",
+                encoding="utf-8",
+            )
+            ok, detail = server.validate_cloned_repo_contract(
+                workspace, {"id": "demo", "image": "demo"}
+            )
+        self.assertTrue(ok, detail)
+
+    def test_missing_cid_and_build_entry_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            ok, detail = server.validate_cloned_repo_contract(
+                workspace, {"id": "demo", "image": "demo"}
+            )
+        self.assertFalse(ok)
+        self.assertIn("missing .cid/build.yaml", detail)
+
+    @patch.object(server, "run_stream", return_value=0)
+    def test_cid_build_command_and_timeout_override_legacy_entrypoint(self, run_stream) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            (workspace / ".cid").mkdir()
+            (workspace / ".cid" / "build.yaml").write_text(
+                """version: 1
+service:
+  id: demo
+  name: Demo
+  language: shell
+  image: demo
+scripts:
+  - id: ut
+    name: Demo UT
+    type: test
+    test_type: ut
+    enabled: false
+    reason: none
+  - id: dt
+    name: Demo DT
+    type: test
+    test_type: dt
+    enabled: false
+    reason: none
+  - id: build
+    name: CID build
+    type: build
+    enabled: true
+    command: bash build/package/build.sh
+    timeout_sec: 321
+artifacts:
+  image:
+    enabled: true
+    delivery: swr
+""",
+                encoding="utf-8",
+            )
+            svc = {"id": "demo", "image": "demo", "repo": "owner/demo"}
+            with patch.object(server, "repo_dir", return_value=workspace):
+                ok, detail = server.build_from_source("no-job", svc, "abcdef1")
+        self.assertTrue(ok, detail)
+        command = " ".join(run_stream.call_args.args[1])
+        self.assertIn("bash build/package/build.sh", command)
+        self.assertIn("CID_IMAGE=local/demo:", command)
+        self.assertIn("find . -maxdepth 5", command)
+        self.assertEqual(321, run_stream.call_args.kwargs["timeout"])
+
     def test_failure_summary_prefers_actionable_error(self) -> None:
         detail = server.summarize_command_failure(
             ["Step 8/10", "ERROR: fetch-lfs.sh missing cache", "build exited"],
@@ -505,7 +648,7 @@ class BuildCommandTests(unittest.TestCase):
 class FleetRuntimeCacheTests(unittest.TestCase):
     @staticmethod
     def write_valid_markers(workspace: server.Path, fingerprint: str = "a" * 64) -> None:
-        marker_dir = workspace / "deploy" / "runtime-images"
+        marker_dir = workspace / "build" / "deploy" / "runtime-images"
         marker_dir.mkdir(parents=True, exist_ok=True)
         (marker_dir / ".build-source.sha256").write_text(fingerprint + "\n", encoding="utf-8")
         (marker_dir / ".build-image-ids").write_text(
@@ -528,7 +671,7 @@ class FleetRuntimeCacheTests(unittest.TestCase):
                 workspace.mkdir()
                 self.assertTrue(server.restore_fleet_runtime_cache("no-job", workspace))
 
-            restored = workspace / "deploy" / "runtime-images"
+            restored = workspace / "build" / "deploy" / "runtime-images"
             self.assertEqual("a" * 64, (restored / ".build-source.sha256").read_text().strip())
             image_ids = (restored / ".build-image-ids").read_text(encoding="utf-8")
             self.assertIn("multica-cloud-opencode:demo\tsha256:", image_ids)
@@ -545,7 +688,7 @@ class FleetRuntimeCacheTests(unittest.TestCase):
                     server.fleet_runtime_cache_dir() / ".build-source.sha256"
                 ).read_text(encoding="utf-8")
 
-                (workspace / "deploy" / "runtime-images" / ".build-image-ids").write_text(
+                (workspace / "build" / "deploy" / "runtime-images" / ".build-image-ids").write_text(
                     "not trusted metadata\n", encoding="utf-8"
                 )
                 self.assertFalse(server.persist_fleet_runtime_cache("no-job", workspace))

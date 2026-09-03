@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 import huawei_cce
+from cid_config import CidConfigError, build_test_plan, enabled_build_step, load_cid_config
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
@@ -222,14 +223,14 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
         ("sha", "记录 Commit SHA"),
     ),
     "test": (
-        ("plan", "加载 test-plans.json"),
+        ("plan", "加载 .cid/build.yaml（兼容旧计划）"),
         ("runner", "启动 test_runner"),
         ("cases", "执行 UT / DT 用例"),
         ("report", "汇总测试报告"),
     ),
     "build": (
         ("deps", "准备构建依赖"),
-        ("script", "deploy.sh / build-image"),
+        ("script", "执行仓库 CID 构建脚本"),
         ("docker", "Docker 多阶段构建"),
         ("verify", "镜像 / 产物校验"),
     ),
@@ -326,7 +327,7 @@ def _step_detail(step_id: str, status: str, result: dict[str, Any] | None, job: 
         tag = str((result or {}).get("tag") or "")
         if tag:
             return tag
-        return "deploy.sh / Docker build"
+        return "CID / legacy Docker build"
     if step_id == "push":
         remote = str((result or {}).get("remote") or job.get("remote") or "")
         if remote and remote != "archive-only":
@@ -449,6 +450,7 @@ def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
             "git ",
             "deploy.sh",
             "build-image.sh",
+            "build.yaml",
             "unknown service",
             "repo",
             "missing deploy",
@@ -1465,6 +1467,10 @@ def load_config() -> dict[str, Any]:
     cfg["archive_root"] = archive_root.rstrip("/") or "/usr/share/nginx/html/images"
     cfg["archive_enabled"] = archive_enabled
     cfg["archive_required"] = archive_required
+    test_policy = str(cfg.get("test_policy") or "report_only").strip().lower()
+    if test_policy not in {"report_only", "blocking"}:
+        raise ValueError("test_policy must be report_only or blocking")
+    cfg["test_policy"] = test_policy
     try:
         cfg["max_concurrent_jobs"] = max(1, min(int(cfg.get("max_concurrent_jobs") or 5), 16))
     except (TypeError, ValueError):
@@ -1690,11 +1696,18 @@ def test_report_dir(job_id: str, service_id: str) -> Path:
 
 
 def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_sha: str) -> dict[str, Any]:
-    """Run trusted UT/DT tests and always return a result that cannot block publishing."""
+    """Run trusted UT/DT tests; the caller applies robot-ci's global test policy."""
     report_dir = test_report_dir(job_id, service_id)
     report_dir.mkdir(parents=True, exist_ok=True)
     summary_path = report_dir / "summary.json"
-    if not TEST_PLANS_PATH.is_file() or not TEST_RUNNER_PATH.is_file():
+    plans_path = TEST_PLANS_PATH
+    cid_error = ""
+    try:
+        cid = load_cid_config(repo_dir, service_id)
+    except CidConfigError as exc:
+        cid = None
+        cid_error = str(exc)
+    if cid_error:
         result = {
             "status": "error",
             "total": 0,
@@ -1702,7 +1715,26 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
             "failed": 0,
             "errors": 1,
             "duration_ms": 0,
-            "failures": [{"name": "test runner", "detail": "test-plans.json or test_runner.py is missing"}],
+            "failures": [{"name": "CID configuration", "detail": cid_error}],
+        }
+    elif cid is not None:
+        plans_path = report_dir / "cid-test-plan.json"
+        plans_path.write_text(
+            json.dumps(build_test_plan(cid), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        append_job_log(job_id, "Loaded test stages from .cid/build.yaml")
+    if cid_error:
+        pass
+    elif not plans_path.is_file() or not TEST_RUNNER_PATH.is_file():
+        result = {
+            "status": "error",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 1,
+            "duration_ms": 0,
+            "failures": [{"name": "test runner", "detail": "test plan or test_runner.py is missing"}],
         }
     else:
         append_job_log(job_id, f"tests start service={service_id} sha={commit_sha}")
@@ -1711,7 +1743,7 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
                 "python3.11",
                 shlex.quote(host_path(TEST_RUNNER_PATH)),
                 "--plans",
-                shlex.quote(host_path(TEST_PLANS_PATH)),
+                shlex.quote(host_path(plans_path)),
                 "--service",
                 shlex.quote(service_id),
                 "--repo",
@@ -1760,8 +1792,19 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
     for item in (result.get("failures") or [])[:20]:
         append_job_log(job_id, f"TEST FAIL {item.get('name')}: {item.get('detail')}")
     if result.get("status") not in ("passed", "not_configured"):
-        append_job_log(job_id, "WARN tests did not pass; phase-1 policy continues to image build")
+        if CFG.get("test_policy") == "blocking":
+            append_job_log(job_id, "ERROR tests did not pass; blocking policy stops the build")
+        else:
+            append_job_log(job_id, "WARN tests did not pass; report_only policy continues to build")
     return result
+
+
+def tests_block_build(result: dict[str, Any]) -> bool:
+    """Whether the configured framework policy rejects this test result."""
+    return (
+        CFG.get("test_policy") == "blocking"
+        and result.get("status") not in ("passed", "not_configured")
+    )
 
 
 def use_wsl() -> bool:
@@ -2212,7 +2255,7 @@ def _validated_fleet_cache_marker(path: Path, marker: str) -> str | None:
 
 def persist_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
     """Persist validated Fleet cache markers outside the disposable checkout."""
-    source_dir = workspace / "deploy" / "runtime-images"
+    source_dir = workspace / "build" / "deploy" / "runtime-images"
     contents: dict[str, str] = {}
     for marker in FLEET_RUNTIME_CACHE_MARKERS:
         content = _validated_fleet_cache_marker(source_dir / marker, marker)
@@ -2247,7 +2290,7 @@ def restore_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
                 return False
             contents[marker] = content
 
-    target_dir = workspace / "deploy" / "runtime-images"
+    target_dir = workspace / "build" / "deploy" / "runtime-images"
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         for marker, content in contents.items():
@@ -2704,15 +2747,30 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
             return False, f"checkout {branch} failed"
 
     run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
-    has_deploy = (dest / "deploy.sh").is_file() or (dest / "build-image.sh").is_file()
-    has_dockerfile = (dest / "Dockerfile").is_file()
-    if not has_deploy and not (svc.get("dockerfile_build") and has_dockerfile):
-        return False, "missing deploy.sh/build-image.sh"
+    ok_contract, contract_error = validate_cloned_repo_contract(dest, svc)
+    if not ok_contract:
+        return False, contract_error
     if svc.get("id") == "multica-fleet":
         restore_fleet_runtime_cache(job_id, dest)
     code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
     append_job_log(job_id, f"HEAD={head if code == 0 else '?'} @ {branch}")
     return True, str(dest)
+
+
+def validate_cloned_repo_contract(dest: Path, svc: dict[str, Any]) -> tuple[bool, str]:
+    """Require a CID contract or a legacy root/Docker build entry."""
+    try:
+        cid = load_cid_config(dest, str(svc.get("id") or ""))
+    except CidConfigError as exc:
+        return False, f"invalid .cid/build.yaml: {exc}"
+    has_legacy = (dest / "deploy.sh").is_file() or (dest / "build-image.sh").is_file()
+    has_package = (dest / "build" / "package" / "build.sh").is_file()
+    has_dockerfile = (dest / "Dockerfile").is_file()
+    if cid is None and not has_legacy and not has_package and not (
+        svc.get("dockerfile_build") and has_dockerfile
+    ):
+        return False, "missing .cid/build.yaml or build/package/build.sh"
+    return True, ""
 
 
 def public_service_dir() -> Path:
@@ -2722,8 +2780,7 @@ def public_service_dir() -> Path:
 
 def ensure_public_service(job_id: str) -> tuple[bool, str]:
     """
-    Many microservice deploy.sh scripts source
-    ../public-service/windows-deploy/lib/source-rrd.sh.
+    Some legacy branches source shared helpers from the sibling public-service.
     Helper clones only the service repo, so keep a shared public-service checkout
     next to it (does not modify service source trees).
 
@@ -2843,8 +2900,36 @@ def build_from_source(
     where = "WSL" if use_wsl() else "host"
     append_job_log(job_id, f"build on {where}: {src}")
 
+    try:
+        cid = load_cid_config(src, str(svc.get("id") or ""))
+    except CidConfigError as exc:
+        return False, f"invalid .cid/build.yaml: {exc}"
+    cid_build = enabled_build_step(cid) if cid is not None else None
+    if cid_build is not None:
+        append_job_log(job_id, f"Loaded build stage from .cid/build.yaml: {cid_build.get('name') or cid_build['id']}")
+
     # Helper-only: CCE_SKIP_EXPORT=1 skips multi-hundred-MB docker save tar (we push from local image).
     extra_env = "CCE_SKIP_EXPORT=1 "
+
+    build_ts = time.strftime("%Y%m%d%H%M")
+    local_image = f"local/{svc.get('image')}:{build_ts}_{git_hash}"
+    image_env_names = (
+        "CID_IMAGE",
+        "IMAGE",
+        "IMAGE_NAME",
+        "TEMPORAL_IMAGE",
+        "SEMANTIC_GATEWAY_IMAGE",
+        "RAG_SERVICE_IMAGE",
+        "MCP_HUB_IMAGE",
+        "SEMANTIC_SCHEDULE_IMAGE",
+        "SEMANTIC_WORKER_IMAGE",
+        "AGENTLINK_IMAGE",
+        "AGENTOPS_IMAGE",
+        "OPS_CONSOLE_IMAGE",
+        "MULTICA_SERVER_IMAGE",
+        "FLEET_IMAGE",
+    )
+    extra_env += " ".join(f"{name}={shlex.quote(local_image)}" for name in image_env_names) + " "
 
     action = str(svc.get("build_action") or "").strip()
     if svc.get("requires_version"):
@@ -2857,7 +2942,7 @@ def build_from_source(
             return False, "archive directory is required for Fleet bundle"
         extra_env += (
             f"FLEET_OUTPUT_DIR={shlex.quote(host_path(archive_dir))} "
-            f"FLEET_GIT_HASH={shlex.quote(git_hash)} INCLUDE_RUNTIME_IMAGES=1 "
+            f"FLEET_BUILD_TS={build_ts} FLEET_GIT_HASH={shlex.quote(git_hash)} INCLUDE_RUNTIME_IMAGES=1 "
         )
         append_job_log(job_id, "Fleet bundle: control image + OpenCode + Hermes; SWR push disabled")
 
@@ -2877,18 +2962,29 @@ def build_from_source(
                 docker_args += f" --build-arg {shlex.quote(str(key))}={shlex.quote(str(value))}"
         append_job_log(job_id, f"dockerfile build local/{svc['image']}:{image_tag}")
 
+    if cid_build is not None:
+        build_invocation = str(cid_build["command"])
+        build_timeout = int(cid_build.get("timeout_sec") or CFG.get("build_timeout_sec") or 7200)
+    else:
+        build_invocation = (
+            f"if [[ -f ./build/package/build.sh ]]; then bash ./build/package/build.sh{deploy_args}; "
+            f"elif [[ -f ./build/deploy/deploy.sh ]]; then bash ./build/deploy/deploy.sh{deploy_args}; "
+            f"elif [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
+            "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
+            f"elif [[ -f ./Dockerfile ]]; then docker build{docker_args} "
+            f"-t local/{shlex.quote(str(svc['image']))}:{shlex.quote(image_tag)} .; "
+            "else echo 'ERROR: no build/package/build.sh'; exit 1; fi"
+        )
+        build_timeout = int(CFG.get("build_timeout_sec") or 7200)
+
     bash = (
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
-        "find . -maxdepth 3 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
+        "find . -maxdepth 5 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
         "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD SKIP_WEBAPP_BUILD SKIP_SERVER_BUILD FORCE_WEBAPP_BUILD FORCE_REBUILD; "
         f"export {build_env_exports}CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
-        f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
-        "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
-        f"elif [[ -f ./Dockerfile ]]; then docker build{docker_args} "
-        f"-t local/{shlex.quote(str(svc['image']))}:{shlex.quote(image_tag)} .; "
-        "else echo 'ERROR: no deploy.sh'; exit 1; fi"
+        f"{build_invocation}"
     )
     output_tail: list[str] = []
     # Runtime credentials/configuration must never become implicit build inputs.
@@ -2931,7 +3027,7 @@ def build_from_source(
     code = run_stream(
         job_id,
         bash_lc(bash),
-        timeout=int(CFG.get("build_timeout_sec") or 7200),
+        timeout=build_timeout,
         output_tail=output_tail,
         env=build_env,
     )
@@ -2957,12 +3053,31 @@ def find_latest_tar(svc: dict[str, Any], workspace: Path | None = None) -> Path 
 
 def find_latest_host_package(svc: dict[str, Any], workspace: Path) -> Path | None:
     """Latest host-install tar.gz produced by services with host_package=true."""
-    export_dir = workspace / "runtime-images" / "cce-export"
-    if not export_dir.is_dir():
-        return None
+    pattern = str(svc.get("package_pattern") or "").strip().replace("\\", "/")
+    if pattern:
+        cands = sorted(
+            [package for package in workspace.glob(pattern) if package.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if cands:
+            return cands[0]
+
     prefix = svc["tar_prefix"]
+    export_dirs = (
+        workspace / ".cid" / "output",
+        workspace / "runtime-images" / "cce-export",
+    )
     cands = sorted(
-        [*export_dir.glob(f"{prefix}*.tar.gz"), *export_dir.glob(f"{prefix}*.tar")],
+        [
+            package
+            for export_dir in export_dirs
+            if export_dir.is_dir()
+            for package in (
+                *export_dir.glob(f"{prefix}*.tar.gz"),
+                *export_dir.glob(f"{prefix}*.tar"),
+            )
+        ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -3459,6 +3574,33 @@ def push_one_service(
         append_job_log(job_id, f"ERROR {detail}")
         return result
 
+    try:
+        cid = load_cid_config(Path(detail), service_id)
+    except CidConfigError as exc:
+        result["error"] = f"invalid .cid/build.yaml: {exc}"
+        append_job_log(job_id, f"ERROR {result['error']}")
+        return result
+    if cid is not None:
+        svc = dict(svc)
+        declared_image = str(cid["service"]["image"])
+        svc["image"] = declared_image
+        image = declared_image
+        result["image"] = declared_image
+        image_artifact = (cid.get("artifacts") or {}).get("image") or {}
+        delivery = str(image_artifact.get("delivery") or "swr")
+        image_enabled = image_artifact.get("enabled") is True
+        svc["archive_only"] = delivery == "archive-only"
+        svc["archive_image"] = image_enabled and image_artifact.get("archive") is True
+        package_artifact = (cid.get("artifacts") or {}).get("package") or {}
+        package_enabled = package_artifact.get("enabled") is True
+        if package_enabled:
+            pattern = str(package_artifact.get("pattern") or "")
+            svc["package_pattern"] = pattern
+            svc["bundle_archive"] = "multica-fleet_bundle_" in pattern
+            if not image_enabled:
+                svc["host_package"] = True
+        append_job_log(job_id, f"CID contract active image={declared_image} delivery={delivery}")
+
     git = git_bin()
     code, head = run_cmd([git, "-C", detail, "rev-parse", "HEAD"], timeout=30)
     commit_sha = head if code == 0 else "0000000000000000000000000000000000000000"
@@ -3487,6 +3629,10 @@ def push_one_service(
     record_test_run(job_id, test_run)
     result["test_status"] = test_run["status"]
     result["test_summary"] = test_summary
+    if tests_block_build(test_result):
+        result["error"] = f"tests failed under blocking policy: {test_result.get('status')}"
+        append_job_log(job_id, f"FAILED service={service_id} stage=testing reason={result['error']}")
+        return result
     set_job(job_id, stage="building")
 
     # Always rebuild; never reuse a previous local image for the same git hash.
@@ -3664,7 +3810,11 @@ def push_one_service(
     # Pin the just-built tags so prune cannot delete them before docker save.
     set_job(job_id, stage="archiving")
     reclaim_ci_disk(job_id, keep_refs=(local_ref, remote))
-    ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
+    if svc.get("archive_image", True):
+        ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
+    else:
+        append_job_log(job_id, "local image archive skipped by .cid/build.yaml")
+        ok_arc, arc_path = True, ""
     if not ok_arc:
         result["remote"] = remote
         if CFG.get("archive_required"):

@@ -12,6 +12,7 @@
   "archive_enabled": true,
   "archive_required": true,
   "archive_root": "/usr/share/nginx/html/images",
+  "test_policy": "report_only",
   "ci_tmp_root": "/home/ci",
   "max_concurrent_jobs": 5,
   "huawei_cloud": {

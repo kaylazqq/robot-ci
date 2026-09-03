@@ -29,9 +29,9 @@ bash deploy-linux.sh
 
 批量构建时，每个所选微服务都按“拉取代码 → 执行该服务 UT/DT → 构建 → 推送 → 归档”的顺序独立执行。页面按微服务显示独立的测试结果卡片和分页表格，单个服务测试失败不会阻止该服务或后续服务继续构建。SWR 登录检测会向仓库发起真实 manifest 探测；仅明确确认登录有效时才开始需要推送的任务，鉴权失败后立即停止后续 SWR 操作。
 
-`multica-server` 构建前必须在页面填写 Daemon 版本，格式为 `vMAJOR.MINOR.PATCH`，例如 `v1.2.3`。前后端使用同一规则校验；工具不修改微服务配置文件，而是通过 `DAEMON_RELEASE_VERSION` 调用仓库的 `./deploy.sh build-cce`，由微服务构建脚本把对应版本写入镜像内的 release manifest。最近一次成功提交构建的合法版本会保存在服务器 `logs/last-daemon-version.json` 并对所有浏览器回填；浏览器本地值只作为服务器状态不可用时的兜底。
+`multica-server` 构建前必须在页面填写 Daemon 版本，格式为 `vMAJOR.MINOR.PATCH`，例如 `v1.2.3`。前后端使用同一规则校验；工具不修改微服务配置文件，而是通过 `DAEMON_RELEASE_VERSION` 调用仓库 `.cid/build.yaml` 声明的 `build/package/build.sh build-cce`，由微服务构建脚本把对应版本写入镜像内的 release manifest。最近一次成功提交构建的合法版本会保存在服务器 `logs/last-daemon-version.json` 并对所有浏览器回填；浏览器本地值只作为服务器状态不可用时的兜底。
 
-`multica-fleet` 来自独立仓库 `censong574-spec/multica-fleet`，属于仅归档服务，不登录或推送 SWR。工具调用仓库的 `./deploy.sh pack`，在同一归档目录生成包含 Fleet、OpenCode、Hermes 三个镜像的单个 tar，以及 `multica-fleet.env` 和已固化本次 tag 的 `deploy-multica-fleet.sh`。
+`multica-fleet` 来自独立仓库 `censong574-spec/multica-fleet`，属于仅归档服务，不登录或推送 SWR。工具调用仓库 `.cid/build.yaml` 声明的 `build/package/build.sh pack`，在同一归档目录生成包含 Fleet、OpenCode、Hermes 三个镜像的单个 tar，以及 `multica-fleet.env` 和已固化本次 tag 的 `deploy-multica-fleet.sh`。
 
 测试运行器会在宿主机持久复用 `~/.cache/robot-ci-tests` 下的 Go build/module、GOPATH 和 pip 下载缓存。即使 systemd 未设置 `HOME`、`GOCACHE`、`GOMODCACHE` 或 `GOPATH`，运行器也会自动补齐并创建目录；可用 `SWR_TEST_CACHE_ROOT` 指定其他缓存根目录。
 
@@ -56,7 +56,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 ## 多人并发与页面刷新
 
-服务器最多同时跑 `max_concurrent_jobs` 个构建任务（默认 5）。**同一微服务也可以并发**（每个任务 clone 到 `<workspace_root>/<仓库名>--<job_id>`），但 **mattermost** 与 **kibana-service** 例外：全机各只允许 **1 个** 并发（`max_concurrent: 1`）。mattermost 与别人共用 `/opt/ai/build-cache/build.swap` 和约 3.6G 内存；kibana 在仓库 `build-image.sh` 里自建 swap 并需要约 8GB Node 堆。`public-service` 仍是共享旁路目录（加锁更新、不删除），好让 `deploy.sh` 继续用 `../public-service`。达到全局或单服务并发上限时新请求返回 `409`。
+服务器最多同时跑 `max_concurrent_jobs` 个构建任务（默认 5）。**同一微服务也可以并发**（每个任务 clone 到 `<workspace_root>/<仓库名>--<job_id>`），但 **mattermost** 与 **kibana-service** 例外：全机各只允许 **1 个** 并发（`max_concurrent: 1`）。mattermost 与别人共用 `/opt/ai/build-cache/build.swap` 和约 3.6G 内存；kibana 在仓库 `build/package/build.sh` 里自建 swap 并需要约 8GB Node 堆。`public-service` 仍是共享旁路目录（加锁更新、不删除），供尚未完全自包含的构建脚本读取共享资源。达到全局或单服务并发上限时新请求返回 `409`。
 
 页面按游标增量读取运行中日志，避免大日志重复传输和慢请求乱序覆盖。任务日志只显示当前这一次构建；运行中可点「停止任务」强制杀掉当前构建进程。本浏览器（`client_id`）的历史任务在「构建历史」里分页查看，点「查看日志」再打开那一次的详情。浏览器只在本地保存 10 分钟“最近查看的 job ID”，用于规避刷新时任务恰好完成造成的日志回显丢失。已完成的 job ID 不占用锁。新任务开始时会清掉该服务已结束任务留下的 `--<job_id>` 目录。
 
@@ -81,9 +81,26 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
   "archive_enabled": true,
   "archive_required": true,
   "archive_root": "/usr/share/nginx/html/images",
+  "test_policy": "report_only",
   "ci_tmp_root": "/home/ci"
 }
 ```
+
+`test_policy` 支持 `report_only` 和 `blocking`，默认是 `report_only`。默认策略下 UT、DT 失败会记录并展示结果，但不会阻断后续构建、归档和推送；只有显式配置为 `blocking` 时才在测试失败后终止当前服务。
+
+## 仓库级 `.cid/build.yaml`
+
+已整改的服务仓以 `.cid/build.yaml` 作为唯一构建契约。robot-ci 在拉取分支后读取该文件，并按 `scripts` 顺序执行启用的 UT、DT 和镜像构建步骤；测试报告格式及路径、构建超时、镜像名称和交付方式也来自该文件。
+
+- `dependencies`、`machine` 由固定构建机环境管理，禁止写入仓库 YAML。
+- `continue_on_error` 由 robot-ci 全局 `test_policy` 管理，禁止写入仓库 YAML。默认 `report_only`，测试失败只展示结果，不阻断构建和推送。
+- `enabled: false` 的测试阶段不执行，也不会作为“跳过用例”展示。
+- 普通服务只在仓内构建本地镜像，SWR 登录、标签、推送、重试、校验和服务器归档由 robot-ci 统一执行。
+- 仓库构建入口是 `build/package/build.sh`；部署模板和本地部署脚本在 `build/deploy/`。根目录不再保留 `build-image.sh` / `deploy.sh`。
+- `multica-fleet` 的 `delivery: archive-only` 仍只生成包含三个镜像、环境模板和部署脚本的下载包，不推送 SWR。
+- `ops-router` 的 `delivery: archive-only` 主机安装包从 `.cid/output/` 读取；旧分支的 `runtime-images/cce-export/` 仍兼容。
+
+robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报告格式、artifact 交付配置和禁止字段。主机安装包按 `artifacts.package.pattern` 从仓库工作区发现；YAML 无效时，当前服务明确失败，不会静默伪装为旧流程。
 
 ## 安全提醒
 
