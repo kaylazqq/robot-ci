@@ -1,0 +1,76 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from cid_config import CidConfigError, build_test_plan, enabled_build_step, load_cid_config
+
+
+VALID = """\
+version: 1
+service:
+  id: demo
+  name: Demo
+  language: python
+  image: demo
+scripts:
+  - id: ut
+    name: Demo UT
+    type: test
+    test_type: ut
+    enabled: true
+    command: bash scripts/ci/ut.sh
+    timeout_sec: 60
+    report:
+      format: junit
+      path: .cid/output/reports/ut/pytest.xml
+  - id: dt
+    name: Demo DT
+    type: test
+    test_type: dt
+    enabled: false
+    reason: No DT yet.
+  - id: build
+    name: Build image
+    type: build
+    enabled: true
+    command: bash build-image.sh
+    timeout_sec: 600
+artifacts:
+  image:
+    enabled: true
+    delivery: swr
+"""
+
+
+class CidConfigTests(unittest.TestCase):
+    def write(self, text: str) -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / ".cid").mkdir()
+        (root / ".cid" / "build.yaml").write_text(text, encoding="utf-8")
+        return root
+
+    def test_loads_build_and_enabled_test_stages(self) -> None:
+        config = load_cid_config(self.write(VALID), "demo")
+        self.assertIsNotNone(config)
+        self.assertEqual("bash build-image.sh", enabled_build_step(config)["command"])
+        plan = build_test_plan(config)
+        command = plan["profiles"]["cid-demo"]["commands"][0]
+        self.assertEqual("ut/pytest.xml", command["report"])
+        self.assertEqual("bash scripts/ci/ut.sh", command["command"])
+        self.assertEqual(1, len(plan["profiles"]["cid-demo"]["commands"]))
+
+    def test_rejects_framework_owned_keys_anywhere(self) -> None:
+        for forbidden in ("dependencies: {}", "machine: {}", "continue_on_error: true"):
+            with self.subTest(forbidden=forbidden):
+                with self.assertRaises(CidConfigError):
+                    load_cid_config(self.write(VALID + "\n" + forbidden), "demo")
+
+    def test_rejects_service_id_mismatch(self) -> None:
+        with self.assertRaisesRegex(CidConfigError, "service.id mismatch"):
+            load_cid_config(self.write(VALID), "another-service")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 import huawei_cce
+from cid_config import CidConfigError, build_test_plan, enabled_build_step, load_cid_config
 
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
@@ -222,14 +223,14 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
         ("sha", "记录 Commit SHA"),
     ),
     "test": (
-        ("plan", "加载 test-plans.json"),
+        ("plan", "加载 .cid/build.yaml（兼容旧计划）"),
         ("runner", "启动 test_runner"),
         ("cases", "执行 UT / DT 用例"),
         ("report", "汇总测试报告"),
     ),
     "build": (
         ("deps", "准备构建依赖"),
-        ("script", "deploy.sh / build-image"),
+        ("script", "执行仓库 CID 构建脚本"),
         ("docker", "Docker 多阶段构建"),
         ("verify", "镜像 / 产物校验"),
     ),
@@ -1694,7 +1695,14 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
     report_dir = test_report_dir(job_id, service_id)
     report_dir.mkdir(parents=True, exist_ok=True)
     summary_path = report_dir / "summary.json"
-    if not TEST_PLANS_PATH.is_file() or not TEST_RUNNER_PATH.is_file():
+    plans_path = TEST_PLANS_PATH
+    cid_error = ""
+    try:
+        cid = load_cid_config(repo_dir, service_id)
+    except CidConfigError as exc:
+        cid = None
+        cid_error = str(exc)
+    if cid_error:
         result = {
             "status": "error",
             "total": 0,
@@ -1702,7 +1710,26 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
             "failed": 0,
             "errors": 1,
             "duration_ms": 0,
-            "failures": [{"name": "test runner", "detail": "test-plans.json or test_runner.py is missing"}],
+            "failures": [{"name": "CID configuration", "detail": cid_error}],
+        }
+    elif cid is not None:
+        plans_path = report_dir / "cid-test-plan.json"
+        plans_path.write_text(
+            json.dumps(build_test_plan(cid), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        append_job_log(job_id, "Loaded test stages from .cid/build.yaml")
+    if cid_error:
+        pass
+    elif not plans_path.is_file() or not TEST_RUNNER_PATH.is_file():
+        result = {
+            "status": "error",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errors": 1,
+            "duration_ms": 0,
+            "failures": [{"name": "test runner", "detail": "test plan or test_runner.py is missing"}],
         }
     else:
         append_job_log(job_id, f"tests start service={service_id} sha={commit_sha}")
@@ -1711,7 +1738,7 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
                 "python3.11",
                 shlex.quote(host_path(TEST_RUNNER_PATH)),
                 "--plans",
-                shlex.quote(host_path(TEST_PLANS_PATH)),
+                shlex.quote(host_path(plans_path)),
                 "--service",
                 shlex.quote(service_id),
                 "--repo",
@@ -2212,7 +2239,7 @@ def _validated_fleet_cache_marker(path: Path, marker: str) -> str | None:
 
 def persist_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
     """Persist validated Fleet cache markers outside the disposable checkout."""
-    source_dir = workspace / "deploy" / "runtime-images"
+    source_dir = workspace / "build" / "deploy" / "runtime-images"
     contents: dict[str, str] = {}
     for marker in FLEET_RUNTIME_CACHE_MARKERS:
         content = _validated_fleet_cache_marker(source_dir / marker, marker)
@@ -2247,7 +2274,7 @@ def restore_fleet_runtime_cache(job_id: str, workspace: Path) -> bool:
                 return False
             contents[marker] = content
 
-    target_dir = workspace / "deploy" / "runtime-images"
+    target_dir = workspace / "build" / "deploy" / "runtime-images"
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         for marker, content in contents.items():
@@ -2841,8 +2868,36 @@ def build_from_source(
     where = "WSL" if use_wsl() else "host"
     append_job_log(job_id, f"build on {where}: {src}")
 
+    try:
+        cid = load_cid_config(src, str(svc.get("id") or ""))
+    except CidConfigError as exc:
+        return False, f"invalid .cid/build.yaml: {exc}"
+    cid_build = enabled_build_step(cid) if cid is not None else None
+    if cid_build is not None:
+        append_job_log(job_id, f"Loaded build stage from .cid/build.yaml: {cid_build.get('name') or cid_build['id']}")
+
     # Helper-only: CCE_SKIP_EXPORT=1 skips multi-hundred-MB docker save tar (we push from local image).
     extra_env = "CCE_SKIP_EXPORT=1 "
+
+    build_ts = time.strftime("%Y%m%d%H%M")
+    local_image = f"local/{svc.get('image')}:{build_ts}_{git_hash}"
+    image_env_names = (
+        "CID_IMAGE",
+        "IMAGE",
+        "IMAGE_NAME",
+        "TEMPORAL_IMAGE",
+        "SEMANTIC_GATEWAY_IMAGE",
+        "RAG_SERVICE_IMAGE",
+        "MCP_HUB_IMAGE",
+        "SEMANTIC_SCHEDULE_IMAGE",
+        "SEMANTIC_WORKER_IMAGE",
+        "AGENTLINK_IMAGE",
+        "AGENTOPS_IMAGE",
+        "OPS_CONSOLE_IMAGE",
+        "MULTICA_SERVER_IMAGE",
+        "FLEET_IMAGE",
+    )
+    extra_env += " ".join(f"{name}={shlex.quote(local_image)}" for name in image_env_names) + " "
 
     action = str(svc.get("build_action") or "").strip()
     if svc.get("requires_version"):
@@ -2855,7 +2910,7 @@ def build_from_source(
             return False, "archive directory is required for Fleet bundle"
         extra_env += (
             f"FLEET_OUTPUT_DIR={shlex.quote(host_path(archive_dir))} "
-            f"FLEET_GIT_HASH={shlex.quote(git_hash)} INCLUDE_RUNTIME_IMAGES=1 "
+            f"FLEET_BUILD_TS={build_ts} FLEET_GIT_HASH={shlex.quote(git_hash)} INCLUDE_RUNTIME_IMAGES=1 "
         )
         append_job_log(job_id, "Fleet bundle: control image + OpenCode + Hermes; SWR push disabled")
 
@@ -2867,6 +2922,17 @@ def build_from_source(
     if build_env_exports:
         build_env_exports += " "
 
+    if cid_build is not None:
+        build_invocation = str(cid_build["command"])
+        build_timeout = int(cid_build.get("timeout_sec") or CFG.get("build_timeout_sec") or 7200)
+    else:
+        build_invocation = (
+            f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
+            "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
+            "else echo 'ERROR: no deploy.sh'; exit 1; fi"
+        )
+        build_timeout = int(CFG.get("build_timeout_sec") or 7200)
+
     bash = (
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
@@ -2874,9 +2940,7 @@ def build_from_source(
         "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD SKIP_WEBAPP_BUILD SKIP_SERVER_BUILD FORCE_WEBAPP_BUILD FORCE_REBUILD; "
         f"export {build_env_exports}CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
-        f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
-        "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
-        "else echo 'ERROR: no deploy.sh'; exit 1; fi"
+        f"{build_invocation}"
     )
     output_tail: list[str] = []
     # Runtime credentials/configuration must never become implicit build inputs.
@@ -2919,7 +2983,7 @@ def build_from_source(
     code = run_stream(
         job_id,
         bash_lc(bash),
-        timeout=int(CFG.get("build_timeout_sec") or 7200),
+        timeout=build_timeout,
         output_tail=output_tail,
         env=build_env,
     )
@@ -3446,6 +3510,27 @@ def push_one_service(
         result["error"] = detail
         append_job_log(job_id, f"ERROR {detail}")
         return result
+
+    try:
+        cid = load_cid_config(Path(detail), service_id)
+    except CidConfigError as exc:
+        result["error"] = f"invalid .cid/build.yaml: {exc}"
+        append_job_log(job_id, f"ERROR {result['error']}")
+        return result
+    if cid is not None:
+        svc = dict(svc)
+        declared_image = str(cid["service"]["image"])
+        svc["image"] = declared_image
+        image = declared_image
+        result["image"] = declared_image
+        image_artifact = (cid.get("artifacts") or {}).get("image") or {}
+        delivery = str(image_artifact.get("delivery") or "swr")
+        svc["archive_only"] = delivery == "archive-only"
+        package_artifact = (cid.get("artifacts") or {}).get("package") or {}
+        if svc["archive_only"] and package_artifact.get("enabled") is True:
+            pattern = str(package_artifact.get("pattern") or "")
+            svc["bundle_archive"] = "multica-fleet_bundle_" in pattern
+        append_job_log(job_id, f"CID contract active image={declared_image} delivery={delivery}")
 
     git = git_bin()
     code, head = run_cmd([git, "-C", detail, "rev-parse", "HEAD"], timeout=30)

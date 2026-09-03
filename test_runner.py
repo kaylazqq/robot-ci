@@ -300,7 +300,10 @@ def build_test_environment(repo_dir: Path, report_dir: Path) -> dict[str, str]:
 
 
 def run_command(command: dict[str, Any], repo_dir: Path, report_dir: Path) -> tuple[int, str, int]:
-    env = build_test_environment(repo_dir, report_dir)
+    report_path = Path(str(command.get("report") or "report.out"))
+    command_report_dir = report_dir / report_path.parent
+    command_report_dir.mkdir(parents=True, exist_ok=True)
+    env = build_test_environment(repo_dir, command_report_dir)
     started = time.monotonic()
     print(f"$ {command['command']}", flush=True)
     try:

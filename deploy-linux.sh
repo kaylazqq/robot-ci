@@ -51,6 +51,11 @@ if [[ -z "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+echo "==> install robot-ci Python deps"
+"$PYTHON_BIN" -m pip install --disable-pip-version-check \
+  -r "$APP_DIR/requirements.txt" \
+  -r "$APP_DIR/requirements-huawei.txt"
+
 echo "==> GitHub SSH key"
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh

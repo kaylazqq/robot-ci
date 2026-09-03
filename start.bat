@@ -27,6 +27,13 @@ if not defined PY (
 )
 
 echo Using: %PY%
+"%PY%" -c "import yaml" >nul 2>&1
+if errorlevel 1 "%PY%" -m pip install --disable-pip-version-check -r "%CD%\requirements.txt" -r "%CD%\requirements-huawei.txt"
+if errorlevel 1 (
+  echo [ERROR] failed to install Python dependencies.
+  pause
+  exit /b 1
+)
 powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*swr-push-helper*server.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Get-NetTCPConnection -LocalPort 18888 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
 ping -n 2 127.0.0.1 >nul
 
