@@ -430,6 +430,49 @@ class BranchLookupTests(unittest.TestCase):
 
 
 class BuildCommandTests(unittest.TestCase):
+    def test_host_package_discovery_supports_cid_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            output = workspace / ".cid" / "output"
+            output.mkdir(parents=True)
+            package = output / "ops-router_202609031800_abcdef1.tar.gz"
+            package.write_bytes(b"archive")
+
+            found = server.find_latest_host_package(
+                {"tar_prefix": "ops-router_"},
+                workspace,
+            )
+
+        self.assertEqual(package, found)
+
+    def test_host_package_discovery_uses_cid_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            output = workspace / ".cid" / "output"
+            output.mkdir(parents=True)
+            package = output / "custom-package.tar.gz"
+            package.write_bytes(b"archive")
+
+            found = server.find_latest_host_package(
+                {
+                    "tar_prefix": "legacy_",
+                    "package_pattern": ".cid/output/custom-*.tar.gz",
+                },
+                workspace,
+            )
+
+        self.assertEqual(package, found)
+
+    def test_report_only_test_policy_does_not_block_build(self) -> None:
+        with patch.dict(server.CFG, {"test_policy": "report_only"}):
+            self.assertFalse(server.tests_block_build({"status": "failed"}))
+            self.assertFalse(server.tests_block_build({"status": "error"}))
+
+    def test_blocking_test_policy_stops_failed_tests(self) -> None:
+        with patch.dict(server.CFG, {"test_policy": "blocking"}):
+            self.assertTrue(server.tests_block_build({"status": "failed"}))
+            self.assertFalse(server.tests_block_build({"status": "passed"}))
+
     @patch.object(server, "run_stream", return_value=0)
     def test_cid_build_command_and_timeout_override_legacy_entrypoint(self, run_stream) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -475,6 +518,7 @@ artifacts:
         command = " ".join(run_stream.call_args.args[1])
         self.assertIn("bash scripts/ci/build-from-cid.sh", command)
         self.assertIn("CID_IMAGE=local/demo:", command)
+        self.assertIn("find . -maxdepth 5", command)
         self.assertEqual(321, run_stream.call_args.kwargs["timeout"])
 
     def test_failure_summary_prefers_actionable_error(self) -> None:

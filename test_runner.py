@@ -51,7 +51,7 @@ def failure(name: str, detail: str) -> dict[str, str]:
     return {"name": name, "detail": (detail or "test command failed").strip()[:1000]}
 
 
-def test_case(
+def make_test_case(
     name: str,
     status: str,
     duration_ms: float | int | None = None,
@@ -160,7 +160,7 @@ def parse_go_json(
         raw_detail = details.get((package, test), output if state == "failed" else "")
         case_detail = "" if state == "passed" else _go_case_detail(raw_detail, state)
         cases.append(
-            test_case(
+            make_test_case(
                 test,
                 state,
                 durations.get((package, test)),
@@ -169,7 +169,7 @@ def parse_go_json(
             )
         )
     if not cases and output:
-        cases = [test_case(command_name, "failed", None, output)]
+        cases = [make_test_case(command_name, "failed", None, output)]
     return len(cases), sum(item["status"] == "passed" for item in cases), sum(item["status"] == "failed" for item in cases), failure_cases(cases), cases
 
 
@@ -186,12 +186,12 @@ def parse_junit(
     path: Path, command_name: str, output: str, repo_dir: Path
 ) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
     if not path.is_file():
-        cases = [test_case(command_name, "error", None, output or "JUnit report was not produced")]
+        cases = [make_test_case(command_name, "error", None, output or "JUnit report was not produced")]
         return 1, 0, 0, failure_cases(cases), cases
     try:
         root = ET.parse(path).getroot()
     except ET.ParseError as exc:
-        cases = [test_case(command_name, "error", None, f"invalid JUnit XML: {exc}")]
+        cases = [make_test_case(command_name, "error", None, f"invalid JUnit XML: {exc}")]
         return 1, 0, 0, failure_cases(cases), cases
     cases = root.findall(".//testcase")
     parsed: list[dict[str, Any]] = []
@@ -215,7 +215,7 @@ def parse_junit(
         detail = (problem.text or problem.get("message") or "test failed") if problem is not None else ""
         if skipped is not None:
             detail = skipped.get("message") or skipped.text or "test skipped by source test"
-        parsed.append(test_case(label, status, duration_ms, detail, source_file))
+        parsed.append(make_test_case(label, status, duration_ms, detail, source_file))
     return len(parsed), sum(item["status"] == "passed" for item in parsed), sum(item["status"] == "failed" for item in parsed), failure_cases(parsed), parsed
 
 
@@ -229,14 +229,14 @@ def parse_unittest(
         failures.append(failure(match.group(1), "unittest failure; see job log"))
     if not failures and "FAILED" in output:
         failures.append(failure(command_name, output))
-    cases = [test_case(command_name, "failed" if failures else "passed", None, failures[0]["detail"] if failures else "")]
+    cases = [make_test_case(command_name, "failed" if failures else "passed", None, failures[0]["detail"] if failures else "")]
     return total, max(0, total - len(failures)), len(failures), failures, cases
 
 
 def parse_shell(
     command_name: str, code: int, output: str, duration_ms: int
 ) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
-    cases = [test_case(command_name, "passed" if code == 0 else "failed", duration_ms, "" if code == 0 else output)]
+    cases = [make_test_case(command_name, "passed" if code == 0 else "failed", duration_ms, "" if code == 0 else output)]
     return 1, int(code == 0), int(code != 0), failure_cases(cases), cases
 
 
@@ -244,15 +244,15 @@ def parse_case_json(
     path: Path, command_name: str, output: str
 ) -> tuple[int, int, int, list[dict[str, str]], list[dict[str, Any]]]:
     if not path.is_file():
-        cases = [test_case(command_name, "error", None, output or "test case report was not produced")]
+        cases = [make_test_case(command_name, "error", None, output or "test case report was not produced")]
         return 1, 0, 0, failure_cases(cases), cases
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         cases = [item for item in data.get("cases", []) if isinstance(item, dict)]
     except (OSError, json.JSONDecodeError) as exc:
-        cases = [test_case(command_name, "error", None, f"invalid test case report: {exc}")]
+        cases = [make_test_case(command_name, "error", None, f"invalid test case report: {exc}")]
     if not cases:
-        cases = [test_case(command_name, "error", None, "test case report has no cases")]
+        cases = [make_test_case(command_name, "error", None, "test case report has no cases")]
     for item in cases:
         item.setdefault("name", command_name)
         item.setdefault("status", "error")
@@ -389,7 +389,7 @@ def main() -> int:
         else:
             total, passed, failed, failures, cases = parse_shell(name, code, output, elapsed)
         if code != 0 and not failures:
-            cases = [test_case(name, "failed", elapsed, output or f"exit={code}")]
+            cases = [make_test_case(name, "failed", elapsed, output or f"exit={code}")]
             failures = failure_cases(cases)
             total, passed, failed = 1, 0, 1
         # A well-formed report is authoritative too: some wrappers collect

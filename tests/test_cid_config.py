@@ -71,6 +71,47 @@ class CidConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(CidConfigError, "service.id mismatch"):
             load_cid_config(self.write(VALID), "another-service")
 
+    def test_rejects_missing_artifact_contract(self) -> None:
+        without_artifacts = VALID.split("artifacts:", 1)[0]
+        with self.assertRaisesRegex(CidConfigError, "artifacts must be a mapping"):
+            load_cid_config(self.write(without_artifacts), "demo")
+
+    def test_accepts_archive_only_package_pattern(self) -> None:
+        package_contract = VALID.replace(
+            """  image:
+    enabled: true
+    delivery: swr
+""",
+            """  image:
+    enabled: false
+    delivery: archive-only
+    archive: false
+  package:
+    enabled: true
+    pattern: .cid/output/demo_*.tar.gz
+    delivery: archive-only
+""",
+        )
+        config = load_cid_config(self.write(package_contract), "demo")
+        self.assertTrue(config["artifacts"]["package"]["enabled"])
+
+    def test_rejects_package_pattern_outside_workspace(self) -> None:
+        unsafe = VALID.replace(
+            """  image:
+    enabled: true
+    delivery: swr
+""",
+            """  image:
+    enabled: false
+    delivery: archive-only
+  package:
+    enabled: true
+    pattern: ../demo_*.tar.gz
+""",
+        )
+        with self.assertRaisesRegex(CidConfigError, "safe relative glob"):
+            load_cid_config(self.write(unsafe), "demo")
+
 
 if __name__ == "__main__":
     unittest.main()

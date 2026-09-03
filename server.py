@@ -1466,6 +1466,10 @@ def load_config() -> dict[str, Any]:
     cfg["archive_root"] = archive_root.rstrip("/") or "/usr/share/nginx/html/images"
     cfg["archive_enabled"] = archive_enabled
     cfg["archive_required"] = archive_required
+    test_policy = str(cfg.get("test_policy") or "report_only").strip().lower()
+    if test_policy not in {"report_only", "blocking"}:
+        raise ValueError("test_policy must be report_only or blocking")
+    cfg["test_policy"] = test_policy
     try:
         cfg["max_concurrent_jobs"] = max(1, min(int(cfg.get("max_concurrent_jobs") or 5), 16))
     except (TypeError, ValueError):
@@ -1691,7 +1695,7 @@ def test_report_dir(job_id: str, service_id: str) -> Path:
 
 
 def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_sha: str) -> dict[str, Any]:
-    """Run trusted UT/DT tests and always return a result that cannot block publishing."""
+    """Run trusted UT/DT tests; the caller applies robot-ci's global test policy."""
     report_dir = test_report_dir(job_id, service_id)
     report_dir.mkdir(parents=True, exist_ok=True)
     summary_path = report_dir / "summary.json"
@@ -1787,8 +1791,19 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
     for item in (result.get("failures") or [])[:20]:
         append_job_log(job_id, f"TEST FAIL {item.get('name')}: {item.get('detail')}")
     if result.get("status") not in ("passed", "not_configured"):
-        append_job_log(job_id, "WARN tests did not pass; phase-1 policy continues to image build")
+        if CFG.get("test_policy") == "blocking":
+            append_job_log(job_id, "ERROR tests did not pass; blocking policy stops the build")
+        else:
+            append_job_log(job_id, "WARN tests did not pass; report_only policy continues to build")
     return result
+
+
+def tests_block_build(result: dict[str, Any]) -> bool:
+    """Whether the configured framework policy rejects this test result."""
+    return (
+        CFG.get("test_policy") == "blocking"
+        and result.get("status") not in ("passed", "not_configured")
+    )
 
 
 def use_wsl() -> bool:
@@ -2948,7 +2963,7 @@ def build_from_source(
     bash = (
         "set -euo pipefail; "
         f"cd '{shell_src}'; "
-        "find . -maxdepth 3 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
+        "find . -maxdepth 5 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
         "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD SKIP_WEBAPP_BUILD SKIP_SERVER_BUILD FORCE_WEBAPP_BUILD FORCE_REBUILD; "
         f"export {build_env_exports}CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
         f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
@@ -3021,12 +3036,31 @@ def find_latest_tar(svc: dict[str, Any], workspace: Path | None = None) -> Path 
 
 def find_latest_host_package(svc: dict[str, Any], workspace: Path) -> Path | None:
     """Latest host-install tar.gz produced by services with host_package=true."""
-    export_dir = workspace / "runtime-images" / "cce-export"
-    if not export_dir.is_dir():
-        return None
+    pattern = str(svc.get("package_pattern") or "").strip().replace("\\", "/")
+    if pattern:
+        cands = sorted(
+            [package for package in workspace.glob(pattern) if package.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if cands:
+            return cands[0]
+
     prefix = svc["tar_prefix"]
+    export_dirs = (
+        workspace / ".cid" / "output",
+        workspace / "runtime-images" / "cce-export",
+    )
     cands = sorted(
-        [*export_dir.glob(f"{prefix}*.tar.gz"), *export_dir.glob(f"{prefix}*.tar")],
+        [
+            package
+            for export_dir in export_dirs
+            if export_dir.is_dir()
+            for package in (
+                *export_dir.glob(f"{prefix}*.tar.gz"),
+                *export_dir.glob(f"{prefix}*.tar"),
+            )
+        ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -3537,11 +3571,17 @@ def push_one_service(
         result["image"] = declared_image
         image_artifact = (cid.get("artifacts") or {}).get("image") or {}
         delivery = str(image_artifact.get("delivery") or "swr")
+        image_enabled = image_artifact.get("enabled") is True
         svc["archive_only"] = delivery == "archive-only"
+        svc["archive_image"] = image_enabled and image_artifact.get("archive") is True
         package_artifact = (cid.get("artifacts") or {}).get("package") or {}
-        if svc["archive_only"] and package_artifact.get("enabled") is True:
+        package_enabled = package_artifact.get("enabled") is True
+        if package_enabled:
             pattern = str(package_artifact.get("pattern") or "")
+            svc["package_pattern"] = pattern
             svc["bundle_archive"] = "multica-fleet_bundle_" in pattern
+            if not image_enabled:
+                svc["host_package"] = True
         append_job_log(job_id, f"CID contract active image={declared_image} delivery={delivery}")
 
     git = git_bin()
@@ -3572,6 +3612,10 @@ def push_one_service(
     record_test_run(job_id, test_run)
     result["test_status"] = test_run["status"]
     result["test_summary"] = test_summary
+    if tests_block_build(test_result):
+        result["error"] = f"tests failed under blocking policy: {test_result.get('status')}"
+        append_job_log(job_id, f"FAILED service={service_id} stage=testing reason={result['error']}")
+        return result
     set_job(job_id, stage="building")
 
     # Always rebuild; never reuse a previous local image for the same git hash.
@@ -3749,7 +3793,11 @@ def push_one_service(
     # Pin the just-built tags so prune cannot delete them before docker save.
     set_job(job_id, stage="archiving")
     reclaim_ci_disk(job_id, keep_refs=(local_ref, remote))
-    ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
+    if svc.get("archive_image", True):
+        ok_arc, arc_path = archive_image_locally(job_id, local_ref, image, tag, out_dir=archive_dir)
+    else:
+        append_job_log(job_id, "local image archive skipped by .cid/build.yaml")
+        ok_arc, arc_path = True, ""
     if not ok_arc:
         result["remote"] = remote
         if CFG.get("archive_required"):

@@ -81,22 +81,25 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
   "archive_enabled": true,
   "archive_required": true,
   "archive_root": "/usr/share/nginx/html/images",
+  "test_policy": "report_only",
   "ci_tmp_root": "/home/ci"
 }
 ```
+
+`test_policy` 支持 `report_only` 和 `blocking`，默认是 `report_only`。默认策略下 UT、DT 失败会记录并展示结果，但不会阻断后续构建、归档和推送；只有显式配置为 `blocking` 时才在测试失败后终止当前服务。
 
 ## 仓库级 `.cid/build.yaml`
 
 已整改的服务仓以 `.cid/build.yaml` 作为唯一构建契约。robot-ci 在拉取分支后读取该文件，并按 `scripts` 顺序执行启用的 UT、DT 和镜像构建步骤；测试报告格式及路径、构建超时、镜像名称和交付方式也来自该文件。
 
 - `dependencies`、`machine` 由固定构建机环境管理，禁止写入仓库 YAML。
-- `continue_on_error` 由 robot-ci 全局策略管理，禁止写入仓库 YAML。当前阶段测试失败只展示结果，不阻断构建和推送。
+- `continue_on_error` 由 robot-ci 全局 `test_policy` 管理，禁止写入仓库 YAML。默认 `report_only`，测试失败只展示结果，不阻断构建和推送。
 - `enabled: false` 的测试阶段不执行，也不会作为“跳过用例”展示。
 - 普通服务只在仓内构建本地镜像，SWR 登录、标签、推送、重试、校验和服务器归档由 robot-ci 统一执行。
 - `multica-fleet` 的 `delivery: archive-only` 仍只生成包含三个镜像、环境模板和部署脚本的下载包，不推送 SWR。
-- 尚未整改的 `cloud-space`、`ops-router` 临时回退到 `test-plans.json` 和 `services.json` 的旧流程。
+- `ops-router` 的 `delivery: archive-only` 主机安装包从 `.cid/output/` 读取；旧分支的 `runtime-images/cce-export/` 仍兼容。
 
-robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报告格式和禁止字段。YAML 无效时，当前服务明确失败，不会静默伪装为旧流程。
+robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报告格式、artifact 交付配置和禁止字段。主机安装包按 `artifacts.package.pattern` 从仓库工作区发现；YAML 无效时，当前服务明确失败，不会静默伪装为旧流程。
 
 ## 安全提醒
 

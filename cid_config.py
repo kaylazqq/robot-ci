@@ -82,6 +82,39 @@ def load_cid_config(repo_dir: Path, expected_service_id: str = "") -> dict[str, 
                 raise CidConfigError(f"scripts[{index}].report.path is required")
     if build_count != 1:
         raise CidConfigError("exactly one enabled build script is required")
+    artifacts = data.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise CidConfigError("artifacts must be a mapping")
+    image_artifact = artifacts.get("image")
+    if not isinstance(image_artifact, dict):
+        raise CidConfigError("artifacts.image must be a mapping")
+    image_enabled = image_artifact.get("enabled")
+    if not isinstance(image_enabled, bool):
+        raise CidConfigError("artifacts.image.enabled must be boolean")
+    image_delivery = str(image_artifact.get("delivery") or "").strip()
+    if image_delivery not in {"swr", "archive-only"}:
+        raise CidConfigError("artifacts.image.delivery must be swr or archive-only")
+    if "archive" in image_artifact and not isinstance(image_artifact.get("archive"), bool):
+        raise CidConfigError("artifacts.image.archive must be boolean")
+
+    package_artifact = artifacts.get("package")
+    package_enabled = False
+    if package_artifact is not None:
+        if not isinstance(package_artifact, dict):
+            raise CidConfigError("artifacts.package must be a mapping")
+        package_enabled = package_artifact.get("enabled")
+        if not isinstance(package_enabled, bool):
+            raise CidConfigError("artifacts.package.enabled must be boolean")
+        if package_enabled:
+            pattern = str(package_artifact.get("pattern") or "").strip().replace("\\", "/")
+            path = PurePosixPath(pattern)
+            if not pattern or path.is_absolute() or ".." in path.parts:
+                raise CidConfigError("artifacts.package.pattern must be a safe relative glob")
+            delivery = str(package_artifact.get("delivery") or "archive-only").strip()
+            if delivery != "archive-only":
+                raise CidConfigError("artifacts.package.delivery must be archive-only")
+    if not image_enabled and not package_enabled:
+        raise CidConfigError("at least one artifact must be enabled")
     return data
 
 
