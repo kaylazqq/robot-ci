@@ -327,7 +327,7 @@ def _step_detail(step_id: str, status: str, result: dict[str, Any] | None, job: 
         tag = str((result or {}).get("tag") or "")
         if tag:
             return tag
-        return "deploy.sh / Docker build"
+        return "CID / legacy Docker build"
     if step_id == "push":
         remote = str((result or {}).get("remote") or job.get("remote") or "")
         if remote and remote != "archive-only":
@@ -450,6 +450,7 @@ def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
             "git ",
             "deploy.sh",
             "build-image.sh",
+            "build.yaml",
             "unknown service",
             "repo",
             "missing deploy",
@@ -2746,15 +2747,30 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
             return False, f"checkout {branch} failed"
 
     run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
-    has_deploy = (dest / "deploy.sh").is_file() or (dest / "build-image.sh").is_file()
-    has_dockerfile = (dest / "Dockerfile").is_file()
-    if not has_deploy and not (svc.get("dockerfile_build") and has_dockerfile):
-        return False, "missing deploy.sh/build-image.sh"
+    ok_contract, contract_error = validate_cloned_repo_contract(dest, svc)
+    if not ok_contract:
+        return False, contract_error
     if svc.get("id") == "multica-fleet":
         restore_fleet_runtime_cache(job_id, dest)
     code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
     append_job_log(job_id, f"HEAD={head if code == 0 else '?'} @ {branch}")
     return True, str(dest)
+
+
+def validate_cloned_repo_contract(dest: Path, svc: dict[str, Any]) -> tuple[bool, str]:
+    """Require a CID contract or a legacy root/Docker build entry."""
+    try:
+        cid = load_cid_config(dest, str(svc.get("id") or ""))
+    except CidConfigError as exc:
+        return False, f"invalid .cid/build.yaml: {exc}"
+    has_legacy = (dest / "deploy.sh").is_file() or (dest / "build-image.sh").is_file()
+    has_package = (dest / "build" / "package" / "build.sh").is_file()
+    has_dockerfile = (dest / "Dockerfile").is_file()
+    if cid is None and not has_legacy and not has_package and not (
+        svc.get("dockerfile_build") and has_dockerfile
+    ):
+        return False, "missing .cid/build.yaml or build/package/build.sh"
+    return True, ""
 
 
 def public_service_dir() -> Path:
@@ -2764,8 +2780,7 @@ def public_service_dir() -> Path:
 
 def ensure_public_service(job_id: str) -> tuple[bool, str]:
     """
-    Many microservice deploy.sh scripts source
-    ../public-service/windows-deploy/lib/source-rrd.sh.
+    Some legacy branches source shared helpers from the sibling public-service.
     Helper clones only the service repo, so keep a shared public-service checkout
     next to it (does not modify service source trees).
 
@@ -2952,11 +2967,13 @@ def build_from_source(
         build_timeout = int(cid_build.get("timeout_sec") or CFG.get("build_timeout_sec") or 7200)
     else:
         build_invocation = (
-            f"if [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
+            f"if [[ -f ./build/package/build.sh ]]; then bash ./build/package/build.sh{deploy_args}; "
+            f"elif [[ -f ./build/deploy/deploy.sh ]]; then bash ./build/deploy/deploy.sh{deploy_args}; "
+            f"elif [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
             "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
             f"elif [[ -f ./Dockerfile ]]; then docker build{docker_args} "
             f"-t local/{shlex.quote(str(svc['image']))}:{shlex.quote(image_tag)} .; "
-            "else echo 'ERROR: no deploy.sh'; exit 1; fi"
+            "else echo 'ERROR: no build/package/build.sh'; exit 1; fi"
         )
         build_timeout = int(CFG.get("build_timeout_sec") or 7200)
 

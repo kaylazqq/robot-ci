@@ -33,7 +33,7 @@ scripts:
     name: Build image
     type: build
     enabled: true
-    command: bash build-image.sh
+    command: bash build/package/build.sh
     timeout_sec: 600
 artifacts:
   image:
@@ -54,7 +54,7 @@ class CidConfigTests(unittest.TestCase):
     def test_loads_build_and_enabled_test_stages(self) -> None:
         config = load_cid_config(self.write(VALID), "demo")
         self.assertIsNotNone(config)
-        self.assertEqual("bash build-image.sh", enabled_build_step(config)["command"])
+        self.assertEqual("bash build/package/build.sh", enabled_build_step(config)["command"])
         plan = build_test_plan(config)
         command = plan["profiles"]["cid-demo"]["commands"][0]
         self.assertEqual("ut/pytest.xml", command["report"])

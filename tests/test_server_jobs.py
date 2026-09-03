@@ -473,6 +473,57 @@ class BuildCommandTests(unittest.TestCase):
             self.assertTrue(server.tests_block_build({"status": "failed"}))
             self.assertFalse(server.tests_block_build({"status": "passed"}))
 
+    def test_cid_contract_does_not_require_root_build_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            (workspace / ".cid").mkdir()
+            (workspace / ".cid" / "build.yaml").write_text(
+                """version: 1
+service:
+  id: demo
+  name: Demo
+  language: shell
+  image: demo
+scripts:
+  - id: ut
+    name: Demo UT
+    type: test
+    test_type: ut
+    enabled: false
+    reason: none
+  - id: dt
+    name: Demo DT
+    type: test
+    test_type: dt
+    enabled: false
+    reason: none
+  - id: build
+    name: CID build
+    type: build
+    enabled: true
+    command: bash build/package/build.sh
+    timeout_sec: 60
+artifacts:
+  image:
+    enabled: true
+    delivery: swr
+""",
+                encoding="utf-8",
+            )
+            ok, detail = server.validate_cloned_repo_contract(
+                workspace, {"id": "demo", "image": "demo"}
+            )
+        self.assertTrue(ok, detail)
+
+    def test_missing_cid_and_build_entry_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = server.Path(temporary)
+            ok, detail = server.validate_cloned_repo_contract(
+                workspace, {"id": "demo", "image": "demo"}
+            )
+        self.assertFalse(ok)
+        self.assertIn("missing .cid/build.yaml", detail)
+
     @patch.object(server, "run_stream", return_value=0)
     def test_cid_build_command_and_timeout_override_legacy_entrypoint(self, run_stream) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -502,7 +553,7 @@ scripts:
     name: CID build
     type: build
     enabled: true
-    command: bash scripts/ci/build-from-cid.sh
+    command: bash build/package/build.sh
     timeout_sec: 321
 artifacts:
   image:
@@ -516,7 +567,7 @@ artifacts:
                 ok, detail = server.build_from_source("no-job", svc, "abcdef1")
         self.assertTrue(ok, detail)
         command = " ".join(run_stream.call_args.args[1])
-        self.assertIn("bash scripts/ci/build-from-cid.sh", command)
+        self.assertIn("bash build/package/build.sh", command)
         self.assertIn("CID_IMAGE=local/demo:", command)
         self.assertIn("find . -maxdepth 5", command)
         self.assertEqual(321, run_stream.call_args.kwargs["timeout"])
