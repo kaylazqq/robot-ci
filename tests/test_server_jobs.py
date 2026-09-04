@@ -221,6 +221,33 @@ class JobWorkspaceTests(unittest.TestCase):
                 self.assertFalse(idle.exists())
                 self.assertFalse(legacy.exists())
 
+    def test_gc_all_drops_other_service_workspaces(self) -> None:
+        svc = {
+            "id": "memory-service",
+            "repo": "rollingfruit/CellMem",
+            "github": "https://github.com/rollingfruit/CellMem.git",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = server.Path(tmp)
+            with patch.dict(server.CFG, {"workspace_root": tmp}):
+                live = server.repo_dir(svc, "livejob00aaaa")
+                other = root / "kibana-service--idlejob00cccc"
+                public = root / "public-service"
+                live.mkdir()
+                other.mkdir()
+                public.mkdir()
+                job = make_job("livejob00aaaa")
+                self.assertIsNone(server.register_job_if_idle(job))
+                try:
+                    with patch.object(server, "append_job_log"):
+                        server.gc_all_idle_clone_dirs("livejob00aaaa")
+                    self.assertTrue(live.is_dir())
+                    self.assertTrue(public.is_dir())
+                    self.assertFalse(other.exists())
+                finally:
+                    with server._jobs_lock:
+                        server._jobs.pop("livejob00aaaa", None)
+
 
 class JobPayloadTests(unittest.TestCase):
     def test_compact_payload_returns_only_log_delta(self) -> None:
@@ -884,13 +911,27 @@ class JobEndpointTests(unittest.TestCase):
 
 class DiskPruneAndArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
+        with server._jobs_lock:
+            self.saved_jobs = dict(server._jobs)
+            server._jobs.clear()
         self.tmp = tempfile.TemporaryDirectory()
         root = server.Path(self.tmp.name)
         self.archive_root = root / "images"
         self.archive_root.mkdir()
+        self.workspace_root = root / "workspaces"
+        self.workspace_root.mkdir()
+        self.ci_tmp_root = root / "ci-tmp"
+        self.ci_tmp_root.mkdir()
         self.log_dir = root / "logs"
         self.log_dir.mkdir()
-        self.cfg = patch.dict(server.CFG, {"archive_root": str(self.archive_root)})
+        self.cfg = patch.dict(
+            server.CFG,
+            {
+                "archive_root": str(self.archive_root),
+                "workspace_root": str(self.workspace_root),
+                "ci_tmp_root": str(self.ci_tmp_root),
+            },
+        )
         self.log = patch.object(server, "LOG_DIR", self.log_dir)
         self.job_log = patch.object(server, "append_job_log")
         self.cfg.start()
@@ -902,6 +943,9 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.log.stop()
         self.cfg.stop()
         self.tmp.cleanup()
+        with server._jobs_lock:
+            server._jobs.clear()
+            server._jobs.update(self.saved_jobs)
 
     def _disk(self, used: int, total: int = 1000):
         return type("usage", (), {"total": total, "used": used, "free": total - used})()
@@ -1056,15 +1100,17 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server._jobs.update(saved)
 
     @patch.object(server, "docker_cmd", return_value=(0, "Total: 1GB"))
-    def test_reclaim_skips_builder_prune_below_80_percent(self, docker_cmd) -> None:
+    def test_reclaim_always_prunes_builder_cache_below_80_percent(self, docker_cmd) -> None:
         with patch.object(server.shutil, "disk_usage", return_value=self._disk(700)):
             with patch.object(server, "reclaim_build_swap", return_value=0):
                 server.reclaim_ci_disk("job-1")
-        docker_cmd.assert_not_called()
+        prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
+        self.assertIn(("builder", "prune", "-af"), prune_args)
+        self.assertNotIn(("image", "prune", "-af"), prune_args)
 
     @patch.object(server, "ensure_protected_image_holds")
     @patch.object(server, "docker_cmd", return_value=(0, "Total: 32GB"))
-    def test_reclaim_prunes_images_then_builder_when_still_over_80(
+    def test_reclaim_prunes_builder_then_images_when_still_over_80(
         self, docker_cmd, ensure_holds
     ) -> None:
         self._stamp_dir("20260804000000")
@@ -1075,9 +1121,9 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
         self.assertIn(("image", "prune", "-af"), prune_args)
         self.assertIn(("builder", "prune", "-af"), prune_args)
-        image_index = prune_args.index(("image", "prune", "-af"))
         builder_index = prune_args.index(("builder", "prune", "-af"))
-        self.assertLess(image_index, builder_index)
+        image_index = prune_args.index(("image", "prune", "-af"))
+        self.assertLess(builder_index, image_index)
 
     @patch.object(server, "ensure_protected_image_holds")
     @patch.object(server, "docker_cmd", return_value=(0, "Total: 32GB"))
@@ -1097,8 +1143,33 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server.reclaim_ci_disk("job-1")
         ensure_holds.assert_called()
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
+        self.assertIn(("builder", "prune", "-af"), prune_args)
         self.assertIn(("image", "prune", "-af"), prune_args)
-        self.assertNotIn(("builder", "prune", "-af"), prune_args)
+
+    def test_gc_all_idle_clone_dirs_keeps_public_service_and_running_jobs(self) -> None:
+        svc = {
+            "id": "memory-service",
+            "repo": "rollingfruit/CellMem",
+            "github": "https://github.com/rollingfruit/CellMem.git",
+        }
+        live = server.repo_dir(svc, "livejob00aaaa")
+        idle = self.workspace_root / "kibana-service--deadjob00bbbb"
+        public = self.workspace_root / "public-service"
+        cache = self.workspace_root / ".robot-ci-cache"
+        leftover_tmp = self.ci_tmp_root / "runtime-apt-debs.abc123"
+        keep_tmp = self.ci_tmp_root / "node-compile-cache"
+        for path in (live, idle, public, cache, leftover_tmp, keep_tmp):
+            path.mkdir()
+        job = make_job("livejob00aaaa")
+        self.assertIsNone(server.register_job_if_idle(job))
+        server.gc_all_idle_clone_dirs("livejob00aaaa")
+        server.reclaim_ci_tmp_leftovers("livejob00aaaa")
+        self.assertTrue(live.is_dir())
+        self.assertTrue(public.is_dir())
+        self.assertTrue(cache.is_dir())
+        self.assertFalse(idle.exists())
+        self.assertFalse(leftover_tmp.exists())
+        self.assertTrue(keep_tmp.is_dir())
 
 
 class BuildHistoryTests(unittest.TestCase):

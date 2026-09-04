@@ -66,6 +66,16 @@ DISK_USAGE_PRUNE_RATIO = 0.80
 CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
+WORKSPACE_KEEP_NAMES = ("public-service", ".robot-ci-cache")
+CI_TMP_GC_PREFIXES = (
+    "runtime-apt-debs.",
+    "mattermost-build-cache.",
+    "go-build",
+    "tmp.",
+    "ops-log-",
+    "gmagent-pytest-",
+)
+CI_TMP_GC_NAMES = ("ops-router-build",)
 PROTECTED_LOCAL_IMAGES = (
     "local/ai-go-toolchain",
     "local/ai-jdk-build",
@@ -2202,6 +2212,14 @@ def existing_clone_dirs(svc: dict[str, Any]) -> list[Path]:
     return found
 
 
+def _kept_workspace_suffixes(job_id: str) -> set[str]:
+    keep = {job_workspace_suffix(job_id)}
+    with _jobs_lock:
+        keep.update(job_workspace_suffix(str(item.get("id") or "")) for item in _running_jobs_locked())
+    keep.discard("")
+    return keep
+
+
 def gc_idle_clone_dirs(job_id: str, svc: dict[str, Any]) -> None:
     """Remove finished per-job checkouts; keep dirs belonging to still-running jobs."""
     root = Path(CFG["workspace_root"])
@@ -2209,10 +2227,7 @@ def gc_idle_clone_dirs(job_id: str, svc: dict[str, Any]) -> None:
         return
     name = clone_dir_name(svc)
     prefix = f"{name}--"
-    keep = {job_workspace_suffix(job_id)}
-    with _jobs_lock:
-        keep.update(job_workspace_suffix(str(item.get("id") or "")) for item in _running_jobs_locked())
-    keep.discard("")
+    keep = _kept_workspace_suffixes(job_id)
     leftover = root / name
     if leftover.exists():
         wipe_workspace_dir(job_id, leftover, label=f"legacy workspace {name}")
@@ -2226,6 +2241,42 @@ def gc_idle_clone_dirs(job_id: str, svc: dict[str, Any]) -> None:
         if path.name[len(prefix) :] in keep:
             continue
         wipe_workspace_dir(job_id, path, label=f"idle workspace {path.name}")
+
+
+def gc_all_idle_clone_dirs(job_id: str) -> None:
+    """Drop every finished checkout. Keep public-service, fleet cache, running jobs."""
+    root = Path(CFG.get("workspace_root") or "")
+    if not root.is_dir():
+        return
+    keep = _kept_workspace_suffixes(job_id)
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return
+    for path in children:
+        if not path.is_dir() or path.is_symlink():
+            continue
+        if path.name in WORKSPACE_KEEP_NAMES:
+            continue
+        suffix = path.name.rsplit("--", 1)[-1] if "--" in path.name else ""
+        if suffix and suffix in keep:
+            continue
+        wipe_workspace_dir(job_id, path, label=f"idle workspace {path.name}")
+
+
+def reclaim_ci_tmp_leftovers(job_id: str) -> None:
+    """Remove leftover compile scratch dirs under /home/ci. Keep the tmp root."""
+    root = ci_tmp_root()
+    if not root.is_dir():
+        return
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return
+    for path in children:
+        name = path.name
+        if name in CI_TMP_GC_NAMES or name.startswith(CI_TMP_GC_PREFIXES):
+            wipe_workspace_dir(job_id, path, label=f"ci tmp leftover {name}")
 
 
 def fleet_runtime_cache_dir() -> Path:
@@ -3298,9 +3349,9 @@ def reclaim_build_swap(job_id: str) -> int:
 
 
 def reclaim_docker_builder_cache(job_id: str) -> None:
-    """Free BuildKit layer cache after unused images are dropped."""
+    """Free unused BuildKit layer cache. This is the usual 100G+ leak on the CI host."""
     append_job_log(job_id, "pruning docker builder cache")
-    code, out = docker_cmd("builder", "prune", "-af", timeout=300)
+    code, out = docker_cmd("builder", "prune", "-af", timeout=1800)
     for line in (out or "").splitlines()[-8:]:
         append_job_log(job_id, line)
     if code != 0:
@@ -3316,24 +3367,34 @@ def reclaim_ci_disk(
 ) -> None:
     """CI disk reclaim used before archive and at job end.
 
-    Always drop leftover build.swap. When usage is >= 80%, prune nginx
-    timestamp archives, then always run ``docker image prune -af`` (even if
-    archives alone dropped usage below the threshold). If still >= 80% after
-    image prune, reclaim BuildKit builder cache.
+    Always drop leftover build.swap, idle git workspaces, /home/ci scratch
+    dirs, and unused BuildKit cache. Those are what filled the CI disk even
+    while usage stayed under the 80% archive/image prune threshold.
+
+    When usage is still >= 80% after that, prune nginx timestamp archives
+    and unused docker images. Protected local/ai-* tags are never removed.
     """
     reclaim_build_swap(job_id)
+    gc_all_idle_clone_dirs(job_id)
+    reclaim_ci_tmp_leftovers(job_id)
+    reclaim_docker_builder_cache(job_id)
     probe = Path((CFG.get("archive_root") or "/").rstrip("/") or "/")
     stats = disk_usage_ratio(probe)
     if stats is None:
         return
     ratio, total, free = stats
     if ratio < max_usage_ratio:
+        append_job_log(
+            job_id,
+            f"disk after routine reclaim: usage={ratio:.0%} "
+            f"free={free // (1024**2)}MB",
+        )
         return
-    reclaim_docker_images = True
     append_job_log(
         job_id,
         f"disk usage={ratio:.0%} >= {max_usage_ratio:.0%} "
-        f"(free={free // (1024**2)}MB / total={total // (1024**2)}MB); reclaiming…",
+        f"(free={free // (1024**2)}MB / total={total // (1024**2)}MB); "
+        "pruning archives and unused docker images…",
     )
     prune_nginx_archives(
         job_id,
@@ -3341,34 +3402,22 @@ def reclaim_ci_disk(
         min_keep=min_keep,
         max_usage_ratio=max_usage_ratio,
     )
-    if reclaim_docker_images:
-        stats = disk_usage_ratio(probe)
-        if stats is not None:
-            ratio, total, free = stats
-            if ratio < max_usage_ratio:
-                append_job_log(
-                    job_id,
-                    f"disk now {ratio:.0%} after archive prune; "
-                    "still reclaiming unused docker images",
-                )
-            else:
-                append_job_log(
-                    job_id,
-                    f"disk still {ratio:.0%} after archive prune; "
-                    "reclaim unused docker images",
-                )
-        reclaim_unused_docker_images(job_id, keep_refs=keep_refs)
     stats = disk_usage_ratio(probe)
-    if stats is None:
-        return
-    ratio, total, free = stats
-    if ratio < max_usage_ratio:
-        return
-    append_job_log(
-        job_id,
-        f"disk still {ratio:.0%} after image prune; reclaim docker builder cache",
-    )
-    reclaim_docker_builder_cache(job_id)
+    if stats is not None:
+        ratio, total, free = stats
+        if ratio < max_usage_ratio:
+            append_job_log(
+                job_id,
+                f"disk now {ratio:.0%} after archive prune; "
+                "still reclaiming unused docker images",
+            )
+        else:
+            append_job_log(
+                job_id,
+                f"disk still {ratio:.0%} after archive prune; "
+                "reclaim unused docker images",
+            )
+    reclaim_unused_docker_images(job_id, keep_refs=keep_refs)
     stats = disk_usage_ratio(probe)
     if stats is not None:
         ratio, total, free = stats
