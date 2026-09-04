@@ -3185,14 +3185,19 @@ def parse_tag_from_tar(tar_path: Path, image: str) -> str:
 
 
 def disk_usage_ratio(path: Path | str) -> tuple[float, int, int] | None:
-    """Return (used/total, total_bytes, free_bytes), or None if unreadable."""
+    """Return (df Use%, total_bytes, free_bytes), or None if unreadable.
+
+    ``df`` Use% is (total - avail) / total. ``used / total`` ignores reserved
+    blocks, so a disk that ``df`` shows as 84% can look like 79.9% and skip
+    reclaim entirely.
+    """
     try:
         usage = shutil.disk_usage(str(path))
     except OSError:
         return None
     if usage.total <= 0:
         return None
-    return usage.used / usage.total, usage.total, usage.free
+    return (usage.total - usage.free) / usage.total, usage.total, usage.free
 
 
 def archive_timestamp_dirs(base: Path) -> list[Path]:

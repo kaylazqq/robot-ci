@@ -957,6 +957,17 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         payload.write_bytes(b"tar")
         return payload
 
+    def test_disk_usage_ratio_matches_df_when_blocks_are_reserved(self) -> None:
+        # Same shape as the CI host: df Size=493G Used=394G Avail=79G Use%=84%.
+        usage = type("usage", (), {"total": 493, "used": 394, "free": 79})()
+        with patch.object(server.shutil, "disk_usage", return_value=usage):
+            ratio, total, free = server.disk_usage_ratio("/")
+        self.assertEqual(total, 493)
+        self.assertEqual(free, 79)
+        self.assertAlmostEqual(ratio, (493 - 79) / 493)
+        self.assertGreaterEqual(ratio, 0.80)
+        self.assertLess(394 / 493, 0.80)
+
     def test_prune_skips_when_usage_below_80_percent(self) -> None:
         for name in ("20260801000000", "20260802000000", "20260803000000", "20260804000000"):
             self._stamp_dir(name)
