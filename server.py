@@ -2928,6 +2928,7 @@ def build_from_source(
         "OPS_CONSOLE_IMAGE",
         "MULTICA_SERVER_IMAGE",
         "FLEET_IMAGE",
+        "LLM_GATEWAY_IMAGE",
     )
     extra_env += " ".join(f"{name}={shlex.quote(local_image)}" for name in image_env_names) + " "
 
