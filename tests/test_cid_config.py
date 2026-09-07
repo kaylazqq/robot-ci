@@ -59,6 +59,7 @@ class CidConfigTests(unittest.TestCase):
         command = plan["profiles"]["cid-demo"]["commands"][0]
         self.assertEqual("ut/pytest.xml", command["report"])
         self.assertEqual("bash scripts/ci/ut.sh", command["command"])
+        self.assertEqual("ut", command["test_type"])
         self.assertEqual(1, len(plan["profiles"]["cid-demo"]["commands"]))
 
     def test_rejects_framework_owned_keys_anywhere(self) -> None:

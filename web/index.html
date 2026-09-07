@@ -3,133 +3,162 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SWR Push Helper</title>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,600;9..40,700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=20260830j" />
+  <title>SWR Push Helper 构建平台</title>
+  <link rel="stylesheet" href="/styles.css?v=202609075" />
 </head>
 <body>
-  <div class="bg"></div>
-  <header class="top">
-    <div class="brand">
-      <span class="mark">SWR</span>
-      <div>
-        <h1>一键推送助手</h1>
-        <p class="sub">登录 SWR → 选分支 → 构建并推送 · 产物可查</p>
+  <div id="loginGate" class="login-gate" hidden>
+    <form id="loginForm" class="login-card" autocomplete="on">
+      <div class="brand-lockup">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M5 7.2h14v2.4H5zm0 3.6h14v2.4H5zm0 3.6h9.2v2.4H5z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-name">SWR Push Helper</span>
       </div>
-    </div>
-    <div class="status-pills">
-      <span class="pill" id="pillAgent">检测中…</span>
-      <span class="pill" id="pillDocker">Docker …</span>
-    </div>
-  </header>
-
-  <main class="layout" id="mainLayout" data-view="services">
-    <section class="panel setup">
-      <h2>使用前</h2>
-      <ol class="steps">
-        <li>任一人粘贴华为云临时 <code>docker login</code> 并登录（服务器共享；不确定时点「检查登录」）</li>
-        <li>勾选一个或多个微服务、选分支，点「构建所选」（也可点单行「构建并推送」）</li>
-        <li>可同时跑多个任务（含同一微服务）；达到并发上限前不必排队。运行中可点「停止任务」强制停掉。多服务同一次任务归档到同一目录</li>
-      </ol>
-      <p class="hint">目标仓库：<code id="targetRepo">—</code></p>
-
-      <label class="label" for="loginCmd">SWR 临时登录指令（可选；已有人登录且未过期时可留空）</label>
-      <textarea id="loginCmd" rows="3" placeholder="docker login -u cn-southwest-2@... -p ... swr.cn-southwest-2.myhuaweicloud.com"></textarea>
-      <div class="row">
-        <button type="button" class="btn primary" id="btnLogin">登录 SWR</button>
-        <button type="button" class="btn ghost" id="btnCheckLogin">检查登录</button>
-        <button type="button" class="btn ghost" id="btnLogout">退出登录</button>
+      <h1>登录构建平台</h1>
+      <label class="label" for="authUser">账号</label>
+      <div class="field-wrap">
+        <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5.5 19.2c.8-3.2 3.4-5 6.5-5s5.7 1.8 6.5 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        <input id="authUser" class="input has-icon" name="username" autocomplete="username" required />
       </div>
-      <pre class="log mini" id="loginLog"></pre>
-
-      <label class="label" for="tokenInput">GitHub Token（私有仓可选）</label>
-      <div class="row">
-        <input id="tokenInput" class="input" type="password" placeholder="ghp_…" style="flex:1;min-width:12rem" autocomplete="off" />
-        <button type="button" class="btn ghost" id="btnSaveToken">保存</button>
+      <label class="label" for="authPass">密码</label>
+      <div class="field-wrap">
+        <svg class="field-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="10" width="12" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9 10V8a3 3 0 0 1 6 0v2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        <input id="authPass" class="input has-icon has-eye" name="password" type="password" autocomplete="current-password" required />
+        <button type="button" class="eye-btn" data-eye="authPass" aria-label="显示密码">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.8 12S6.2 6.8 12 6.8 21.2 12 21.2 12 17.8 17.2 12 17.2 2.8 12 2.8 12z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="12" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+        </button>
       </div>
-      <p class="hint" id="tokenStatus">—</p>
+      <p class="hint error" id="loginError" hidden></p>
+      <button type="submit" class="btn primary" id="btnAuthLogin">登录</button>
+    </form>
+  </div>
 
-      <div class="cce-session-note">
-        <h3 class="cce-session-title">华为云 AK/SK（CCE）</h3>
-        <p class="hint">AK/SK 来自华为云控制台 → <strong>我的凭证 → 访问密钥</strong>，不是左侧 SWR docker login 的临时密码。</p>
-        <p class="hint">启用后 SK 会从输入框清除（仍保留在页面内存）。刷新或关闭标签页后失效，不会写入服务器。</p>
-        <label class="label" for="hwAccessKey">Access Key</label>
-        <input id="hwAccessKey" class="input" type="password" autocomplete="off" placeholder="AK" />
-        <label class="label" for="hwSecretKey">Secret Key</label>
-        <input id="hwSecretKey" class="input" type="password" autocomplete="off" placeholder="SK" />
-        <label class="label" for="hwRegion">Region</label>
-        <select id="hwRegion" class="input"></select>
-        <label class="label" for="hwProjectId">Project ID（可选）</label>
-        <input id="hwProjectId" class="input" type="text" autocomplete="off" placeholder="留空则按 Region 自动解析" />
+  <div id="appShell" class="app" hidden>
+    <aside class="nav" aria-label="主导航">
+      <div class="brand-lockup nav-brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M5 7.2h14v2.4H5zm0 3.6h14v2.4H5zm0 3.6h9.2v2.4H5z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-name">SWR Push Helper</span>
+      </div>
+      <button type="button" class="nav-item" data-nav="swr" id="navSwr">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 18a5 5 0 0 1 .7-9.9A6 6 0 0 1 19 11a4 4 0 0 1 0 8H7z" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9 13.5 12 11l3 2.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>SWR登录</span>
+      </button>
+      <button type="button" class="nav-item active" data-nav="build" id="navBuild">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="18" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="18" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8.2 12h5.3M15.8 7.6 13.5 12l2.3 4.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        <span>微服务构建</span>
+      </button>
+      <button type="button" class="nav-item" data-nav="cce" id="navCce">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="4" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="13" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="13" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+        <span>环境管理</span>
+      </button>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="user-wrap" id="userWrap">
+          <button type="button" class="user-btn" id="btnUserMenu" aria-haspopup="true" aria-expanded="false" title="账号">
+            <span class="user-avatar" id="userAvatar">L</span>
+            <span id="userNameLabel">—</span>
+          </button>
+          <div class="user-menu" id="userMenu" hidden>
+            <button type="button" id="btnChangePass">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="10" width="12" height="9" rx="2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M9 10V8a3 3 0 0 1 6 0v2" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
+              修改密码
+            </button>
+            <button type="button" id="btnAuthLogout">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 7V5.8A1.8 1.8 0 0 1 11.8 4h6.4A1.8 1.8 0 0 1 20 5.8v12.4A1.8 1.8 0 0 1 18.2 20h-6.4A1.8 1.8 0 0 1 10 18.2V17" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M4 12h10M11 8.5 14.5 12 11 15.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              退出登录
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <section class="page page-narrow page-swr" id="pageSwr" hidden>
+        <h2 class="page-title">SWR登录凭证</h2>
+        <textarea id="loginCmd" class="login-cmd" rows="8" placeholder="docker login -u cn-southwest-2@... -p ... swr.cn-southwest-2.myhuaweicloud.com"></textarea>
         <div class="row">
-          <button type="button" class="btn primary" id="btnHwApplyCreds">启用本会话凭证</button>
-          <button type="button" class="btn ghost" id="btnHwClearCreds">清除</button>
+          <button type="button" class="btn primary" id="btnLogin">登录 SWR</button>
+          <button type="button" class="btn ghost" id="btnCheckLogin">检查登录</button>
+          <button type="button" class="btn ghost" id="btnLogout">退出登录</button>
         </div>
-        <p class="hint" id="hwCredStatus">华为云凭证：未设置</p>
-      </div>
-    </section>
+        <pre class="log mini" id="loginLog"></pre>
+      </section>
 
-    <section class="panel workspace" id="workspacePanel">
-      <nav class="view-tabs" aria-label="主功能">
-        <button type="button" class="view-tab active" data-view="services" id="tabServices">微服务</button>
-        <button type="button" class="view-tab" data-view="artifacts" id="tabArtifacts">产物管理</button>
-        <button type="button" class="view-tab" data-view="history" id="tabHistory">构建历史</button>
-        <button type="button" class="view-tab" data-view="cce" id="tabCce">CCE 集群</button>
-      </nav>
+      <section class="page" id="pageBuild">
+        <div class="toolbar toolbar-1">
+          <div class="svc-picker" id="svcPicker">
+            <span class="svc-select-label">微服务</span>
+            <button type="button" class="svc-trigger" id="serviceTrigger" aria-haspopup="listbox" aria-expanded="false">
+              <span id="serviceTriggerLabel">选择微服务</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="svc-menu" id="serviceMenu" hidden>
+              <div class="svc-menu-search">
+                <input id="serviceSearch" class="input" type="search" placeholder="请输入关键词" autocomplete="off" />
+              </div>
+              <div class="svc-menu-list" id="serviceMenuList"></div>
+              <div class="svc-pager" id="servicePager"></div>
+            </div>
+          </div>
+          <nav class="subtabs" aria-label="构建视图">
+            <button type="button" class="subtab active" data-tab="pipeline">流水线详情</button>
+            <button type="button" class="subtab" data-tab="history">构建历史</button>
+            <button type="button" class="subtab" data-tab="artifacts">产物管理</button>
+          </nav>
+        </div>
+        <div class="toolbar toolbar-2" id="pipelineActions">
+          <button type="button" class="icon-btn" id="btnRun" title="运行">
+            <svg viewBox="0 0 24 24"><path d="M8 6.5v11l10-5.5z" fill="currentColor"/></svg>
+            <span>运行</span>
+          </button>
+          <button type="button" class="icon-btn" id="btnStop" title="停止" disabled>
+            <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" fill="currentColor"/></svg>
+            <span>停止</span>
+          </button>
+          <button type="button" class="icon-btn" id="btnParams" title="参数配置" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M4.7 7.4l1.6 1.6M17.7 15l1.6 1.6M3.5 12h2.2M18.3 12h2.2M4.7 16.6l1.6-1.6M17.7 9l1.6-1.6"/></svg>
+            <span>参数配置</span>
+          </button>
+          <button type="button" class="icon-btn" id="btnRefreshPipeline" title="刷新">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <span>刷新</span>
+          </button>
+        </div>
+        <div class="toolbar toolbar-3" id="jobMetaBar">
+          <span>分支 <strong id="metaBranch">—</strong></span>
+          <span>Commit <strong id="metaCommit">—</strong></span>
+          <span>操作人 <strong id="metaOperator">—</strong></span>
+          <span>发起时间 <strong id="metaStarted">—</strong></span>
+          <span id="metaFinishedWrap" hidden>结束时间 <strong id="metaFinished">—</strong></span>
+          <span id="metaDurationWrap" hidden>共耗时 <strong id="metaDuration">—</strong></span>
+        </div>
 
-      <div class="view-pane" id="viewServices">
-        <div class="list-head">
-          <p class="hint">从 GitHub 拉取分支，本机 Docker 构建后推到 SWR；多选时 tar 归档到同一目录。</p>
+        <div class="view-pane" id="viewPipeline">
+          <section class="job-pipeline" id="liveJobPipeline" aria-label="构建流水线" hidden></section>
+          <p class="pipeline-blank" id="pipelineEmpty">当前服务无构建历史记录</p>
         </div>
-        <div class="batch-bar">
-          <label class="svc-pick-all"><input type="checkbox" id="chkAll" /> 全选</label>
-          <span class="hint">已选 <strong id="selCount">0</strong> 个</span>
-          <button type="button" class="btn primary" id="btnBatch" disabled>构建所选</button>
-        </div>
-        <div id="serviceTable" class="table"></div>
-      </div>
-
-      <div class="view-pane" id="viewArtifacts" hidden>
-        <div class="list-head artifacts-head">
-          <p class="hint">本助手部署后成功构建的记录（时间 / 微服务 / 分支 / 镜像名 / 包文件）。历史包被磁盘清理后会显示为已失效。</p>
-          <button type="button" class="btn ghost" id="btnRefreshArtifacts">刷新</button>
-        </div>
-        <div class="art-table-wrap">
-          <table class="art-table" id="artifactsTable">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>微服务</th>
-                <th>分支</th>
-                <th>Commit</th>
-                <th>镜像名</th>
-                <th>包文件</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="artifactsBody">
-              <tr><td colspan="7" class="hint">暂无产物；成功构建后会出现在这里。</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="test-pager" id="artifactsPager" hidden></div>
-      </div>
-
-      <div class="view-pane" id="viewHistory" hidden>
-        <div id="historyList">
-          <div class="list-head artifacts-head">
-            <p class="hint">只显示本浏览器发起的构建。点「查看日志」在本页打开那一次的记录，可返回列表。</p>
-            <button type="button" class="btn ghost" id="btnRefreshHistory">刷新</button>
+        <div class="view-pane" id="viewHistory" hidden>
+          <div class="list-head">
+            <p class="hint" id="historyHint">当前微服务的构建记录。点「查看」打开该次流水线。</p>
+            <button type="button" class="btn ghost btn-refresh" id="btnRefreshHistory" title="刷新">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span>刷新</span>
+            </button>
           </div>
           <div class="art-table-wrap">
-            <table class="art-table history-table" id="historyTable">
+            <table class="art-table history-table">
               <colgroup>
-                <col class="col-time" />
-                <col class="col-svc" />
-                <col class="col-branch" />
-                <col class="col-status" />
-                <col class="col-sha" />
-                <col class="col-act" />
+                <col class="hist-col-time" />
+                <col class="hist-col-svc" />
+                <col class="hist-col-branch" />
+                <col class="hist-col-status" />
+                <col class="hist-col-sha" />
+                <col class="hist-col-dur" />
+                <col class="hist-col-op" />
+                <col class="hist-col-act" />
               </colgroup>
               <thead>
                 <tr>
@@ -138,32 +167,71 @@
                   <th>分支</th>
                   <th>状态</th>
                   <th>Commit</th>
+                  <th>构建耗时</th>
+                  <th>操作人</th>
                   <th></th>
                 </tr>
               </thead>
-              <tbody id="historyBody">
-                <tr><td colspan="6" class="hint">暂无本浏览器的构建记录。</td></tr>
-              </tbody>
+              <tbody id="historyBody"></tbody>
             </table>
           </div>
           <div class="test-pager" id="historyPager" hidden></div>
         </div>
-        <div id="historyDetail" hidden>
-          <div class="list-head artifacts-head">
-            <div>
-              <button type="button" class="btn ghost" id="btnHistoryBack">返回构建历史</button>
-              <button type="button" class="btn danger" id="btnHistoryStop" hidden>停止任务</button>
-              <p class="hint" id="historyDetailMeta">—</p>
-            </div>
+        <div class="view-pane" id="viewArtifacts" hidden>
+          <div class="list-head">
+            <p class="hint" id="artifactsHint">当前微服务的产物记录。磁盘清理后包文件会显示为已失效，记录仍保留。</p>
+            <button type="button" class="btn ghost btn-refresh" id="btnRefreshArtifacts" title="刷新">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <span>刷新</span>
+            </button>
           </div>
-          <section class="job-pipeline" id="historyJobPipeline" hidden aria-label="构建流水线"></section>
-          <pre class="log history-log" id="historyJobLog">正在加载这次构建的日志…</pre>
+          <div class="art-table-wrap">
+            <table class="art-table artifacts-table">
+              <colgroup>
+                <col class="art-col-time" />
+                <col class="art-col-svc" />
+                <col class="art-col-branch" />
+                <col class="art-col-sha" />
+                <col class="art-col-image" />
+                <col class="art-col-pkg" />
+                <col class="art-col-op" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>微服务</th>
+                  <th>分支</th>
+                  <th>Commit</th>
+                  <th>镜像名</th>
+                  <th>包文件</th>
+                  <th>操作人</th>
+                </tr>
+              </thead>
+              <tbody id="artifactsBody"></tbody>
+            </table>
+          </div>
+          <div class="test-pager" id="artifactsPager" hidden></div>
         </div>
-      </div>
+      </section>
 
-      <div class="view-pane" id="viewCce" hidden>
-        <div class="list-head">
-          <p class="hint">请先在左侧设置华为云 AK/SK（仅当前页面有效）。选定 Region 与集群后可查看负载列表与详情。</p>
+      <section class="page page-narrow" id="pageCce" hidden>
+        <h2>环境管理</h2>
+        <p class="hint">AK/SK 来自华为云控制台 → 我的凭证 → 访问密钥，不是左侧 SWR docker login 的临时密码。</p>
+        <p class="hint">启用后 SK 会从输入框清除（仍保留在页面内存）。刷新或关闭标签页后失效，不会写入服务器。</p>
+        <div class="cce-creds">
+          <label class="label" for="hwAccessKey">Access Key</label>
+          <input id="hwAccessKey" class="input" type="password" autocomplete="off" placeholder="AK" />
+          <label class="label" for="hwSecretKey">Secret Key</label>
+          <input id="hwSecretKey" class="input" type="password" autocomplete="off" placeholder="SK" />
+          <label class="label" for="hwRegion">Region</label>
+          <select id="hwRegion" class="input"></select>
+          <label class="label" for="hwProjectId">Project ID（可选）</label>
+          <input id="hwProjectId" class="input" type="text" autocomplete="off" placeholder="留空则按 Region 自动解析" />
+          <div class="row">
+            <button type="button" class="btn primary" id="btnHwApplyCreds">启用本会话凭证</button>
+            <button type="button" class="btn ghost" id="btnHwClearCreds">清除</button>
+          </div>
+          <p class="hint" id="hwCredStatus">华为云凭证：未设置</p>
         </div>
         <div class="cce-toolbar row">
           <button type="button" class="btn ghost" id="btnCceRefreshClusters" disabled>刷新集群</button>
@@ -196,22 +264,21 @@
           </table>
         </div>
         <pre class="log mini cce-detail" id="cceWorkloadDetail" hidden></pre>
-      </div>
-    </section>
+      </section>
+    </div>
+  </div>
 
-    <section class="panel logs" id="logsPanel">
-      <div class="list-head job-log-head">
-        <h2>任务日志</h2>
-        <span class="hint" id="jobMeta">尚无任务</span>
-        <button type="button" class="btn danger" id="btnStopJob" hidden>停止任务</button>
+  <div class="modal-root" id="modalRoot" hidden>
+    <div class="modal-backdrop" data-close-modal></div>
+    <div class="modal" id="modalBox" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h3 id="modalTitle">对话框</h3>
+        <button type="button" class="btn ghost" data-close-modal>关闭</button>
       </div>
-      <section class="job-pipeline" id="liveJobPipeline" hidden aria-label="构建流水线"></section>
-      <section class="test-result" id="testResult" hidden aria-live="polite"></section>
-      <pre class="log" id="jobLog">点击「构建并推送」后，这里只显示本次任务的 clone / build / push 日志。历史记录在「构建历史」里分页查看。</pre>
-    </section>
-  </main>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
 
-  <footer class="foot" id="footNote">SWR 临时密码只用于本机 Docker 登录 · 不写入业务仓库</footer>
-  <script src="/app.js?v=20260830j"></script>
+  <script src="/app.js?v=202609075"></script>
 </body>
 </html>

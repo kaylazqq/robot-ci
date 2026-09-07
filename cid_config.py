@@ -151,6 +151,7 @@ def build_test_plan(config: dict[str, Any]) -> dict[str, Any]:
                 "parser": str(report["format"]),
                 "report": _report_relative_path(str(report["path"]), str(step["id"])),
                 "timeout_sec": int(step.get("timeout_sec") or 1200),
+                "test_type": str(step.get("test_type") or ""),
             }
         )
     if not commands:
