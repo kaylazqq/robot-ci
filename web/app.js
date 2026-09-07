@@ -692,15 +692,13 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep) {
   const graph = document.createElement("div");
   graph.className = "pl-graph";
   const isComplete = (stage) => Boolean(stage && stage.status === "done");
-  const hasCompleteLink = (left, right) => isComplete(left) && isComplete(right);
-  graph.appendChild(createEndpoint("start", isComplete(stages[0])));
+  // Start represents a job that has begun. Every following link represents
+  // a hand-off and is filled only after its source stage has completed.
+  graph.appendChild(createEndpoint("start", true));
   stages.forEach((stage, index) => {
     const previous = stages[index - 1];
-    const next = stages[index + 1];
-    const incomingComplete = index === 0 ? isComplete(stage) : hasCompleteLink(previous, stage);
-    const outgoingComplete = next
-      ? hasCompleteLink(stage, next)
-      : isComplete(stage) && status === "ok";
+    const incomingComplete = index === 0 || isComplete(previous);
+    const outgoingComplete = isComplete(stage);
     graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep));
   });
   graph.appendChild(createEndpoint("end", isComplete(stages[stages.length - 1]) && status === "ok"));
