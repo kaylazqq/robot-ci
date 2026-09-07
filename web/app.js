@@ -1237,6 +1237,7 @@ function startPolling(jobId) {
 }
 
 function closeModal() {
+  document.querySelectorAll(".branch-menu-portal").forEach((menu) => menu.remove());
   $("modalRoot").hidden = true;
   $("modalBox").classList.remove("narrow", "wide");
   $("modalBody").replaceChildren();
@@ -1305,6 +1306,18 @@ function createBranchPicker(root) {
   const close = () => {
     menu.hidden = true;
     trigger.setAttribute("aria-expanded", "false");
+    menu.remove();
+  };
+  const positionMenu = () => {
+    const rect = trigger.getBoundingClientRect();
+    const viewportGap = 12;
+    const maxHeight = Math.max(120, Math.min(360, window.innerHeight - rect.bottom - viewportGap));
+    menu.classList.add("branch-menu-portal");
+    menu.style.left = rect.left + "px";
+    menu.style.top = (rect.bottom + 6) + "px";
+    menu.style.width = rect.width + "px";
+    menu.style.maxHeight = maxHeight + "px";
+    document.body.appendChild(menu);
   };
   const setValue = (next) => {
     value = next;
@@ -1318,12 +1331,14 @@ function createBranchPicker(root) {
   trigger.addEventListener("click", () => {
     if (trigger.disabled) return;
     const opening = menu.hidden;
+    if (opening) positionMenu();
+    else close();
     menu.hidden = !opening;
     trigger.setAttribute("aria-expanded", String(opening));
   });
   root.addEventListener("focusout", () => {
     setTimeout(() => {
-      if (!root.contains(document.activeElement)) close();
+      if (!root.contains(document.activeElement) && !menu.contains(document.activeElement)) close();
     }, 0);
   });
   root.addEventListener("keydown", (event) => {

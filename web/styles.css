@@ -894,6 +894,10 @@ textarea { resize: vertical; min-height: 88px; }
   border-radius: 6px;
   box-shadow: 0 10px 28px rgba(52, 73, 94, 0.16);
 }
+.branch-menu.branch-menu-portal {
+  position: fixed;
+  z-index: 50;
+}
 .branch-option {
   display: block;
   width: 100%;
