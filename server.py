@@ -2,18 +2,24 @@
 """SWR push helper for sharing: web login + GitHub branch → local build → push SWR."""
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -31,7 +37,43 @@ SERVICES_PATH = ROOT / "services.json"
 TEST_PLANS_PATH = ROOT / "test-plans.json"
 TEST_RUNNER_PATH = ROOT / "test_runner.py"
 LAST_DAEMON_VERSION_PATH = LOG_DIR / "last-daemon-version.json"
+DATA_DIR = ROOT / "data"
+DB_PATH = DATA_DIR / "robot-ci.db"
+USERS_PATH = ROOT / "users.json"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_COOKIE = "robot_ci_session"
+SESSION_MAX_AGE_SEC = 7 * 24 * 3600
+PBKDF2_ROUNDS = 120_000
+DEFAULT_USERNAME = "l30042018"
+DEFAULT_PASSWORD = "@l30042018"
+DEFAULT_USERNAMES = (
+    "c50065452",
+    "g50065646",
+    "h00858007",
+    "h00970575",
+    "j00603704",
+    "k30003632",
+    "l00612085",
+    "l00855954",
+    "l00987661",
+    "l30042018",
+    "l50059896",
+    "w00938605",
+    "w30033098",
+    "w50062658",
+    "y00895149",
+    "y30082836",
+    "z00578775",
+    "z00616552",
+    "z00982866",
+    "z00987657",
+)
+DEFAULT_USERS = tuple((name, f"@{name}") for name in DEFAULT_USERNAMES)
+AUTH_PUBLIC_GET = {"/api/auth/me", "/api/health"}
+AUTH_PUBLIC_POST = {"/api/auth/login"}
+_sessions: dict[str, dict[str, Any]] = {}
+_sessions_lock = threading.Lock()
+_db_lock = threading.Lock()
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -47,19 +89,28 @@ class JobStopped(Exception):
 
 _login_ok = False
 _login_lock = threading.Lock()
+_login_probe_lock = threading.Lock()
 _login_probe_cache: tuple[float, bool] | None = None  # (ts, ok)
 _token_cache: str | None = None
 _docker_cache: tuple[float, dict[str, Any]] | None = None
+_docker_cache_lock = threading.Lock()
 _daemon_version_lock = threading.Lock()
 _branch_cache: dict[str, tuple[float, list[str]]] = {}
 _branch_cache_lock = threading.Lock()
 _artifacts_lock = threading.Lock()
 _public_service_lock = threading.Lock()
+_public_service_ready_at = 0.0
+PUBLIC_SERVICE_REUSE_SEC = 120
+_history_disk_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
+_history_disk_cache_lock = threading.Lock()
 _fleet_cache_lock = threading.Lock()
+_slot_lock = threading.Lock()
+_slot_cond = threading.Condition(_slot_lock)
+_slot_queue: list[str] = []
 ARTIFACTS_MAX_ENTRIES = 100
 ARTIFACTS_TRIM_TO = 50
-ARTIFACTS_DEFAULT_PAGE_SIZE = 20
-HISTORY_DEFAULT_PAGE_SIZE = 20
+ARTIFACTS_DEFAULT_PAGE_SIZE = 10
+HISTORY_DEFAULT_PAGE_SIZE = 10
 HISTORY_MAX_ENTRIES = 100
 HISTORY_TRIM_TO = 50
 DISK_USAGE_PRUNE_RATIO = 0.80
@@ -98,6 +149,7 @@ ARCHIVE_IMAGE_HOLD_PREFIX = "ci-archive-hold-"
 # concurrent job swapoff/OOM-kills webpack. Override via services.json
 # `max_concurrent` when needed.
 DEFAULT_SERVICE_CONCURRENCY = {"mattermost": 1, "kibana-service": 1}
+DEFAULT_SERVICE_MAX_CONCURRENT = 1
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
@@ -135,9 +187,336 @@ def save_last_daemon_version(version: str) -> bool:
     except OSError:
         return False
 
+
+def _hash_password(password: str, salt_hex: str = "") -> tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
+    return salt.hex(), digest.hex()
+
+
+def _password_ok(password: str, salt_hex: str, hash_hex: str) -> bool:
+    if not salt_hex or not hash_hex:
+        return False
+    _, digest = _hash_password(password, salt_hex)
+    return hmac.compare_digest(digest, hash_hex)
+
+
+def _connect_db() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_store() -> None:
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS run_templates (
+                    username TEXT NOT NULL,
+                    service_id TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (username, service_id)
+                );
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    expires REAL NOT NULL
+                );
+                """
+            )
+            conn.commit()
+            try:
+                os.chmod(DB_PATH, 0o600)
+            except OSError:
+                pass
+            _migrate_users_json_locked(conn)
+        finally:
+            conn.close()
+
+
+def _migrate_users_json_locked(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+        return
+    try:
+        payload = json.loads(USERS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return
+    users = payload.get("users") if isinstance(payload, dict) else payload
+    if not isinstance(users, list):
+        return
+    for item in users:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username") or "").strip()
+        salt = str(item.get("salt") or "")
+        digest = str(item.get("password_hash") or "")
+        if not username or not salt or not digest:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO users (username, salt, password_hash) VALUES (?, ?, ?)",
+            (username, salt, digest),
+        )
+    conn.commit()
+
+
+def _load_users() -> list[dict[str, str]]:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT username, salt, password_hash FROM users ORDER BY username"
+            ).fetchall()
+        finally:
+            conn.close()
+    return [
+        {"username": str(row["username"]), "salt": str(row["salt"]), "password_hash": str(row["password_hash"])}
+        for row in rows
+    ]
+
+
+def _save_users(users: list[dict[str, str]]) -> None:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute("DELETE FROM users")
+            conn.executemany(
+                "INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)",
+                [
+                    (
+                        str(item.get("username") or "").strip(),
+                        str(item.get("salt") or ""),
+                        str(item.get("password_hash") or ""),
+                    )
+                    for item in users
+                    if str(item.get("username") or "").strip()
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_run_template(username: str, service_id: str) -> str:
+    user = str(username or "").strip()
+    sid = str(service_id or "").strip()
+    if not user or not sid:
+        return ""
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute(
+                "SELECT branch FROM run_templates WHERE username = ? AND service_id = ?",
+                (user, sid),
+            ).fetchone()
+        finally:
+            conn.close()
+    return str(row["branch"] or "").strip() if row else ""
+
+
+def save_run_template(username: str, service_id: str, branch: str) -> str:
+    user = str(username or "").strip()
+    sid = str(service_id or "").strip()
+    value = str(branch or "").strip()
+    if not user:
+        return "未登录"
+    if not sid:
+        return "缺少微服务"
+    if not value or not re.match(r"^[\w./\-]+$", value):
+        return "分支无效"
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO run_templates (username, service_id, branch, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(username, service_id) DO UPDATE SET
+                    branch = excluded.branch,
+                    updated_at = excluded.updated_at
+                """,
+                (user, sid, value, time.strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return ""
+
+
+def resolve_template_branch(
+    username: str,
+    service_id: str,
+    branches: list[str],
+    default: str = "main",
+) -> str:
+    names = [str(item).strip() for item in (branches or []) if str(item).strip()]
+    fallback = str(default or "main").strip() or "main"
+    preferred = get_run_template(username, service_id)
+    if preferred and preferred in names:
+        return preferred
+    if fallback in names:
+        return fallback
+    return names[0] if names else fallback
+
+
+def ensure_default_users() -> None:
+    init_store()
+    users = _load_users()
+    names = {str(item.get("username") or "").strip() for item in users}
+    changed = False
+    for username, password in DEFAULT_USERS:
+        if username in names:
+            continue
+        salt, digest = _hash_password(password)
+        users.append({"username": username, "salt": salt, "password_hash": digest})
+        names.add(username)
+        changed = True
+    if changed:
+        _save_users(users)
+
+
+def authenticate_user(username: str, password: str) -> str:
+    want = str(username or "").strip()
+    if not want or not password:
+        return ""
+    for item in _load_users():
+        if str(item.get("username") or "").strip() != want:
+            continue
+        if _password_ok(password, str(item.get("salt") or ""), str(item.get("password_hash") or "")):
+            return want
+        return ""
+    return ""
+
+
+def change_user_password(username: str, old_password: str, new_password: str) -> str:
+    want = str(username or "").strip()
+    new_value = str(new_password or "")
+    if not want:
+        return "用户不存在"
+    if len(new_value) < 8:
+        return "新密码至少 8 位"
+    users = _load_users()
+    for item in users:
+        if str(item.get("username") or "").strip() != want:
+            continue
+        if not _password_ok(old_password, str(item.get("salt") or ""), str(item.get("password_hash") or "")):
+            return "当前密码不正确"
+        salt, digest = _hash_password(new_value)
+        item["salt"] = salt
+        item["password_hash"] = digest
+        _save_users(users)
+        return ""
+    return "用户不存在"
+
+
+def create_session(username: str) -> str:
+    token = secrets.token_urlsafe(32)
+    expires = time.time() + SESSION_MAX_AGE_SEC
+    with _sessions_lock:
+        _sessions[token] = {"username": username, "expires": expires}
+    _persist_session(token, username, expires)
+    return token
+
+
+def destroy_session(token: str) -> None:
+    with _sessions_lock:
+        _sessions.pop(token or "", None)
+    _delete_persisted_session(token)
+
+
+def session_username(token: str) -> str:
+    if not token:
+        return ""
+    now = time.time()
+    with _sessions_lock:
+        item = _sessions.get(token)
+        if item:
+            if float(item.get("expires") or 0) < now:
+                _sessions.pop(token, None)
+                item = None
+            else:
+                item["expires"] = now + SESSION_MAX_AGE_SEC
+                return str(item.get("username") or "")
+    loaded = _load_persisted_session(token)
+    if not loaded or float(loaded.get("expires") or 0) < now:
+        _delete_persisted_session(token)
+        return ""
+    username = str(loaded.get("username") or "")
+    with _sessions_lock:
+        loaded["expires"] = now + SESSION_MAX_AGE_SEC
+        _sessions[token] = loaded
+    return username
+
+
+def _persist_session(token: str, username: str, expires: float) -> None:
+    if not token:
+        return
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO sessions (token, username, expires) VALUES (?, ?, ?)",
+                (token, username, float(expires)),
+            )
+            conn.execute("DELETE FROM sessions WHERE expires < ?", (time.time(),))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _delete_persisted_session(token: str) -> None:
+    if not token:
+        return
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _load_persisted_session(token: str) -> dict[str, Any] | None:
+    if not token:
+        return None
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute(
+                "SELECT username, expires FROM sessions WHERE token = ?",
+                (token,),
+            ).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return None
+    return {"username": str(row["username"] or ""), "expires": float(row["expires"] or 0)}
+
+
+ensure_default_users()
+
 JOB_PUBLIC_FIELDS = (
     "id",
     "client_id",
+    "operator",
+    "created_at",
+    "finished_at",
     "service_id",
     "service_ids",
     "branch",
@@ -158,11 +537,16 @@ JOB_PUBLIC_FIELDS = (
     "test_cases",
     "test_report",
     "test_runs",
+    "test_kinds",
+    "cancel_requested",
 )
 
 JOB_COMPACT_FIELDS = (
     "id",
     "client_id",
+    "operator",
+    "created_at",
+    "finished_at",
     "service_id",
     "service_ids",
     "branch",
@@ -179,6 +563,10 @@ JOB_COMPACT_FIELDS = (
     "test_status",
     "test_summary",
     "test_report",
+    "test_kinds",
+    "cancel_requested",
+    "slot_held",
+    "queue_position",
 )
 
 
@@ -192,16 +580,15 @@ def _job_service_ids(job: dict[str, Any]) -> list[str]:
 
 PIPELINE_STEP_DEFS: tuple[tuple[str, str, str], ...] = (
     ("sync", "拉代码", "git"),
-    ("test", "单元测试", "test"),
+    ("test", "测试执行", "test"),
     ("build", "构建镜像", "build"),
     ("push", "推送 SWR", "push"),
     ("archive", "本地归档", "archive"),
 )
 
 PIPELINE_PREPARE_DEFS: tuple[tuple[str, str, str], ...] = (
-    ("env", "Runner 环境", "Docker / 工作区"),
-    ("swr", "SWR 鉴权", "docker login"),
-    ("ps", "public-service", "共享旁路仓库"),
+    ("env", "检查环境", "Docker / 工作区"),
+    ("slot", "等待并发槽位", "全机并行上限"),
     ("adir", "归档目录", "nginx 产物路径"),
 )
 
@@ -209,17 +596,10 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
     "env": (
         ("docker", "Docker daemon"),
         ("disk", "磁盘空间检查"),
-        ("slot", "并发槽位分配"),
     ),
-    "swr": (
-        ("parse", "解析 login 指令"),
-        ("login", "docker login"),
-        ("probe", "SWR 鉴权探针"),
-    ),
-    "ps": (
-        ("lock", "旁路目录加锁"),
-        ("fetch", "fetch public-service"),
-        ("head", "HEAD 校验"),
+    "slot": (
+        ("wait", "排队等待"),
+        ("acquire", "获得执行槽"),
     ),
     "adir": (
         ("mkdir", "创建时间戳目录"),
@@ -227,44 +607,66 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
         ("nginx", "nginx 映射路径"),
     ),
     "sync": (
-        ("clone", "Clone 仓库"),
-        ("fetch", "Fetch 远程分支"),
-        ("checkout", "Checkout 工作区"),
-        ("sha", "记录 Commit SHA"),
+        ("clone", "克隆仓库"),
+        ("sha", "记录提交"),
     ),
     "test": (
-        ("plan", "加载 .cid/build.yaml（兼容旧计划）"),
-        ("runner", "启动 test_runner"),
-        ("cases", "执行 UT / DT 用例"),
-        ("report", "汇总测试报告"),
+        ("plan", "加载build.yaml"),
+        ("runner", "启动测试"),
+        ("ut-cases", "执行UT"),
+        ("dt-cases", "执行DT"),
     ),
     "build": (
-        ("deps", "准备构建依赖"),
-        ("script", "执行仓库 CID 构建脚本"),
-        ("docker", "Docker 多阶段构建"),
-        ("verify", "镜像 / 产物校验"),
+        ("script", "执行构建脚本"),
+        ("docker", "Docker构建"),
+        ("verify", "产物校验"),
     ),
     "push": (
-        ("tag", "docker tag"),
-        ("push", "docker push"),
-        ("retry", "失败重试 (最多 4 次)"),
-        ("verify", "SWR 推送确认"),
+        ("tag", "标记镜像"),
+        ("push", "推送镜像"),
+        ("verify", "推送确认"),
     ),
     "archive": (
-        ("reclaim", "磁盘清理 (保留当前镜像)"),
-        ("save", "docker save / tar 打包"),
-        ("publish", "写入 nginx 归档目录"),
-        ("record", "产物登记 & 下载链接"),
+        ("save", "归档镜像"),
     ),
 }
 
 STAGE_TO_PIPELINE_STEP = {
+    "starting": "prepare",
+    "queued": "prepare",
     "syncing": "sync",
     "testing": "test",
     "building": "build",
     "pushing": "push",
     "archiving": "archive",
 }
+_TERMINAL_PIPELINE_STAGES = {"interrupted", "stopping", "done", ""}
+
+
+def _infer_pipeline_stage(job: dict[str, Any]) -> str:
+    test_status = str(job.get("test_status") or "")
+    runs = job.get("test_runs") or []
+    commands = (runs[0] or {}).get("commands") or [] if runs and isinstance(runs[0], dict) else []
+    if test_status or commands:
+        return "testing"
+    sha = str(job.get("commit_sha") or "")
+    if sha and not sha.startswith("0000000"):
+        return "testing"
+    if str(job.get("current") or "").strip():
+        return "syncing"
+    return "starting"
+
+
+def _effective_pipeline_stage(job: dict[str, Any]) -> str:
+    raw = str(job.get("stage") or "")
+    before = str(job.get("stage_before_stop") or "")
+    if raw in ("interrupted", "stopping") or job.get("cancel_requested"):
+        if before and before not in _TERMINAL_PIPELINE_STAGES:
+            return before
+        return _infer_pipeline_stage(job)
+    if raw in _TERMINAL_PIPELINE_STAGES:
+        return _infer_pipeline_stage(job) if raw in ("interrupted", "stopping", "") else raw
+    return raw
 
 
 def _service_skip_push(svc: dict[str, Any] | None) -> bool:
@@ -285,19 +687,19 @@ def _spread_status_to_subtasks(status: str, count: int, *, fail_index: int | Non
         return []
     if status in ("pending", "skipped"):
         return [status] * count
+    if status == "queued":
+        if count == 1:
+            return ["queued"]
+        return ["queued"] + ["pending"] * (count - 1)
     if status == "done":
         return ["done"] * count
-    if status == "warn":
-        out = ["done"] * count
-        out[-1] = "warn"
-        return out
     if status == "failed":
         idx = fail_index if fail_index is not None else count - 1
         idx = max(0, min(idx, count - 1))
         out = ["done"] * count
         out[idx] = "failed"
         for pos in range(idx + 1, count):
-            out[pos] = "pending"
+            out[pos] = "skipped"
         return out
     if status == "running":
         idx = min(count - 1, max(0, count // 2))
@@ -309,16 +711,126 @@ def _spread_status_to_subtasks(status: str, count: int, *, fail_index: int | Non
     return ["pending"] * count
 
 
-def _subtask_rows(step_id: str, status: str) -> list[dict[str, str]]:
-    defs = PIPELINE_SUBTASK_DEFS.get(step_id, ())
-    fail_index = len(defs) - 1 if status == "failed" else None
-    if step_id == "test" and status == "warn":
+def _test_subtask_defs(job: dict[str, Any] | None) -> tuple[tuple[str, str], ...]:
+    job = job or {}
+    if "test_kinds" not in job:
+        return (
+            ("plan", "加载build.yaml"),
+            ("runner", "启动测试"),
+        )
+    kinds = [str(kind) for kind in (job.get("test_kinds") or []) if kind in {"ut", "dt"}]
+    rows: list[tuple[str, str]] = [("plan", "加载build.yaml")]
+    if not kinds:
+        return tuple(rows)
+    rows.append(("runner", "启动测试"))
+    if "ut" in kinds:
+        rows.append(("ut-cases", "执行 UT 用例"))
+    if "dt" in kinds:
+        rows.append(("dt-cases", "执行 DT 用例"))
+    return tuple(rows)
+
+
+def _test_fail_index(defs: tuple[tuple[str, str], ...], job: dict[str, Any] | None) -> int | None:
+    if not defs:
+        return None
+    ids = [item[0] for item in defs]
+    run = ((job or {}).get("test_runs") or [{}])
+    commands = (run[0] or {}).get("commands") or []
+    failed_kinds = {
+        str(item.get("test_type") or "")
+        for item in commands
+        if item.get("test_type") in {"ut", "dt"} and int(item.get("exit_code") or 0) != 0
+    }
+    for kind, sub_id in (("ut", "ut-cases"), ("dt", "dt-cases")):
+        if kind in failed_kinds and sub_id in ids:
+            return ids.index(sub_id)
+    for sub_id in ("ut-cases", "dt-cases", "runner"):
+        if sub_id in ids:
+            return ids.index(sub_id)
+    return len(ids) - 1
+
+
+def _job_progressed_past_prepare(job: dict[str, Any]) -> bool:
+    sha = str(job.get("commit_sha") or "")
+    if sha and not sha.startswith("0000000"):
+        return True
+    if job.get("current") or job.get("results") or job.get("archive_dir"):
+        return True
+    stage = str(job.get("stage") or "")
+    before = str(job.get("stage_before_stop") or "")
+    later = ("syncing", "testing", "building", "pushing", "archiving", "done")
+    return stage in later or before in later
+
+
+def _sync_fail_index(
+    defs: tuple[tuple[str, str], ...],
+    job: dict[str, Any] | None,
+    result: dict[str, Any] | None = None,
+) -> int:
+    ids = [item[0] for item in defs]
+    if not ids:
+        return 0
+    err = str((result or {}).get("error") or (job or {}).get("error") or "").lower()
+    sha = str((result or {}).get("commit_sha") or (job or {}).get("commit_sha") or "")
+    sha_ok = bool(sha) and not sha.startswith("0000000")
+    clone_failed = any(
+        token in err
+        for token in (
+            "clone",
+            "checkout",
+            "timed out",
+            "could not read",
+            "access rights",
+            "repository",
+            "git ",
+        )
+    )
+    if "clone" in ids and (clone_failed or not sha_ok):
+        return ids.index("clone")
+    if "sha" in ids:
+        return ids.index("sha")
+    return len(ids) - 1
+
+
+def _subtask_rows(
+    step_id: str,
+    status: str,
+    job: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    defs = _test_subtask_defs(job) if step_id == "test" else PIPELINE_SUBTASK_DEFS.get(step_id, ())
+    if status != "failed":
+        fail_index = None
+    elif step_id == "test":
+        fail_index = _test_fail_index(defs, job)
+    elif step_id == "sync":
+        fail_index = _sync_fail_index(defs, job, result)
+    else:
         fail_index = len(defs) - 1
     statuses = _spread_status_to_subtasks(status, len(defs), fail_index=fail_index)
-    return [
+    rows = [
         {"id": sub_id, "label": label, "status": statuses[idx] if idx < len(statuses) else "pending"}
         for idx, (sub_id, label) in enumerate(defs)
     ]
+    if step_id != "test":
+        return rows
+    run = ((job or {}).get("test_runs") or [{}])
+    commands = (run[0] or {}).get("commands") or []
+    by_kind: dict[str, str] = {}
+    for item in commands:
+        kind = str(item.get("test_type") or "")
+        if kind not in {"ut", "dt"}:
+            continue
+        by_kind[kind] = "failed" if int(item.get("exit_code") or 0) != 0 else "done"
+    for row in rows:
+        kind = "ut" if row["id"] == "ut-cases" else "dt" if row["id"] == "dt-cases" else ""
+        if not kind:
+            continue
+        if kind in by_kind and status not in ("pending", "skipped"):
+            row["status"] = by_kind[kind]
+        elif status == "failed":
+            row["status"] = "skipped"
+    return rows
 
 
 def _step_detail(step_id: str, status: str, result: dict[str, Any] | None, job: dict[str, Any]) -> str:
@@ -357,41 +869,66 @@ def _prepare_lane_for_job(
     catalog: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
     services = [catalog[sid] for sid in service_ids if sid in catalog]
-    needs_swr = any(not svc.get("archive_only") for svc in services) if services else True
-    needs_ps = any(not svc.get("skip_public_service") for svc in services) if services else True
     needs_archive = bool(CFG.get("archive_enabled")) or any(svc.get("bundle_archive") for svc in services)
     job_status = str(job.get("status") or "")
     error = str(job.get("error") or "")
     archive_dir = str(job.get("archive_dir") or "")
+    active = STAGE_TO_PIPELINE_STEP.get(_effective_pipeline_stage(job))
 
     rows: list[dict[str, Any]] = []
     for step_id, label, hint in PIPELINE_PREPARE_DEFS:
         if step_id == "env":
-            st = "done" if job_status else "pending"
-            detail = "Docker 可用 · 工作区就绪"
-        elif step_id == "swr":
-            if not needs_swr:
-                st = "skipped"
-                detail = "全部服务为仅归档"
-            elif any(token in error for token in ("SWR", "swr", "login", "鉴权", "docker login")):
+            if any(token in error for token in ("SWR", "swr", "login", "鉴权", "docker login", "docker unavailable")):
                 st = "failed"
-                detail = "登录失败"
-            elif job_status in ("running", "ok", "failed", "stopped"):
+                detail = "环境检查失败"
+            elif "public-service" in error:
+                st = "failed"
+                detail = "依赖仓库同步失败"
+            elif job_status == "failed" and active in (None, "prepare") and not _job_progressed_past_prepare(job):
+                st = "failed"
+                detail = (error[:80] if error else "前置准备失败")
+            elif job_status == "queued":
                 st = "done"
-                detail = f"{CFG.get('swr_registry', 'swr')}/{CFG.get('swr_org', 'org')}"
+                detail = "Docker 可用 · 工作区就绪"
+            elif job_status == "running" and str(job.get("stage") or "") in ("starting", "queued"):
+                st = "done" if job.get("slot_held") else "running"
+                detail = "Docker 可用 · 工作区就绪" if job.get("slot_held") else "检查 Docker / 工作区…"
+            elif job_status:
+                st = "done"
+                detail = "Docker 可用 · 工作区就绪"
             else:
                 st = "pending"
                 detail = hint
-        elif step_id == "ps":
-            if not needs_ps:
-                st = "skipped"
-                detail = "所选服务不需要"
-            elif "public-service" in error:
-                st = "failed"
-                detail = "同步失败"
-            elif job_status in ("running", "ok", "failed", "stopped"):
+        elif step_id == "slot":
+            limit = max_concurrent_jobs()
+            pos = int(job.get("queue_position") or 0)
+            if job.get("slot_held"):
                 st = "done"
-                detail = "共享旁路已就绪"
+                detail = f"已获得执行槽（并行上限 {limit}）"
+            elif job_status == "queued":
+                st = "queued"
+                detail = f"排队中 · 第 {pos or 1} 位，并行上限 {limit}"
+            elif job_status == "running" and str(job.get("stage") or "") in ("starting", "queued"):
+                st = "running"
+                detail = f"申请执行槽（并行上限 {limit}）"
+            elif job_status == "failed" and active in (None, "prepare") and not (
+                archive_dir or job.get("current") or job.get("results")
+            ):
+                st = "skipped"
+                detail = "未执行"
+            elif job_status in ("ok", "failed", "stopped") and (
+                archive_dir
+                or job.get("current")
+                or job.get("results")
+                or job.get("commit_sha")
+                or job.get("test_status")
+                or str(job.get("stage_before_stop") or "") not in ("", "starting", "queued")
+            ):
+                st = "done"
+                detail = "已获得执行槽"
+            elif job_status in ("stopped", "failed"):
+                st = "skipped"
+                detail = "已停止" if job_status == "stopped" else "未执行"
             else:
                 st = "pending"
                 detail = hint
@@ -402,9 +939,15 @@ def _prepare_lane_for_job(
             elif archive_dir:
                 st = "done"
                 detail = Path(archive_dir).name
+            elif job_status == "queued":
+                st = "pending"
+                detail = hint
             elif job_status == "running":
                 st = "running"
                 detail = "创建目录…"
+            elif job_status in ("stopped", "failed"):
+                st = "skipped"
+                detail = "已停止" if job_status == "stopped" else "未执行"
             else:
                 st = "pending"
                 detail = hint
@@ -443,7 +986,7 @@ def _pipeline_step_rows(
                 "icon": icon,
                 "status": status,
                 "detail": _step_detail(step_id, status, result, job),
-                "subtasks": _subtask_rows(step_id, status),
+                "subtasks": _subtask_rows(step_id, status, job, result),
             }
         )
     return rows
@@ -482,7 +1025,7 @@ def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
 def _pipeline_summary(steps: list[dict[str, Any]], prepare: list[dict[str, Any]]) -> dict[str, Any]:
     all_steps = list(prepare) + list(steps)
     total = len(all_steps)
-    counts = {"done": 0, "running": 0, "failed": 0, "pending": 0, "skipped": 0, "warn": 0}
+    counts = {"done": 0, "running": 0, "failed": 0, "pending": 0, "skipped": 0, "warn": 0, "queued": 0}
     for item in all_steps:
         key = str(item.get("status") or "pending")
         counts[key] = counts.get(key, 0) + 1
@@ -546,6 +1089,18 @@ def _running_pipeline_statuses(
     return statuses
 
 
+def _apply_live_test_status(
+    statuses: dict[str, str],
+    job: dict[str, Any],
+    result: dict[str, Any] | None = None,
+) -> None:
+    test_status = str((result or {}).get("test_status") or job.get("test_status") or "")
+    if not test_status or test_status in ("passed", "not_configured"):
+        return
+    if statuses.get("test") in ("done", "running", "warn"):
+        statuses["test"] = "failed"
+
+
 def _completed_pipeline_statuses(
     result: dict[str, Any],
     step_defs: list[tuple[str, str, str]],
@@ -562,23 +1117,50 @@ def _completed_pipeline_statuses(
                 statuses[step_id] = "done"
         test_status = str(result.get("test_status") or "")
         if test_status and test_status not in ("passed", "not_configured"):
-            statuses["test"] = "warn"
+            statuses["test"] = "failed"
         return statuses
 
     failed = _failed_pipeline_step(result, step_ids)
     failed_idx = step_ids.index(failed) if failed in step_ids else len(step_ids) - 1
-    build_idx = step_ids.index("build") if "build" in step_ids else -1
     for idx, (step_id, _, _) in enumerate(step_defs):
         if step_id == "push" and skip_push:
-            statuses[step_id] = "skipped" if failed_idx > build_idx else "pending"
+            statuses[step_id] = "skipped"
             continue
         if idx < failed_idx:
             statuses[step_id] = "done"
         elif idx == failed_idx:
             statuses[step_id] = "failed"
         else:
-            statuses[step_id] = "pending"
+            statuses[step_id] = "skipped"
     return statuses
+
+
+def _failed_job_step_statuses(
+    job: dict[str, Any],
+    step_defs: list[tuple[str, str, str]],
+    *,
+    skip_push: bool,
+) -> dict[str, str]:
+    step_ids = [step_id for step_id, _, _ in step_defs]
+    statuses = _running_pipeline_statuses(
+        _effective_pipeline_stage(job),
+        step_ids,
+        skip_push=skip_push,
+    )
+    out: dict[str, str] = {}
+    marked_failed = False
+    for step_id in step_ids:
+        st = statuses.get(step_id, "pending")
+        if marked_failed:
+            out[step_id] = "skipped"
+        elif st == "running":
+            out[step_id] = "failed"
+            marked_failed = True
+        elif st == "pending":
+            out[step_id] = "skipped"
+        else:
+            out[step_id] = st
+    return out
 
 
 def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
@@ -602,8 +1184,8 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         current_idx = max(0, int(progress_match.group(1)) - 1)
 
     job_status = str(job.get("status") or "")
-    stage = str(job.get("stage") or "")
-    is_running = job_status in ("running", "unknown")
+    stage = _effective_pipeline_stage(job)
+    is_running = job_status in ("running", "queued", "unknown")
 
     services_out: list[dict[str, Any]] = []
     focus_sid = ""
@@ -617,6 +1199,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         if service_id in results_by_id:
             result = results_by_id[service_id]
             statuses = _completed_pipeline_statuses(result, step_defs, skip_push=skip_push)
+            _apply_live_test_status(statuses, job, result)
             svc_status = "ok" if result.get("ok") else "failed"
             if not focus_sid and svc_status == "failed":
                 focus_sid = service_id
@@ -626,6 +1209,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
                 [step_id for step_id, _, _ in step_defs],
                 skip_push=skip_push,
             )
+            _apply_live_test_status(statuses, job)
             svc_status = "running"
             focus_sid = service_id
         elif is_running and idx < current_idx:
@@ -633,6 +1217,25 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             if skip_push:
                 statuses["push"] = "skipped"
             svc_status = "done"
+        elif job_status == "stopped" and service_id in {current_sid, str(job.get("service_id") or "")}:
+            statuses = _running_pipeline_statuses(
+                stage,
+                [step_id for step_id, _, _ in step_defs],
+                skip_push=skip_push,
+            )
+            _apply_live_test_status(statuses, job)
+            for step_id, st in list(statuses.items()):
+                if st in ("running", "pending"):
+                    statuses[step_id] = "skipped"
+            svc_status = "stopped"
+            if not focus_sid:
+                focus_sid = service_id
+        elif job_status == "failed":
+            statuses = _failed_job_step_statuses(job, step_defs, skip_push=skip_push)
+            _apply_live_test_status(statuses, job)
+            svc_status = "failed"
+            if not focus_sid:
+                focus_sid = service_id
         else:
             statuses = {step_id: "pending" for step_id, _, _ in step_defs}
             svc_status = "pending"
@@ -696,7 +1299,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def service_concurrency_cap(service_id: str) -> int | None:
-    """Per-service cap. None means no extra limit beyond the global job cap."""
+    """Per-service cap. Every microservice defaults to 1 concurrent job."""
     for item in load_services():
         if item.get("id") != service_id:
             continue
@@ -707,8 +1310,8 @@ def service_concurrency_cap(service_id: str) -> int | None:
             value = int(raw)
         except (TypeError, ValueError):
             break
-        return value if value > 0 else None
-    return DEFAULT_SERVICE_CONCURRENCY.get(service_id)
+        return value if value > 0 else DEFAULT_SERVICE_MAX_CONCURRENT
+    return DEFAULT_SERVICE_CONCURRENCY.get(service_id, DEFAULT_SERVICE_MAX_CONCURRENT)
 
 
 def other_job_uses_build_swap(job_id: str) -> bool:
@@ -724,6 +1327,19 @@ def other_job_uses_build_swap(job_id: str) -> bool:
 
 def _running_jobs_locked() -> list[dict[str, Any]]:
     return [job for job in _jobs.values() if job.get("status") == "running"]
+
+
+def _live_jobs_locked() -> list[dict[str, Any]]:
+    """Jobs that occupy a microservice: running or queued."""
+    return [job for job in _jobs.values() if job.get("status") in ("running", "queued")]
+
+
+def _held_slot_count_locked() -> int:
+    return sum(
+        1
+        for job in _jobs.values()
+        if job.get("slot_held") and job.get("status") in ("running", "queued")
+    )
 
 
 def _running_job_locked() -> dict[str, Any] | None:
@@ -745,54 +1361,52 @@ def max_concurrent_jobs() -> int:
         return 5
 
 
-def active_job_summary(client_id: str = "") -> dict[str, Any] | None:
-    """Return one running job. Prefer the caller's client_id when provided."""
+def active_job_summary(client_id: str = "", service_id: str = "") -> dict[str, Any] | None:
+    """Return the occupying job for a service (running or queued)."""
     want = _normalize_client_id(client_id)
+    sid = str(service_id or "").strip()
     with _jobs_lock:
-        running = _running_jobs_locked()
-        if not running:
+        live = _live_jobs_locked()
+        if sid:
+            live = [job for job in live if sid in _job_service_ids(job)]
+        if not live:
             return None
-        if want:
-            mine = [job for job in running if _normalize_client_id(job.get("client_id")) == want]
+        if want and not sid:
+            mine = [job for job in live if _normalize_client_id(job.get("client_id")) == want]
             if mine:
                 return deepcopy({key: mine[0].get(key) for key in JOB_COMPACT_FIELDS})
             return None
-        return deepcopy({key: running[0].get(key) for key in JOB_COMPACT_FIELDS})
+        return deepcopy({key: live[0].get(key) for key in JOB_COMPACT_FIELDS})
 
 
-def list_running_job_summaries(client_id: str = "") -> list[dict[str, Any]]:
+def list_running_job_summaries(client_id: str = "", service_id: str = "") -> list[dict[str, Any]]:
     want = _normalize_client_id(client_id)
+    sid = str(service_id or "").strip()
     with _jobs_lock:
-        running = _running_jobs_locked()
-        if want:
-            running = [job for job in running if _normalize_client_id(job.get("client_id")) == want]
-        return [deepcopy({key: job.get(key) for key in JOB_COMPACT_FIELDS}) for job in running]
+        live = _live_jobs_locked()
+        if sid:
+            live = [job for job in live if sid in _job_service_ids(job)]
+        elif want:
+            live = [job for job in live if _normalize_client_id(job.get("client_id")) == want]
+        return [deepcopy({key: job.get(key) for key in JOB_COMPACT_FIELDS}) for job in live]
 
 
 def register_concurrent_job(job: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Register a job for concurrent execution.
-    Same microservice may run twice except services with max_concurrent
-    (mattermost defaults to 1 because of shared build.swap / RAM).
-    Returns an error payload when the global or per-service cap is reached.
+    Register a job. Each microservice may have at most one live (running/queued)
+    job. Global parallelism is enforced later via FIFO slots, not by rejecting
+    the request.
     """
     incoming = _job_service_ids(job)
     caps = {sid: service_concurrency_cap(sid) for sid in incoming}
+    job.setdefault("slot_held", False)
+    job.setdefault("queue_position", 0)
     with _jobs_lock:
-        running = _running_jobs_locked()
-        limit = max_concurrent_jobs()
-        if len(running) >= limit:
-            return {
-                "error": f"已有 {len(running)} 个任务在跑，达到并发上限 {limit}",
-                "error_code": "concurrency_limit",
-                "active_jobs": [
-                    deepcopy({key: item.get(key) for key in JOB_COMPACT_FIELDS}) for item in running
-                ],
-            }
+        live = _live_jobs_locked()
         for service_id, cap in caps.items():
             if not cap:
                 continue
-            same = [item for item in running if service_id in _job_service_ids(item)]
+            same = [item for item in live if service_id in _job_service_ids(item)]
             if len(same) >= cap:
                 return {
                     "error": (
@@ -829,6 +1443,84 @@ def register_job_if_idle(job: dict[str, Any]) -> dict[str, Any] | None:
         "error": err.get("error"),
         "service_id": ",".join(err.get("busy_services") or []),
     }
+
+
+def reset_job_scheduler() -> None:
+    """Test helper: drop the FIFO wait queue."""
+    with _slot_lock:
+        _slot_queue.clear()
+        _slot_cond.notify_all()
+
+
+def _queue_position_locked(job_id: str) -> int:
+    try:
+        return _slot_queue.index(job_id) + 1
+    except ValueError:
+        return 0
+
+
+def release_build_slot(job_id: str) -> None:
+    if not job_id:
+        return
+    with _slot_lock:
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                job["slot_held"] = False
+                if job.get("status") == "queued":
+                    pass
+        if job_id in _slot_queue:
+            _slot_queue.remove(job_id)
+        _slot_cond.notify_all()
+
+
+def wait_for_build_slot(job_id: str) -> bool:
+    """FIFO wait until this job may occupy a global execution slot."""
+    logged_wait = False
+    with log_substep("slot"):
+        with _slot_lock:
+            if job_id not in _slot_queue:
+                _slot_queue.append(job_id)
+            while True:
+                if job_cancel_requested(job_id):
+                    if job_id in _slot_queue:
+                        _slot_queue.remove(job_id)
+                    return False
+                limit = max_concurrent_jobs()
+                with _jobs_lock:
+                    held = _held_slot_count_locked()
+                    job = _jobs.get(job_id)
+                    if not job or job.get("status") not in ("running", "queued"):
+                        if job_id in _slot_queue:
+                            _slot_queue.remove(job_id)
+                        return False
+                if held < limit and _slot_queue and _slot_queue[0] == job_id:
+                    _slot_queue.pop(0)
+                    set_job(
+                        job_id,
+                        status="running",
+                        stage="starting",
+                        slot_held=True,
+                        queue_position=0,
+                    )
+                    append_job_log(job_id, f"acquired build slot ({held + 1}/{limit})")
+                    _slot_cond.notify_all()
+                    return True
+                pos = _queue_position_locked(job_id)
+                set_job(
+                    job_id,
+                    status="queued",
+                    stage="queued",
+                    slot_held=False,
+                    queue_position=pos,
+                )
+                if not logged_wait:
+                    append_job_log(
+                        job_id,
+                        f"build slot full ({held}/{limit}); queued at position {pos}",
+                    )
+                    logged_wait = True
+                _slot_cond.wait(timeout=1.0)
 
 
 def _quiet_dependency_log(line: str) -> bool:
@@ -879,6 +1571,41 @@ def filter_ui_log(lines: list[str]) -> list[str]:
     return list(state["ui_log"])
 
 
+def snapshot_job_for_payload(
+    job: dict[str, Any],
+    *,
+    compact: bool = False,
+    view_ui: bool = False,
+    step: str = "",
+) -> dict[str, Any]:
+    """Copy job fields needed for HTTP payloads. Caller must hold `_jobs_lock`."""
+    fields = JOB_COMPACT_FIELDS if compact else JOB_PUBLIC_FIELDS
+    snap = {key: job.get(key) for key in fields}
+    snap["stage_before_stop"] = job.get("stage_before_stop")
+    snap["cancel_requested"] = job.get("cancel_requested")
+    snap["_ui_test_running"] = job.get("_ui_test_running")
+    snap["results"] = list(job.get("results") or [])
+    snap["test_runs"] = list(job.get("test_runs") or [])
+    if not compact:
+        snap["test_cases"] = list(job.get("test_cases") or [])
+        snap["test_failures"] = list(job.get("test_failures") or [])
+        snap["test_commands"] = list(job.get("test_commands") or [])
+    if view_ui:
+        snap["ui_log"] = list(job.get("ui_log") or [])
+        snap["log"] = []
+    else:
+        snap["log"] = list(job.get("log") or [])
+        if "ui_log" in job:
+            snap["ui_log"] = list(job.get("ui_log") or [])
+    if step:
+        snap["step_logs"] = {
+            key: list(val or []) for key, val in (job.get("step_logs") or {}).items()
+        }
+    else:
+        snap["step_logs"] = {}
+    return snap
+
+
 def job_payload(
     job: dict[str, Any],
     *,
@@ -886,10 +1613,18 @@ def job_payload(
     view_ui: bool = False,
     log_after: int = 0,
     test_revision: int = -1,
+    step: str = "",
+    sub: str = "",
 ) -> dict[str, Any]:
     fields = JOB_COMPACT_FIELDS if compact else JOB_PUBLIC_FIELDS
     payload = deepcopy({key: job.get(key) for key in fields})
-    if view_ui and "ui_log" in job:
+    payload["duration_sec"] = _job_duration_sec(job)
+    step_id = str(step or "").strip()
+    sub_id = str(sub or "").strip()
+    logs = job.get("step_logs") or {}
+    if step_id:
+        selected_log = _selected_step_logs(logs, step_id, sub_id)
+    elif view_ui and "ui_log" in job:
         selected_log = list(job.get("ui_log") or [])
     else:
         raw_log = list(job.get("log") or [])
@@ -897,6 +1632,8 @@ def job_payload(
     cursor = max(0, min(int(log_after or 0), len(selected_log))) if compact else 0
     payload["log"] = selected_log[cursor:]
     payload["log_cursor"] = len(selected_log)
+    payload["step"] = step_id or None
+    payload["sub"] = sub_id or None
     revision = len(job.get("test_runs") or [])
     payload["test_revision"] = revision
     if compact and test_revision != revision:
@@ -937,64 +1674,12 @@ def _running_job_ids_for_client(client_id: str) -> set[str]:
 
 
 def prune_build_history(client_id: str, keep_job_id: str = "") -> int:
-    """When one browser has >100 history rows, delete oldest down to 50."""
-    want = _normalize_client_id(client_id)
-    if not want:
-        return 0
-    rows: list[tuple[str, dict[str, Any], float]] = []
-    for path in LOG_DIR.glob("job-*.json"):
-        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
-        if not match:
-            continue
-        job_id = match.group(1)
-        try:
-            meta = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(meta, dict):
-            continue
-        if _normalize_client_id(meta.get("client_id")) != want:
-            continue
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = 0.0
-        meta.setdefault("id", job_id)
-        rows.append((job_id, meta, mtime))
-    if len(rows) <= HISTORY_MAX_ENTRIES:
-        return 0
-    rows.sort(key=lambda item: (_history_created_at(item[1], item[2]), item[0]))
-    keep_ids = {job_id for job_id, _, _ in rows[-HISTORY_TRIM_TO:]}
-    keep_ids.update(_running_job_ids_for_client(want))
-    if keep_job_id:
-        keep_ids.add(str(keep_job_id))
-    removed = 0
-    for job_id, _, _ in rows:
-        if job_id in keep_ids:
-            continue
-        delete_job_disk_files(job_id)
-        with _jobs_lock:
-            _jobs.pop(job_id, None)
-        removed += 1
-    return removed
+    """History metadata is kept in full; disk archive cleanup is separate."""
+    return 0
 
 
 def prune_all_build_histories() -> int:
-    clients: set[str] = set()
-    for path in LOG_DIR.glob("job-*.json"):
-        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
-        if not match:
-            continue
-        try:
-            meta = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(meta, dict):
-            continue
-        cid = _normalize_client_id(meta.get("client_id"))
-        if cid:
-            clients.add(cid)
-    return sum(prune_build_history(client_id) for client_id in clients)
+    return 0
 
 
 def prune_artifacts_log() -> int:
@@ -1090,7 +1775,8 @@ def trim_oldest_when_over(items: list[Any], max_entries: int, trim_to: int) -> l
 
 
 def trim_artifact_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return trim_oldest_when_over(entries, ARTIFACTS_MAX_ENTRIES, ARTIFACTS_TRIM_TO)
+    """Keep full artifact metadata; disk tar cleanup is handled separately."""
+    return list(entries)
 
 
 def annotate_artifact_entry(item: dict[str, Any]) -> dict[str, Any]:
@@ -1104,6 +1790,12 @@ def annotate_artifact_entry(item: dict[str, Any]) -> dict[str, Any]:
         "expired": not available,
         "download_url": url,
     }
+
+
+def _job_operator_name(job_id: str) -> str:
+    with _jobs_lock:
+        job = _jobs.get(job_id) or {}
+        return str(job.get("operator") or "")
 
 
 def record_build_artifact(entry: dict[str, Any]) -> None:
@@ -1159,7 +1851,11 @@ def sync_artifact_availability() -> int:
         return newly_expired
 
 
-def list_build_artifacts(page: int = 1, page_size: int = ARTIFACTS_DEFAULT_PAGE_SIZE) -> dict[str, Any]:
+def list_build_artifacts(
+    page: int = 1,
+    page_size: int = ARTIFACTS_DEFAULT_PAGE_SIZE,
+    service_id: str = "",
+) -> dict[str, Any]:
     path = artifacts_log_path()
     entries: list[dict[str, Any]] = []
     if path.is_file():
@@ -1168,12 +1864,15 @@ def list_build_artifacts(page: int = 1, page_size: int = ARTIFACTS_DEFAULT_PAGE_
         except OSError:
             entries = []
     annotated = [annotate_artifact_entry(item) for item in reversed(entries)]
+    sid = str(service_id or "").strip()
+    if sid:
+        annotated = [item for item in annotated if str(item.get("service_id") or "") == sid]
     total = len(annotated)
     try:
         size = int(page_size or ARTIFACTS_DEFAULT_PAGE_SIZE)
     except (TypeError, ValueError):
         size = ARTIFACTS_DEFAULT_PAGE_SIZE
-    size = max(1, min(size, ARTIFACTS_MAX_ENTRIES))
+    size = max(1, min(size, 200))
     page_count = max(1, (total + size - 1) // size) if total else 1
     try:
         current = int(page or 1)
@@ -1188,6 +1887,7 @@ def list_build_artifacts(page: int = 1, page_size: int = ARTIFACTS_DEFAULT_PAGE_
         "page_size": size,
         "page_count": page_count,
         "expired_count": sum(1 for item in annotated if item.get("expired")),
+        "service_id": sid or None,
     }
 
 
@@ -1200,11 +1900,34 @@ def _history_created_at(meta: dict[str, Any], mtime: float = 0.0) -> str:
     return ""
 
 
+def _parse_job_ts(value: str) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(text[:19], fmt))
+        except ValueError:
+            continue
+    return None
+
+
+def _job_duration_sec(meta: dict[str, Any]) -> int | None:
+    start = _parse_job_ts(str(meta.get("created_at") or ""))
+    end = _parse_job_ts(str(meta.get("finished_at") or ""))
+    if start is None or end is None:
+        return None
+    return max(0, int(end - start))
+
+
 def _history_row(meta: dict[str, Any], mtime: float = 0.0) -> dict[str, Any]:
     return {
         "id": str(meta.get("id") or ""),
         "client_id": meta.get("client_id") or "",
+        "operator": meta.get("operator") or "",
         "created_at": _history_created_at(meta, mtime),
+        "finished_at": str(meta.get("finished_at") or ""),
+        "duration_sec": _job_duration_sec(meta),
         "service_id": meta.get("service_id"),
         "service_ids": meta.get("service_ids") or _job_service_ids(meta),
         "branch": meta.get("branch"),
@@ -1221,52 +1944,49 @@ def _history_row(meta: dict[str, Any], mtime: float = 0.0) -> dict[str, Any]:
 
 def list_build_history(
     client_id: str = "",
+    service_id: str = "",
     page: int = 1,
     page_size: int = HISTORY_DEFAULT_PAGE_SIZE,
 ) -> dict[str, Any]:
-    """Paginated jobs for one browser client_id. Empty client_id returns no rows."""
+    """Paginated jobs for the whole platform. Optional client_id / service_id filters."""
     want = _normalize_client_id(client_id)
+    sid = str(service_id or "").strip()
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
-    if want:
-        with _jobs_lock:
-            for job in _jobs.values():
-                if _normalize_client_id(job.get("client_id")) != want:
-                    continue
-                job_id = str(job.get("id") or "")
-                if not job_id:
-                    continue
-                rows.append(_history_row(job))
-                seen.add(job_id)
-        for path in LOG_DIR.glob("job-*.json"):
-            match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
-            if not match:
+    with _jobs_lock:
+        for job in _jobs.values():
+            if want and _normalize_client_id(job.get("client_id")) != want:
                 continue
-            job_id = match.group(1)
-            if job_id in seen:
+            if sid and sid not in _job_service_ids(job):
                 continue
-            try:
-                meta = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, TypeError):
+            job_id = str(job.get("id") or "")
+            if not job_id:
                 continue
-            if not isinstance(meta, dict):
-                continue
-            if _normalize_client_id(meta.get("client_id")) != want:
-                continue
-            meta.setdefault("id", job_id)
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                mtime = 0.0
-            rows.append(_history_row(meta, mtime))
+            rows.append(_history_row(job))
             seen.add(job_id)
+    for path in LOG_DIR.glob("job-*.json"):
+        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
+        if not match:
+            continue
+        job_id = match.group(1)
+        if job_id in seen:
+            continue
+        row = _history_row_from_disk(path, job_id)
+        if not row:
+            continue
+        if want and _normalize_client_id(row.get("client_id")) != want:
+            continue
+        if sid and sid not in _job_service_ids(row):
+            continue
+        rows.append(row)
+        seen.add(job_id)
     rows.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")), reverse=True)
     total = len(rows)
     try:
         size = int(page_size or HISTORY_DEFAULT_PAGE_SIZE)
     except (TypeError, ValueError):
         size = HISTORY_DEFAULT_PAGE_SIZE
-    size = max(1, min(size, HISTORY_MAX_ENTRIES))
+    size = max(1, min(size, 200))
     page_count = max(1, (total + size - 1) // size) if total else 1
     try:
         current = int(page or 1)
@@ -1281,7 +2001,36 @@ def list_build_history(
         "page_size": size,
         "page_count": page_count,
         "client_id": want or None,
+        "service_id": sid or None,
     }
+
+
+def _history_row_from_disk(path: Path, job_id: str) -> dict[str, Any] | None:
+    """Parse a job meta file into a slim history row, with mtime/size cache."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    with _history_disk_cache_lock:
+        cached = _history_disk_cache.get(key)
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return dict(cached[2])
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    meta.setdefault("id", job_id)
+    row = _history_row(meta, st.st_mtime)
+    with _history_disk_cache_lock:
+        _history_disk_cache[key] = (st.st_mtime, st.st_size, row)
+        if len(_history_disk_cache) > 400:
+            extra = len(_history_disk_cache) - 300
+            for old_key in list(_history_disk_cache.keys())[:extra]:
+                _history_disk_cache.pop(old_key, None)
+    return dict(row)
 
 
 def persist_job_meta(job_id: str) -> None:
@@ -1289,34 +2038,43 @@ def persist_job_meta(job_id: str) -> None:
         job = _jobs.get(job_id)
         if not job:
             return
-        meta = {
-            k: job.get(k)
-            for k in (
-                "id",
-                "client_id",
-                "created_at",
-                "service_id",
-                "service_ids",
-                "branch",
-                "status",
-                "stage",
-                "error",
-                "remote",
-                "archive",
-                "archive_dir",
-                "results",
-                "progress",
-                "current",
-                "commit_sha",
-                "test_status",
-                "test_summary",
-                "test_commands",
-                "test_failures",
-                "test_cases",
-                "test_report",
-                "test_runs",
-            )
-        }
+        status = str(job.get("status") or "")
+        keys = (
+            "id",
+            "client_id",
+            "operator",
+            "created_at",
+            "finished_at",
+            "service_id",
+            "service_ids",
+            "branch",
+            "status",
+            "stage",
+            "error",
+            "remote",
+            "archive",
+            "archive_dir",
+            "results",
+            "progress",
+            "current",
+            "commit_sha",
+            "test_status",
+            "test_summary",
+            "test_commands",
+            "test_failures",
+            "test_cases",
+            "test_report",
+            "test_runs",
+            "test_kinds",
+            "cancel_requested",
+            "stage_before_stop",
+            "slot_held",
+            "queue_position",
+        )
+        meta = {k: job.get(k) for k in keys}
+        # Keep running-job JSON small so history listing stays cheap.
+        if status in ("ok", "failed", "stopped"):
+            meta["step_logs"] = job.get("step_logs")
     try:
         job_meta_path(job_id).write_text(
             json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
@@ -1352,7 +2110,9 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
     return {
         "id": job_id,
         "client_id": meta.get("client_id") or "",
+        "operator": meta.get("operator") or "",
         "created_at": meta.get("created_at") or "",
+        "finished_at": meta.get("finished_at") or "",
         "service_id": meta.get("service_id"),
         "service_ids": meta.get("service_ids") or _job_service_ids(meta),
         "branch": meta.get("branch"),
@@ -1373,6 +2133,10 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "test_cases": meta.get("test_cases"),
         "test_report": meta.get("test_report"),
         "test_runs": meta.get("test_runs") or [],
+        "test_kinds": meta.get("test_kinds") or [],
+        "step_logs": meta.get("step_logs") or {},
+        "cancel_requested": bool(meta.get("cancel_requested")),
+        "stage_before_stop": meta.get("stage_before_stop"),
         "log": log_lines,
     }
 
@@ -1393,6 +2157,9 @@ def reap_orphaned_running_jobs() -> int:
             continue
         if not isinstance(meta, dict) or meta.get("status") != "running":
             continue
+        prev_stage = str(meta.get("stage") or "")
+        if prev_stage and prev_stage not in _TERMINAL_PIPELINE_STAGES and not meta.get("stage_before_stop"):
+            meta["stage_before_stop"] = prev_stage
         meta["status"] = "failed"
         meta["stage"] = "interrupted"
         meta["error"] = INTERRUPTED_JOB_ERROR
@@ -1927,7 +2694,7 @@ def request_job_stop(job_id: str) -> dict[str, Any]:
         job = _jobs.get(job_id)
         if not job:
             return {"ok": False, "error": "job not found", "http_status": 404}
-        if job.get("status") != "running":
+        if job.get("status") not in ("running", "queued"):
             return {
                 "ok": False,
                 "error": f"任务已结束（{job.get('status')}）",
@@ -1935,12 +2702,16 @@ def request_job_stop(job_id: str) -> dict[str, Any]:
                 "status": job.get("status"),
             }
         already = bool(job.get("cancel_requested"))
+        if not already:
+            job["stage_before_stop"] = job.get("stage")
         job["cancel_requested"] = True
         job["stage"] = "stopping"
     persist_job_meta(job_id)
     if not already:
         append_job_log(job_id, "STOP requested: killing current process")
     kill_job_procs(job_id)
+    with _slot_lock:
+        _slot_cond.notify_all()
     return {"ok": True, "id": job_id, "status": "stopping"}
 
 
@@ -2015,24 +2786,214 @@ def win_to_wsl(path: Path) -> str:
     return f"/mnt/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}"
 
 
+def interruptible_sleep(job_id: str, seconds: float, interval: float = 0.25) -> None:
+    deadline = time.monotonic() + max(0.0, float(seconds or 0))
+    while time.monotonic() < deadline:
+        if job_id and job_cancel_requested(job_id):
+            raise JobStopped()
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+
+@contextmanager
+def log_substep(sub_id: str):
+    prev = str(getattr(_job_ctx, "log_substep", "") or "")
+    _job_ctx.log_substep = str(sub_id or "")
+    try:
+        yield
+    finally:
+        _job_ctx.log_substep = prev
+
+
+def _infer_test_log_substep(line: str) -> str:
+    text = str(line or "")
+    if "@@TEST_STEP@@" in text:
+        type_match = re.search(r"@@TEST_TYPE@@\s*(ut|dt)\b", text, re.I)
+        if type_match:
+            return f"{type_match.group(1).lower()}-cases"
+        name = re.split(r"@@TEST_TYPE@@", text.split("@@TEST_STEP@@", 1)[-1], maxsplit=1)[0].strip()
+        tokens = set(re.findall(r"[a-z]+", name.lower()))
+        has_ut = "ut" in tokens or "单元" in name
+        has_dt = "dt" in tokens
+        if has_ut and not has_dt:
+            return "ut-cases"
+        if has_dt and not has_ut:
+            return "dt-cases"
+        return "cases"
+    if "Loaded test stages" in text or "加载 .cid/build.yaml" in text:
+        return "plan"
+    if "tests start" in text or "启动 test_runner" in text:
+        return "runner"
+    lowered = text.lower()
+    if (
+        "test summary" in lowered
+        or "@@test_summary@@" in lowered
+        or "tests completed" in lowered
+        or "tests passed" in lowered
+        or "tests failed" in lowered
+    ):
+        return "report"
+    return ""
+
+
+_TEST_LOG_SUBS = {"plan", "runner", "ut-cases", "dt-cases", "cases", "report"}
+
+
+def _strip_log_prefix(line: str) -> str:
+    text = str(line or "")
+    if text.startswith("[") and "]" in text[:16]:
+        text = text.split("]", 1)[-1].strip()
+    return text
+
+
+def _canonical_log_substep(step_id: str, sub_id: str) -> str:
+    sub_id = str(sub_id or "").strip()
+    if step_id == "prepare" and sub_id in {"swr", "ps"}:
+        return "env"
+    if step_id == "sync" and sub_id in {"fetch", "checkout"}:
+        return "clone"
+    if step_id == "build" and sub_id == "deps":
+        return "script"
+    if step_id == "test" and sub_id == "report":
+        return "runner"
+    return sub_id
+
+
+def _infer_pipeline_log_substep(step_id: str, line: str) -> str:
+    text = _strip_log_prefix(line)
+    lowered = text.lower()
+    if step_id == "test":
+        inferred = _infer_test_log_substep(text) or _infer_test_log_substep(line)
+        return _canonical_log_substep("test", inferred)
+    if step_id == "prepare":
+        if any(
+            token in lowered
+            for token in (
+                "archive dir",
+                "cannot create archive",
+                "归档目录",
+                "remove old archive dir",
+                "pruning old nginx archives",
+            )
+        ):
+            return "adir"
+        return "env"
+    if step_id == "sync":
+        if lowered.startswith("head=") or "commit sha" in lowered or "记录 commit sha" in lowered:
+            return "sha"
+        return "clone"
+    if step_id == "build":
+        if any(token in lowered for token in ("build finished", "error build", "产物校验")):
+            return "verify"
+        if any(
+            token in lowered
+            for token in (
+                "dockerfile",
+                "docker build",
+                "sending build context",
+                "successfully tagged",
+                "docker 多阶段",
+            )
+        ):
+            return "docker"
+        return "script"
+    if step_id == "push":
+        if "docker tag" in lowered or lowered.startswith("tag "):
+            return "tag"
+        if any(token in lowered for token in ("digest:", "推送确认")):
+            return "verify"
+        if lowered.startswith("ok ") and "archive" not in lowered and "host package" not in lowered:
+            return "verify"
+        return "push"
+    if step_id == "archive":
+        return "save"
+    return ""
+
+
+def _substep_alias_keys(step_id: str, sub_id: str) -> list[str]:
+    want = _canonical_log_substep(step_id, sub_id)
+    keys = [f"{step_id}:{want}"]
+    if want == "env":
+        keys.extend([f"{step_id}:swr", f"{step_id}:ps"])
+    elif want == "clone":
+        keys.extend([f"{step_id}:fetch", f"{step_id}:checkout"])
+    elif want == "script":
+        keys.append(f"{step_id}:deps")
+    elif want == "runner":
+        keys.append(f"{step_id}:report")
+    return keys
+
+
+def _selected_step_logs(logs: dict[str, Any], step_id: str, sub_id: str) -> list[str]:
+    parent = list(logs.get(step_id) or [])
+    if not sub_id:
+        return parent
+    want = _canonical_log_substep(step_id, sub_id)
+    selected: list[str] = []
+    seen: set[str] = set()
+    for key in _substep_alias_keys(step_id, want):
+        for line in logs.get(key) or []:
+            if line in seen:
+                continue
+            seen.add(line)
+            selected.append(line)
+    if selected:
+        return selected
+    return [line for line in parent if _infer_pipeline_log_substep(step_id, line) == want]
+
+
+def _current_log_step(job: dict[str, Any]) -> str:
+    stage = str(job.get("stage") or "")
+    if stage == "stopping":
+        stage = str(job.get("stage_before_stop") or "")
+    return STAGE_TO_PIPELINE_STEP.get(stage, "prepare")
+
+
 def append_job_log(job_id: str, line: str) -> None:
     ts = time.strftime("%H:%M:%S")
     text = f"[{ts}] {line}"
+    log_file = ""
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
             return
         job["log"].append(text)
         _append_ui_log(job, text)
-        log_file = job.get("log_file")
-        if log_file:
-            Path(log_file).open("a", encoding="utf-8").write(text + "\n")
+        step_id = _current_log_step(job)
+        job.setdefault("step_logs", {}).setdefault(step_id, []).append(text)
+        inferred_test = _infer_test_log_substep(line)
+        ctx_sub = str(getattr(_job_ctx, "log_substep", "") or "").strip()
+        if step_id == "test":
+            if inferred_test:
+                _job_ctx.log_substep = inferred_test
+                sub_id = inferred_test
+            else:
+                sub_id = ctx_sub
+        else:
+            if ctx_sub in _TEST_LOG_SUBS:
+                ctx_sub = ""
+            sub_id = ctx_sub or _infer_pipeline_log_substep(step_id, line)
+        sub_id = _canonical_log_substep(step_id, sub_id)
+        if sub_id:
+            job["step_logs"].setdefault(f"{step_id}:{sub_id}", []).append(text)
+            if sub_id in ("ut-cases", "dt-cases"):
+                job["step_logs"].setdefault(f"{step_id}:cases", []).append(text)
+        log_file = str(job.get("log_file") or "")
+    if log_file:
+        try:
+            with Path(log_file).open("a", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError:
+            pass
 
 
 def set_job(job_id: str, **fields: Any) -> None:
     with _jobs_lock:
-        if job_id in _jobs:
-            _jobs[job_id].update(fields)
+        if job_id not in _jobs:
+            return
+        status = str(fields.get("status") or "")
+        if status in ("ok", "failed", "stopped") and not _jobs[job_id].get("finished_at"):
+            fields.setdefault("finished_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+        _jobs[job_id].update(fields)
     persist_job_meta(job_id)
 
 
@@ -2215,7 +3176,7 @@ def existing_clone_dirs(svc: dict[str, Any]) -> list[Path]:
 def _kept_workspace_suffixes(job_id: str) -> set[str]:
     keep = {job_workspace_suffix(job_id)}
     with _jobs_lock:
-        keep.update(job_workspace_suffix(str(item.get("id") or "")) for item in _running_jobs_locked())
+        keep.update(job_workspace_suffix(str(item.get("id") or "")) for item in _live_jobs_locked())
     keep.discard("")
     return keep
 
@@ -2371,25 +3332,37 @@ def finalize_fleet_bundle_artifacts(job_id: str, bundle: Path) -> bool:
 
 
 def check_docker(force: bool = False) -> dict[str, Any]:
-    """Probe Docker via `docker info` (native Linux or WSL). Cached ~45s."""
+    """Probe Docker via `docker info` (native Linux or WSL).
+
+    Successful probes are cached ~45s. Failures are cached only ~3s so a busy
+    daemon during an in-flight build does not 503 subsequent /api/push calls.
+    """
     global _docker_cache
     now = time.time()
-    if not force and _docker_cache and now - _docker_cache[0] < 45:
-        return dict(_docker_cache[1])
+    with _docker_cache_lock:
+        cached = _docker_cache
+    if not force and cached:
+        ts, st = cached
+        ttl = 45 if st.get("ok") else 3
+        if now - ts < ttl:
+            return dict(st)
     if use_wsl():
         pass
     elif shutil.which("docker") is None:
         st = {"ok": False, "detail": "docker not installed"}
-        _docker_cache = (now, st)
+        with _docker_cache_lock:
+            _docker_cache = (now, st)
         return dict(st)
     code, out = docker_cmd("info", timeout=8)
     if code != 0:
         st = {"ok": False, "detail": ((out or "")[-400:] or "docker unavailable")}
-        _docker_cache = (now, st)
+        with _docker_cache_lock:
+            _docker_cache = (now, st)
         return dict(st)
     where = f"WSL:{CFG['wsl_distro']}" if use_wsl() else "native"
     st = {"ok": True, "detail": f"Docker ok / {where}"}
-    _docker_cache = (now, st)
+    with _docker_cache_lock:
+        _docker_cache = (now, st)
     return dict(st)
 
 
@@ -2429,16 +3402,44 @@ def login_status_fast() -> bool:
 
 def docker_status_cached() -> dict[str, Any]:
     """Never block HTTP handlers on `docker info` (slow during builds)."""
-    if _docker_cache:
-        return dict(_docker_cache[1])
+    with _docker_cache_lock:
+        cached = _docker_cache
+    if cached:
+        return dict(cached[1])
     return {"ok": True, "detail": "Docker (后台检测中)"}
+
+
+def docker_ready_for_push() -> dict[str, Any]:
+    """Decide whether /api/push may start a job without blocking on `docker info`.
+
+    A live probe during a heavy build often times out; caching that failure used
+    to 503 retries for 45s. If a job is already running, Docker is available.
+    Otherwise trust a recent OK cache, reject only a confirmed missing binary,
+    and otherwise allow the job (it will fail later if Docker is truly down).
+    """
+    with _jobs_lock:
+        running = bool(_live_jobs_locked())
+    cached = docker_status_cached()
+    if running:
+        return {"ok": True, "detail": cached.get("detail") or "Docker in use by a running job"}
+    if cached.get("ok"):
+        return dict(cached)
+    if str(cached.get("detail") or "") == "docker not installed":
+        return dict(cached)
+    schedule_docker_probe()
+    return {"ok": True, "detail": cached.get("detail") or "Docker (后台检测中)"}
 
 
 def schedule_docker_probe() -> None:
     """Refresh docker cache in background if stale/missing."""
     now = time.time()
-    if _docker_cache and now - _docker_cache[0] < 45:
-        return
+    with _docker_cache_lock:
+        cached = _docker_cache
+    if cached:
+        ts, st = cached
+        ttl = 45 if st.get("ok") else 3
+        if now - ts < ttl:
+            return
 
     def _run() -> None:
         try:
@@ -2526,25 +3527,36 @@ def check_login_detail(force: bool = False) -> tuple[bool, str]:
     """Like check_login, but also return the probe snippet for job logs."""
     global _login_ok, _login_probe_cache
     now = time.time()
-    if not force and _login_probe_cache and now - _login_probe_cache[0] < 45:
-        ok = bool(_login_probe_cache[1])
+    with _login_lock:
+        if not force and _login_probe_cache:
+            ts, ok = _login_probe_cache
+            ttl = 45 if ok else 5
+            if now - ts < ttl:
+                _login_ok = bool(ok)
+                return bool(ok), "cached"
+
+    with _login_probe_lock:
+        now = time.time()
+        with _login_lock:
+            if not force and _login_probe_cache:
+                ts, ok = _login_probe_cache
+                ttl = 45 if ok else 5
+                if now - ts < ttl:
+                    _login_ok = bool(ok)
+                    return bool(ok), "cached"
+        if not docker_config_has_swr_auth():
+            with _login_lock:
+                _login_ok = False
+                _login_probe_cache = (now, False)
+            return False, "local docker config has no SWR auth"
+
+        remote = f"{CFG['swr_registry']}/{CFG['swr_org']}/robot-ci-auth-probe-does-not-exist"
+        code, out = docker_cmd("manifest", "inspect", remote, timeout=12)
+        ok, snippet = _swr_probe_ok(code, out)
         with _login_lock:
             _login_ok = ok
-        return ok, "cached"
-
-    if not docker_config_has_swr_auth():
-        with _login_lock:
-            _login_ok = False
-            _login_probe_cache = (now, False)
-        return False, "local docker config has no SWR auth"
-
-    remote = f"{CFG['swr_registry']}/{CFG['swr_org']}/robot-ci-auth-probe-does-not-exist"
-    code, out = docker_cmd("manifest", "inspect", remote, timeout=12)
-    ok, snippet = _swr_probe_ok(code, out)
-    with _login_lock:
-        _login_ok = ok
-        _login_probe_cache = (now, ok)
-    return ok, snippet
+            _login_probe_cache = (time.time(), ok)
+        return ok, snippet
 
 
 def mark_swr_login_invalid() -> None:
@@ -2804,7 +3816,8 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     if svc.get("id") == "multica-fleet":
         restore_fleet_runtime_cache(job_id, dest)
     code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
-    append_job_log(job_id, f"HEAD={head if code == 0 else '?'} @ {branch}")
+    with log_substep("sha"):
+        append_job_log(job_id, f"HEAD={head if code == 0 else '?'} @ {branch}")
     return True, str(dest)
 
 
@@ -2838,7 +3851,8 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
     Concurrent jobs share this checkout: update in place under a lock, never wipe
     an existing tree (wiping would break other in-flight builds).
     """
-    with _public_service_lock:
+    global _public_service_ready_at
+    with log_substep("env"), _public_service_lock:
         dest = public_service_dir()
         branch = (CFG.get("public_service_branch") or "main").strip() or "main"
         url = (CFG.get("public_service_github") or "https://github.com/rollingfruit/public-service.git").strip()
@@ -2846,7 +3860,17 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
         clone_url = clone_url_for(url)
         genv = git_env()
         dest.parent.mkdir(parents=True, exist_ok=True)
+        rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
+        now = time.time()
         append_job_log(job_id, f"ensure shared public-service → {dest} @ {branch}")
+
+        if (dest / ".git").is_dir() and rrd.is_file() and now - _public_service_ready_at < PUBLIC_SERVICE_REUSE_SEC:
+            code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
+            append_job_log(
+                job_id,
+                f"public-service recently updated; reuse HEAD={head if code == 0 else '?'} @ {branch}",
+            )
+            return True, str(dest)
 
         if (dest / ".git").is_dir():
             append_job_log(job_id, "public-service exists; fetch/update (no wipe, safe for concurrency)")
@@ -2858,15 +3882,31 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
                 env=genv,
             )
             if code != 0:
+                if rrd.is_file():
+                    append_job_log(job_id, "WARN git fetch public-service failed; reusing existing checkout")
+                    _public_service_ready_at = now
+                    return True, str(dest)
                 return False, "git fetch public-service failed"
-            code = run_stream(
-                job_id,
-                git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
-                timeout=120,
-                env=genv,
-            )
-            if code != 0:
-                return False, f"checkout public-service {branch} failed"
+            code, old_head = run_cmd(git_args("-C", str(dest), "rev-parse", "HEAD"), timeout=30, env=genv)
+            code_fh, new_head = run_cmd(git_args("-C", str(dest), "rev-parse", "FETCH_HEAD"), timeout=30, env=genv)
+            if code == 0 and code_fh == 0 and (old_head or "").strip() == (new_head or "").strip():
+                append_job_log(job_id, "public-service already at FETCH_HEAD; skip checkout")
+            else:
+                code = run_stream(
+                    job_id,
+                    git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
+                    timeout=120,
+                    env=genv,
+                )
+                if code != 0:
+                    if rrd.is_file():
+                        append_job_log(
+                            job_id,
+                            f"WARN checkout public-service {branch} failed; reusing existing checkout",
+                        )
+                        _public_service_ready_at = now
+                        return True, str(dest)
+                    return False, f"checkout public-service {branch} failed"
         else:
             append_job_log(job_id, "git clone public-service…")
             code = run_stream(
@@ -2901,11 +3941,13 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
                     return False, f"checkout public-service {branch} failed"
 
         run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
-        rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
+        if not rrd.is_file():
+            rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
         if not rrd.is_file():
             return False, f"missing {rrd}"
         code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
         append_job_log(job_id, f"public-service HEAD={head if code == 0 else '?'} @ {branch}")
+        _public_service_ready_at = time.time()
         return True, str(dest)
 
 
@@ -3076,17 +4118,21 @@ def build_from_source(
         and not key.startswith(runtime_prefixes)
     }
     apply_ci_tmp_env(build_env)
-    code = run_stream(
-        job_id,
-        bash_lc(bash),
-        timeout=build_timeout,
-        output_tail=output_tail,
-        env=build_env,
-    )
+    stream_sub = "docker" if svc.get("dockerfile_build") else "script"
+    with log_substep(stream_sub):
+        code = run_stream(
+            job_id,
+            bash_lc(bash),
+            timeout=build_timeout,
+            output_tail=output_tail,
+            env=build_env,
+        )
     if code != 0:
-        append_job_log(job_id, f"ERROR build exit={code}")
+        with log_substep("verify"):
+            append_job_log(job_id, f"ERROR build exit={code}")
         return False, summarize_command_failure(output_tail, f"build exited with code {code}")
-    append_job_log(job_id, "build finished")
+    with log_substep("verify"):
+        append_job_log(job_id, "build finished")
     return True, ""
 
 
@@ -3455,9 +4501,10 @@ def archive_image_locally(
     out_dir: Path | None = None,
 ) -> tuple[bool, str]:
     """docker save image tar under archive dir (shared dir for batch jobs)."""
-    if not CFG.get("archive_enabled"):
-        append_job_log(job_id, "local archive skipped (disabled)")
-        return True, ""
+    with log_substep("save"):
+        if not CFG.get("archive_enabled"):
+            append_job_log(job_id, "local archive skipped (disabled)")
+            return True, ""
 
     if out_dir is None:
         try:
@@ -3549,29 +4596,39 @@ def resolve_local_image(
 
 def ensure_swr_login(job_id: str, login_command: str = "") -> bool:
     """Shared-server SWR login; returns False and sets job failed on error."""
-    cmd = (login_command or "").strip()
-    if cmd:
-        append_job_log(job_id, "SWR login from page credentials…")
-        ok_login, out_login = do_login(cmd)
-        append_job_log(job_id, (out_login or "")[-800:])
-        if not ok_login:
-            set_job(job_id, status="failed", error="SWR login failed")
-            append_job_log(job_id, "ERROR: paste a valid Huawei SWR temporary login command")
-            return False
-        ok_probe, probe_detail = check_login_detail(force=True)
-        if not ok_probe:
-            set_job(job_id, status="failed", error="SWR login verification failed")
+    with log_substep("env"):
+        cmd = (login_command or "").strip()
+        if cmd:
+            append_job_log(job_id, "SWR login from page credentials…")
+            ok_login, out_login = do_login(cmd)
+            append_job_log(job_id, (out_login or "")[-800:])
+            if not ok_login:
+                set_job(job_id, status="failed", error="SWR login failed")
+                append_job_log(job_id, "ERROR: paste a valid Huawei SWR temporary login command")
+                return False
+            ok_probe, probe_detail = check_login_detail(force=True)
+            if not ok_probe:
+                set_job(job_id, status="failed", error="SWR login verification failed")
+                append_job_log(
+                    job_id,
+                    "ERROR: SWR login command succeeded locally but registry verification failed: "
+                    + probe_detail,
+                )
+                return False
+            return True
+
+        append_job_log(job_id, "reusing shared SWR login on this server…")
+        ok_probe, probe_detail = check_login_detail(force=False)
+        if ok_probe:
+            append_job_log(job_id, "shared SWR login still valid")
+            return True
+        if docker_config_has_swr_auth():
             append_job_log(
                 job_id,
-                "ERROR: SWR login command succeeded locally but registry verification failed: "
+                "WARN SWR registry probe failed; continuing with local docker auth: "
                 + probe_detail,
             )
-            return False
-        return True
-
-    append_job_log(job_id, "reusing shared SWR login on this server…")
-    ok_probe, probe_detail = check_login_detail(force=True)
-    if not ok_probe:
+            return True
         set_job(job_id, status="failed", error="not logged in to SWR")
         append_job_log(
             job_id,
@@ -3579,8 +4636,6 @@ def ensure_swr_login(job_id: str, login_command: str = "") -> bool:
             f" 校验: {probe_detail}",
         )
         return False
-    append_job_log(job_id, "shared SWR login still valid")
-    return True
 
 
 def push_one_service(
@@ -3655,6 +4710,14 @@ def push_one_service(
             if not image_enabled:
                 svc["host_package"] = True
         append_job_log(job_id, f"CID contract active image={declared_image} delivery={delivery}")
+        test_kinds = [
+            str(step.get("test_type") or "")
+            for step in (cid.get("scripts") or [])
+            if step.get("type") == "test"
+            and step.get("enabled") is True
+            and step.get("test_type") in {"ut", "dt"}
+        ]
+        set_job(job_id, test_kinds=test_kinds)
 
     git = git_bin()
     code, head = run_cmd([git, "-C", detail, "rev-parse", "HEAD"], timeout=30)
@@ -3662,6 +4725,8 @@ def push_one_service(
     git_hash = commit_sha[:7]
     result["commit_sha"] = commit_sha
 
+    if job_cancel_requested(job_id):
+        raise JobStopped()
     set_job(job_id, stage="testing", current=f"{service_id}@{branch}", commit_sha=commit_sha)
     test_result = run_tests_nonblocking(job_id, service_id, Path(detail), commit_sha)
     test_summary = {
@@ -3688,6 +4753,8 @@ def push_one_service(
         result["error"] = f"tests failed under blocking policy: {test_result.get('status')}"
         append_job_log(job_id, f"FAILED service={service_id} stage=testing reason={result['error']}")
         return result
+    if job_cancel_requested(job_id):
+        raise JobStopped()
     set_job(job_id, stage="building")
 
     # Always rebuild; never reuse a previous local image for the same git hash.
@@ -3718,10 +4785,13 @@ def push_one_service(
             append_job_log(job_id, f"FAILED service={service_id} stage=archiving reason={result['error']}")
             return result
         result.update(host_result)
+        if job_cancel_requested(job_id):
+            raise JobStopped()
         record_build_artifact(
             {
                 "created_at": result["created_at"],
                 "job_id": job_id,
+                "operator": _job_operator_name(job_id),
                 "service_id": service_id,
                 "title": result["title"],
                 "branch": branch,
@@ -3767,10 +4837,13 @@ def push_one_service(
         result["package_name"] = bundle.name
         result["download_url"] = public_archive_url(str(bundle))
         result["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if job_cancel_requested(job_id):
+            raise JobStopped()
         record_build_artifact(
             {
                 "created_at": result["created_at"],
                 "job_id": job_id,
+                "operator": _job_operator_name(job_id),
                 "service_id": service_id,
                 "title": result["title"],
                 "branch": branch,
@@ -3796,46 +4869,50 @@ def push_one_service(
         result["error"] = "no image/tar after build"
         return result
 
+    if job_cancel_requested(job_id):
+        raise JobStopped()
     set_job(job_id, stage="pushing")
     remote = f"{registry}/{org}/{image}:{tag}"
-    append_job_log(job_id, f"docker tag {local_ref} -> {remote}")
-    code, out = docker_cmd("tag", local_ref, remote, timeout=60)
-    if code != 0:
-        append_job_log(job_id, out)
-        result["error"] = "docker tag failed"
-        return result
+    with log_substep("tag"):
+        append_job_log(job_id, f"docker tag {local_ref} -> {remote}")
+        code, out = docker_cmd("tag", local_ref, remote, timeout=60)
+        if code != 0:
+            append_job_log(job_id, out)
+            result["error"] = "docker tag failed"
+            return result
 
     push_attempts = 4
     code, out = 1, ""
-    for attempt in range(1, push_attempts + 1):
-        append_job_log(job_id, f"docker push {remote} (try {attempt}/{push_attempts})")
-        code, out = docker_cmd("push", remote, timeout=3600)
-        for line in (out or "").splitlines()[-40:]:
-            append_job_log(job_id, line)
-        if code == 0:
-            break
-        text = (out or "").lower()
-        retryable = any(
-            x in text
-            for x in (
-                "timeout",
-                "temporarily unavailable",
-                "connection reset",
-                "connection refused",
-                "tls handshake",
-                "i/o timeout",
-                "network is unreachable",
-                "request canceled",
+    with log_substep("push"):
+        for attempt in range(1, push_attempts + 1):
+            append_job_log(job_id, f"docker push {remote} (try {attempt}/{push_attempts})")
+            code, out = docker_cmd("push", remote, timeout=3600)
+            for line in (out or "").splitlines()[-40:]:
+                append_job_log(job_id, line)
+            if code == 0:
+                break
+            text = (out or "").lower()
+            retryable = any(
+                x in text
+                for x in (
+                    "timeout",
+                    "temporarily unavailable",
+                    "connection reset",
+                    "connection refused",
+                    "tls handshake",
+                    "i/o timeout",
+                    "network is unreachable",
+                    "request canceled",
+                )
             )
-        )
-        if not retryable or attempt >= push_attempts:
-            break
-        wait_s = min(30, 5 * attempt)
-        append_job_log(job_id, f"push network error; retry in {wait_s}s…")
-        for _ in range(wait_s):
-            if job_cancel_requested(job_id):
-                raise JobStopped()
-            time.sleep(1)
+            if not retryable or attempt >= push_attempts:
+                break
+            wait_s = min(30, 5 * attempt)
+            append_job_log(job_id, f"push network error; retry in {wait_s}s…")
+            for _ in range(wait_s):
+                if job_cancel_requested(job_id):
+                    raise JobStopped()
+                time.sleep(1)
     if code != 0:
         result["remote"] = remote
         result["error"] = summarize_command_failure(
@@ -3863,6 +4940,10 @@ def push_one_service(
 
     # Free space before large docker save when disk is tight.
     # Pin the just-built tags so prune cannot delete them before docker save.
+    if job_cancel_requested(job_id):
+        raise JobStopped()
+    with log_substep("verify"):
+        append_job_log(job_id, f"OK {remote}")
     set_job(job_id, stage="archiving")
     reclaim_ci_disk(job_id, keep_refs=(local_ref, remote))
     if svc.get("archive_image", True):
@@ -3891,10 +4972,13 @@ def push_one_service(
     result["package_name"] = Path(arc_path).name if arc_path else ""
     result["download_url"] = public_archive_url(arc_path or "")
     result["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if job_cancel_requested(job_id):
+        raise JobStopped()
     record_build_artifact(
         {
             "created_at": result["created_at"],
             "job_id": job_id,
+            "operator": _job_operator_name(job_id),
             "service_id": service_id,
             "title": result["title"],
             "branch": branch,
@@ -3908,7 +4992,6 @@ def push_one_service(
             "download_url": result["download_url"],
         }
     )
-    append_job_log(job_id, f"OK {remote}")
     if arc_path:
         append_job_log(job_id, f"OK archive {arc_path}")
     return result
@@ -3950,6 +5033,11 @@ def run_push_job(
             branch=",".join(br for _, br, _ in resolved),
         )
 
+        with log_substep("env"):
+            append_job_log(job_id, "environment check: docker/workspace ready")
+        if not wait_for_build_slot(job_id):
+            raise JobStopped()
+
         needs_swr = any(not svc.get("archive_only") for svc, _, _ in resolved)
         if needs_swr and not ensure_swr_login(job_id, login_command):
             return
@@ -3970,16 +5058,18 @@ def run_push_job(
         needs_archive_dir = bool(CFG.get("archive_enabled")) or bundle_required
         if needs_archive_dir:
             try:
-                archive_dir = make_archive_dir(job_id)
+                with log_substep("adir"):
+                    archive_dir = make_archive_dir(job_id)
+                    append_job_log(job_id, f"shared archive dir={archive_dir}")
+                set_job(job_id, archive_dir=str(archive_dir))
             except OSError as e:
                 if CFG.get("archive_required") or bundle_required:
                     set_job(job_id, status="failed", error=f"cannot create archive dir: {e}")
-                    append_job_log(job_id, f"ERROR cannot create archive dir: {e}")
+                    with log_substep("adir"):
+                        append_job_log(job_id, f"ERROR cannot create archive dir: {e}")
                     return
-                append_job_log(job_id, f"WARN: cannot create archive dir: {e}")
-            else:
-                append_job_log(job_id, f"shared archive dir={archive_dir}")
-                set_job(job_id, archive_dir=str(archive_dir))
+                with log_substep("adir"):
+                    append_job_log(job_id, f"WARN: cannot create archive dir: {e}")
 
         results: list[dict[str, Any]] = []
         total = len(resolved)
@@ -4066,6 +5156,7 @@ def run_push_job(
             set_job(job_id, status="failed", error=str(e))
             append_job_log(job_id, f"ERROR {e}")
     finally:
+        release_build_slot(job_id)
         _job_ctx.job_id = None
         reclaim_ci_disk(job_id)
 
@@ -4093,14 +5184,51 @@ class Handler(SimpleHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
-    def _json(self, code: int, payload: Any) -> None:
+    def _json(self, code: int, payload: Any, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _session_token(self) -> str:
+        raw = self.headers.get("Cookie") or ""
+        cookies = SimpleCookie()
+        try:
+            cookies.load(raw)
+        except Exception:
+            return ""
+        morsel = cookies.get(SESSION_COOKIE)
+        return morsel.value if morsel else ""
+
+    def _current_user(self) -> str:
+        return session_username(self._session_token())
+
+    def _session_cookie_header(self, token: str, *, clear: bool = False) -> str:
+        if clear:
+            return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        return (
+            f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
+            f"Max-Age={SESSION_MAX_AGE_SEC}"
+        )
+
+    def _require_api_user(self, path: str, method: str) -> str | None:
+        if not path.startswith("/api/"):
+            return ""
+        if method == "GET" and path in AUTH_PUBLIC_GET:
+            return self._current_user()
+        if method == "POST" and path in AUTH_PUBLIC_POST:
+            return self._current_user()
+        user = self._current_user()
+        if user:
+            return user
+        self._json(401, {"error": "请先登录", "error_code": "auth_required"})
+        return None
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
@@ -4123,6 +5251,12 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        user = self._require_api_user(path, "GET")
+        if user is None:
+            return
+        if path == "/api/auth/me":
+            self._json(200, {"user": user or None, "username": user or None})
+            return
         if path == "/api/login/status":
             # Instant: no docker info / no SWR network round-trip.
             self._json(
@@ -4210,7 +5344,8 @@ class Handler(SimpleHTTPRequestHandler):
                 page_size = _query_int("page_size", ARTIFACTS_DEFAULT_PAGE_SIZE)
             else:
                 page_size = _query_int("limit", ARTIFACTS_DEFAULT_PAGE_SIZE)
-            payload = list_build_artifacts(page=page, page_size=page_size)
+            service_id = str((query.get("service_id") or [""])[0]).strip()
+            payload = list_build_artifacts(page=page, page_size=page_size, service_id=service_id)
             payload["archive_root"] = (CFG.get("archive_root") or "").strip()
             payload["download_via"] = "helper"
             self._json(200, payload)
@@ -4267,7 +5402,26 @@ class Handler(SimpleHTTPRequestHandler):
             if default in branches:
                 branches.remove(default)
                 branches.insert(0, default)
-            self._json(200, {"branches": branches, "default_branch": default})
+            preferred = get_run_template(user or "", str(svc.get("id") or ""))
+            selected = resolve_template_branch(user or "", str(svc.get("id") or ""), branches, default)
+            self._json(
+                200,
+                {
+                    "branches": branches,
+                    "default_branch": default,
+                    "preferred_branch": preferred or None,
+                    "selected_branch": selected,
+                },
+            )
+            return
+
+        if path == "/api/run-templates":
+            service_id = str((query.get("service_id") or [""])[0]).strip()
+            if not service_id:
+                self._json(400, {"error": "缺少微服务"})
+                return
+            preferred = get_run_template(user or "", service_id)
+            self._json(200, {"service_id": service_id, "branch": preferred or None})
             return
 
         if path == "/api/jobs":
@@ -4278,12 +5432,21 @@ class Handler(SimpleHTTPRequestHandler):
                     return default
 
             client_id = _normalize_client_id((query.get("client_id") or [""])[0])
+            service_id = str((query.get("service_id") or [""])[0]).strip()
             page = _query_int("page", 1)
             if "page_size" in query:
                 page_size = _query_int("page_size", HISTORY_DEFAULT_PAGE_SIZE)
             else:
                 page_size = _query_int("limit", HISTORY_DEFAULT_PAGE_SIZE)
-            self._json(200, list_build_history(client_id=client_id, page=page, page_size=page_size))
+            self._json(
+                200,
+                list_build_history(
+                    client_id=client_id,
+                    service_id=service_id,
+                    page=page,
+                    page_size=page_size,
+                ),
+            )
             return
 
         if path.startswith("/api/jobs/"):
@@ -4298,19 +5461,31 @@ class Handler(SimpleHTTPRequestHandler):
                 test_revision = int((query.get("test_revision") or ["-1"])[0])
             except ValueError:
                 test_revision = -1
+            step = str((query.get("step") or [""])[0]).strip()
+            sub = str((query.get("sub") or [""])[0]).strip()
             payload = None
             with _jobs_lock:
                 job = _jobs.get(job_id)
                 if job:
-                    payload = job_payload(
+                    payload = snapshot_job_for_payload(
                         job,
+                        compact=compact,
+                        view_ui=view_ui,
+                        step=step,
+                    )
+            if payload is not None:
+                self._json(
+                    200,
+                    job_payload(
+                        payload,
                         compact=compact,
                         view_ui=view_ui,
                         log_after=log_after,
                         test_revision=test_revision,
-                    )
-            if payload is not None:
-                self._json(200, payload)
+                        step=step,
+                        sub=sub,
+                    ),
+                )
                 return
             disk = load_job_from_disk(job_id)
             if disk:
@@ -4322,7 +5497,9 @@ class Handler(SimpleHTTPRequestHandler):
                         view_ui=view_ui,
                         log_after=log_after,
                         test_revision=test_revision,
-                    ) if compact or view_ui else disk,
+                        step=step,
+                        sub=sub,
+                    ) if compact or view_ui or step else disk,
                 )
                 return
             self._json(404, {"error": "job not found"})
@@ -4331,21 +5508,32 @@ class Handler(SimpleHTTPRequestHandler):
         # Active-job discovery. Prefer client_id so each browser only sees its jobs.
         if path == "/api/running-job":
             client_id = _normalize_client_id((query.get("client_id") or [""])[0])
-            payload = active_job_summary(client_id=client_id)
+            service_id = str((query.get("service_id") or [""])[0]).strip()
+            payload = active_job_summary(client_id=client_id, service_id=service_id)
             if payload:
                 self._json(200, payload)
                 return
-            self._json(200, {"id": None, "status": "idle", "client_id": client_id or None})
+            self._json(
+                200,
+                {
+                    "id": None,
+                    "status": "idle",
+                    "client_id": client_id or None,
+                    "service_id": service_id or None,
+                },
+            )
             return
 
         if path == "/api/running-jobs":
             client_id = _normalize_client_id((query.get("client_id") or [""])[0])
-            jobs = list_running_job_summaries(client_id=client_id)
+            service_id = str((query.get("service_id") or [""])[0]).strip()
+            jobs = list_running_job_summaries(client_id=client_id, service_id=service_id)
             self._json(
                 200,
                 {
                     "jobs": jobs,
                     "client_id": client_id or None,
+                    "service_id": service_id or None,
                     "max_concurrent_jobs": max_concurrent_jobs(),
                 },
             )
@@ -4367,6 +5555,57 @@ class Handler(SimpleHTTPRequestHandler):
     def _do_POST(self) -> None:
         path = urlparse(self.path).path
         data = self._read_json()
+        user = self._require_api_user(path, "POST")
+        if user is None:
+            return
+
+        if path == "/api/auth/login":
+            username = authenticate_user(str(data.get("username") or ""), str(data.get("password") or ""))
+            if not username:
+                self._json(401, {"ok": False, "error": "账号或密码错误", "error_code": "auth_failed"})
+                return
+            token = create_session(username)
+            self._json(
+                200,
+                {"ok": True, "username": username, "user": username},
+                extra_headers={"Set-Cookie": self._session_cookie_header(token)},
+            )
+            return
+
+        if path == "/api/auth/logout":
+            destroy_session(self._session_token())
+            self._json(
+                200,
+                {"ok": True},
+                extra_headers={"Set-Cookie": self._session_cookie_header("", clear=True)},
+            )
+            return
+
+        if path == "/api/auth/password":
+            err = change_user_password(
+                user,
+                str(data.get("old_password") or data.get("current_password") or ""),
+                str(data.get("new_password") or ""),
+            )
+            if err:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True})
+            return
+
+        if path == "/api/run-templates":
+            service_id = str(data.get("service_id") or "").strip()
+            branch = str(data.get("branch") or "").strip()
+            catalog = {str(item.get("id")): item for item in load_services()}
+            if service_id not in catalog:
+                self._json(404, {"ok": False, "error": "未知微服务"})
+                return
+            err = save_run_template(user, service_id, branch)
+            if err:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "service_id": service_id, "branch": branch})
+            return
 
         if path == "/api/login":
             ok, out = do_login((data.get("command") or "").strip())
@@ -4510,8 +5749,14 @@ class Handler(SimpleHTTPRequestHandler):
             if not items:
                 self._json(400, {"error": "service_id or items[] required"})
                 return
-            if len(items) > 32:
-                self._json(400, {"error": "too many services (max 32)"})
+            if len(items) != 1:
+                self._json(
+                    400,
+                    {
+                        "error": "一次只能构建一个微服务，请切换微服务后分别运行",
+                        "error_code": "single_service_only",
+                    },
+                )
                 return
             catalog = {svc["id"]: svc for svc in load_services()}
             for item in items:
@@ -4531,7 +5776,7 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                     return
             client_id = _normalize_client_id(data.get("client_id"))
-            docker = check_docker()
+            docker = docker_ready_for_push()
             if not docker["ok"]:
                 self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
                 return
@@ -4543,12 +5788,14 @@ class Handler(SimpleHTTPRequestHandler):
             new_job = {
                 "id": job_id,
                 "client_id": client_id,
+                "operator": user,
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": "",
                 "service_id": ids,
                 "service_ids": service_ids,
                 "branch": branches,
                 "status": "running",
-                "stage": "syncing",
+                "stage": "starting",
                 "error": None,
                 "remote": None,
                 "archive": None,
@@ -4566,8 +5813,11 @@ class Handler(SimpleHTTPRequestHandler):
                 "test_runs": [],
                 "log": [],
                 "ui_log": [],
+                "step_logs": {},
                 "_ui_test_running": False,
                 "cancel_requested": False,
+                "slot_held": False,
+                "queue_position": 0,
                 "log_file": str(log_file),
             }
             conflict = register_concurrent_job(new_job)
@@ -4581,7 +5831,7 @@ class Handler(SimpleHTTPRequestHandler):
             persist_job_meta(job_id)
             append_job_log(
                 job_id,
-                f"job start services={len(items)} [{ids}] branches=[{branches}] client={client_id or '-'}",
+                f"job start service={ids} branch={branches} operator={user or '-'}",
             )
             threading.Thread(
                 target=run_push_job,
@@ -4593,6 +5843,7 @@ class Handler(SimpleHTTPRequestHandler):
                 {
                     "job_id": job_id,
                     "client_id": client_id or None,
+                    "operator": user,
                     "count": len(items),
                     "items": items,
                     "branch": branches,
@@ -4622,6 +5873,7 @@ def main() -> None:
     apply_ci_tmp_env()
     print(f"[swr-push-helper] ci_tmp={ci_tmp_root()}", flush=True)
     print(f"[swr-push-helper] allow_remote={allow_remote}", flush=True)
+    ensure_default_users()
     reaped = reap_orphaned_running_jobs()
     if reaped:
         print(f"[swr-push-helper] marked {reaped} interrupted job(s) after restart", flush=True)

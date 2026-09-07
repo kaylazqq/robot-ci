@@ -1,67 +1,56 @@
-
 const $ = (id) => document.getElementById(id);
-let pollTimer = null;
-let activeProbeTimer = null;
-let lastJobExpiryTimer = null;
-let busy = true;
-let pollFails = 0;
-let pollGeneration = 0;
-let activeJobId = "";
-let liveLogLines = [];
-let logCursor = 0;
-let testRevision = -1;
-let cachedTestRuns = [];
-const branchCache = {};
-const BRANCH_LOAD_LIMIT = 3;
-let branchLoadsActive = 0;
-const branchLoadQueue = [];
-let testResultJobId = "";
-const testTableState = new Map();
-const artifactsPager = { page: 1, pageSize: 20 };
-const historyPager = { page: 1, pageSize: 20 };
-let historyDetailTimer = null;
-let historyDetailGen = 0;
-let historyDetailJobId = "";
-let historyLogLines = [];
-let historyLogCursor = 0;
-const LAST_JOB_KEY = "robotCiLastJob";
-const LEGACY_ACTIVE_JOB_KEY = "robotCiActiveJob";
-const MY_JOBS_KEY = "robotCiMyJobs";
-const CLIENT_ID_KEY = "robotCiClientId";
-const LAST_JOB_TTL_MS = 10 * 60 * 1000;
 const DAEMON_VERSION_KEY = "robotCiDaemonVersion";
 const DAEMON_VERSION_PATTERN = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
+const SERVICE_KEY = "robotCiService";
+const ALL_SERVICES_ID = "all";
 const LOG_FOLLOW_SLOP_PX = 48;
-let myJobs = [];
-let submitting = false;
-const liveLogFollow = newLogFollowState();
-const historyLogFollow = newLogFollowState();
 
-/** In-memory Huawei Cloud credentials for CCE APIs only (never persisted). */
+let currentUser = "";
+let nav = "build";
+let tab = "pipeline";
+let services = [];
+let currentServiceId = "";
+let currentJobId = "";
+let currentJob = null;
+let pinnedJobId = "";
+let serviceActiveJobId = "";
+let pollTimer = null;
+let pollGeneration = 0;
+let viewGeneration = 0;
+let sessionLive = false;
+let logCursor = 0;
+let submitting = false;
 let hwCloudCreds = null;
 let cceRegionsLoaded = false;
+let svcMenuPage = 1;
+const SVC_PAGE_SIZE = 8;
+const branchCache = {};
+const branchLoads = {};
+const BRANCH_LOAD_LIMIT = 3;
+const branchLoadQueue = [];
+let branchLoadsActive = 0;
+const testTableState = new Map();
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
+const artifactsPager = { page: 1, pageSize: 10 };
+const historyPager = { page: 1, pageSize: 10 };
+const stepLogFollow = { dragging: false, follow: true, pendingText: null, flush: null };
 
 function newLogFollowState() {
   return { dragging: false, follow: true, pendingText: null, flush: null };
 }
-
 function resetLogFollow(state) {
   state.dragging = false;
   state.follow = true;
   state.pendingText = null;
 }
-
 function isLogNearBottom(el) {
   if (!el) return true;
   return el.scrollHeight - el.scrollTop - el.clientHeight <= LOG_FOLLOW_SLOP_PX;
 }
-
 function bindLogFollow(el, state) {
   if (!el || el.dataset.logFollowBound === "1") return;
   el.dataset.logFollowBound = "1";
-  const onDown = () => {
-    state.dragging = true;
-  };
+  const onDown = () => { state.dragging = true; };
   const onUp = () => {
     if (!state.dragging) return;
     state.dragging = false;
@@ -69,117 +58,101 @@ function bindLogFollow(el, state) {
     if (typeof state.flush === "function") state.flush();
   };
   el.addEventListener("pointerdown", onDown);
-  el.addEventListener("mousedown", onDown);
   window.addEventListener("pointerup", onUp);
-  window.addEventListener("mouseup", onUp);
-  window.addEventListener("pointercancel", onUp);
   el.addEventListener("scroll", () => {
-    if (state.dragging) {
-      state.follow = false;
-      return;
-    }
+    if (state.dragging) { state.follow = false; return; }
     state.follow = isLogNearBottom(el);
   });
 }
-
 function paintLog(el, text, state) {
   if (!el) return;
-  bindLogFollow(el, state);
-  const write = (nextText) => {
-    const keepTop = el.scrollTop;
-    const stick = state.follow && !state.dragging;
-    if (el.textContent === nextText) {
-      if (stick) el.scrollTop = el.scrollHeight;
-      return;
-    }
-    el.textContent = nextText;
-    el.scrollTop = stick ? el.scrollHeight : keepTop;
-  };
-  state.flush = () => {
-    if (state.pendingText === null) return;
-    const nextText = state.pendingText;
-    state.pendingText = null;
-    write(nextText);
-  };
-  if (state.dragging) {
+  if (state && !state.follow) {
     state.pendingText = text;
+    state.flush = () => {
+      if (state.follow && state.pendingText != null) {
+        el.textContent = state.pendingText;
+        el.scrollTop = el.scrollHeight;
+        state.pendingText = null;
+      }
+    };
     return;
   }
-  state.pendingText = null;
-  write(text);
+  el.textContent = text;
+  el.scrollTop = el.scrollHeight;
 }
 
-function clientId() {
+function esc(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function clipTd(text, className) {
+  const raw = text == null ? "" : String(text);
+  const shown = raw || "—";
+  const title = raw ? ' title="' + esc(raw) + '"' : "";
+  return '<td class="' + className + '"' + title + '><span class="cell-clip-text">' + esc(shown) + "</span></td>";
+}
+const REFRESH_BUSY_MS = 360;
+function beginRefresh(btn) {
+  if (!btn) return;
+  btn._refreshCount = (btn._refreshCount || 0) + 1;
+  if (btn._refreshCount > 1) return;
+  btn.classList.add("loading");
+  btn.setAttribute("aria-busy", "true");
+  const label = btn.querySelector("span");
+  if (label) {
+    if (label.dataset.idleLabel == null) label.dataset.idleLabel = label.textContent;
+    label.textContent = "刷新中";
+  }
+}
+function endRefresh(btn) {
+  if (!btn) return;
+  btn._refreshCount = Math.max(0, (btn._refreshCount || 1) - 1);
+  if (btn._refreshCount) return;
+  btn.classList.remove("loading");
+  btn.setAttribute("aria-busy", "false");
+  const label = btn.querySelector("span");
+  if (label && label.dataset.idleLabel != null) label.textContent = label.dataset.idleLabel;
+}
+async function withRefresh(btn, work) {
+  beginRefresh(btn);
+  const started = Date.now();
   try {
-    let id = localStorage.getItem(CLIENT_ID_KEY) || "";
-    if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) {
-      id =
-        (crypto.randomUUID && crypto.randomUUID().replace(/-/g, "")) ||
-        ("c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
-      localStorage.setItem(CLIENT_ID_KEY, id);
-    }
-    return id;
-  } catch (_) {
-    return "anon" + Date.now().toString(36);
+    await work();
+  } finally {
+    const wait = REFRESH_BUSY_MS - (Date.now() - started);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    endRefresh(btn);
   }
 }
-
-function loadMyJobs() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(MY_JOBS_KEY) || "[]");
-    myJobs = Array.isArray(raw) ? raw.filter((j) => j && j.id) : [];
-  } catch (_) {
-    myJobs = [];
-  }
+function shortSha(sha) {
+  const value = String(sha || "").trim();
+  return value.length > 12 ? value.slice(0, 12) : value || "—";
 }
-
-function saveMyJobs() {
-  try {
-    localStorage.setItem(MY_JOBS_KEY, JSON.stringify(myJobs.slice(0, 20)));
-  } catch (_) {
-    /* ignore */
-  }
-}
-
-function upsertMyJob(jobId, summary, status) {
-  if (!jobId) return;
-  const existing = myJobs.find((j) => j.id === jobId);
-  if (existing) {
-    existing.summary = summary || existing.summary;
-    if (status) existing.status = status;
-    existing.observed_at = Date.now();
-  } else {
-    myJobs.unshift({
-      id: jobId,
-      summary: summary || jobId,
-      status: status || "running",
-      observed_at: Date.now(),
-    });
-  }
-  myJobs = myJobs.slice(0, 20);
-  saveMyJobs();
-}
-
 function rememberedDaemonVersion() {
-  try {
-    const value = (localStorage.getItem(DAEMON_VERSION_KEY) || "").trim();
-    return DAEMON_VERSION_PATTERN.test(value) ? value : "";
-  } catch (_) {
-    return "";
-  }
+  try { return localStorage.getItem(DAEMON_VERSION_KEY) || ""; } catch (_) { return ""; }
+}
+function rememberDaemonVersion(value) {
+  try { localStorage.setItem(DAEMON_VERSION_KEY, value || ""); } catch (_) {}
 }
 
-function rememberDaemonVersion(value) {
-  if (!DAEMON_VERSION_PATTERN.test(value || "")) return;
-  try { localStorage.setItem(DAEMON_VERSION_KEY, value); } catch (_) { /* storage may be disabled */ }
+function isPublicAuthPath(path) {
+  return path === "/api/auth/login" || path === "/api/auth/me" || path === "/api/auth/logout";
 }
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
     ...opts,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && !isPublicAuthPath(path)) {
+    if (sessionLive) showLogin("登录已过期，请重新登录");
+    const err = new Error("请先登录");
+    err.status = 401;
+    err.data = data;
+    throw err;
+  }
   if (!res.ok) {
     const err = new Error(data.error || data.detail || data.message || res.statusText);
     err.data = data;
@@ -189,803 +162,422 @@ async function api(path, opts = {}) {
   return data;
 }
 
+function isAllServices() {
+  return currentServiceId === ALL_SERVICES_ID;
+}
+function isKnownServiceId(id) {
+  return !!id && (id === ALL_SERVICES_ID || services.some((item) => item.id === id));
+}
+function currentService() {
+  if (isAllServices()) return null;
+  return services.find((item) => item.id === currentServiceId) || null;
+}
+function serviceQuery() {
+  if (!currentServiceId || isAllServices()) return "";
+  return "&service_id=" + encodeURIComponent(currentServiceId);
+}
+function jobServiceIds(job) {
+  if (!job) return [];
+  if (Array.isArray(job.service_ids) && job.service_ids.length) {
+    return job.service_ids.map((id) => String(id || "").trim()).filter(Boolean);
+  }
+  return String(job.service_id || "").split(",").map((id) => id.trim()).filter(Boolean);
+}
+function jobBelongsToService(job, serviceId) {
+  if (!job || !serviceId || serviceId === ALL_SERVICES_ID) return false;
+  return jobServiceIds(job).includes(serviceId);
+}
+function viewIsCurrent(gen, serviceId) {
+  return sessionLive && gen === viewGeneration && serviceId === currentServiceId;
+}
+
 function setPill(el, text, cls) {
   if (!el) return;
   el.textContent = text;
   el.className = "pill" + (cls ? " " + cls : "");
 }
 
-function showJob(msg, logText) {
-  const meta = $("jobMeta");
-  const log = $("jobLog");
-  if (meta) meta.textContent = msg;
-  if (log && logText !== undefined) {
-    resetLogFollow(liveLogFollow);
-    log.textContent = logText;
-    log.scrollTop = log.scrollHeight;
-  }
-  renderTestResult(null);
-  const panel = $("logsPanel");
-  if (panel && getMainView() === "services") {
-    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
+function endSession() {
+  sessionLive = false;
+  stopPolling();
+  viewGeneration += 1;
+  branchLoadQueue.length = 0;
+  currentJob = null;
+  currentJobId = "";
+  closeModal();
 }
 
-function getMainView() {
-  return ($("mainLayout") && $("mainLayout").dataset.view) || "services";
-}
-
-function setMainView(view) {
-  const prev = getMainView();
-  const next =
-    view === "artifacts" || view === "history" || view === "cce" ? view : "services";
-  const layout = $("mainLayout");
-  if (layout) layout.dataset.view = next;
-  const servicesPane = $("viewServices");
-  const artifactsPane = $("viewArtifacts");
-  const historyPane = $("viewHistory");
-  const ccePane = $("viewCce");
-  if (servicesPane) servicesPane.hidden = next !== "services";
-  if (artifactsPane) artifactsPane.hidden = next !== "artifacts";
-  if (historyPane) historyPane.hidden = next !== "history";
-  if (ccePane) ccePane.hidden = next !== "cce";
-  document.querySelectorAll(".view-tab").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.view === next);
-  });
-  if (next === "artifacts") {
-    refreshArtifacts().catch(() => {});
-  }
-  if (next === "history") {
-    if (prev === "history" && historyDetailJobId) {
-      closeHistoryDetail();
-    } else if (!historyDetailJobId) {
-      refreshHistory().catch(() => {});
-    }
-  }
-  if (next === "cce") {
-    initCceView().catch(() => {});
-  }
-  try {
-    localStorage.setItem("robotCiMainView", next);
-  } catch (_) {
-    /* ignore */
-  }
-}
-
-function shortSha(sha) {
-  const value = String(sha || "").trim();
-  return value ? value.slice(0, 7) : "—";
-}
-
-function esc(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (ch) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch])
-  );
-}
-
-function renderArtifacts(items, meta) {
-  const body = $("artifactsBody");
-  if (!body) return;
-  const rows = Array.isArray(items) ? items : [];
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="7" class="hint">暂无产物；成功构建后会出现在这里。</td></tr>';
-    renderArtifactsPager(meta || { total: 0, page: 1, page_count: 1, page_size: artifactsPager.pageSize });
-    return;
-  }
-  body.innerHTML = rows
-    .map((item) => {
-      const expired = item.expired || item.available === false;
-      const imageName = item.remote && item.remote !== "archive-only"
-        ? item.remote
-        : item.image_ref || ((item.image || "") + (item.tag ? ":" + item.tag : ""));
-      const pkg = item.package_name || (item.archive ? String(item.archive).split(/[/\\]/).pop() : "—");
-      const link = expired
-        ? '<span class="art-expired">已失效</span>'
-        : item.download_url
-          ? `<a href="${esc(item.download_url)}" target="_blank" rel="noopener">下载</a>`
-          : '<span class="art-expired">已失效</span>';
-      return (
-        `<tr${expired ? ' class="expired"' : ""}>` +
-        `<td class="mono">${esc(item.created_at || "—")}</td>` +
-        `<td>${esc(item.title || item.service_id || "—")}</td>` +
-        `<td class="mono">${esc(item.branch || "—")}</td>` +
-        `<td class="mono" title="${esc(item.commit_sha || "")}">${esc(shortSha(item.commit_sha))}</td>` +
-        `<td class="mono">${esc(imageName || "—")}</td>` +
-        `<td class="mono">${esc(pkg)}</td>` +
-        `<td>${link}</td>` +
-        "</tr>"
-      );
-    })
-    .join("");
-  renderArtifactsPager(meta);
-}
-
-function renderArtifactsPager(meta) {
-  const pager = $("artifactsPager");
-  if (!pager) return;
-  const total = Number((meta && meta.total) || 0);
-  const pageCount = Math.max(1, Number((meta && meta.page_count) || 1));
-  const pageSize = Number((meta && meta.page_size) || artifactsPager.pageSize) || 20;
-  artifactsPager.page = Math.min(Math.max(1, Number((meta && meta.page) || artifactsPager.page) || 1), pageCount);
-  artifactsPager.pageSize = pageSize;
-  if (!total) {
-    pager.hidden = true;
-    pager.innerHTML = "";
-    return;
-  }
-  pager.hidden = false;
-  pager.innerHTML = "";
-  const sizeControl = document.createElement("label");
-  sizeControl.className = "test-page-size";
-  sizeControl.append("每页 ");
-  const sizeSelect = document.createElement("select");
-  [10, 20, 50, 100].forEach((size) => {
-    const option = document.createElement("option");
-    option.value = String(size);
-    option.textContent = String(size);
-    option.selected = size === pageSize;
-    sizeSelect.appendChild(option);
-  });
-  sizeSelect.addEventListener("change", () => {
-    artifactsPager.pageSize = Number(sizeSelect.value) || 20;
-    artifactsPager.page = 1;
-    refreshArtifacts().catch(() => {});
-  });
-  sizeControl.append(sizeSelect, " 条");
-  const previous = document.createElement("button");
-  previous.type = "button";
-  previous.className = "btn ghost";
-  previous.textContent = "上一页";
-  previous.disabled = artifactsPager.page <= 1;
-  previous.addEventListener("click", () => {
-    artifactsPager.page -= 1;
-    refreshArtifacts().catch(() => {});
-  });
-  const position = document.createElement("span");
-  const expired = Number((meta && meta.expired_count) || 0);
-  position.textContent =
-    "第 " + artifactsPager.page + " / " + pageCount + " 页（" + total + " 条" +
-    (expired ? "，已失效 " + expired : "") + "）";
-  const next = document.createElement("button");
-  next.type = "button";
-  next.className = "btn ghost";
-  next.textContent = "下一页";
-  next.disabled = artifactsPager.page >= pageCount;
-  next.addEventListener("click", () => {
-    artifactsPager.page += 1;
-    refreshArtifacts().catch(() => {});
-  });
-  pager.append(sizeControl, previous, position, next);
-}
-
-async function refreshArtifacts() {
-  try {
-    const data = await api(
-      "/api/artifacts?page=" + encodeURIComponent(String(artifactsPager.page)) +
-      "&page_size=" + encodeURIComponent(String(artifactsPager.pageSize))
-    );
-    renderArtifacts(data.artifacts || [], data);
-  } catch (e) {
-    const body = $("artifactsBody");
-    if (body) {
-      body.innerHTML =
-        '<tr><td colspan="7" class="hint" style="color:var(--danger)">产物列表加载失败：' +
-        String(e.message || e) +
-        "</td></tr>";
-    }
-    const pager = $("artifactsPager");
-    if (pager) {
-      pager.hidden = true;
-      pager.innerHTML = "";
+function showLogin(message) {
+  if (sessionLive) endSession();
+  $("appShell").hidden = true;
+  $("loginGate").hidden = false;
+  if ($("loginError")) {
+    if (message) {
+      $("loginError").hidden = false;
+      $("loginError").textContent = message;
+    } else {
+      $("loginError").hidden = true;
+      $("loginError").textContent = "";
     }
   }
 }
 
-function historyStatusLabel(status) {
-  if (status === "ok") return "成功";
-  if (status === "running") return "进行中";
-  if (status === "failed") return "失败";
-  if (status === "stopped") return "已停止";
-  return status || "—";
+function enterApp(username) {
+  sessionLive = true;
+  currentUser = username;
+  $("loginGate").hidden = true;
+  $("appShell").hidden = false;
+  $("userNameLabel").textContent = username;
+  $("userAvatar").textContent = String(username).slice(0, 1).toUpperCase();
 }
 
-function historyStatusClass(status) {
-  if (status === "ok") return "art-status-ok";
-  if (status === "failed") return "art-status-failed";
-  if (status === "running") return "art-status-running";
-  if (status === "stopped") return "art-status-stopped";
-  return "";
-}
-
-function setStopButtonState(btn, visible, stopping) {
-  if (!btn) return;
-  btn.hidden = !visible;
-  btn.disabled = !!stopping;
-  btn.textContent = stopping ? "正在停止…" : "停止任务";
-}
-
-function setLiveStopVisible(visible, stopping) {
-  setStopButtonState($("btnStopJob"), visible, stopping);
-}
-
-async function stopRunningJob(jobId, { button, onStopping } = {}) {
-  if (!jobId) return;
-  setStopButtonState(button, true, true);
-  try {
-    await api("/api/jobs/" + jobId + "/stop", { method: "POST", body: "{}" });
-    if (typeof onStopping === "function") onStopping();
-  } catch (e) {
-    setStopButtonState(button, true, false);
-    const msg = (e.data && (e.data.detail || e.data.error)) || e.message || String(e);
-    if ($("jobMeta") && jobId === activeJobId) {
-      $("jobMeta").textContent = "停止失败 · " + msg;
-    }
-  }
-}
-
-function renderHistory(items, meta) {
-  const body = $("historyBody");
-  if (!body) return;
-  const rows = Array.isArray(items) ? items : [];
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="6" class="hint">暂无本浏览器的构建记录。</td></tr>';
-    renderHistoryPager(meta || { total: 0, page: 1, page_count: 1, page_size: historyPager.pageSize });
-    return;
-  }
-  body.innerHTML = rows
-    .map((item) => {
-      const status = item.status || "unknown";
-      const services = Array.isArray(item.service_ids) && item.service_ids.length
-        ? item.service_ids.join(", ")
-        : (item.service_id || "—");
-      const summary = services + (item.branch ? " @ " + item.branch : "");
-      return (
-        "<tr>" +
-        `<td class="hist-time">${esc(item.created_at || "—")}</td>` +
-        `<td class="hist-svc" title="${esc(services)}">${esc(services)}</td>` +
-        `<td class="hist-branch" title="${esc(item.branch || "")}">${esc(item.branch || "—")}</td>` +
-        `<td class="hist-status ${historyStatusClass(status)}">${esc(historyStatusLabel(status))}</td>` +
-        `<td class="hist-sha">${esc(shortSha(item.commit_sha))}</td>` +
-        `<td class="hist-act">` +
-        (status === "running"
-          ? `<button type="button" class="btn danger" data-history-stop="${esc(item.id)}">停止</button> `
-          : "") +
-        `<button type="button" class="btn ghost" data-history-job="${esc(item.id)}" data-history-summary="${esc(summary)}">查看日志</button>` +
-        `</td>` +
-        "</tr>"
-      );
-    })
-    .join("");
-  body.querySelectorAll("[data-history-job]").forEach((btn) => {
+function bindEyeButtons(root) {
+  (root || document).querySelectorAll("[data-eye]").forEach((btn) => {
+    if (btn.dataset.bound === "1") return;
+    btn.dataset.bound = "1";
     btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-history-job");
-      const summary = btn.getAttribute("data-history-summary") || id;
-      if (id) openHistoryJob(id, summary);
+      const input = (root || document).querySelector("#" + btn.getAttribute("data-eye"));
+      if (!input) return;
+      const show = input.type === "password";
+      input.type = show ? "text" : "password";
+      btn.classList.toggle("is-on", show);
+      btn.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
     });
   });
-  body.querySelectorAll("[data-history-stop]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.getAttribute("data-history-stop");
-      if (!id) return;
-      stopRunningJob(id, {
-        button: btn,
-        onStopping: () => refreshHistory().catch(() => {}),
-      });
-    });
-  });
-  renderHistoryPager(meta);
 }
-
-function renderHistoryPager(meta) {
-  const pager = $("historyPager");
-  if (!pager) return;
-  const total = Number((meta && meta.total) || 0);
-  const pageCount = Math.max(1, Number((meta && meta.page_count) || 1));
-  const pageSize = Number((meta && meta.page_size) || historyPager.pageSize) || 20;
-  historyPager.page = Math.min(Math.max(1, Number((meta && meta.page) || historyPager.page) || 1), pageCount);
-  historyPager.pageSize = pageSize;
-  if (!total) {
-    pager.hidden = true;
-    pager.innerHTML = "";
-    return;
-  }
-  pager.hidden = false;
-  pager.innerHTML = "";
-  const sizeControl = document.createElement("label");
-  sizeControl.className = "test-page-size";
-  sizeControl.append("每页 ");
-  const sizeSelect = document.createElement("select");
-  [10, 20, 50, 100].forEach((size) => {
-    const option = document.createElement("option");
-    option.value = String(size);
-    option.textContent = String(size);
-    option.selected = size === pageSize;
-    sizeSelect.appendChild(option);
-  });
-  sizeSelect.addEventListener("change", () => {
-    historyPager.pageSize = Number(sizeSelect.value) || 20;
-    historyPager.page = 1;
-    refreshHistory().catch(() => {});
-  });
-  sizeControl.append(sizeSelect, " 条");
-  const previous = document.createElement("button");
-  previous.type = "button";
-  previous.className = "btn ghost";
-  previous.textContent = "上一页";
-  previous.disabled = historyPager.page <= 1;
-  previous.addEventListener("click", () => {
-    historyPager.page -= 1;
-    refreshHistory().catch(() => {});
-  });
-  const position = document.createElement("span");
-  position.textContent = "第 " + historyPager.page + " / " + pageCount + " 页（" + total + " 条）";
-  const next = document.createElement("button");
-  next.type = "button";
-  next.className = "btn ghost";
-  next.textContent = "下一页";
-  next.disabled = historyPager.page >= pageCount;
-  next.addEventListener("click", () => {
-    historyPager.page += 1;
-    refreshHistory().catch(() => {});
-  });
-  pager.append(sizeControl, previous, position, next);
-}
-
-function stopHistoryDetailPoll() {
-  historyDetailGen += 1;
-  if (historyDetailTimer) clearTimeout(historyDetailTimer);
-  historyDetailTimer = null;
-}
-
-function showHistoryList() {
-  stopHistoryDetailPoll();
-  historyDetailJobId = "";
-  historyLogLines = [];
-  historyLogCursor = 0;
-  renderJobPipeline("historyJobPipeline", null);
-  setStopButtonState($("btnHistoryStop"), false, false);
-  const list = $("historyList");
-  const detail = $("historyDetail");
-  if (list) list.hidden = false;
-  if (detail) detail.hidden = true;
-}
-
-function closeHistoryDetail() {
-  showHistoryList();
-  refreshHistory().catch(() => {});
-}
-
-function openHistoryJob(jobId, summary) {
-  stopHistoryDetailPoll();
-  historyDetailJobId = jobId;
-  historyLogLines = [];
-  historyLogCursor = 0;
-  const list = $("historyList");
-  const detail = $("historyDetail");
-  const meta = $("historyDetailMeta");
-  const logEl = $("historyJobLog");
-  if (list) list.hidden = true;
-  if (detail) detail.hidden = false;
-  if (meta) meta.textContent = (summary || jobId) + " · 加载中…";
-  if (logEl) {
-    resetLogFollow(historyLogFollow);
-    logEl.textContent = "正在加载这次构建的日志…";
-    logEl.scrollTop = 0;
-  }
-  const gen = historyDetailGen;
-  const tick = async () => {
-    if (gen !== historyDetailGen) return;
-    try {
-      const query = new URLSearchParams({
-        compact: "1",
-        view: "ui",
-        log_after: String(historyLogCursor),
-      });
-      const job = await api("/api/jobs/" + jobId + "?" + query.toString());
-      if (gen !== historyDetailGen) return;
-      if (Array.isArray(job.log) && job.log.length) historyLogLines.push(...job.log);
-      historyLogCursor = Number.isFinite(Number(job.log_cursor))
-        ? Number(job.log_cursor)
-        : historyLogLines.length;
-      if (logEl) {
-        paintLog(logEl, displayJobLog(historyLogLines), historyLogFollow);
-      }
-      renderJobPipeline("historyJobPipeline", job.pipeline, job.status);
-      if (meta) {
-        meta.textContent =
-          (summary || job.service_id || jobId) +
-          " · " +
-          historyStatusLabel(job.status) +
-          (job.progress ? " · " + job.progress : "") +
-          (job.current ? " · " + job.current : "") +
-          (job.error ? " · " + job.error : "");
-      }
-      const running = job.status === "running" || job.status === "unknown";
-      setStopButtonState($("btnHistoryStop"), running, job.stage === "stopping");
-      if (running) {
-        historyDetailTimer = setTimeout(tick, 1500);
-      }
-    } catch (e) {
-      if (gen !== historyDetailGen) return;
-      if (meta) meta.textContent = (summary || jobId) + " · 加载失败";
-      if (logEl) logEl.textContent = String(e.message || e);
-    }
-  };
-  tick();
-}
-
-async function refreshHistory() {
-  try {
-    const data = await api(
-      "/api/jobs?client_id=" + encodeURIComponent(clientId()) +
-      "&page=" + encodeURIComponent(String(historyPager.page)) +
-      "&page_size=" + encodeURIComponent(String(historyPager.pageSize))
-    );
-    renderHistory(data.jobs || [], data);
-  } catch (e) {
-    const body = $("historyBody");
-    if (body) {
-      body.innerHTML =
-        '<tr><td colspan="6" class="hint" style="color:var(--danger)">构建历史加载失败：' +
-        String(e.message || e) +
-        "</td></tr>";
-    }
-    const pager = $("historyPager");
-    if (pager) {
-      pager.hidden = true;
-      pager.innerHTML = "";
-    }
-  }
-}
-
-function formatDuration(ms) {
-  const value = Number(ms || 0);
-  if (value === 0) return "<0.001 ms";
-  if (value < 1) return value.toFixed(3) + " ms";
-  if (value < 10) return value.toFixed(2) + " ms";
-  if (value < 1000) return value.toFixed(1) + " ms";
-  return (value / 1000).toFixed(value >= 10000 ? 0 : 1) + " s";
-}
-
-function isQuietDependencyLog(line) {
-  const text = String(line || "").replace(/^\[[^\]]+\]\s*/, "").trim().toLowerCase();
+function passwordFieldHtml(id, label, autocomplete) {
   return (
-    text.startsWith("requirement already satisfied:") ||
-    text.startsWith("collecting ") ||
-    text.startsWith("downloading ") ||
-    text.startsWith("using cached ") ||
-    text.startsWith("building wheels for collected packages") ||
-    text.startsWith("building wheel for ") ||
-    text.startsWith("installing collected packages:") ||
-    text.startsWith("successfully installed ") ||
-    text.startsWith("looking in indexes:") ||
-    text.startsWith("processing ") ||
-    text.startsWith("defaulting to user installation")
+    '<label class="label" for="' + id + '">' + label + "</label>" +
+    '<div class="field-wrap">' +
+    '<input id="' + id + '" class="input has-eye" type="password" autocomplete="' + autocomplete + '" />' +
+    '<button type="button" class="eye-btn" data-eye="' + id + '" aria-label="显示密码">' +
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.8 12S6.2 6.8 12 6.8 21.2 12 21.2 12 17.8 17.2 12 17.2 2.8 12 2.8 12z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="12" r="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>' +
+    "</button></div>"
   );
 }
 
-function displayJobLog(lines) {
-  const visible = [];
-  let testRunning = false;
-  for (const line of lines || []) {
-    const text = String(line || "");
-    const plain = text.replace(/^\[[^\]]+\]\s*/, "").trim();
-    if (plain.startsWith("tests start ")) {
-      testRunning = true;
-      visible.push(text.replace("tests start", "Starting tests"));
-      continue;
-    }
-    if (plain.startsWith("@@TEST_STEP@@ ")) {
-      visible.push(text.replace("@@TEST_STEP@@ ", "Running test suite: "));
-      continue;
-    }
-    if (plain.startsWith("@@TEST_ERROR@@ ")) {
-      visible.push(text.replace("@@TEST_ERROR@@ ", "Test infrastructure error: "));
-      continue;
-    }
-    if (plain.startsWith("TEST summary ")) {
-      testRunning = false;
-      continue;
-    }
-    if (plain.startsWith("Tests completed ")) {
-      // Also accept the user-facing completion line as a boundary. This keeps
-      // old in-memory jobs readable even if their internal summary was filtered.
-      testRunning = false;
-      visible.push(text);
-      continue;
-    }
-    if (text.includes("@@TEST_SUMMARY@@")) {
-      continue;
-    }
-    if (testRunning) {
-      if (/^\{.*"Action"\s*:/.test(plain)) {
-        continue;
-      }
-      continue;
-    }
-    if (isQuietDependencyLog(line)) {
-      continue;
-    }
-    visible.push(line);
-  }
-  return visible.join("\n") || "(暂无日志)";
+function closeUserMenu() {
+  const menu = $("userMenu");
+  if (menu) menu.hidden = true;
+  const btn = $("btnUserMenu");
+  if (btn) btn.setAttribute("aria-expanded", "false");
 }
 
-function decodeUnicodeEscapes(value) {
-  return String(value || "").replace(/(?:\\u[0-9a-fA-F]{4})+/g, (sequence) => {
-    try {
-      return JSON.parse('"' + sequence + '"');
-    } catch (_) {
-      return sequence;
-    }
+function setNav(next, skipHash) {
+  nav = next === "swr" || next === "cce" ? next : "build";
+  document.querySelectorAll(".nav-item").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.nav === nav);
   });
+  $("pageSwr").hidden = nav !== "swr";
+  $("pageBuild").hidden = nav !== "build";
+  $("pageCce").hidden = nav !== "cce";
+  if (nav === "cce") initCceView().catch(() => {});
+  if (!skipHash) writeHash();
 }
 
-function shortCaseName(name) {
-  const value = decodeUnicodeEscapes(name);
-  if (value.startsWith("Test") || value.startsWith("test_")) return value;
-  if (value.startsWith("github.com/")) {
-    const testMarker = value.indexOf(".Test");
-    return testMarker >= 0 ? value.slice(testMarker + 1) : value;
+function applyServiceChrome() {
+  const all = isAllServices();
+  const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
+  if (pipeBtn) pipeBtn.hidden = all;
+  $("viewPipeline").hidden = tab !== "pipeline";
+  $("viewHistory").hidden = tab !== "history";
+  $("viewArtifacts").hidden = tab !== "artifacts";
+  $("pipelineActions").hidden = all || tab !== "pipeline";
+  $("jobMetaBar").hidden = all || tab !== "pipeline";
+  if ($("historyHint")) {
+    $("historyHint").textContent = all
+      ? "全量构建记录。点「查看」打开该次流水线。"
+      : "当前微服务的构建记录。点「查看」打开该次流水线。";
   }
-  const parts = value.split(".");
-  return parts.length > 2 ? parts.slice(-2).join(".") : value;
+  if ($("artifactsHint")) {
+    $("artifactsHint").textContent = all
+      ? "全量产物记录。磁盘清理后包文件会显示为已失效，记录仍保留。"
+      : "当前微服务的产物记录。磁盘清理后包文件会显示为已失效，记录仍保留。";
+  }
 }
 
-function renderTestRun(root, run, stateKey, rerender) {
-  const summary = run.summary || {};
-  const testStatus = run.status || "error";
-  const isOk = testStatus === "passed";
-  const overallLabel = isOk ? "通过" : testStatus === "not_configured" ? "未配置" : "未通过";
-  const commands = Array.isArray(run.commands) ? run.commands : [];
-  const cases = Array.isArray(run.test_cases) ? run.test_cases : [];
-  const failures = Array.isArray(run.failures) ? run.failures : [];
-  const state = testTableState.get(stateKey) || { page: 1, pageSize: 10 };
-  testTableState.set(stateKey, state);
+function jobIsLive(job) {
+  return !!(job && (job.status === "running" || job.status === "queued"));
+}
 
-  const head = document.createElement("div");
-  head.className = "test-result-head";
-  const title = document.createElement("strong");
-  title.textContent = "测试结果：" + overallLabel;
-  title.className = "test-status " + (isOk ? "ok" : "bad");
-  const overview = document.createElement("span");
-  overview.className = "test-result-summary";
-  overview.textContent = "总用例 " + (summary.total || 0) + " · 通过 " + (summary.passed || 0) + " · 失败 " + (summary.failed || 0) + " · 错误 " + (summary.errors || 0) + " · 跳过 " + (summary.skipped || 0) + " · 总耗时 " + formatDuration(summary.duration_ms);
-  head.append(title, overview);
-  root.appendChild(head);
-
-  const gateHint = document.createElement("div");
-  gateHint.className = "test-gate-hint";
-  gateHint.textContent = "当前测试结果不阻塞镜像构建和推送";
-  root.appendChild(gateHint);
-
-  const sourceRows = cases.length ? cases : commands;
-  const statusPriority = { failed: 0, error: 0, skipped: 1, passed: 2 };
-  const sourceFileOf = (item) => String(item.file || item.command || "");
-  const scriptPriority = new Map();
-  if (cases.length) {
-    sourceRows.forEach((item) => {
-      const sourceFile = sourceFileOf(item);
-      const priority = statusPriority[item.status] ?? 0;
-      scriptPriority.set(sourceFile, Math.min(scriptPriority.get(sourceFile) ?? priority, priority));
-    });
-  }
-  const rows = cases.length
-    ? sourceRows.map((item, index) => ({ item, index }))
-        .sort((left, right) => {
-          const leftFile = sourceFileOf(left.item);
-          const rightFile = sourceFileOf(right.item);
-          return (scriptPriority.get(leftFile) ?? 0) - (scriptPriority.get(rightFile) ?? 0)
-            || leftFile.localeCompare(rightFile, "en")
-            || (statusPriority[left.item.status] ?? 0) - (statusPriority[right.item.status] ?? 0)
-            || left.index - right.index;
-        })
-        .map(({ item }) => item)
-    : sourceRows;
-  if (rows.length) {
-    const pageSize = state.pageSize;
-    const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
-    state.page = Math.min(state.page, pageCount);
-    const start = (state.page - 1) * pageSize;
-    const pageRows = rows.slice(start, start + pageSize);
-    const table = document.createElement("table");
-    table.className = "test-table";
-    const thead = document.createElement("thead");
-    const header = document.createElement("tr");
-    (cases.length ? ["测试脚本", "测试用例", "结果", "耗时"] : ["执行脚本", "结果", "耗时"]).forEach((label, index) => {
-      const th = document.createElement("th");
-      th.textContent = label;
-      if (cases.length) {
-        th.className = ["test-script-column", "test-case-column", "test-status-column", "test-duration-column"][index];
+function setTab(next) {
+  if (!sessionLive) return;
+  if (isAllServices() && next !== "history" && next !== "artifacts") next = "history";
+  const nextTab = next === "history" || next === "artifacts" ? next : "pipeline";
+  const changed = tab !== nextTab;
+  tab = nextTab;
+  document.querySelectorAll(".subtab[data-tab]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === tab);
+  });
+  applyServiceChrome();
+  if (changed) {
+    if (tab === "history") refreshHistory().catch(() => {});
+    if (tab === "artifacts") refreshArtifacts().catch(() => {});
+    if (tab === "pipeline" && !isAllServices()) {
+      if (pinnedJobId) {
+        if (currentJobId !== pinnedJobId) openJob(pinnedJobId).catch(() => {});
+      } else {
+        loadServiceJob();
       }
-      header.appendChild(th);
-    });
-    thead.appendChild(header);
-    table.appendChild(thead);
-    const body = document.createElement("tbody");
-    pageRows.forEach((command, index) => {
-      const row = document.createElement("tr");
-      const sourceFile = command.file || command.command;
-      const previousSourceFile = index > 0 ? (pageRows[index - 1].file || pageRows[index - 1].command) : "";
-      if (cases.length && (index === 0 || previousSourceFile !== sourceFile)) {
-        const script = document.createElement("td");
-        script.className = "test-script";
-        script.textContent = sourceFile || "测试脚本";
-        let span = 1;
-        while (index + span < pageRows.length && (pageRows[index + span].file || pageRows[index + span].command) === sourceFile) span += 1;
-        script.rowSpan = span;
-        row.appendChild(script);
-      }
-      const name = document.createElement("td");
-      name.className = "test-case";
-      const caseName = document.createElement("div");
-      caseName.textContent = cases.length ? shortCaseName(command.name) : command.name || "测试脚本";
-      name.appendChild(caseName);
-      if (command.detail && command.status !== "passed") {
-        const detail = document.createElement("div");
-        detail.className = "test-case-detail";
-        detail.textContent = command.detail;
-        name.appendChild(detail);
-      }
-      const status = document.createElement("td");
-      const caseStatus = command.status;
-      const passed = caseStatus ? caseStatus === "passed" : Number(command.exit_code) === 0;
-      const skipped = caseStatus === "skipped";
-      status.textContent = skipped ? "跳过" : passed ? "通过" : caseStatus === "error" ? "错误" : "失败";
-      status.className = "test-status " + (passed ? "ok" : skipped ? "" : "bad");
-      const duration = document.createElement("td");
-      duration.textContent = command.duration_ms == null ? "—" : formatDuration(command.duration_ms);
-      row.append(name, status, duration);
-      body.appendChild(row);
-    });
-    table.appendChild(body);
-    root.appendChild(table);
-    {
-      const pager = document.createElement("div");
-      pager.className = "test-pager";
-      const sizeControl = document.createElement("label");
-      sizeControl.className = "test-page-size";
-      sizeControl.append("每页 ");
-      const sizeSelect = document.createElement("select");
-      [10, 25, 50, 100].forEach((size) => {
-        const option = document.createElement("option");
-        option.value = String(size);
-        option.textContent = String(size);
-        option.selected = size === state.pageSize;
-        sizeSelect.appendChild(option);
-      });
-      sizeSelect.addEventListener("change", () => {
-        state.pageSize = Number(sizeSelect.value) || 10;
-        state.page = 1;
-        rerender();
-      });
-      sizeControl.append(sizeSelect, " 条");
-      const previous = document.createElement("button");
-      previous.type = "button";
-      previous.className = "btn ghost";
-      previous.textContent = "上一页";
-      previous.disabled = state.page <= 1;
-      previous.addEventListener("click", () => { state.page -= 1; rerender(); });
-      const position = document.createElement("span");
-      position.textContent = "第 " + state.page + " / " + pageCount + " 页（" + rows.length + " 条用例）";
-      const next = document.createElement("button");
-      next.type = "button";
-      next.className = "btn ghost";
-      next.textContent = "下一页";
-      next.disabled = state.page >= pageCount;
-      next.addEventListener("click", () => { state.page += 1; rerender(); });
-      pager.append(sizeControl, previous, position, next);
-      root.appendChild(pager);
     }
   }
+  writeHash();
+}
 
-  if (failures.length) {
-    const list = document.createElement("ul");
-    list.className = "test-failures";
-    failures.slice(0, 10).forEach((failure) => {
-      const item = document.createElement("li");
-      item.textContent = (failure.name || "测试失败") + "：" + (failure.detail || "请查看完整作业日志");
-      list.appendChild(item);
-    });
-    root.appendChild(list);
+function writeHash() {
+  let next;
+  if (nav !== "build") {
+    next = "#/" + nav;
+  } else {
+    const svc = encodeURIComponent(currentServiceId || "");
+    if (tab === "pipeline" && pinnedJobId && !isAllServices()) {
+      next = "#/build/" + svc + "/job/" + encodeURIComponent(pinnedJobId);
+    } else if (tab === "pipeline") {
+      next = "#/build/" + svc;
+    } else {
+      next = "#/build/" + svc + "/" + tab;
+    }
   }
+  if (location.hash === next) return;
+  location.hash = next;
+}
+
+function readHash() {
+  const raw = (location.hash || "").replace(/^#\/?/, "");
+  const parts = raw.split("/").filter(Boolean);
+  if (parts[0] === "swr" || parts[0] === "cce") return { nav: parts[0], service: "", tab: "pipeline", job: "" };
+  const service = decodeURIComponent(parts[1] || "");
+  let nextTab = "pipeline";
+  let job = "";
+  if (parts[2] === "history" || parts[2] === "artifacts") nextTab = parts[2];
+  else if (parts[2] === "job" && parts[3]) job = decodeURIComponent(parts[3]);
+  return { nav: "build", service, tab: nextTab, job };
+}
+
+function formatClock(value) {
+  return String(value || "").trim() || "—";
+}
+function formatDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return "—";
+  if (n < 1000) return Math.round(n) + "ms";
+  const sec = Math.round(n / 1000);
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) return m + "m" + String(s).padStart(2, "0") + "s";
+  return Math.floor(m / 60) + "h" + String(m % 60).padStart(2, "0") + "m";
+}
+function formatDurationSec(sec) {
+  if (sec == null || sec === "") return "—";
+  return formatDuration(Number(sec) * 1000);
+}
+
+function updateActionButtons() {
+  const svc = currentService();
+  const live = jobIsLive(currentJob);
+  const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
+  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId;
+  $("btnStop").disabled = !live || stopping;
+  $("btnParams").disabled = !(svc && svc.requires_version);
+}
+
+function renderJobMeta(job) {
+  const live = jobIsLive(job);
+  $("metaBranch").textContent = (job && job.branch) || "—";
+  $("metaCommit").textContent = shortSha(job && job.commit_sha);
+  $("metaOperator").textContent = (job && job.operator) || "—";
+  $("metaStarted").textContent = formatClock(job && job.created_at);
+  $("metaFinishedWrap").hidden = !job || live || !job.finished_at;
+  $("metaDurationWrap").hidden = !job || live || job.duration_sec == null;
+  $("metaFinished").textContent = formatClock(job && job.finished_at);
+  $("metaDuration").textContent = formatDurationSec(job && job.duration_sec);
 }
 
 const PIPELINE_STATE_LABELS = {
-  pending: "未开始",
+  pending: "等待",
+  queued: "排队中",
   running: "进行中",
-  done: "已通过",
+  done: "成功",
   failed: "失败",
+  warn: "失败",
   skipped: "跳过",
-  warn: "有告警",
 };
-
-const PIPELINE_POST_STEPS = [
-  { id: "cleanup", label: "镜像清理", status: "pending" },
-  { id: "index", label: "产物索引", status: "pending" },
-  { id: "notify", label: "状态回写", status: "pending" },
-];
-
-function pipelineJobStatusLabel(status) {
-  const map = { running: "执行中", ok: "成功", failed: "失败", stopped: "已停止", unknown: "未知" };
-  return map[status] || status || "";
+const PIPELINE_TASK_LABELS = {
+  env: "检查环境",
+  slot: "等待并发槽位",
+  wait: "排队等待",
+  acquire: "获得执行槽",
+  swr: "SWR登录",
+  ps: "依赖仓库",
+  adir: "归档目录",
+  clone: "克隆仓库",
+  sha: "记录提交",
+  plan: "加载build.yaml",
+  runner: "启动测试",
+  "ut-cases": "执行UT",
+  "dt-cases": "执行DT",
+  deps: "准备依赖",
+  script: "执行构建脚本",
+  docker: "Docker构建",
+  "build:verify": "产物校验",
+  tag: "标记镜像",
+  push: "推送镜像",
+  "push:verify": "推送确认",
+  save: "归档镜像",
+};
+const HIDDEN_PIPELINE_TASKS = {
+  prepare: new Set(["swr", "ps"]),
+  sync: new Set(["fetch", "checkout"]),
+  build: new Set(["deps"]),
+  push: new Set(["retry"]),
+  archive: new Set(["reclaim", "record", "publish"]),
+};
+function commandTestKind(command) {
+  if (typeof command === "string") {
+    return commandTestKind({ name: command });
+  }
+  const typed = String((command && command.test_type) || "").toLowerCase();
+  if (typed === "ut" || typed === "dt") return typed;
+  const name = String((command && (command.name || command.command)) || "");
+  const hasUt = /\bUT\b/i.test(name);
+  const hasDt = /\bDT\b/i.test(name);
+  if (hasUt && hasDt) return "both";
+  if (hasDt) return "dt";
+  if (hasUt) return "ut";
+  return "";
+}
+function currentTestRun(job) {
+  const runs = (job && job.test_runs) || [];
+  return runs[0] || null;
+}
+function detectTestSplit(job) {
+  const declared = new Set((job && job.test_kinds) || []);
+  if (declared.has("ut") && declared.has("dt")) return true;
+  const commands = (currentTestRun(job) && currentTestRun(job).commands) || [];
+  if (!commands.length) return false;
+  if (commands.some((item) => commandTestKind(item) === "both")) return false;
+  const kinds = new Set(commands.map(commandTestKind).filter(Boolean));
+  return kinds.has("ut") && kinds.has("dt");
+}
+function kindStatus(run, kind, fallback) {
+  const commands = ((run && run.commands) || []).filter((item) => commandTestKind(item) === kind);
+  if (!commands.length) return fallback || "pending";
+  if (commands.some((item) => Number(item.exit_code) !== 0)) return "failed";
+  return "done";
+}
+function casesForKind(run, kind) {
+  const commands = (run && run.commands) || [];
+  const names = new Set(commands.filter((item) => commandTestKind(item) === kind).map((item) => item.name));
+  return ((run && run.test_cases) || []).filter((item) => {
+    if (item.test_type === kind) return true;
+    if (names.has(item.command)) return true;
+    return commandTestKind({ name: item.command, test_type: item.test_type }) === kind;
+  });
 }
 
+function pipelineJobStatusLabel(status, stage, cancelRequested) {
+  if (status === "stopped") return "已停止";
+  if (status === "queued") return "排队中";
+  if (status === "running" && (cancelRequested || stage === "stopping")) return "停止中";
+  const map = { running: "执行中", queued: "排队中", ok: "成功", failed: "失败", stopped: "已停止", unknown: "未知" };
+  return map[status] || status || "";
+}
 function rollupStatus(items) {
   const list = (items || []).map((item) => item.status || "pending");
   if (!list.length) return "pending";
-  if (list.some((s) => s === "failed")) return "failed";
+  if (list.some((s) => s === "failed" || s === "warn")) return "failed";
+  if (list.some((s) => s === "queued")) return "queued";
   if (list.some((s) => s === "running")) return "running";
-  if (list.some((s) => s === "warn")) return "warn";
   if (list.every((s) => s === "skipped")) return "skipped";
-  if (list.every((s) => s === "done" || s === "skipped" || s === "warn")) return "done";
-  if (list.every((s) => s === "pending")) return "pending";
+  if (list.every((s) => s === "done" || s === "skipped")) return "done";
   return "pending";
 }
-
-function resolvePostSteps(pipeline, jobStatus) {
-  const steps = PIPELINE_POST_STEPS.map((item) => ({ ...item }));
-  if (jobStatus === "ok") {
-    steps.forEach((item) => { item.status = "done"; });
-  } else if (jobStatus === "running") {
-    const mainDone = (pipeline.steps || []).every((step) =>
-      ["done", "skipped", "warn"].includes(step.status)
-    );
-    if (mainDone) steps[0].status = "running";
-  } else if (jobStatus === "failed" || jobStatus === "stopped") {
-    steps.forEach((item) => { item.status = "skipped"; });
-  }
-  return steps;
+function decoratePipelineTask(task, logStep, stageId) {
+  const id = task.id || "";
+  const label = PIPELINE_TASK_LABELS[stageId + ":" + id] || PIPELINE_TASK_LABELS[id] || task.label || id;
+  return {
+    ...task,
+    id,
+    label,
+    logStep: task.logStep || logStep || stageId,
+    status: task.status === "warn" ? "failed" : (task.status || "pending"),
+  };
 }
-
+function visiblePipelineTasks(step) {
+  const hidden = HIDDEN_PIPELINE_TASKS[step.id] || new Set();
+  const raw = Array.isArray(step.subtasks) && step.subtasks.length
+    ? step.subtasks
+    : [{ id: step.id, label: step.label || step.id, status: step.status || "pending" }];
+  const tasks = raw
+    .filter((task) => !hidden.has(task.id))
+    .map((task) => decoratePipelineTask(task, step.id, step.id));
+  if (step.id === "archive") {
+    return [decoratePipelineTask({
+      id: "save",
+      label: "归档镜像",
+      status: step.status || "pending",
+    }, "archive", "archive")];
+  }
+  return tasks;
+}
 function buildPipelineStages(pipeline, jobStatus) {
   const stages = [];
-  if (Array.isArray(pipeline.prepare) && pipeline.prepare.length) {
+  const syncStep = (pipeline.steps || []).find((step) => step.id === "sync");
+  const prepareHidden = HIDDEN_PIPELINE_TASKS.prepare || new Set();
+  const prepareItems = (Array.isArray(pipeline.prepare) ? pipeline.prepare : [])
+    .filter((item) => !prepareHidden.has(item.id));
+  const preTasks = prepareItems.map((item) => decoratePipelineTask(item, "prepare", "prepare"));
+  if (syncStep) {
+    visiblePipelineTasks(syncStep).forEach((task) => preTasks.push(task));
+  }
+  if (preTasks.length) {
     stages.push({
       id: "prepare",
-      label: "准备",
-      status: rollupStatus(pipeline.prepare),
-      tasks: pipeline.prepare,
+      logStep: "prepare",
+      label: "前置准备",
+      status: rollupStatus(prepareItems.concat(syncStep || [])),
+      tasks: preTasks,
     });
   }
   (pipeline.steps || []).forEach((step) => {
+    if (step.id === "sync") return;
     stages.push({
       id: step.id,
+      logStep: step.id,
       label: step.label || step.id,
-      status: step.status || "pending",
-      tasks: Array.isArray(step.subtasks) && step.subtasks.length
-        ? step.subtasks
-        : [{ id: step.id, label: step.label || step.id, status: step.status || "pending" }],
+      status: step.status === "warn" ? "failed" : (step.status || "pending"),
+      tasks: visiblePipelineTasks(step),
     });
   });
-  const post = resolvePostSteps(pipeline, jobStatus);
-  stages.push({ id: "post", label: "收尾", status: rollupStatus(post), tasks: post });
+  if (jobStatus === "stopped" || jobStatus === "failed") {
+    stages.forEach((stage) => {
+      if (stage.status === "running") stage.status = jobStatus === "failed" ? "failed" : "skipped";
+      else if (stage.status === "pending") stage.status = "skipped";
+      (stage.tasks || []).forEach((task) => {
+        if (task.status === "running") task.status = jobStatus === "failed" ? "failed" : "skipped";
+        else if (task.status === "pending") task.status = "skipped";
+      });
+    });
+  }
   return stages;
 }
-
 function railClass(status) {
-  if (status === "done" || status === "warn" || status === "running") return "is-ok";
-  if (status === "failed") return "is-fail";
+  if (status === "done" || status === "running" || status === "queued") return "is-ok";
+  if (status === "failed" || status === "warn") return "is-fail";
   return "is-wait";
 }
-
 function createStatusIcon(status, kind) {
   const icon = document.createElement("span");
   icon.className = (kind || "pl-icon") + " is-" + (status || "pending");
-  if (status === "done") icon.textContent = "✓";
-  else if (status === "failed") icon.textContent = "✕";
-  else if (status === "warn") icon.textContent = "!";
-  else if (status === "skipped") icon.textContent = "–";
-  else if (status === "running") icon.textContent = "●";
-  else icon.textContent = "";
+  icon.textContent = status === "done" ? "✓" : (status === "failed" || status === "warn") ? "✕" : status === "skipped" ? "–" : (status === "running" || status === "queued") ? "●" : "";
   return icon;
 }
-
-function createStageColumn(stage, incomingOk) {
+function createStageColumn(stage, incomingOk, onStep) {
   const status = stage.status || "pending";
   const col = document.createElement("div");
   col.className = "pl-col is-" + status;
-
+  col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
   const cap = document.createElement("div");
   cap.className = "pl-caption";
   const title = document.createElement("div");
@@ -996,7 +588,6 @@ function createStageColumn(stage, incomingOk) {
   dur.textContent = PIPELINE_STATE_LABELS[status] || status;
   cap.append(title, dur);
   col.appendChild(cap);
-
   const spine = document.createElement("div");
   spine.className = "pl-spine";
   const left = document.createElement("div");
@@ -1005,33 +596,33 @@ function createStageColumn(stage, incomingOk) {
   right.className = "pl-rail right " + railClass(status);
   spine.append(left, createStatusIcon(status, "pl-stage-icon"), right);
   col.appendChild(spine);
-
   const drop = document.createElement("div");
   drop.className = "pl-drop";
   const diamond = document.createElement("div");
   diamond.className = "pl-diamond";
-  diamond.setAttribute("aria-hidden", "true");
   diamond.append(document.createElement("span"), document.createElement("span"));
   drop.appendChild(diamond);
-
   const tree = document.createElement("div");
   tree.className = "pl-tree";
   (stage.tasks || []).forEach((task) => {
     const row = document.createElement("div");
     row.className = "pl-task is-" + (task.status || "pending");
+    row.appendChild(document.createElement("span"));
     row.appendChild(createStatusIcon(task.status, "pl-task-icon"));
     const name = document.createElement("span");
     name.className = "pl-task-name";
     name.textContent = task.label || task.id || "";
-    name.title = task.detail || name.textContent;
     row.appendChild(name);
+    row.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      onStep && onStep(stage.id, task.id);
+    });
     tree.appendChild(row);
   });
   drop.appendChild(tree);
   col.appendChild(drop);
   return col;
 }
-
 function createEndpoint(kind, lit) {
   const col = document.createElement("div");
   col.className = "pl-end is-" + kind;
@@ -1040,21 +631,24 @@ function createEndpoint(kind, lit) {
   const title = document.createElement("div");
   title.className = "pl-title";
   title.textContent = kind === "start" ? "Start" : "End";
-  cap.appendChild(title);
+  const dur = document.createElement("div");
+  dur.className = "pl-dur";
+  dur.innerHTML = "&nbsp;";
+  cap.append(title, dur);
   col.appendChild(cap);
   const spine = document.createElement("div");
   spine.className = "pl-spine";
-  const pad = document.createElement("div");
-  pad.className = "pl-rail " + (kind === "start" ? "right" : "left") + " " + (lit ? "is-ok" : "is-wait");
-  const dot = document.createElement("span");
-  dot.className = "pl-end-dot" + (lit ? " is-ok" : " is-wait");
-  if (kind === "start") spine.append(dot, pad);
-  else spine.append(pad, dot);
+  const left = document.createElement("div");
+  left.className = "pl-rail left " + (kind === "start" ? "is-none" : (lit ? "is-ok" : "is-wait"));
+  const right = document.createElement("div");
+  right.className = "pl-rail right " + (kind === "end" ? "is-none" : (lit ? "is-ok" : "is-wait"));
+  const icon = document.createElement("span");
+  icon.className = "pl-stage-icon is-end" + (lit ? " is-ok" : " is-wait");
+  spine.append(left, icon, right);
   col.appendChild(spine);
   return col;
 }
-
-function renderJobPipeline(containerId, pipeline, jobStatus) {
+function renderJobPipeline(containerId, pipeline, jobStatus, onStep) {
   const root = $(containerId);
   if (!root) return;
   const steps = pipeline && Array.isArray(pipeline.steps) ? pipeline.steps : [];
@@ -1063,49 +657,41 @@ function renderJobPipeline(containerId, pipeline, jobStatus) {
     root.replaceChildren();
     return;
   }
-
   root.hidden = false;
   root.replaceChildren();
-
   const meta = pipeline.meta || {};
   const status = jobStatus || meta.status || "";
   const stages = buildPipelineStages(pipeline, status);
-  const services = Array.isArray(pipeline.services) ? pipeline.services : [];
-  const focusId = pipeline.focus_service || pipeline.current_service || "";
-  const focusSvc = services.find((item) => item.service_id === focusId) || services[0];
-  const artifacts = pipeline.artifacts || {};
-
   const head = document.createElement("div");
   head.className = "pl-head";
-  const left = document.createElement("div");
-  left.className = "pl-head-left";
-  left.appendChild(document.createTextNode("执行流水线 "));
+  const line = document.createElement("div");
+  line.className = "pl-head-left";
+  line.append("执行流水线 ");
   const svc = document.createElement("strong");
-  svc.textContent = focusSvc
-    ? (focusSvc.title || focusSvc.service_id) + (meta.branch ? " @ " + String(meta.branch).split(",")[0] : "")
-    : "";
-  left.appendChild(svc);
-  left.appendChild(document.createTextNode(" "));
+  const focus = (pipeline.services || [])[0];
+  const title = focus ? (focus.title || focus.service_id) : ((currentService() && currentService().title) || "");
+  const branch = (currentJob && currentJob.branch) || meta.branch || "";
+  svc.textContent = title + (branch ? "@" + branch : "");
+  line.appendChild(svc);
   const st = document.createElement("em");
   st.className = "pl-job-status is-" + (status || "unknown");
-  st.textContent = pipelineJobStatusLabel(status) || "执行中";
-  left.appendChild(st);
-  head.appendChild(left);
-  root.appendChild(head);
-
-  if (services.length > 1) {
-    const batch = document.createElement("div");
-    batch.className = "pl-batch";
-    services.forEach((item) => {
-      const chip = document.createElement("span");
-      chip.className = "pl-batch-chip is-" + (item.status || "pending");
-      if (item.service_id === focusId) chip.classList.add("is-focus");
-      chip.textContent = item.title || item.service_id;
-      batch.appendChild(chip);
-    });
-    root.appendChild(batch);
+  st.textContent = " " + (pipelineJobStatusLabel(status, currentJob && currentJob.stage, currentJob && currentJob.cancel_requested) || (status ? "执行中" : "未运行"));
+  line.appendChild(st);
+  head.appendChild(line);
+  const arts = (pipeline && pipeline.artifacts) || {};
+  if (arts.image && arts.tag) {
+    const art = document.createElement("div");
+    art.className = "pl-artifact";
+    art.append("镜像 " + arts.image + " " + arts.tag + " ");
+    if (arts.download_url) {
+      const link = document.createElement("a");
+      link.href = arts.download_url;
+      link.textContent = "下载";
+      art.appendChild(link);
+    }
+    head.appendChild(art);
   }
-
+  root.appendChild(head);
   const scroll = document.createElement("div");
   scroll.className = "pl-scroll";
   const graph = document.createElement("div");
@@ -1113,117 +699,1106 @@ function renderJobPipeline(containerId, pipeline, jobStatus) {
   graph.appendChild(createEndpoint("start", true));
   let incomingOk = true;
   stages.forEach((stage) => {
-    graph.appendChild(createStageColumn(stage, incomingOk));
-    incomingOk = ["done", "warn", "running"].includes(stage.status);
+    graph.appendChild(createStageColumn(stage, incomingOk, onStep));
+    incomingOk = ["done", "running", "failed", "warn"].includes(stage.status);
   });
   graph.appendChild(createEndpoint("end", status === "ok"));
   scroll.appendChild(graph);
   root.appendChild(scroll);
-
-  const foot = document.createElement("div");
-  foot.className = "pl-foot";
-  const imageName = artifacts.image || (focusSvc && focusSvc.image) || (focusSvc && focusSvc.service_id) || "";
-  foot.appendChild(document.createTextNode("镜像 "));
-  const img = document.createElement("strong");
-  img.textContent = imageName || "—";
-  foot.appendChild(img);
-  if (artifacts.tag) foot.appendChild(document.createTextNode("  " + artifacts.tag));
-  if (artifacts.download_url) {
-    const link = document.createElement("a");
-    link.className = "pl-foot-link";
-    link.href = artifacts.download_url;
-    link.target = "_blank";
-    link.rel = "noopener";
-    link.textContent = "下载";
-    foot.appendChild(document.createTextNode("  "));
-    foot.appendChild(link);
-  }
-  root.appendChild(foot);
 }
 
-function renderTestResult(job) {
-  const root = $("testResult");
-  if (!root) return;
-  const runs = job && Array.isArray(job.test_runs) && job.test_runs.length
-    ? job.test_runs
-    : job && job.test_status
-      ? [{
-          service_id: job.service_id,
-          branch: job.branch,
-          commit_sha: job.commit_sha,
-          status: job.test_status,
-          summary: job.test_summary || {},
-          commands: job.test_commands || [],
-          failures: job.test_failures || [],
-          test_cases: job.test_cases || [],
-        }]
-      : [];
-  if (!job || !runs.length) {
-    root.hidden = true;
-    root.classList.remove("test-result-list");
-    root.replaceChildren();
+function historyStatusLabel(status) {
+  return ({ ok: "成功", failed: "失败", running: "执行中", queued: "排队中", stopped: "已停止" })[status] || status || "未知";
+}
+function historyStatusClass(status) {
+  return ({ ok: "art-status-ok", failed: "art-status-failed", running: "art-status-running", queued: "art-status-queued", stopped: "art-status-stopped" })[status] || "";
+}
+function historyDurationLabel(item) {
+  if (jobIsLive(item)) return "—";
+  return formatDurationSec(item && item.duration_sec);
+}
+
+function renderPager(el, pager, meta, onChange) {
+  if (!el) return;
+  const total = Number((meta && meta.total) || 0);
+  const pageCount = Math.max(1, Number((meta && meta.page_count) || 1));
+  pager.page = Math.min(Math.max(1, Number((meta && meta.page) || pager.page) || 1), pageCount);
+  if (!total) { el.hidden = true; el.replaceChildren(); return; }
+  el.hidden = false;
+  el.replaceChildren();
+  const sizeWrap = document.createElement("label");
+  sizeWrap.className = "test-page-size";
+  sizeWrap.append("每页 ");
+  const size = document.createElement("select");
+  size.className = "input";
+  PAGE_SIZE_OPTIONS.forEach((n) => {
+    const opt = document.createElement("option");
+    opt.value = String(n);
+    opt.textContent = String(n);
+    if (n === pager.pageSize) opt.selected = true;
+    size.appendChild(opt);
+  });
+  size.addEventListener("change", () => {
+    pager.pageSize = Number(size.value) || 10;
+    pager.page = 1;
+    onChange();
+  });
+  sizeWrap.append(size, " 条");
+  const prev = document.createElement("button");
+  prev.type = "button";
+  prev.className = "btn ghost";
+  prev.textContent = "上一页";
+  prev.disabled = pager.page <= 1;
+  prev.addEventListener("click", () => { pager.page -= 1; onChange(); });
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "btn ghost";
+  next.textContent = "下一页";
+  next.disabled = pager.page >= pageCount;
+  next.addEventListener("click", () => { pager.page += 1; onChange(); });
+  const pos = document.createElement("span");
+  pos.textContent = "第 " + pager.page + " / " + pageCount + " 页（" + total + " 条）";
+  el.append(sizeWrap, prev, pos, next);
+}
+
+function renderHistory(items, meta) {
+  const body = $("historyBody");
+  if (!body) return;
+  if (!items.length) {
+    body.innerHTML = '<tr><td colspan="8" class="hint">暂无构建记录。</td></tr>';
+  } else {
+    body.innerHTML = items.map((item) => (
+      "<tr>" +
+      '<td class="hist-time">' + esc(item.created_at || "—") + "</td>" +
+      "<td>" + esc(item.service_id || "—") + "</td>" +
+      clipTd(item.branch, "hist-branch") +
+      '<td class="' + historyStatusClass(item.status) + '">' + esc(historyStatusLabel(item.status)) + "</td>" +
+      '<td class="mono">' + esc(shortSha(item.commit_sha)) + "</td>" +
+      '<td class="hist-dur">' + esc(historyDurationLabel(item)) + "</td>" +
+      "<td>" + esc(item.operator || "—") + "</td>" +
+      '<td class="hist-act"><button type="button" class="btn ghost" data-open-job="' + esc(item.id) + '">查看</button></td>' +
+      "</tr>"
+    )).join("");
+    body.querySelectorAll("[data-open-job]").forEach((btn) => {
+      btn.addEventListener("click", () => openJob(btn.getAttribute("data-open-job"), { fromHistory: true }));
+    });
+  }
+  renderPager($("historyPager"), historyPager, meta, () => refreshHistory().catch(() => {}));
+}
+
+function renderArtifacts(items, meta) {
+  const body = $("artifactsBody");
+  if (!body) return;
+  if (!items.length) {
+    body.innerHTML = '<tr><td colspan="7" class="hint">暂无产物。</td></tr>';
+  } else {
+    body.innerHTML = items.map((item) => {
+      const expired = item.expired;
+      const fileCell = expired
+        ? '<span class="art-expired">已失效</span>'
+        : (item.download_url ? '<a href="' + esc(item.download_url) + '">' + esc(item.package_name || "下载") + "</a>" : "—");
+      return (
+        '<tr class="' + (expired ? "expired" : "") + '">' +
+        "<td>" + esc(item.created_at || "—") + "</td>" +
+        "<td>" + esc(item.title || item.service_id || "—") + "</td>" +
+        clipTd(item.branch, "art-branch") +
+        '<td class="mono">' + esc(shortSha(item.commit_sha)) + "</td>" +
+        clipTd(item.image_ref || item.image, "art-image mono") +
+        "<td>" + fileCell + "</td>" +
+        "<td>" + esc(item.operator || "—") + "</td>" +
+        "</tr>"
+      );
+    }).join("");
+  }
+  renderPager($("artifactsPager"), artifactsPager, meta, () => refreshArtifacts().catch(() => {}));
+}
+
+async function refreshHistory() {
+  if (!sessionLive) return;
+  await withRefresh($("btnRefreshHistory"), async () => {
+    const gen = viewGeneration;
+    const sid = currentServiceId;
+    try {
+      const data = await api("/api/jobs?page=" + historyPager.page + "&page_size=" + historyPager.pageSize + serviceQuery());
+      if (!viewIsCurrent(gen, sid)) return;
+      const got = data.service_id || "";
+      const want = isAllServices() ? "" : sid;
+      if (got !== want) return;
+      renderHistory(data.jobs || [], data);
+    } catch (_) {
+      if (!viewIsCurrent(gen, sid)) return;
+      if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="8" class="hint">加载失败，请刷新。</td></tr>';
+    }
+  });
+}
+async function refreshArtifacts() {
+  if (!sessionLive) return;
+  await withRefresh($("btnRefreshArtifacts"), async () => {
+    const gen = viewGeneration;
+    const sid = currentServiceId;
+    try {
+      const data = await api("/api/artifacts?page=" + artifactsPager.page + "&page_size=" + artifactsPager.pageSize + serviceQuery());
+      if (!viewIsCurrent(gen, sid)) return;
+      const got = data.service_id || "";
+      const want = isAllServices() ? "" : sid;
+      if (got !== want) return;
+      renderArtifacts(data.artifacts || [], data);
+    } catch (_) {
+      if (!viewIsCurrent(gen, sid)) return;
+      if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="7" class="hint">加载失败，请刷新。</td></tr>';
+    }
+  });
+}
+
+async function refreshPipeline() {
+  if (!sessionLive || isAllServices() || !currentServiceId) return;
+  await withRefresh($("btnRefreshPipeline"), async () => {
+    const target = pinnedJobId || currentJobId;
+    if (target) {
+      await openJob(target);
+      await refreshServiceOccupancy();
+      return;
+    }
+    await loadServiceJob();
+  });
+}
+
+function serviceTitle(item) {
+  return (item && (item.title || item.id)) || "";
+}
+function sortedServices() {
+  return services.slice().sort((a, b) =>
+    serviceTitle(a).localeCompare(serviceTitle(b), "en", { sensitivity: "base" })
+  );
+}
+function serviceMatches(item, query) {
+  const parts = String(query || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!parts.length) return true;
+  const hay = [item.id, item.title, item.image, item.repo, item.github].join(" ").toLowerCase();
+  return parts.every((part) => hay.includes(part));
+}
+function hideServiceMenu() {
+  if ($("serviceMenu")) $("serviceMenu").hidden = true;
+  if ($("serviceTrigger")) $("serviceTrigger").setAttribute("aria-expanded", "false");
+}
+function showServiceMenu() {
+  const menu = $("serviceMenu");
+  const trigger = $("serviceTrigger");
+  if (!menu || !trigger) return;
+  svcMenuPage = 1;
+  if ($("serviceSearch")) $("serviceSearch").value = "";
+  menu.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+  renderServiceMenu();
+  if ($("serviceSearch")) $("serviceSearch").focus();
+}
+function renderServiceMenu() {
+  const list = $("serviceMenuList");
+  const pager = $("servicePager");
+  if (!list || !$("serviceMenu")) return;
+  $("serviceMenu").hidden = false;
+  const query = $("serviceSearch") ? $("serviceSearch").value : "";
+  const q = String(query || "").trim().toLowerCase();
+  const showAll = !q || "全部微服务".includes(q) || q === "all";
+  const items = sortedServices().filter((item) => serviceMatches(item, query));
+  const pageCount = Math.max(1, Math.ceil(items.length / SVC_PAGE_SIZE));
+  svcMenuPage = Math.min(Math.max(1, svcMenuPage), pageCount);
+  const pageItems = items.slice((svcMenuPage - 1) * SVC_PAGE_SIZE, svcMenuPage * SVC_PAGE_SIZE);
+  list.replaceChildren();
+  if (showAll) {
+    const allBtn = document.createElement("button");
+    allBtn.type = "button";
+    allBtn.className = (isAllServices() ? "active " : "") + "is-all";
+    allBtn.textContent = "全部微服务";
+    allBtn.addEventListener("mousedown", (ev) => ev.preventDefault());
+    allBtn.addEventListener("click", () => {
+      selectService(ALL_SERVICES_ID);
+      hideServiceMenu();
+    });
+    list.appendChild(allBtn);
+  }
+  if (!pageItems.length && !showAll) {
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "无匹配微服务";
+    list.appendChild(empty);
+  } else {
+    pageItems.forEach((item) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = item.id === currentServiceId ? "active" : "";
+      btn.textContent = serviceTitle(item);
+      btn.addEventListener("mousedown", (ev) => ev.preventDefault());
+      btn.addEventListener("click", () => {
+        selectService(item.id);
+        hideServiceMenu();
+      });
+      list.appendChild(btn);
+    });
+  }
+  if (pager) {
+    pager.replaceChildren();
+    const total = document.createElement("span");
+    total.textContent = "共 " + items.length + " 条";
+    const pages = document.createElement("div");
+    pages.className = "pages";
+    const prev = document.createElement("button");
+    prev.type = "button";
+    prev.textContent = "<";
+    prev.disabled = svcMenuPage <= 1;
+    prev.dataset.page = String(svcMenuPage - 1);
+    pages.appendChild(prev);
+    const start = Math.max(1, svcMenuPage - 3);
+    const end = Math.min(pageCount, start + 6);
+    for (let page = start; page <= end; page += 1) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = String(page);
+      btn.dataset.page = String(page);
+      btn.className = page === svcMenuPage ? "active" : "";
+      pages.appendChild(btn);
+    }
+    const next = document.createElement("button");
+    next.type = "button";
+    next.textContent = ">";
+    next.disabled = svcMenuPage >= pageCount;
+    next.dataset.page = String(svcMenuPage + 1);
+    pages.appendChild(next);
+    pager.append(total, pages);
+  }
+}
+function fillServiceSelect() {
+  if ($("serviceTriggerLabel")) {
+    $("serviceTriggerLabel").textContent = isAllServices()
+      ? "全部微服务"
+      : (currentService() ? serviceTitle(currentService()) : "选择微服务");
+  }
+}
+function clearStaleLists() {
+  if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="8" class="hint">加载中…</td></tr>';
+  if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="7" class="hint">加载中…</td></tr>';
+  const histPager = $("historyPager");
+  const artPager = $("artifactsPager");
+  if (histPager) histPager.hidden = true;
+  if (artPager) artPager.hidden = true;
+}
+function activateService(id) {
+  if (!id) {
+    fillServiceSelect();
+    applyServiceChrome();
+    return false;
+  }
+  if (id === currentServiceId) {
+    fillServiceSelect();
+    applyServiceChrome();
+    return false;
+  }
+  currentServiceId = id;
+  pinnedJobId = "";
+  serviceActiveJobId = "";
+  viewGeneration += 1;
+  historyPager.page = 1;
+  artifactsPager.page = 1;
+  fillServiceSelect();
+  try { localStorage.setItem(SERVICE_KEY, currentServiceId); } catch (_) {}
+  applyServiceChrome();
+  updateActionButtons();
+  clearStaleLists();
+  if (currentJob && (isAllServices() || !jobBelongsToService(currentJob, currentServiceId))) {
+    applyJob(null, { loading: !isAllServices() && tab === "pipeline" });
+  }
+  return true;
+}
+function selectService(id) {
+  if (!sessionLive) return;
+  const changed = activateService(id);
+  if (!changed) return;
+  if (isAllServices()) {
+    stopPolling();
+    applyJob(null);
+    if (tab === "pipeline") {
+      setTab("history");
+      return;
+    }
+    writeHash();
+    if (tab === "history") refreshHistory().catch(() => {});
+    else refreshArtifacts().catch(() => {});
     return;
   }
-  if ((job.id || "") !== testResultJobId) {
-    testResultJobId = job.id || "";
-    testTableState.clear();
+  writeHash();
+  refreshServiceOccupancy().catch(() => {});
+  if (tab === "pipeline") loadServiceJob();
+  else {
+    stopPolling();
+    if (tab === "history") refreshHistory().catch(() => {});
+    else refreshArtifacts().catch(() => {});
   }
-
-  const isBatch = runs.length > 1 || String(job.service_id || "").includes(",");
-  root.hidden = false;
-  root.classList.toggle("test-result-list", isBatch);
-  root.replaceChildren();
-  runs.forEach((run, index) => {
-    const serviceId = run.service_id || "service-" + (index + 1);
-    const target = isBatch ? document.createElement("section") : root;
-    if (isBatch) {
-      target.className = "test-result-card";
-      const serviceHead = document.createElement("div");
-      serviceHead.className = "test-service-head";
-      serviceHead.textContent = (run.title || serviceId) + (run.branch ? " @ " + run.branch : "");
-      target.appendChild(serviceHead);
-      root.appendChild(target);
-    }
-    const stateKey = (job.id || "job") + ":" + serviceId;
-    renderTestRun(target, run, stateKey, () => renderTestResult(job));
+}
+function bindServicePicker() {
+  const trigger = $("serviceTrigger");
+  const input = $("serviceSearch");
+  const menu = $("serviceMenu");
+  if (!trigger || trigger.dataset.bound === "1") return;
+  trigger.dataset.bound = "1";
+  trigger.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if ($("serviceMenu") && !$("serviceMenu").hidden) hideServiceMenu();
+    else showServiceMenu();
   });
+  if (menu) {
+    menu.addEventListener("click", (ev) => ev.stopPropagation());
+    menu.addEventListener("mousedown", (ev) => ev.stopPropagation());
+  }
+  const pager = $("servicePager");
+  if (pager && pager.dataset.bound !== "1") {
+    pager.dataset.bound = "1";
+    pager.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const btn = ev.target.closest("button");
+      if (!btn || btn.disabled) return;
+      const next = Number(btn.dataset.page);
+      if (!Number.isFinite(next) || next < 1) return;
+      svcMenuPage = next;
+      renderServiceMenu();
+    });
+  }
+  if (input) {
+    input.addEventListener("input", () => { svcMenuPage = 1; renderServiceMenu(); });
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") hideServiceMenu();
+      if (ev.key === "Enter") {
+        const q = String(input.value || "").trim().toLowerCase();
+        if (q && ("全部微服务".includes(q) || q === "all")) {
+          ev.preventDefault();
+          selectService(ALL_SERVICES_ID);
+          hideServiceMenu();
+          return;
+        }
+        const first = sortedServices().find((item) => serviceMatches(item, input.value));
+        if (first) {
+          ev.preventDefault();
+          selectService(first.id);
+          hideServiceMenu();
+        }
+      }
+    });
+  }
+}
+
+async function refreshServices() {
+  const data = await api("/api/services");
+  services = data.services || [];
+  if ($("targetRepo") && data.registry) $("targetRepo").textContent = data.registry + "/" + data.org;
+  if (!isKnownServiceId(currentServiceId)) {
+    try { currentServiceId = localStorage.getItem(SERVICE_KEY) || ""; } catch (_) {}
+    if (!isKnownServiceId(currentServiceId)) currentServiceId = (sortedServices()[0] && sortedServices()[0].id) || "";
+  }
+  fillServiceSelect();
+  applyServiceChrome();
+  updateActionButtons();
 }
 
 async function refreshHealth() {
-  const h = await api("/api/health");
-  setPill($("pillAgent"), "助手在线", "ok");
-  if (h.docker && h.docker.ok) setPill($("pillDocker"), "Docker 可用", "ok");
-  else setPill($("pillDocker"), "Docker 不可用", "bad");
-  if ($("targetRepo")) $("targetRepo").textContent = h.registry + "/" + h.org;
-  if ($("footNote")) {
-    $("footNote").textContent = h.allow_remote
-      ? "服务器共享模式 · 一人登录 SWR 后，过期前其他人可直接构建推送"
-      : "仅本机访问 · SWR 临时密码只用于 Docker 登录";
-  }
-  if ($("tokenStatus")) {
-    if (h.github_ssh_configured) {
-      $("tokenStatus").textContent = "已配置 GitHub SSH（服务器密钥）";
-      $("tokenStatus").style.color = "var(--ok)";
-    } else {
-      $("tokenStatus").textContent = h.github_token_configured
-        ? "已配置 GitHub Token"
-        : "未配置 Token / SSH";
-      $("tokenStatus").style.color = h.github_token_configured ? "var(--ok)" : "var(--muted)";
+  await api("/api/health");
+}
+
+function stopPolling() {
+  pollGeneration += 1;
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+}
+
+function applyJob(job, { loading } = {}) {
+  if (job && !sessionLive) return;
+  if (job && !isAllServices() && currentServiceId && !jobBelongsToService(job, currentServiceId)) return;
+  currentJob = job;
+  currentJobId = job && job.id || "";
+  renderJobMeta(job);
+  updateActionButtons();
+  const empty = $("pipelineEmpty");
+  const root = $("liveJobPipeline");
+  const hasJob = !!(job && job.id);
+  if (!hasJob) {
+    if (root) { root.hidden = true; root.replaceChildren(); }
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = loading ? "正在加载流水线…" : "当前服务无构建历史记录";
     }
+    return;
   }
-  return h;
-}
-
-async function saveToken() {
-  await api("/api/config/token", {
-    method: "POST",
-    body: JSON.stringify({ github_token: ($("tokenInput").value || "").trim() }),
+  if (empty) empty.hidden = true;
+  renderJobPipeline("liveJobPipeline", job.pipeline, job.status, (stageId, taskId) => {
+    openStepModal(stageId, taskId);
   });
-  $("tokenInput").value = "";
-  await refreshHealth();
 }
 
-async function login() {
+async function openJob(jobId, { fromHistory } = {}) {
+  if (!jobId || !sessionLive) return false;
+  const gen = viewGeneration;
+  const sidBefore = currentServiceId;
+  stopPolling();
+  const job = await api("/api/jobs/" + jobId + "?compact=1");
+  if (!sessionLive) return false;
+  const sid = jobServiceIds(job)[0] || "";
+  if (fromHistory) {
+    if (sid && sid !== currentServiceId && services.some((item) => item.id === sid)) {
+      activateService(sid);
+    }
+    pinnedJobId = jobId;
+    applyJob(job);
+    setTab("pipeline");
+    if (jobIsLive(job)) startPolling(jobId);
+    refreshServiceOccupancy().catch(() => {});
+    return true;
+  }
+  if (!viewIsCurrent(gen, sidBefore)) return false;
+  if (!isAllServices() && sid && sid !== currentServiceId) return false;
+  applyJob(job);
+  if (jobIsLive(job)) startPolling(jobId);
+  return true;
+}
+
+async function refreshServiceOccupancy() {
+  if (!sessionLive || isAllServices() || !currentServiceId) {
+    serviceActiveJobId = "";
+    updateActionButtons();
+    return;
+  }
+  try {
+    const running = await api("/api/running-job?service_id=" + encodeURIComponent(currentServiceId));
+    serviceActiveJobId = (running && running.id) || "";
+  } catch (_) {
+    serviceActiveJobId = "";
+  }
+  updateActionButtons();
+}
+
+async function loadServiceJob() {
+  const gen = viewGeneration;
+  const sid = currentServiceId;
+  stopPolling();
+  pinnedJobId = "";
+  if (!sessionLive || !sid || sid === ALL_SERVICES_ID) {
+    applyJob(null);
+    return;
+  }
+  const btn = $("btnRefreshPipeline");
+  beginRefresh(btn);
+  const started = Date.now();
+  if (currentJob && !jobBelongsToService(currentJob, sid)) applyJob(null, { loading: true });
+  else if (!currentJob) applyJob(null, { loading: true });
+  try {
+    const running = await api("/api/running-job?service_id=" + encodeURIComponent(sid));
+    if (!viewIsCurrent(gen, sid)) return;
+    serviceActiveJobId = (running && running.id) || "";
+    updateActionButtons();
+    if (running && running.id && await openJob(running.id)) return;
+    if (!viewIsCurrent(gen, sid)) return;
+    const hist = await api("/api/jobs?service_id=" + encodeURIComponent(sid) + "&page=1&page_size=1");
+    if (!viewIsCurrent(gen, sid)) return;
+    const latest = hist.jobs && hist.jobs[0];
+    if (latest && latest.id && await openJob(latest.id)) return;
+    if (!viewIsCurrent(gen, sid)) return;
+    applyJob(null);
+  } catch (e) {
+    if (!viewIsCurrent(gen, sid)) return;
+    const empty = $("pipelineEmpty");
+    const root = $("liveJobPipeline");
+    if (root) { root.hidden = true; root.replaceChildren(); }
+    if (empty) {
+      empty.hidden = false;
+      empty.textContent = "流水线加载失败，请稍后重试";
+    }
+  } finally {
+    const wait = REFRESH_BUSY_MS - (Date.now() - started);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    endRefresh(btn);
+  }
+}
+
+function startPolling(jobId) {
+  stopPolling();
+  if (!sessionLive) return;
+  const generation = pollGeneration;
+  const tick = async () => {
+    if (!sessionLive || generation !== pollGeneration) return;
+    try {
+      const job = await api("/api/jobs/" + jobId + "?compact=1&view=ui&log_after=0");
+      if (!sessionLive || generation !== pollGeneration) return;
+      if (!isAllServices() && !jobBelongsToService(job, currentServiceId)) return;
+      applyJob(job);
+      if (jobIsLive(job)) pollTimer = setTimeout(tick, 1500);
+      else refreshServiceOccupancy().catch(() => {});
+    } catch (_) {
+      if (sessionLive && generation === pollGeneration) pollTimer = setTimeout(tick, 2500);
+    }
+  };
+  tick();
+}
+
+function closeModal() {
+  $("modalRoot").hidden = true;
+  $("modalBox").classList.remove("narrow", "wide");
+  $("modalBody").replaceChildren();
+}
+function openModal(title, body, { narrow, wide } = {}) {
+  $("modalTitle").textContent = title;
+  $("modalBox").classList.toggle("narrow", !!narrow);
+  $("modalBox").classList.toggle("wide", !!wide);
+  $("modalBody").replaceChildren(body);
+  $("modalRoot").hidden = false;
+}
+
+function runQueuedBranchLoads() {
+  while (branchLoadsActive < BRANCH_LOAD_LIMIT && branchLoadQueue.length) {
+    const item = branchLoadQueue.shift();
+    branchLoadsActive += 1;
+    Promise.resolve()
+      .then(item.task)
+      .then(item.resolve, item.reject)
+      .finally(() => {
+        branchLoadsActive -= 1;
+        runQueuedBranchLoads();
+      });
+  }
+}
+function queueBranchLoad(task, priority) {
+  return new Promise((resolve, reject) => {
+    const item = { task, resolve, reject };
+    if (priority) branchLoadQueue.unshift(item);
+    else branchLoadQueue.push(item);
+    runQueuedBranchLoads();
+  });
+}
+function fetchServiceBranches(serviceId, force, priority) {
+  if (!sessionLive) return Promise.reject(new Error("请先登录"));
+  if (!force && branchCache[serviceId] && branchCache[serviceId].loaded) {
+    return Promise.resolve(branchCache[serviceId]);
+  }
+  if (!force && branchLoads[serviceId]) return branchLoads[serviceId];
+  const req = queueBranchLoad(() => {
+    if (!sessionLive) return Promise.reject(new Error("请先登录"));
+    return api("/api/services/" + encodeURIComponent(serviceId) + "/branches" + (force ? "?refresh=1" : ""));
+  }, !!priority).then((data) => {
+    if (!sessionLive) return data;
+    const cached = {
+      loaded: true,
+      branches: data.branches || [],
+      selected_branch: data.selected_branch || data.preferred_branch || "",
+      default_branch: data.default_branch || "",
+    };
+    branchCache[serviceId] = cached;
+    delete branchLoads[serviceId];
+    return cached;
+  }).catch((err) => {
+    delete branchLoads[serviceId];
+    throw err;
+  });
+  branchLoads[serviceId] = req;
+  return req;
+}
+function fillBranchSelect(selectEl, branches, selectedBranch, fallback) {
+  selectEl.innerHTML = "";
+  const list = branches && branches.length ? branches : [selectedBranch || fallback || "main"];
+  const wanted = list.includes(selectedBranch) ? selectedBranch : (list.includes(fallback) ? fallback : list[0]);
+  list.forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    if (name === wanted) opt.selected = true;
+    selectEl.appendChild(opt);
+  });
+}
+
+async function preferredTemplateBranch(serviceId, fallback) {
+  try {
+    const tmpl = await api("/api/run-templates?service_id=" + encodeURIComponent(serviceId));
+    if (tmpl && tmpl.branch) {
+      if (branchCache[serviceId]) branchCache[serviceId].selected_branch = tmpl.branch;
+      return tmpl.branch;
+    }
+  } catch (_) {}
+  return fallback;
+}
+
+async function openRunDialog() {
+  const svc = currentService();
+  if (!svc) return;
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    '<p class="hint">微服务 ' + esc(svc.title) + '</p>' +
+    '<label class="label">代码库地址</label>' +
+    '<p class="run-repo" id="runRepo">' + esc(svc.github || svc.repo || "") + '</p>' +
+    '<label class="label" for="runBranch">分支</label>' +
+    '<div class="run-branch-row">' +
+    '<select class="input" id="runBranch"></select>' +
+    '<button type="button" class="icon-btn" id="btnRefreshBranches" title="刷新" aria-label="刷新">' +
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+    '</button>' +
+    '<button type="button" class="btn ghost" id="btnSaveTemplate">保存为模板</button>' +
+    '</div>' +
+    '<p class="branch-status" id="runBranchStatus"></p>' +
+    '<p class="hint run-template-hint" id="runTemplateHint"></p>' +
+    '<div class="row"><button type="button" class="btn ghost" data-close-modal>取消</button>' +
+    '<button type="button" class="btn primary" id="btnRunConfirm">确定</button></div>';
+  const select = wrap.querySelector("#runBranch");
+  const statusEl = wrap.querySelector("#runBranchStatus");
+  const retryBtn = wrap.querySelector("#btnRefreshBranches");
+  const hint = wrap.querySelector("#runTemplateHint");
+  const fallbackBranch = svc.default_branch || "main";
+  const cached = branchCache[svc.id];
+  const alreadyLoaded = !!(cached && cached.loaded);
+  let selected = (cached && cached.selected_branch) || fallbackBranch;
+  if (alreadyLoaded) selected = await preferredTemplateBranch(svc.id, selected);
+  fillBranchSelect(select, cached && cached.branches, selected, (cached && cached.default_branch) || fallbackBranch);
+  openModal("运行流水线", wrap, { narrow: true });
+  if (!alreadyLoaded) {
+    statusEl.textContent = "正在加载中";
+    retryBtn.classList.add("loading");
+    select.disabled = true;
+  }
+  const setLoading = (loading) => {
+    retryBtn.classList.toggle("loading", loading);
+    select.disabled = loading;
+    if (loading) {
+      statusEl.textContent = "正在加载中";
+      statusEl.className = "branch-status";
+    }
+  };
+  const applyCached = (data, updated) => {
+    fillBranchSelect(
+      select,
+      data.branches,
+      data.selected_branch || fallbackBranch,
+      data.default_branch || fallbackBranch
+    );
+    const n = (data.branches || []).length;
+    statusEl.textContent = updated ? ("已更新" + n + "个分支") : ("已加载" + n + "个分支");
+    statusEl.className = "branch-status ok";
+  };
+  const loadBranches = async (force) => {
+    if (!force && branchCache[svc.id] && branchCache[svc.id].loaded) {
+      const preferred = await preferredTemplateBranch(svc.id, branchCache[svc.id].selected_branch || fallbackBranch);
+      applyCached({ ...branchCache[svc.id], selected_branch: preferred }, false);
+      return;
+    }
+    setLoading(true);
+    try {
+      const data = await fetchServiceBranches(svc.id, force, true);
+      applyCached(data, true);
+    } catch (e) {
+      fillBranchSelect(select, [fallbackBranch], fallbackBranch, fallbackBranch);
+      statusEl.textContent = e.message || "加载分支失败";
+      statusEl.className = "branch-status error";
+      delete branchCache[svc.id];
+    } finally {
+      retryBtn.classList.remove("loading");
+      select.disabled = false;
+    }
+  };
+  wrap.querySelector("#btnRefreshBranches").addEventListener("click", () => {
+    loadBranches(true);
+  });
+  wrap.querySelector("#btnSaveTemplate").addEventListener("click", async () => {
+    try {
+      await api("/api/run-templates", {
+        method: "POST",
+        body: JSON.stringify({ service_id: svc.id, branch: select.value }),
+      });
+      if (branchCache[svc.id]) branchCache[svc.id].selected_branch = select.value;
+      hint.textContent = "已保存 " + svc.title + " @ " + select.value;
+    } catch (e) {
+      hint.textContent = e.message || "保存模板失败";
+    }
+  });
+  loadBranches(false);
+  wrap.querySelector("#btnRunConfirm").addEventListener("click", () => startRun(select.value));
+}
+
+async function startRun(branch) {
+  const svc = currentService();
+  if (!svc || submitting) return;
+  if (svc.requires_version && !DAEMON_VERSION_PATTERN.test(rememberedDaemonVersion() || svc.last_version || "")) {
+    closeModal();
+    openParamsDialog("运行前请先配置 Daemon version");
+    return;
+  }
+    submitting = true;
+  try {
+    const resp = await api("/api/push", {
+      method: "POST",
+      body: JSON.stringify({
+        service_id: svc.id,
+        branch: branch || svc.default_branch || "main",
+        version: rememberedDaemonVersion() || svc.last_version || "",
+        login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
+      }),
+    });
+    closeModal();
+    pinnedJobId = "";
+    setTab("pipeline");
+    await openJob(resp.job_id);
+    refreshServiceOccupancy().catch(() => {});
+  } catch (e) {
+    const code = e.data && e.data.error_code;
+    if (code === "service_busy" || code === "concurrency_limit") {
+      alert(e.message || "当前无法启动新的构建");
+    } else if (e.status === 503) {
+      alert(e.message || "服务暂时繁忙，请稍后重试");
+    } else {
+      alert(e.message || "启动失败");
+    }
+  } finally {
+    submitting = false;
+  }
+}
+
+function openStopDialog() {
+  if (!currentJobId || !jobIsLive(currentJob)) return;
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    '<p>确认停止当前任务？停止后无法恢复，需要重新运行。</p>' +
+    '<div class="row"><button type="button" class="btn ghost" data-close-modal>取消</button>' +
+    '<button type="button" class="btn danger" id="btnStopConfirm">确认停止</button></div>';
+  openModal("停止当前任务", wrap, { narrow: true });
+  wrap.querySelector("#btnStopConfirm").addEventListener("click", async () => {
+    try {
+      await api("/api/jobs/" + currentJobId + "/stop", { method: "POST", body: "{}" });
+      if (currentJob) {
+        currentJob.cancel_requested = true;
+        currentJob.stage_before_stop = currentJob.stage;
+        currentJob.stage = "stopping";
+        applyJob(currentJob);
+      }
+      closeModal();
+      refreshServiceOccupancy().catch(() => {});
+    } catch (e) {
+      alert(e.message || "停止失败");
+    }
+  });
+}
+
+function openParamsDialog(notice) {
+  const svc = currentService();
+  const wrap = document.createElement("div");
+  const example = (svc && svc.version_example) || "v1.2.3";
+  const last = (svc && svc.last_version) || "";
+  const cached = rememberedDaemonVersion();
+  wrap.innerHTML =
+    (notice ? '<p class="hint error">' + esc(notice) + "</p>" : "") +
+    '<div class="param-daemon-row">' +
+    '<label class="label" for="paramVersion">Daemon version（例如 ' + esc(example) + "）</label>" +
+    '<input class="input" id="paramVersion" />' +
+    "</div>" +
+    '<p class="hint">Daemon版本变化时需要修改版本号，无变化时可不修改</p>' +
+    '<div class="row"><button type="button" class="btn ghost" data-close-modal>取消</button>' +
+    '<button type="button" class="btn primary" id="btnParamSave">保存</button></div>';
+  wrap.querySelector("#paramVersion").value = cached || last || "";
+  openModal("参数配置 · " + ((svc && svc.title) || "multica-server"), wrap, { narrow: true });
+  wrap.querySelector("#btnParamSave").addEventListener("click", () => {
+    const value = wrap.querySelector("#paramVersion").value.trim();
+    if (value && !DAEMON_VERSION_PATTERN.test(value)) {
+      alert("格式必须为 vMAJOR.MINOR.PATCH，例如 " + example);
+      return;
+    }
+    if (value) rememberDaemonVersion(value);
+    closeModal();
+  });
+}
+
+function decodeUnicodeEscapes(value) {
+  return String(value || "").replace(/(?:\\u[0-9a-fA-F]{4})+/g, (sequence) => {
+    try { return JSON.parse('"' + sequence + '"'); } catch (_) { return sequence; }
+  });
+}
+function shortCaseName(name) {
+  const value = decodeUnicodeEscapes(name);
+  if (value.startsWith("Test") || value.startsWith("test_")) return value;
+  const parts = value.split(".");
+  return parts.length > 2 ? parts.slice(-2).join(".") : value;
+}
+function filterRun(run, kind) {
+  if (!run || !kind) return run;
+  const cases = casesForKind(run, kind);
+  const commands = (run.commands || []).filter((item) => commandTestKind(item) === kind);
+  const passed = cases.filter((item) => item.status === "passed").length;
+  const skipped = cases.filter((item) => item.status === "skipped").length;
+  const errors = cases.filter((item) => item.status === "error").length;
+  const failed = Math.max(0, cases.length - passed - skipped - errors);
+  const status = errors ? "error" : (failed || commands.some((item) => Number(item.exit_code) !== 0) ? "failed" : "passed");
+  return {
+    ...run,
+    status,
+    commands,
+    test_cases: cases,
+    summary: { total: cases.length, passed, failed, errors, skipped },
+  };
+}
+function renderTestRun(root, run, heading) {
+  if (!run) {
+    root.textContent = "暂无测试结果。";
+    return;
+  }
+  const summary = run.summary || {};
+  const testStatus = run.status || "error";
+  const isOk = testStatus === "passed";
+  const head = document.createElement("div");
+  head.className = "test-result-head";
+  const title = document.createElement("strong");
+  title.className = "test-status " + (isOk ? "ok" : "bad");
+  title.textContent = (heading || "测试结果") + "：" + (isOk ? "通过" : "未通过");
+  const overview = document.createElement("span");
+  overview.className = "test-result-summary";
+  overview.textContent = "总用例 " + (summary.total || 0) + " · 通过 " + (summary.passed || 0) +
+    " · 失败 " + (summary.failed || 0) + " · 错误 " + (summary.errors || 0);
+  head.append(title, overview);
+  root.appendChild(head);
+  const cases = Array.isArray(run.test_cases) ? run.test_cases : [];
+  if (!cases.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "暂无用例明细。";
+    root.appendChild(empty);
+    return;
+  }
+  const key = heading || "all";
+  const state = testTableState.get(key) || { page: 1, pageSize: 20 };
+  const pageCount = Math.max(1, Math.ceil(cases.length / state.pageSize));
+  state.page = Math.min(Math.max(1, state.page), pageCount);
+  testTableState.set(key, state);
+  const table = document.createElement("table");
+  table.className = "test-table";
+  table.innerHTML = "<thead><tr><th>用例</th><th>结果</th><th>耗时</th></tr></thead>";
+  const body = document.createElement("tbody");
+  const start = (state.page - 1) * state.pageSize;
+  cases.slice(start, start + state.pageSize).forEach((item) => {
+    const row = document.createElement("tr");
+    const name = document.createElement("td");
+    name.textContent = shortCaseName(item.name);
+    const status = document.createElement("td");
+    const passed = item.status === "passed";
+    status.textContent = passed ? "通过" : item.status === "skipped" ? "跳过" : "失败";
+    status.className = "test-status " + (passed ? "ok" : item.status === "skipped" ? "" : "bad");
+    const dur = document.createElement("td");
+    dur.textContent = item.duration_ms == null ? "—" : formatDuration(item.duration_ms);
+    row.append(name, status, dur);
+    body.appendChild(row);
+  });
+  table.appendChild(body);
+  root.appendChild(table);
+  const pager = document.createElement("div");
+  pager.className = "test-pager";
+  const sizeWrap = document.createElement("label");
+  sizeWrap.className = "test-page-size";
+  sizeWrap.append("每页 ");
+  const size = document.createElement("select");
+  size.className = "input";
+  [10, 20, 50].forEach((n) => {
+    const opt = document.createElement("option");
+    opt.value = String(n);
+    opt.textContent = String(n);
+    if (n === state.pageSize) opt.selected = true;
+    size.appendChild(opt);
+  });
+  size.addEventListener("change", () => {
+    state.pageSize = Number(size.value) || 20;
+    state.page = 1;
+    testTableState.set(key, state);
+    root.replaceChildren();
+    renderTestRun(root, run, heading);
+  });
+  sizeWrap.append(size, " 条");
+  const prev = document.createElement("button");
+  prev.type = "button";
+  prev.className = "btn ghost";
+  prev.textContent = "上一页";
+  prev.disabled = state.page <= 1;
+  prev.addEventListener("click", () => {
+    state.page -= 1;
+    testTableState.set(key, state);
+    root.replaceChildren();
+    renderTestRun(root, run, heading);
+  });
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "btn ghost";
+  next.textContent = "下一页";
+  next.disabled = state.page >= pageCount;
+  next.addEventListener("click", () => {
+    state.page += 1;
+    testTableState.set(key, state);
+    root.replaceChildren();
+    renderTestRun(root, run, heading);
+  });
+  const pos = document.createElement("span");
+  pos.textContent = "第 " + state.page + " / " + pageCount + " 页（" + cases.length + " 条）";
+  pager.append(sizeWrap, prev, pos, next);
+  root.appendChild(pager);
+}
+
+function flattenPipelineSteps(pipeline) {
+  return buildPipelineStages(pipeline || { steps: [] }, currentJob && currentJob.status);
+}
+function appendStepButton(list, label, status, className, active, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = (className || "") + (active ? " active" : "");
+  if (status) {
+    const dot = document.createElement("span");
+    dot.className = "step-dot is-" + (status || "pending");
+    btn.appendChild(dot);
+  }
+  const text = document.createElement("span");
+  text.textContent = label;
+  btn.appendChild(text);
+  btn.addEventListener("click", onClick);
+  list.appendChild(btn);
+}
+function appendStepHeading(list, label, status, className) {
+  const row = document.createElement("div");
+  row.className = "step-heading " + (className || "");
+  const dot = document.createElement("span");
+  dot.className = "step-dot is-" + (status || "pending");
+  const text = document.createElement("span");
+  text.textContent = label;
+  row.append(dot, text);
+  list.appendChild(row);
+}
+function isCaseTaskId(id) {
+  return id === "ut-cases" || id === "dt-cases";
+}
+function parseCaseSelection(selected) {
+  const match = String(selected || "").match(/^(ut-cases|dt-cases):(results|log)$/);
+  if (!match) return null;
+  return { taskId: match[1], view: match[2] };
+}
+function normalizeStepSelection(taskId, stage) {
+  if (isCaseTaskId(taskId)) return taskId + ":results";
+  return taskId || (stage.tasks && stage.tasks[0] && stage.tasks[0].id) || stage.id;
+}
+
+async function openStepModal(stageId, taskId) {
+  if (!currentJobId) return;
+  const stages = flattenPipelineSteps(currentJob && currentJob.pipeline);
+  const stage = stages.find((item) => item.id === stageId) || stages[0];
+  if (!stage) return;
+  const wrap = document.createElement("div");
+  wrap.className = "step-modal";
+  const list = document.createElement("div");
+  list.className = "step-list";
+  const pane = document.createElement("div");
+  pane.className = "step-log-pane";
+  const tableWrap = document.createElement("div");
+  tableWrap.className = "step-tests";
+  tableWrap.hidden = true;
+  const logEl = document.createElement("pre");
+  logEl.className = "log step-log";
+  pane.append(tableWrap, logEl);
+  wrap.append(list, pane);
+  openModal("步骤详情", wrap, { wide: true });
+
+  let selectedTask = normalizeStepSelection(taskId, stage);
+  if (parseCaseSelection(selectedTask)) logEl.hidden = true;
+  const follow = newLogFollowState();
+  bindLogFollow(logEl, follow);
+
+  const paintList = () => {
+    list.replaceChildren();
+    appendStepButton(list, stage.label || stage.id, stage.status, "", selectedTask === stage.id, () => {
+      selectedTask = stage.id;
+      paintList();
+      loadStep();
+    });
+    (stage.tasks || []).forEach((task) => {
+      if (isCaseTaskId(task.id)) {
+        appendStepHeading(list, task.label || task.id, task.status, "sub");
+        appendStepButton(list, "测试结果", "", "sub nested", selectedTask === task.id + ":results", () => {
+          selectedTask = task.id + ":results";
+          paintList();
+          loadStep();
+        });
+        appendStepButton(list, "日志详情", "", "sub nested", selectedTask === task.id + ":log", () => {
+          selectedTask = task.id + ":log";
+          paintList();
+          loadStep();
+        });
+        return;
+      }
+      appendStepButton(list, task.label || task.id, task.status, "sub", selectedTask === task.id, () => {
+        selectedTask = task.id;
+        paintList();
+        loadStep();
+      });
+    });
+  };
+
+  const loadStep = async () => {
+    const caseSel = parseCaseSelection(selectedTask);
+    const selected = caseSel
+      ? (stage.tasks || []).find((task) => task.id === caseSel.taskId)
+      : (stage.tasks || []).find((task) => task.id === selectedTask);
+    const logStep = (selected && selected.logStep) || stage.logStep || stage.id;
+    const sub = caseSel ? caseSel.taskId : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
+    try {
+      const job = await api("/api/jobs/" + currentJobId + "?step=" + encodeURIComponent(logStep) + (sub ? "&sub=" + encodeURIComponent(sub) : "") + "&view=ui");
+      const lines = Array.isArray(job.log) ? job.log : [];
+      const run = (job.test_runs && job.test_runs[0]) || currentTestRun(currentJob);
+      tableWrap.replaceChildren();
+      if (caseSel && caseSel.view === "results") {
+        logEl.hidden = true;
+        tableWrap.hidden = false;
+        if (caseSel.taskId === "ut-cases") renderTestRun(tableWrap, filterRun(run, "ut"), "UT 测试结果");
+        else renderTestRun(tableWrap, filterRun(run, "dt"), "DT 测试结果");
+        return;
+      }
+      tableWrap.hidden = true;
+      logEl.hidden = false;
+      paintLog(logEl, lines.length ? lines.join("\n") : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。"), follow);
+    } catch (e) {
+      tableWrap.hidden = true;
+      logEl.hidden = false;
+      paintLog(logEl, e.message || "加载日志失败", follow);
+    }
+  };
+
+  paintList();
+  loadStep();
+}
+
+function openPasswordDialog() {
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    passwordFieldHtml("oldPass", "当前密码", "current-password") +
+    passwordFieldHtml("newPass", "新密码", "new-password") +
+    passwordFieldHtml("newPass2", "确认新密码", "new-password") +
+    '<div class="row"><button type="button" class="btn ghost" data-close-modal>取消</button>' +
+    '<button type="button" class="btn primary" id="btnPassSave">保存</button></div>';
+  openModal("修改密码", wrap, { narrow: true });
+  bindEyeButtons(wrap);
+  wrap.querySelector("#btnPassSave").addEventListener("click", async () => {
+    const next = wrap.querySelector("#newPass").value;
+    const again = wrap.querySelector("#newPass2").value;
+    if (next !== again) {
+      alert("两次输入的新密码不一致");
+      return;
+    }
+    try {
+      await api("/api/auth/password", {
+        method: "POST",
+        body: JSON.stringify({
+          old_password: wrap.querySelector("#oldPass").value,
+          new_password: next,
+        }),
+      });
+      closeModal();
+    } catch (e) {
+      alert(e.message || "修改失败");
+    }
+  });
+}
+
+async function loginSWR() {
   $("loginLog").textContent = "登录中…";
   try {
     const data = await api("/api/login", {
@@ -1235,510 +1810,111 @@ async function login() {
     $("loginLog").textContent = (e.data && e.data.output) || e.message;
   }
 }
-
-async function checkLogin() {
+async function checkSWR() {
   $("loginLog").textContent = "检查中…";
   try {
     const data = await api("/api/login/check", { method: "POST", body: "{}" });
-    $("loginLog").textContent = data.ok
-      ? "登录有效：服务器共享凭证仍可用，其他人可直接构建推送"
-      : "未登录或已过期：需要任一人重新粘贴 docker login";
+    $("loginLog").textContent = data.ok ? "登录有效" : "未登录或已过期";
+  } catch (e) {
+    $("loginLog").textContent = e.message;
+  }
+}
+async function logoutSWR() {
+  try {
+    const data = await api("/api/login/logout", { method: "POST", body: "{}" });
+    $("loginLog").textContent = data.output || "已退出";
   } catch (e) {
     $("loginLog").textContent = e.message;
   }
 }
 
-async function logout() {
-  const log = $("loginLog");
-  if (log) log.textContent = "正在退出服务器上的共享 SWR 登录…";
-  try {
-    const data = await api("/api/login/logout", { method: "POST", body: "{}" });
-    if (log) {
-      log.textContent =
-        (data.output || "已退出") +
-        "\n共享凭证已清除；之后需要任一人重新登录才能推送。";
-    }
-    if ($("loginCmd")) $("loginCmd").value = "";
-  } catch (e) {
-    if (log) log.textContent = "退出失败：" + ((e.data && e.data.output) || e.message || String(e));
-  }
+function updateHwCredStatus() {
+  const el = $("hwCredStatus");
+  if (!el) return;
+  el.textContent = hwCloudCreds ? "华为云凭证：已启用（仅本会话）" : "华为云凭证：未设置";
 }
-
-function fillBranchSelect(selectEl, branches, defaultBranch) {
-  selectEl.innerHTML = "";
-  const list = branches && branches.length ? branches : [defaultBranch || "main"];
-  for (const b of list) {
-    const opt = document.createElement("option");
-    opt.value = b;
-    opt.textContent = b;
-    if (b === defaultBranch) opt.selected = true;
-    selectEl.appendChild(opt);
-  }
-  selectEl.disabled = false;
-}
-
-function runQueuedBranchLoads() {
-  while (branchLoadsActive < BRANCH_LOAD_LIMIT && branchLoadQueue.length) {
-    const queued = branchLoadQueue.shift();
-    branchLoadsActive += 1;
-    Promise.resolve()
-      .then(queued.task)
-      .then(queued.resolve, queued.reject)
-      .finally(() => {
-        branchLoadsActive -= 1;
-        runQueuedBranchLoads();
-      });
-  }
-}
-
-function queueBranchLoad(task, priority = false) {
-  return new Promise((resolve, reject) => {
-    const queued = {task, resolve, reject};
-    if (priority) branchLoadQueue.unshift(queued);
-    else branchLoadQueue.push(queued);
-    runQueuedBranchLoads();
+function setCceControlsEnabled(enabled) {
+  ["btnCceRefreshClusters", "cceClusterSelect", "btnCceRefreshWorkloads"].forEach((id) => {
+    if ($(id)) $(id).disabled = !enabled;
   });
 }
-
-function setBranchLoadState(row, state, message = "") {
-  const status = row && row.querySelector("[data-branch-status]");
-  const retry = row && row.querySelector("[data-branch-retry]");
-  if (status) {
-    status.textContent = message;
-    status.className = "branch-status" + (state ? " " + state : "");
-    if (state !== "error") status.removeAttribute("title");
-  }
-  if (retry) {
-    retry.disabled = submitting || state === "loading";
-    retry.classList.toggle("loading", state === "loading");
-  }
+function clearHwCloudCreds() {
+  hwCloudCreds = null;
+  setCceControlsEnabled(false);
+  updateHwCredStatus();
 }
-
-async function loadBranches(serviceId, selectEl, defaultBranch, force = false) {
-  const row = selectEl.closest(".row-svc");
-  if (!force && branchCache[serviceId] && branchCache[serviceId].loaded) {
-    const cached = branchCache[serviceId].branches;
-    fillBranchSelect(selectEl, cached, defaultBranch);
-    setBranchLoadState(row, "ok", "已加载 " + cached.length + " 个分支");
+function applyHwCloudCreds() {
+  const ak = ($("hwAccessKey").value || "").trim();
+  const sk = ($("hwSecretKey").value || "").trim();
+  if (!ak || !sk) throw new Error("请填写 Access Key 和 Secret Key");
+  hwCloudCreds = { access_key: ak, secret_key: sk, region: $("hwRegion").value, project_id: ($("hwProjectId").value || "").trim() };
+  $("hwSecretKey").value = "";
+  setCceControlsEnabled(true);
+  updateHwCredStatus();
+}
+function requireHwCloudCreds() {
+  if (!hwCloudCreds) throw new Error("请先启用本会话凭证");
+  return hwCloudCreds;
+}
+async function hwCcePost(path, extra) {
+  const creds = requireHwCloudCreds();
+  return api(path, { method: "POST", body: JSON.stringify({ ...creds, ...(extra || {}) }) });
+}
+function formatCceError(err) { return (err && err.data && err.data.error) || err.message || String(err); }
+function setCceLog(text) { if ($("cceLog")) $("cceLog").textContent = text || ""; }
+async function initCceView() {
+  if (cceRegionsLoaded) return;
+  const data = await api("/api/cce/regions");
+  const select = $("hwRegion");
+  select.innerHTML = (data.regions || []).map((item) =>
+    '<option value="' + esc(item.id) + '">' + esc(item.label || item.name || item.id) + " (" + esc(item.id) + ")</option>"
+  ).join("");
+  cceRegionsLoaded = true;
+}
+async function refreshCceClusters() {
+  setCceLog("正在加载集群…");
+  const data = await hwCcePost("/api/cce/clusters");
+  const select = $("cceClusterSelect");
+  const clusters = data.clusters || [];
+  select.innerHTML = clusters.length
+    ? clusters.map((item) => '<option value="' + esc(item.id) + '">' + esc(item.name || item.id) + "</option>").join("")
+    : '<option value="">无集群</option>';
+  select.disabled = !clusters.length;
+  setCceLog("已加载 " + clusters.length + " 个集群。");
+}
+function renderCceWorkloads(rows) {
+  const body = $("cceWorkloadsBody");
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="6" class="hint">该命名空间下无 Deployment。</td></tr>';
     return;
   }
-  selectEl.disabled = true;
-  setBranchLoadState(row, "loading", force ? "正在重新加载…" : "正在加载分支…");
-  try {
-    const suffix = force ? "?refresh=1" : "";
-    const data = await queueBranchLoad(
-      () => api("/api/services/" + encodeURIComponent(serviceId) + "/branches" + suffix),
-      force
-    );
-    branchCache[serviceId] = { loaded: true, branches: data.branches || [] };
-    fillBranchSelect(selectEl, data.branches || [], data.default_branch || defaultBranch);
-    setBranchLoadState(row, "ok", "已更新 " + (data.branches || []).length + " 个分支");
-  } catch (e) {
-    fillBranchSelect(selectEl, [defaultBranch || "main"], defaultBranch || "main");
-    delete branchCache[serviceId];
-    const detail = (e.data && (e.data.detail || e.data.error)) || e.message || "未知错误";
-    setBranchLoadState(row, "error", "分支加载失败，当前仅保留默认 " + (defaultBranch || "main"));
-    const status = row && row.querySelector("[data-branch-status]");
-    if (status) status.title = String(detail);
-  }
-}
-
-function selectedItems() {
-  const items = [];
-  document.querySelectorAll(".row-svc").forEach((row) => {
-    const cb = row.querySelector('[data-act="pick"]');
-    if (!cb || !cb.checked) return;
-    const id = row.getAttribute("data-id");
-    const title = row.getAttribute("data-title") || id;
-    const select = row.querySelector("[data-branch]");
-    const branch = ((select && select.value) || row.getAttribute("data-default-branch") || "main").trim();
-    const versionInput = row.querySelector("[data-version]");
-    const version = ((versionInput && versionInput.value) || "").trim();
-    items.push({ service_id: id, branch, title, version, requires_version: !!versionInput });
+  body.innerHTML = rows.map((item) => (
+    "<tr><td class=\"mono\">" + esc(item.name || "—") + "</td><td>" + esc(item.replicas ?? "—") +
+    "</td><td>" + esc(item.ready_replicas ?? "—") + "</td><td class=\"mono\">" +
+    esc(Array.isArray(item.images) ? item.images.join(", ") : "—") + "</td><td>" +
+    esc(item.strategy || "—") + '</td><td><button type="button" class="btn ghost cce-detail-btn" data-name="' +
+    esc(item.name || "") + '">详情</button></td></tr>'
+  )).join("");
+  body.querySelectorAll(".cce-detail-btn").forEach((btn) => {
+    btn.addEventListener("click", () => loadCceWorkloadDetail(btn.getAttribute("data-name") || "").catch((e) => setCceLog(formatCceError(e))));
   });
-  return items;
 }
-
-function updateBatchUi() {
-  const items = selectedItems();
-  const btn = $("btnBatch");
-  const count = $("selCount");
-  if (count) count.textContent = String(items.length);
-  if (btn) {
-    btn.disabled = submitting || items.length === 0;
-    btn.textContent = items.length ? "构建所选 (" + items.length + ")" : "构建所选";
-  }
-  const all = $("chkAll");
-  if (all) {
-    const boxes = Array.from(document.querySelectorAll('[data-act="pick"]'));
-    const checked = boxes.filter((b) => b.checked).length;
-    all.checked = boxes.length > 0 && checked === boxes.length;
-    all.indeterminate = checked > 0 && checked < boxes.length;
-  }
+async function refreshCceWorkloads() {
+  const clusterId = $("cceClusterSelect").value;
+  if (!clusterId) throw new Error("请先选择集群");
+  const namespace = ($("cceNamespace").value || "default").trim() || "default";
+  setCceLog("正在加载负载…");
+  const data = await hwCcePost("/api/cce/workloads", { cluster_id: clusterId, namespace, kind: "deployments" });
+  renderCceWorkloads(data.workloads || []);
+  setCceLog("已加载 " + (data.count || 0) + " 个负载。");
 }
-
-function setButtonsDisabled(disabled) {
-  document.querySelectorAll('[data-act="run"]').forEach((btn) => {
-    btn.disabled = !!disabled;
-  });
-  document.querySelectorAll('[data-act="pick"]').forEach((cb) => {
-    cb.disabled = !!disabled;
-  });
-  document.querySelectorAll("[data-version]").forEach((input) => {
-    input.disabled = !!disabled;
-  });
-  document.querySelectorAll("[data-branch-retry]").forEach((button) => {
-    button.disabled = !!disabled || button.classList.contains("loading");
-  });
-  if ($("chkAll")) $("chkAll").disabled = !!disabled;
-  if ($("btnBatch")) $("btnBatch").disabled = !!disabled || selectedItems().length === 0;
-}
-
-async function refreshServices() {
-  const data = await api("/api/services");
-  const root = $("serviceTable");
-  root.innerHTML = "";
-  for (const s of data.services) {
-    const row = document.createElement("div");
-    row.className = "row-svc";
-    row.setAttribute("data-id", s.id);
-    row.setAttribute("data-title", s.title || s.id);
-    row.setAttribute("data-default-branch", s.default_branch || "main");
-    const versionField = s.requires_version
-      ? '<label class="version-label">' +
-        '<span></span><input class="input version-input" data-version required ' +
-        'pattern="v[0-9]+\\.[0-9]+\\.[0-9]+" placeholder="' + (s.version_example || "v1.2.3") + '" />' +
-        '</label><div class="version-hint">Daemon版本变化时需要修改版本号，无变化时可不修改</div>'
-      : "";
-    const runLabel = s.archive_only ? "构建并归档" : "构建并推送";
-    row.innerHTML =
-      '<label class="svc-pick"><input type="checkbox" data-act="pick" /></label>' +
-      "<div>" +
-      '<div class="svc-title"></div>' +
-      '<div class="svc-meta"></div>' +
-      '<div class="branch-row">' +
-      '<label class="branch-label">分支 <select class="input branch-select" data-branch></select></label>' +
-      '<button type="button" class="branch-retry" data-branch-retry title="重新拉取该微服务的最新分支" aria-label="重新拉取该微服务的最新分支">↻</button>' +
-      '<span class="branch-status" data-branch-status></span>' +
-      '</div>' +
-      versionField +
-      "</div>" +
-      '<div class="svc-actions"><button type="button" class="btn primary" data-act="run"></button></div>';
-    row.querySelector(".svc-title").textContent = s.title;
-    row.querySelector(".svc-meta").textContent = (s.repo || s.github || "") + (s.archive_only ? " · 仅生成归档，不推送 SWR" : "");
-    const versionLabel = row.querySelector(".version-label span");
-    if (versionLabel) versionLabel.textContent = (s.version_label || "Version") + "（例如 " + (s.version_example || "v1.2.3") + "）";
-    const versionInput = row.querySelector("[data-version]");
-    if (versionInput) {
-      versionInput.value = s.last_version || rememberedDaemonVersion();
-      rememberDaemonVersion(versionInput.value);
-      versionInput.addEventListener("input", () => {
-        versionInput.setCustomValidity("");
-        rememberDaemonVersion(versionInput.value.trim());
-      });
-    }
-    const select = row.querySelector("[data-branch]");
-    fillBranchSelect(select, [s.default_branch || "main"], s.default_branch || "main");
-    row.querySelector("[data-branch-retry]").addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      loadBranches(s.id, select, s.default_branch, true);
-    });
-    setTimeout(() => loadBranches(s.id, select, s.default_branch), 30);
-    row.querySelector('[data-act="pick"]').addEventListener("change", updateBatchUi);
-    const btn = row.querySelector('[data-act="run"]');
-    btn.textContent = runLabel;
-    btn.dataset.defaultLabel = runLabel;
-    btn.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      const branch = (select.value || s.default_branch || "main").trim();
-      const versionInput = row.querySelector("[data-version]");
-      pushItems([{
-        service_id: s.id,
-        branch,
-        title: s.title,
-        version: ((versionInput && versionInput.value) || "").trim(),
-        requires_version: !!versionInput,
-      }], btn);
-    });
-    root.appendChild(row);
-  }
-  updateBatchUi();
-  if (submitting) setButtonsDisabled(true);
-}
-
-function rememberLastJob(jobId, summary) {
-  try {
-    const observedAt = Date.now();
-    localStorage.setItem(LAST_JOB_KEY, JSON.stringify({ id: jobId, summary, observed_at: observedAt }));
-    localStorage.removeItem(LEGACY_ACTIVE_JOB_KEY);
-    scheduleLastJobExpiry(jobId, observedAt, LAST_JOB_TTL_MS);
-  } catch (_) { /* storage may be disabled */ }
-}
-
-function clearStoredLastJob() {
-  try {
-    localStorage.removeItem(LAST_JOB_KEY);
-    localStorage.removeItem(LEGACY_ACTIVE_JOB_KEY);
-  } catch (_) { /* storage may be disabled */ }
-}
-
-function scheduleLastJobExpiry(jobId, observedAt, delay) {
-  if (lastJobExpiryTimer) clearTimeout(lastJobExpiryTimer);
-  lastJobExpiryTimer = setTimeout(() => {
-    lastJobExpiryTimer = null;
-    try {
-      const current = JSON.parse(localStorage.getItem(LAST_JOB_KEY) || "null");
-      if (current && current.id === jobId && Number(current.observed_at) === observedAt) {
-        clearStoredLastJob();
-      }
-    } catch (_) {
-      clearStoredLastJob();
-    }
-  }, Math.max(0, delay));
-}
-
-function rememberedLastJob() {
-  try {
-    const raw = localStorage.getItem(LAST_JOB_KEY) || localStorage.getItem(LEGACY_ACTIVE_JOB_KEY);
-    const value = JSON.parse(raw || "null");
-    const observedAt = Number(value && value.observed_at);
-    const age = Date.now() - observedAt;
-    if (!value || !value.id || !observedAt || age < 0 || age >= LAST_JOB_TTL_MS) {
-      clearStoredLastJob();
-      return null;
-    }
-    scheduleLastJobExpiry(value.id, observedAt, LAST_JOB_TTL_MS - age);
-    return value;
-  } catch (_) {
-    clearStoredLastJob();
-    return null;
-  }
-}
-
-function stopPolling() {
-  pollGeneration += 1;
-  if (pollTimer) clearTimeout(pollTimer);
-  pollTimer = null;
-}
-
-function stopActiveProbe() {
-  if (activeProbeTimer) clearTimeout(activeProbeTimer);
-  activeProbeTimer = null;
-}
-
-function resetJobView() {
-  liveLogLines = [];
-  logCursor = 0;
-  testRevision = -1;
-  cachedTestRuns = [];
-  pollFails = 0;
-  resetLogFollow(liveLogFollow);
-}
-
-function scheduleActiveProbe(delay = 1500) {
-  stopActiveProbe();
-  // Only watch THIS browser's jobs; never steal another person's build stream.
-  activeProbeTimer = setTimeout(async () => {
-    activeProbeTimer = null;
-    try {
-      const data = await api("/api/running-jobs?client_id=" + encodeURIComponent(clientId()));
-      const jobs = (data && data.jobs) || [];
-      jobs.forEach((job) => upsertMyJob(job.id, job.service_id || "任务", job.status || "running"));
-      if (!activeJobId) {
-        const first = jobs[0];
-        if (first && first.id) {
-          startPolling(first.id, first.service_id || "任务");
-          return;
-        }
-      }
-    } catch (_) {
-      /* ignore transient probe failures */
-    }
-    scheduleActiveProbe();
-  }, delay);
-}
-
-function startPolling(jobId, summary) {
-  stopActiveProbe();
-  stopPolling();
-  const generation = pollGeneration;
-  activeJobId = jobId;
-  resetJobView();
-  busy = true;
-  // Concurrent: keep build buttons usable so this page can start another job.
-  setButtonsDisabled(false);
-  updateBatchUi();
-  upsertMyJob(jobId, summary, "running");
-  rememberLastJob(jobId, summary);
-  setLiveStopVisible(true, false);
-  showJob(summary + " · job " + jobId, "Connecting to active job…");
-
-  const tick = async () => {
-    const keepPolling = await pollJob(jobId, summary, generation, true);
-    if (keepPolling && generation === pollGeneration) {
-      pollTimer = setTimeout(tick, 1500);
-    }
-  };
-  tick();
-}
-
-async function restoreLastJob(saved) {
-  if (!saved || !saved.id || activeJobId) return;
-  stopPolling();
-  const generation = pollGeneration;
-  resetJobView();
-  const summary = saved.summary || "最近任务";
-  showJob(summary + " · 恢复最近任务…", "Loading saved job…");
-  const stillRunning = await pollJob(saved.id, summary, generation);
-  if (stillRunning && generation === pollGeneration) startPolling(saved.id, summary);
-}
-
-async function pushItems(items, btn) {
-  if (submitting) {
-    showJob("正在提交上一个请求，请稍候");
-    return;
-  }
-  if (!items || !items.length) {
-    showJob("请先勾选要构建的微服务");
-    return;
-  }
-  const invalidVersion = items.find((item) => item.requires_version && !DAEMON_VERSION_PATTERN.test(item.version || ""));
-  if (invalidVersion) {
-    showJob(
-      invalidVersion.title + " · 版本格式错误",
-      "Version is required and must match vMAJOR.MINOR.PATCH, for example v1.2.3"
-    );
-    const row = document.querySelector('.row-svc[data-id="' + invalidVersion.service_id + '"]');
-    const input = row && row.querySelector("[data-version]");
-    if (input) { input.focus(); input.setCustomValidity("请输入类似 v1.2.3 的版本号"); input.reportValidity(); }
-    return;
-  }
-  items.filter((item) => item.requires_version).forEach((item) => rememberDaemonVersion(item.version));
-  document.querySelectorAll("[data-version]").forEach((input) => input.setCustomValidity(""));
-  submitting = true;
-  stopActiveProbe();
-  if (btn) btn.textContent = "提交中…";
-  const summary =
-    items.length === 1
-      ? items[0].title + " @ " + items[0].branch
-      : items.length + " 个服务";
-  showJob(summary + " · 已提交，正在启动…", "正在请求 /api/push …\n");
-  try {
-    const loginCmd = (($("loginCmd") && $("loginCmd").value) || "").trim();
-    const resp = await api("/api/push", {
-      method: "POST",
-      body: JSON.stringify({
-        client_id: clientId(),
-        items: items.map((it) => ({ service_id: it.service_id, branch: it.branch, version: it.version || "" })),
-        login_command: loginCmd,
-      }),
-    });
-    startPolling(resp.job_id, summary);
-  } catch (e) {
-    const msg = (e.data && (e.data.detail || e.data.error)) || e.message;
-    showJob(summary + " · 未能启动", String(msg));
-    scheduleActiveProbe();
-  } finally {
-    submitting = false;
-    if (btn) btn.textContent = btn.dataset.defaultLabel || "构建并推送";
-    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = b.dataset.defaultLabel || "构建并推送"));
-    setButtonsDisabled(false);
-    updateBatchUi();
-  }
-}
-
-async function pollJob(jobId, summary, generation = pollGeneration, trackRecent = false) {
-  try {
-    const query = new URLSearchParams({
-      compact: "1",
-      view: "ui",
-      log_after: String(logCursor),
-      test_revision: String(testRevision),
-    });
-    const job = await api("/api/jobs/" + jobId + "?" + query.toString());
-    if (generation !== pollGeneration) return false;
-    if (trackRecent) rememberLastJob(jobId, summary);
-    pollFails = 0;
-    if (Array.isArray(job.log) && job.log.length) liveLogLines.push(...job.log);
-    logCursor = Number.isFinite(Number(job.log_cursor)) ? Number(job.log_cursor) : liveLogLines.length;
-    if (Array.isArray(job.test_runs)) cachedTestRuns = job.test_runs;
-    if (Number.isFinite(Number(job.test_revision))) testRevision = Number(job.test_revision);
-
-    const renderJob = { ...job, test_runs: cachedTestRuns };
-    const logEl = $("jobLog");
-    if (logEl) {
-      paintLog(logEl, displayJobLog(liveLogLines), liveLogFollow);
-    }
-    renderTestResult(renderJob);
-    renderJobPipeline("liveJobPipeline", job.pipeline, job.status);
-    const progress = job.progress ? " · " + job.progress : "";
-    const current = job.current ? " · " + job.current : "";
-    const stage = job.stage ? " · " + job.stage : "";
-    if (job.status === "running" || job.status === "unknown") {
-      upsertMyJob(jobId, summary, "running");
-      setLiveStopVisible(true, job.stage === "stopping");
-      $("jobMeta").textContent =
-        summary +
-        (job.stage === "stopping" ? " · 正在停止" : " · 进行中") +
-        progress +
-        current +
-        stage;
-      return true;
-    }
-
-    const finalStatus = job.status === "ok" ? "ok" : job.status === "stopped" ? "stopped" : "failed";
-    upsertMyJob(jobId, summary, finalStatus);
-    setLiveStopVisible(false, false);
-    if (activeJobId === jobId) activeJobId = "";
-    busy = false;
-    setButtonsDisabled(false);
-    document.querySelectorAll('[data-act="run"]').forEach((b) => (b.textContent = b.dataset.defaultLabel || "构建并推送"));
-    updateBatchUi();
-    const archiveHint = job.archive_dir || job.archive || "";
-    if (job.status === "ok") {
-      $("jobMeta").textContent =
-        summary +
-        " · 成功" +
-        (archiveHint ? " · 归档 " + archiveHint : "") +
-        (job.remote ? " · " + job.remote : "");
-      refreshArtifacts();
-    } else if (job.status === "stopped") {
-      $("jobMeta").textContent = summary + " · 已停止";
-    } else {
-      $("jobMeta").textContent =
-        summary +
-        " · 失败 · " +
-        (job.error || "") +
-        (archiveHint ? " · 归档 " + archiveHint : "");
-    }
-    // Prefer next running job owned by this browser.
-    const next = myJobs.find((j) => j.status === "running" && j.id !== jobId);
-    if (next) {
-      startPolling(next.id, next.summary || next.id);
-      return false;
-    }
-    scheduleActiveProbe();
-    return false;
-  } catch (e) {
-    if (generation !== pollGeneration) return false;
-    pollFails += 1;
-    if (pollFails < 80) {
-      if ($("jobMeta")) {
-        $("jobMeta").textContent = summary + " · 网络抖动，重连中 (" + pollFails + ")";
-      }
-      return true;
-    }
-    if (activeJobId === jobId) activeJobId = "";
-    busy = false;
-    setLiveStopVisible(false, false);
-    setButtonsDisabled(false);
-    updateBatchUi();
-    showJob("轮询失败", e.message || String(e));
-    scheduleActiveProbe();
-    return false;
-  }
+async function loadCceWorkloadDetail(name) {
+  const clusterId = $("cceClusterSelect").value;
+  const namespace = ($("cceNamespace").value || "default").trim() || "default";
+  const data = await hwCcePost("/api/cce/workloads/detail", { cluster_id: clusterId, namespace, kind: "deployments", name });
+  const detail = $("cceWorkloadDetail");
+  detail.hidden = false;
+  detail.textContent = JSON.stringify(data, null, 2);
 }
 
 function bind(id, fn) {
@@ -1746,376 +1922,151 @@ function bind(id, fn) {
   if (el) el.addEventListener("click", fn);
 }
 
-function updateHwCredStatus() {
-  const el = $("hwCredStatus");
-  if (!el) return;
-  if (hwCloudCreds && hwCloudCreds.access_key && hwCloudCreds.secret_key) {
-    el.textContent = "华为云凭证：已启用（仅当前页面，" + (hwCloudCreds.region || "—") + "）";
-    el.style.color = "var(--ok)";
-  } else {
-    el.textContent = "华为云凭证：未设置";
-    el.style.color = "";
-  }
-}
-
-function setCceControlsEnabled(enabled) {
-  ["btnCceRefreshClusters", "cceClusterSelect", "btnCceRefreshWorkloads"].forEach((id) => {
-    const el = $(id);
-    if (el) el.disabled = !enabled;
-  });
-}
-
-function clearHwCloudCreds() {
-  hwCloudCreds = null;
-  const sk = $("hwSecretKey");
-  if (sk) sk.value = "";
-  updateHwCredStatus();
-  setCceControlsEnabled(false);
-  const clusterSelect = $("cceClusterSelect");
-  if (clusterSelect) {
-    clusterSelect.innerHTML = '<option value="">— 先刷新集群 —</option>';
-    clusterSelect.disabled = true;
-  }
-  const body = $("cceWorkloadsBody");
-  if (body) {
-    body.innerHTML = '<tr><td colspan="6" class="hint">设置凭证并选择集群后刷新负载。</td></tr>';
-  }
-  const detail = $("cceWorkloadDetail");
-  if (detail) {
-    detail.hidden = true;
-    detail.textContent = "";
-  }
-  const log = $("cceLog");
-  if (log) log.textContent = "";
-}
-
-function applyHwCloudCreds() {
-  const accessKey = ($("hwAccessKey") && $("hwAccessKey").value || "").trim();
-  const secretKey = ($("hwSecretKey") && $("hwSecretKey").value || "").trim();
-  const region = ($("hwRegion") && $("hwRegion").value || "").trim();
-  const projectId = ($("hwProjectId") && $("hwProjectId").value || "").trim();
-  if (!accessKey || !secretKey) {
-    throw new Error("请填写 Access Key 和 Secret Key");
-  }
-  if (!region) {
-    throw new Error("请选择 Region");
-  }
-  hwCloudCreds = {
-    access_key: accessKey,
-    secret_key: secretKey,
-    region,
-    project_id: projectId,
-  };
-  if ($("hwSecretKey")) $("hwSecretKey").value = "";
-  updateHwCredStatus();
-  setCceControlsEnabled(true);
-  const log = $("cceLog");
-  if (log) log.textContent = "凭证已启用（SK 已从输入框清除，仍保留在页面内存）。可刷新集群列表。";
-}
-
-function requireHwCloudCreds() {
-  if (!hwCloudCreds || !hwCloudCreds.access_key || !hwCloudCreds.secret_key) {
-    throw new Error("请先在左侧点击「启用本会话凭证」");
-  }
-  return hwCloudCreds;
-}
-
-async function hwCcePost(path, extra) {
-  const creds = requireHwCloudCreds();
-  return api(path, {
-    method: "POST",
-    body: JSON.stringify({
-      access_key: creds.access_key,
-      secret_key: creds.secret_key,
-      region: creds.region,
-      project_id: creds.project_id || "",
-      ...(extra || {}),
-    }),
-  });
-}
-
-function formatCceError(err) {
-  let msg = String((err && err.message) || err || "unknown error");
-  const data = err && err.data;
-  if (data && data.detail) {
-    const detail =
-      typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail, null, 2);
-    msg += "\n" + detail;
-  }
-  return msg;
-}
-
-function setCceLog(text) {
-  const el = $("cceLog");
-  if (el) el.textContent = text || "";
-}
-
-async function initCceView() {
-  const select = $("hwRegion");
-  if (!select || cceRegionsLoaded) {
-    updateHwCredStatus();
-    setCceControlsEnabled(!!hwCloudCreds);
-    return;
-  }
-  const data = await api("/api/cce/regions");
-  const regions = (data && data.regions) || [];
-  select.innerHTML = regions
-    .map(
-      (item) =>
-        `<option value="${esc(item.id)}">${esc(item.label || item.id)} (${esc(item.id)})</option>`
-    )
-    .join("");
-  if (!select.value && regions.length) {
-    const preferred = regions.find((r) => r.id === "cn-southwest-2") || regions[0];
-    select.value = preferred.id;
-  }
-  cceRegionsLoaded = true;
-  updateHwCredStatus();
-  setCceControlsEnabled(!!hwCloudCreds);
-}
-
-async function refreshCceClusters() {
-  setCceLog("正在加载集群…");
-  const data = await hwCcePost("/api/cce/clusters");
-  const clusters = (data && data.clusters) || [];
-  const select = $("cceClusterSelect");
-  if (!select) return;
-  if (!clusters.length) {
-    select.innerHTML = '<option value="">（无集群）</option>';
-    setCceLog("未找到集群。");
-    return;
-  }
-  select.innerHTML = clusters
-    .map((item) => {
-      const label = [item.name, item.status, item.version].filter(Boolean).join(" · ");
-      return `<option value="${esc(item.id)}">${esc(label || item.id)}</option>`;
-    })
-    .join("");
-  select.disabled = false;
-  setCceLog(
-    "已加载 " +
-      clusters.length +
-      " 个集群（project: " +
-      (data.project_name || data.project_id || "—") +
-      "）。"
-  );
-}
-
-function selectedCceClusterId() {
-  const select = $("cceClusterSelect");
-  return select ? String(select.value || "").trim() : "";
-}
-
-function renderCceWorkloads(rows) {
-  const body = $("cceWorkloadsBody");
-  if (!body) return;
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="6" class="hint">该命名空间下无 Deployment。</td></tr>';
-    return;
-  }
-  body.innerHTML = rows
-    .map((item) => {
-      const images = Array.isArray(item.images) ? item.images.join(", ") : "—";
-      return (
-        `<tr>` +
-        `<td class="mono">${esc(item.name || "—")}</td>` +
-        `<td>${esc(item.replicas ?? "—")}</td>` +
-        `<td>${esc(item.ready_replicas ?? "—")}</td>` +
-        `<td class="mono">${esc(images)}</td>` +
-        `<td>${esc(item.strategy || "—")}</td>` +
-        `<td><button type="button" class="btn ghost cce-detail-btn" data-name="${esc(item.name || "")}">详情</button></td>` +
-        `</tr>`
-      );
-    })
-    .join("");
-  body.querySelectorAll(".cce-detail-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const name = btn.getAttribute("data-name") || "";
-      loadCceWorkloadDetail(name).catch((e) => setCceLog(formatCceError(e)));
-    });
-  });
-}
-
-async function refreshCceWorkloads() {
-  const clusterId = selectedCceClusterId();
-  if (!clusterId) {
-    throw new Error("请先选择集群");
-  }
-  const namespace = ($("cceNamespace") && $("cceNamespace").value || "default").trim() || "default";
-  setCceLog("正在加载负载…");
-  const data = await hwCcePost("/api/cce/workloads", {
-    cluster_id: clusterId,
-    namespace,
-    kind: "deployments",
-  });
-  renderCceWorkloads((data && data.workloads) || []);
-  setCceLog("已加载 " + ((data && data.count) || 0) + " 个负载（" + namespace + "）。");
-  const detail = $("cceWorkloadDetail");
-  if (detail) {
-    detail.hidden = true;
-    detail.textContent = "";
-  }
-}
-
-async function loadCceWorkloadDetail(name) {
-  const clusterId = selectedCceClusterId();
-  if (!clusterId) {
-    throw new Error("请先选择集群");
-  }
-  const namespace = ($("cceNamespace") && $("cceNamespace").value || "default").trim() || "default";
-  setCceLog("正在加载 " + name + " 详情…");
-  const data = await hwCcePost("/api/cce/workloads/detail", {
-    cluster_id: clusterId,
-    namespace,
-    kind: "deployments",
-    name,
-  });
-  const detail = $("cceWorkloadDetail");
-  if (detail) {
-    detail.hidden = false;
-    detail.textContent = JSON.stringify(data, null, 2);
-  }
-  setCceLog("已加载负载详情：" + name);
-}
-
-bind("btnLogin", login);
-bind("btnCheckLogin", checkLogin);
-bind("btnLogout", logout);
-bind("btnSaveToken", () =>
-  saveToken().catch((e) => {
-    $("tokenStatus").textContent = e.message;
-    $("tokenStatus").style.color = "var(--danger)";
-  })
-);
-bind("btnBatch", () => {
-  const items = selectedItems();
-  pushItems(items, $("btnBatch"));
-});
-bind("btnRefreshArtifacts", () => {
-  refreshArtifacts().catch(() => {});
-});
-bind("btnRefreshHistory", () => {
-  refreshHistory().catch(() => {});
-});
-bind("btnHistoryBack", () => {
-  closeHistoryDetail();
-});
-bind("btnStopJob", () => {
-  if (!activeJobId) return;
-  stopRunningJob(activeJobId, {
-    button: $("btnStopJob"),
-    onStopping: () => {
-      if ($("jobMeta")) $("jobMeta").textContent = "正在停止任务…";
-    },
-  });
-});
-bind("btnHistoryStop", () => {
-  if (!historyDetailJobId) return;
-  stopRunningJob(historyDetailJobId, {
-    button: $("btnHistoryStop"),
-    onStopping: () => {
-      if ($("historyDetailMeta")) $("historyDetailMeta").textContent = "正在停止任务…";
-    },
-  });
-});
-
-bind("btnHwApplyCreds", () => {
+$("loginForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("loginError").hidden = true;
   try {
-    applyHwCloudCreds();
+    const data = await api("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: $("authUser").value.trim(), password: $("authPass").value }),
+    });
+    await bootApp(data.username);
   } catch (e) {
-    updateHwCredStatus();
-    const el = $("hwCredStatus");
-    if (el) {
-      el.textContent = String(e.message || e);
-      el.style.color = "var(--danger)";
-    }
+    $("loginError").hidden = false;
+    $("loginError").textContent = e.message || "登录失败";
+  }
+});
+
+document.querySelectorAll(".nav-item").forEach((btn) => {
+  btn.addEventListener("click", () => setNav(btn.dataset.nav));
+});
+document.querySelectorAll(".subtab[data-tab]").forEach((btn) => {
+  btn.addEventListener("click", () => setTab(btn.dataset.tab));
+});
+bindServicePicker();
+bindEyeButtons(document);
+bind("btnRun", () => openRunDialog());
+bind("btnStop", () => openStopDialog());
+bind("btnParams", () => openParamsDialog());
+bind("btnRefreshPipeline", () => refreshPipeline().catch(() => {}));
+bind("btnRefreshHistory", () => refreshHistory().catch(() => {}));
+bind("btnRefreshArtifacts", () => refreshArtifacts().catch(() => {}));
+bind("btnLogin", () => loginSWR());
+bind("btnCheckLogin", () => checkSWR());
+bind("btnLogout", () => logoutSWR());
+bind("btnSaveToken", async () => {
+  await api("/api/config/token", { method: "POST", body: JSON.stringify({ github_token: $("tokenInput").value.trim() }) });
+  $("tokenInput").value = "";
+  await refreshHealth();
+});
+bind("btnUserMenu", () => {
+  const menu = $("userMenu");
+  menu.hidden = !menu.hidden;
+  $("btnUserMenu").setAttribute("aria-expanded", String(!menu.hidden));
+});
+bind("btnChangePass", () => { closeUserMenu(); openPasswordDialog(); });
+bind("btnAuthLogout", async () => {
+  closeUserMenu();
+  showLogin();
+  try {
+    await api("/api/auth/logout", { method: "POST", body: "{}" });
+  } catch (_) {}
+});
+bind("btnHwApplyCreds", () => {
+  try { applyHwCloudCreds(); } catch (e) {
+    $("hwCredStatus").textContent = e.message;
+    $("hwCredStatus").style.color = "var(--danger)";
   }
 });
 bind("btnHwClearCreds", () => clearHwCloudCreds());
-const hwRegionEl = $("hwRegion");
-if (hwRegionEl) {
-  hwRegionEl.addEventListener("change", () => {
-    if (hwCloudCreds) {
-      hwCloudCreds.region = String(hwRegionEl.value || "").trim();
-      updateHwCredStatus();
+bind("btnCceRefreshClusters", () => refreshCceClusters().catch((e) => setCceLog(formatCceError(e))));
+bind("btnCceRefreshWorkloads", () => refreshCceWorkloads().catch((e) => setCceLog(formatCceError(e))));
+document.querySelectorAll("[data-close-modal]").forEach((el) => el.addEventListener("click", closeModal));
+$("modalRoot").addEventListener("click", (ev) => {
+  if (ev.target && ev.target.getAttribute("data-close-modal") != null) closeModal();
+});
+document.addEventListener("click", (ev) => {
+  if (!ev.target.closest(".user-wrap")) closeUserMenu();
+  if (ev.target.isConnected && !ev.target.closest("#svcPicker")) hideServiceMenu();
+});
+window.addEventListener("hashchange", async () => {
+  if (!sessionLive) return;
+  const parsed = readHash();
+  if (
+    parsed.nav === nav &&
+    parsed.service === (currentServiceId || "") &&
+    parsed.tab === tab &&
+    (parsed.job || "") === (pinnedJobId || "")
+  ) return;
+  if (parsed.nav !== nav) setNav(parsed.nav);
+  if (parsed.nav !== "build") return;
+  if (parsed.service && parsed.service !== currentServiceId && isKnownServiceId(parsed.service)) {
+    activateService(parsed.service);
+    if (isAllServices()) {
+      stopPolling();
+      applyJob(null);
+      if (tab === "pipeline" || parsed.tab === "pipeline") setTab(parsed.tab === "artifacts" ? "artifacts" : "history");
+      else if (parsed.tab !== tab) setTab(parsed.tab);
+      else if (tab === "history") refreshHistory().catch(() => {});
+      else refreshArtifacts().catch(() => {});
+      return;
     }
-  });
-}
-bind("btnCceRefreshClusters", () => {
-  refreshCceClusters().catch((e) => setCceLog(formatCceError(e)));
-});
-bind("btnCceRefreshWorkloads", () => {
-  refreshCceWorkloads().catch((e) => setCceLog(formatCceError(e)));
+    if (parsed.job) {
+      pinnedJobId = parsed.job;
+      if (parsed.tab !== tab) setTab(parsed.tab);
+      await openJob(parsed.job);
+      return;
+    }
+    if (parsed.tab !== tab) setTab(parsed.tab);
+    if (tab === "pipeline") await loadServiceJob();
+    else {
+      stopPolling();
+      refreshServiceOccupancy().catch(() => {});
+      if (tab === "history") refreshHistory().catch(() => {});
+      else refreshArtifacts().catch(() => {});
+    }
+    return;
+  }
+  if (parsed.job && parsed.job !== pinnedJobId) {
+    pinnedJobId = parsed.job;
+    if (parsed.tab !== tab) setTab(parsed.tab);
+    await openJob(parsed.job);
+    return;
+  }
+  if (parsed.tab !== tab) setTab(parsed.tab);
 });
 
-window.addEventListener("beforeunload", () => {
-  hwCloudCreds = null;
-});
-
-document.querySelectorAll(".view-tab").forEach((btn) => {
-  btn.addEventListener("click", () => setMainView(btn.dataset.view || "services"));
-});
-
-const chkAll = $("chkAll");
-if (chkAll) {
-  chkAll.addEventListener("change", () => {
-    const on = !!chkAll.checked;
-    document.querySelectorAll('[data-act="pick"]').forEach((cb) => {
-      cb.checked = on;
-    });
-    updateBatchUi();
-  });
+async function bootApp(username) {
+  enterApp(username);
+  const parsed = readHash();
+  if (parsed.service) currentServiceId = parsed.service;
+  await Promise.all([refreshHealth(), refreshServices()]);
+  setNav(parsed.nav, true);
+  if (nav === "build") {
+    applyServiceChrome();
+    if (isAllServices()) {
+      setTab(parsed.tab === "artifacts" ? "artifacts" : "history");
+    } else if (parsed.job) {
+      pinnedJobId = parsed.job;
+      setTab("pipeline");
+      await openJob(parsed.job);
+      refreshServiceOccupancy().catch(() => {});
+    } else {
+      setTab(parsed.tab);
+      if (tab === "pipeline") await loadServiceJob();
+      else refreshServiceOccupancy().catch(() => {});
+    }
+  } else {
+    writeHash();
+  }
 }
 
 (async function boot() {
-  busy = true;
-  setButtonsDisabled(true);
-  loadMyJobs();
-  let rememberedView = "services";
   try {
-    rememberedView = localStorage.getItem("robotCiMainView") || "services";
+    const me = await api("/api/auth/me");
+    if (me.user) await bootApp(me.user);
+    else showLogin();
   } catch (_) {
-    rememberedView = "services";
-  }
-  setMainView(rememberedView);
-  initCceView().catch(() => {});
-  showJob("Checking active jobs…", "Connecting to server…");
-  try {
-    const pageReady = Promise.all([refreshHealth(), refreshServices(), refreshArtifacts()]);
-    let mine = [];
-    try {
-      const data = await api("/api/running-jobs?client_id=" + encodeURIComponent(clientId()));
-      mine = (data && data.jobs) || [];
-    } catch (e) {
-      await pageReady;
-      showJob("Unable to check active jobs", String(e.message || e));
-      return;
-    }
-    await pageReady;
-
-    mine.forEach((job) => upsertMyJob(job.id, job.service_id || "任务", "running"));
-    if (mine.length) {
-      startPolling(mine[0].id, mine[0].service_id || "任务");
-      return;
-    }
-
-    busy = false;
-    setButtonsDisabled(false);
-    updateBatchUi();
-    scheduleActiveProbe();
-
-    const saved = rememberedLastJob();
-    if (saved) {
-      restoreLastJob(saved);
-      return;
-    }
-
-    showJob(
-      "就绪",
-      "可同时发起多个构建。任务日志只显示当前这一次；历史记录在「构建历史」里分页查看。\n可勾选多个微服务后点「构建所选」，或点单行「构建并推送」。"
-    );
-  } catch (e) {
-    $("serviceTable").innerHTML = '<p class="hint">无法连接助手，请先运行 start.bat</p>';
-    showJob("助手未连接", String(e.message || e));
+    showLogin();
   }
 })();

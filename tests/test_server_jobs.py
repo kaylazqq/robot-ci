@@ -42,8 +42,10 @@ class JobCoordinationTests(unittest.TestCase):
         with server._jobs_lock:
             self.saved_jobs = dict(server._jobs)
             server._jobs.clear()
+        server.reset_job_scheduler()
 
     def tearDown(self) -> None:
+        server.reset_job_scheduler()
         with server._job_procs_lock:
             server._job_procs.clear()
         with server._jobs_lock:
@@ -60,10 +62,18 @@ class JobCoordinationTests(unittest.TestCase):
             stored = server._jobs["stop-job-aa"]
         self.assertTrue(stored["cancel_requested"])
         self.assertEqual("stopping", stored["stage"])
+        self.assertEqual("testing", stored["stage_before_stop"])
         self.assertTrue(server.request_job_stop("stop-job-aa")["ok"])
         missing = server.request_job_stop("missing-job")
         self.assertFalse(missing["ok"])
         self.assertEqual(404, missing["http_status"])
+
+    def test_interruptible_sleep_raises_after_stop(self) -> None:
+        job = make_job("sleep-stop-aa")
+        self.assertIsNone(server.register_job_if_idle(job))
+        self.assertTrue(server.request_job_stop("sleep-stop-aa")["ok"])
+        with self.assertRaises(server.JobStopped):
+            server.interruptible_sleep("sleep-stop-aa", 3, interval=0.01)
 
     def test_request_job_stop_rejects_finished_job(self) -> None:
         job = make_job("done-job-aa", status="ok")
@@ -97,14 +107,21 @@ class JobCoordinationTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(raised)
 
-    def test_concurrent_jobs_are_capped_not_serialized_per_service(self) -> None:
+    def test_concurrent_jobs_are_accepted_for_distinct_services(self) -> None:
         barrier = threading.Barrier(8)
         outcomes: list[tuple[str, dict | None]] = []
+        catalog = [item["id"] for item in server.load_services()]
+        self.assertGreaterEqual(len(catalog), 8)
 
         def register(index: int) -> None:
             job_id = f"job-{index}"
             barrier.wait()
-            outcomes.append((job_id, server.register_job_if_idle(make_job(job_id))))
+            outcomes.append(
+                (
+                    job_id,
+                    server.register_job_if_idle(make_job(job_id, service_id=catalog[index])),
+                )
+            )
 
         threads = [threading.Thread(target=register, args=(index,)) for index in range(8)]
         for thread in threads:
@@ -113,18 +130,62 @@ class JobCoordinationTests(unittest.TestCase):
             thread.join()
 
         accepted = [job_id for job_id, active in outcomes if active is None]
-        limit = server.max_concurrent_jobs()
-        self.assertEqual(limit, len(accepted))
-        self.assertEqual(limit, len(server._jobs))
+        self.assertEqual(8, len(accepted))
+        self.assertEqual(8, len(server._jobs))
         self.assertIn(server.active_job_summary()["id"], accepted)
 
-    def test_same_service_can_run_two_jobs_under_the_cap(self) -> None:
+    def test_jobs_queue_fifo_when_slots_full(self) -> None:
+        with patch.object(server, "max_concurrent_jobs", return_value=1):
+            first = make_job("slot-a000000", service_id="temporal")
+            first["slot_held"] = True
+            self.assertIsNone(server.register_job_if_idle(first))
+            second = make_job("slot-b000000", service_id="agentlink")
+            self.assertIsNone(server.register_job_if_idle(second))
+            acquired: list[bool] = []
+
+            def waiter() -> None:
+                with patch.object(server, "append_job_log"), patch.object(server, "persist_job_meta"):
+                    acquired.append(server.wait_for_build_slot("slot-b000000"))
+
+            worker = threading.Thread(target=waiter)
+            worker.start()
+            time.sleep(0.4)
+            with server._jobs_lock:
+                self.assertEqual("queued", server._jobs["slot-b000000"]["status"])
+            first["status"] = "ok"
+            first["slot_held"] = False
+            server.release_build_slot("slot-a000000")
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual([True], acquired)
+            with server._jobs_lock:
+                self.assertTrue(server._jobs["slot-b000000"]["slot_held"])
+                self.assertEqual("running", server._jobs["slot-b000000"]["status"])
+
+    def test_queued_job_pipeline_shows_waiting_slot(self) -> None:
+        job = make_job("pipe-queue000", status="queued")
+        job["stage"] = "queued"
+        job["slot_held"] = False
+        job["queue_position"] = 2
+        job["current"] = ""
+        job["results"] = []
+        job["test_status"] = ""
+        job["test_runs"] = []
+        payload = server.job_payload(job, compact=True)
+        prepare = {item["id"]: item["status"] for item in payload["pipeline"]["prepare"]}
+        self.assertEqual("done", prepare["env"])
+        self.assertEqual("queued", prepare["slot"])
+        self.assertEqual("pending", prepare["adir"])
+
+    def test_same_service_second_job_is_rejected(self) -> None:
         first = make_job("job-a")
         second = make_job("job-b")
         self.assertIsNone(server.register_job_if_idle(first))
-        self.assertIsNone(server.register_job_if_idle(second))
+        conflict = server.register_concurrent_job(second)
+        self.assertEqual("service_busy", conflict["error_code"])
+        self.assertEqual("memory-service", conflict["service"])
         ids = {item["id"] for item in server.list_running_job_summaries()}
-        self.assertEqual({"job-a", "job-b"}, ids)
+        self.assertEqual({"job-a"}, ids)
 
     def test_mattermost_second_job_is_rejected(self) -> None:
         first = make_job("mm-a", service_id="mattermost")
@@ -276,6 +337,65 @@ class JobPayloadTests(unittest.TestCase):
         self.assertEqual([], unchanged["log"])
         self.assertNotIn("test_runs", unchanged)
 
+    def test_step_sub_logs_are_isolated(self) -> None:
+        job = make_job("sub-log-aa")
+        job["step_logs"] = {
+            "sync": ["[all] clone and fetch"],
+            "sync:clone": ["[clone] git clone"],
+            "sync:fetch": ["[fetch] git fetch"],
+        }
+        clone = server.job_payload(job, step="sync", sub="clone")
+        self.assertEqual(["[clone] git clone", "[fetch] git fetch"], clone["log"])
+        self.assertEqual("clone", clone["sub"])
+        whole = server.job_payload(job, step="sync")
+        self.assertEqual(["[all] clone and fetch"], whole["log"])
+        missing = server.job_payload(job, step="sync", sub="missing")
+        self.assertEqual([], missing["log"])
+
+    def test_parent_step_logs_are_split_when_sub_logs_missing(self) -> None:
+        job = make_job("sub-log-infer")
+        job["step_logs"] = {
+            "prepare": [
+                "[11:30:24] reusing shared SWR login on this server…",
+                "[11:30:25] shared SWR login still valid",
+                "[11:30:25] ensure shared public-service → /tmp/public-service @ main",
+                "[11:30:26] shared archive dir=/tmp/archives/x",
+            ],
+            "sync": [
+                "[11:30:27] git clone…",
+                "[11:30:40] HEAD=abc1234 @ release",
+            ],
+            "build": [
+                "[11:31:01] build on WSL: /tmp/src",
+                "[11:31:02] dockerfile build local/service:tag",
+                "[11:32:00] build finished",
+            ],
+        }
+        env = server.job_payload(job, step="prepare", sub="env")
+        self.assertEqual(3, len(env["log"]))
+        self.assertIn("reusing shared SWR login", env["log"][0])
+        adir = server.job_payload(job, step="prepare", sub="adir")
+        self.assertEqual(["[11:30:26] shared archive dir=/tmp/archives/x"], adir["log"])
+        clone = server.job_payload(job, step="sync", sub="clone")
+        self.assertEqual(["[11:30:27] git clone…"], clone["log"])
+        sha = server.job_payload(job, step="sync", sub="sha")
+        self.assertEqual(["[11:30:40] HEAD=abc1234 @ release"], sha["log"])
+        script = server.job_payload(job, step="build", sub="script")
+        self.assertEqual(["[11:31:01] build on WSL: /tmp/src"], script["log"])
+        docker = server.job_payload(job, step="build", sub="docker")
+        self.assertEqual(["[11:31:02] dockerfile build local/service:tag"], docker["log"])
+        verify = server.job_payload(job, step="build", sub="verify")
+        self.assertEqual(["[11:32:00] build finished"], verify["log"])
+
+    def test_test_step_markers_route_to_ut_or_dt_sublogs(self) -> None:
+        self.assertEqual("ut-cases", server._infer_test_log_substep("@@TEST_STEP@@ Temporal shell UT @@TEST_TYPE@@ ut"))
+        self.assertEqual("dt-cases", server._infer_test_log_substep("@@TEST_STEP@@ Service Router DT @@TEST_TYPE@@ dt"))
+        self.assertEqual("ut-cases", server._infer_test_log_substep("@@TEST_STEP@@ Temporal shell UT"))
+        self.assertEqual("cases", server._infer_test_log_substep("@@TEST_STEP@@ CellMem pure UT/DT"))
+        self.assertEqual("plan", server._infer_test_log_substep("Loaded test stages from .cid/build.yaml"))
+        self.assertEqual("runner", server._infer_test_log_substep("tests start service=service-router sha=abc"))
+        self.assertEqual("report", server._infer_test_log_substep("TEST summary status=passed total=3"))
+
     def test_ui_log_keeps_steps_and_errors_but_hides_runner_noise(self) -> None:
         raw = [
             "[10:00:00] git fetch…",
@@ -317,6 +437,71 @@ class JobPipelineTests(unittest.TestCase):
         self.assertEqual("running", statuses["build"])
         self.assertEqual("pending", statuses["push"])
 
+    def test_failed_tests_turn_red_while_later_steps_run(self) -> None:
+        job = make_job("pipe-test-fail")
+        job["stage"] = "building"
+        job["current"] = "memory-service@main"
+        job["test_status"] = "failed"
+        payload = server.job_payload(job, compact=True)
+        statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
+        self.assertEqual("failed", statuses["test"])
+        self.assertEqual("running", statuses["build"])
+        job["test_kinds"] = ["ut", "dt"]
+        job["test_runs"] = [{"commands": [{"test_type": "ut", "exit_code": 1}]}]
+        test = next(step for step in server.job_payload(job, compact=True)["pipeline"]["steps"] if step["id"] == "test")
+        sub = {item["id"]: item["status"] for item in test["subtasks"]}
+        self.assertEqual("failed", sub["ut-cases"])
+        self.assertEqual("skipped", sub["dt-cases"])
+
+    def test_test_subtasks_follow_cid_kinds(self) -> None:
+        job = make_job("pipe-kinds")
+        job["test_kinds"] = ["ut"]
+        payload = server.job_payload(job, compact=True)
+        test = next(step for step in payload["pipeline"]["steps"] if step["id"] == "test")
+        self.assertEqual("测试执行", test["label"])
+        self.assertEqual(["plan", "runner", "ut-cases"], [item["id"] for item in test["subtasks"]])
+        self.assertTrue(all("兼容" not in item["label"] for item in test["subtasks"]))
+
+        job["test_kinds"] = ["ut", "dt"]
+        test = next(step for step in server.job_payload(job, compact=True)["pipeline"]["steps"] if step["id"] == "test")
+        self.assertEqual(["plan", "runner", "ut-cases", "dt-cases"], [item["id"] for item in test["subtasks"]])
+
+        job["test_kinds"] = []
+        test = next(step for step in server.job_payload(job, compact=True)["pipeline"]["steps"] if step["id"] == "test")
+        self.assertEqual(["plan"], [item["id"] for item in test["subtasks"]])
+        self.assertEqual("加载build.yaml", test["subtasks"][0]["label"])
+
+    def test_pipeline_subtasks_hide_retry_and_cleanup(self) -> None:
+        job = make_job("pipe-display")
+        payload = server.job_payload(job, compact=True)
+        by_id = {step["id"]: step for step in payload["pipeline"]["steps"]}
+        self.assertEqual(["clone", "sha"], [item["id"] for item in by_id["sync"]["subtasks"]])
+        self.assertEqual("执行构建脚本", next(item["label"] for item in by_id["build"]["subtasks"] if item["id"] == "script"))
+        self.assertEqual(["tag", "push", "verify"], [item["id"] for item in by_id["push"]["subtasks"]])
+        self.assertEqual(["save"], [item["id"] for item in by_id["archive"]["subtasks"]])
+        self.assertEqual("归档镜像", by_id["archive"]["subtasks"][0]["label"])
+        self.assertEqual("检查环境", payload["pipeline"]["prepare"][0]["label"])
+        self.assertEqual(["env", "slot", "adir"], [item["id"] for item in payload["pipeline"]["prepare"]])
+        env = next(item for item in payload["pipeline"]["prepare"] if item["id"] == "env")
+        self.assertEqual(["docker", "disk"], [item["id"] for item in env["subtasks"]])
+        self.assertEqual(["script", "docker", "verify"], [item["id"] for item in by_id["build"]["subtasks"]])
+
+    def test_stopped_job_keeps_completed_steps(self) -> None:
+        job = make_job("pipe-stop", status="stopped")
+        job["stage"] = "done"
+        job["stage_before_stop"] = "building"
+        job["cancel_requested"] = True
+        job["current"] = ""
+        payload = server.job_payload(job, compact=True)
+        statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
+        self.assertEqual("done", statuses["sync"])
+        self.assertEqual("done", statuses["test"])
+        self.assertEqual("skipped", statuses["build"])
+        self.assertEqual("skipped", statuses["push"])
+        prepare = {item["id"]: item["status"] for item in payload["pipeline"]["prepare"]}
+        self.assertEqual("skipped", prepare["adir"])
+        self.assertEqual("done", prepare["slot"])
+
     def test_archive_only_service_skips_push_step(self) -> None:
         job = make_job("pipe-archive")
         job["stage"] = "archiving"
@@ -343,9 +528,65 @@ class JobPipelineTests(unittest.TestCase):
         payload = server.job_payload(job, compact=True)
         statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
         self.assertEqual("failed", statuses["sync"])
-        self.assertEqual("pending", statuses["build"])
+        self.assertEqual("skipped", statuses["build"])
         self.assertTrue(payload["pipeline"]["prepare"])
         self.assertTrue(all("subtasks" in step for step in payload["pipeline"]["steps"]))
+        prepare = {item["id"]: item["status"] for item in payload["pipeline"]["prepare"]}
+        self.assertEqual("done", prepare["env"])
+        sync = next(step for step in payload["pipeline"]["steps"] if step["id"] == "sync")
+        sub = {item["id"]: item["status"] for item in sync["subtasks"]}
+        self.assertEqual("failed", sub["clone"])
+        self.assertEqual("skipped", sub["sha"])
+
+    def test_failed_job_without_results_marks_active_step(self) -> None:
+        job = make_job("pipe-interrupt", status="failed")
+        job["stage"] = "interrupted"
+        job["stage_before_stop"] = "testing"
+        job["error"] = server.INTERRUPTED_JOB_ERROR
+        job["results"] = []
+        job["test_kinds"] = ["ut"]
+        job["test_runs"] = [{"commands": [{"test_type": "ut", "exit_code": 0}]}]
+        payload = server.job_payload(job, compact=True)
+        statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
+        self.assertEqual("done", statuses["sync"])
+        self.assertEqual("failed", statuses["test"])
+        self.assertEqual("skipped", statuses["build"])
+        self.assertEqual("skipped", statuses["push"])
+        test = next(step for step in payload["pipeline"]["steps"] if step["id"] == "test")
+        sub = {item["id"]: item["status"] for item in test["subtasks"]}
+        self.assertEqual("done", sub["plan"])
+        self.assertEqual("done", sub["ut-cases"])
+        prepare = {item["id"]: item["status"] for item in payload["pipeline"]["prepare"]}
+        self.assertEqual("done", prepare["env"])
+        self.assertEqual("done", prepare["slot"])
+        self.assertEqual("skipped", prepare["adir"])
+
+    def test_failed_prepare_job_marks_env_and_skips_steps(self) -> None:
+        job = make_job("pipe-prep-fail", status="failed")
+        job["stage"] = "interrupted"
+        job["error"] = server.INTERRUPTED_JOB_ERROR
+        job["results"] = []
+        job["commit_sha"] = ""
+        job["current"] = ""
+        job["test_status"] = ""
+        job["test_runs"] = []
+        job["test_kinds"] = []
+        payload = server.job_payload(job, compact=True)
+        statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
+        self.assertTrue(all(status == "skipped" for status in statuses.values()))
+        prepare = {item["id"]: item["status"] for item in payload["pipeline"]["prepare"]}
+        self.assertEqual("failed", prepare["env"])
+        self.assertEqual("skipped", prepare["slot"])
+
+    def test_ut_success_does_not_override_pending_test_step(self) -> None:
+        job = {
+            "test_kinds": ["ut"],
+            "test_runs": [{"commands": [{"test_type": "ut", "exit_code": 0}]}],
+        }
+        pending = {item["id"]: item["status"] for item in server._subtask_rows("test", "pending", job)}
+        self.assertEqual("pending", pending["ut-cases"])
+        failed = {item["id"]: item["status"] for item in server._subtask_rows("test", "failed", job)}
+        self.assertEqual("done", failed["ut-cases"])
 
     def test_pipeline_includes_meta_and_summary(self) -> None:
         job = make_job("pipe-meta")
@@ -762,16 +1003,40 @@ class JobEndpointTests(unittest.TestCase):
         with server._jobs_lock:
             self.saved_jobs = dict(server._jobs)
             server._jobs.clear()
+        server.reset_job_scheduler()
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.httpd.server_port}"
         self.opener = build_opener(ProxyHandler({}))
+        server.ensure_default_users()
+        login = Request(
+            self.base_url + "/api/auth/login",
+            data=json.dumps(
+                {"username": server.DEFAULT_USERNAME, "password": server.DEFAULT_PASSWORD}
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.opener.open(login, timeout=2) as response:
+            cookie = response.headers.get("Set-Cookie") or ""
+        self.cookie = cookie.split(";", 1)[0]
+
+    def _open(self, path: str, data: bytes | None = None, method: str = "GET"):
+        headers = {"Content-Type": "application/json", "Cookie": self.cookie}
+        request = Request(
+            self.base_url + path,
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        return self.opener.open(request, timeout=2)
 
     def tearDown(self) -> None:
         self.httpd.shutdown()
         self.httpd.server_close()
         self.thread.join(timeout=2)
+        server.reset_job_scheduler()
         with server._job_procs_lock:
             server._job_procs.clear()
         with server._jobs_lock:
@@ -781,13 +1046,7 @@ class JobEndpointTests(unittest.TestCase):
     def test_stop_endpoint_stops_running_job(self) -> None:
         job = make_job("active-stop")
         self.assertIsNone(server.register_job_if_idle(job))
-        request = Request(
-            self.base_url + "/api/jobs/active-stop/stop",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with self.opener.open(request, timeout=2) as response:
+        with self._open("/api/jobs/active-stop/stop", data=b"{}", method="POST") as response:
             payload = json.loads(response.read().decode("utf-8"))
         self.assertTrue(payload["ok"])
         self.assertEqual("stopping", payload["status"])
@@ -797,90 +1056,77 @@ class JobEndpointTests(unittest.TestCase):
     def test_stop_endpoint_rejects_idle_and_missing_jobs(self) -> None:
         job = make_job("done-stop", status="failed")
         self.assertIsNone(server.register_job_if_idle(job))
-        finished = Request(
-            self.base_url + "/api/jobs/done-stop/stop",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         with self.assertRaises(HTTPError) as raised:
-            self.opener.open(finished, timeout=2)
+            self._open("/api/jobs/done-stop/stop", data=b"{}", method="POST")
         self.assertEqual(409, raised.exception.code)
-        missing = Request(
-            self.base_url + "/api/jobs/deadbeefdead/stop",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         with self.assertRaises(HTTPError) as missing_err:
-            self.opener.open(missing, timeout=2)
+            self._open("/api/jobs/deadbeefdead/stop", data=b"{}", method="POST")
         self.assertEqual(404, missing_err.exception.code)
 
-    def test_running_endpoint_is_lightweight_and_push_hits_concurrency_limit(self) -> None:
-        job = make_job("active-job")
+    def test_running_endpoint_is_lightweight_and_push_queues_past_slot_cap(self) -> None:
+        catalog = [item["id"] for item in server.load_services()]
+        job = make_job("active-job", service_id=catalog[0])
         job["log"] = ["large raw log"]
+        job["slot_held"] = True
         self.assertIsNone(server.register_job_if_idle(job))
 
-        with self.opener.open(self.base_url + "/api/running-job", timeout=2) as response:
+        with self._open("/api/running-job") as response:
             active = json.loads(response.read().decode("utf-8"))
         self.assertEqual("active-job", active["id"])
         self.assertNotIn("log", active)
         self.assertNotIn("test_runs", active)
 
         for index in range(1, server.max_concurrent_jobs()):
-            extra = make_job(f"active-job-{index}")
+            extra = make_job(f"active-job-{index}", service_id=catalog[index])
+            extra["slot_held"] = True
             self.assertIsNone(server.register_job_if_idle(extra))
 
-        request = Request(
-            self.base_url + "/api/push",
-            data=json.dumps({"items": [{"service_id": "memory-service", "branch": "main"}]}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with patch.object(server, "check_docker", return_value={"ok": True, "detail": ""}):
-            with self.assertRaises(HTTPError) as raised:
-                self.opener.open(request, timeout=2)
-        self.assertEqual(409, raised.exception.code)
-        payload = json.loads(raised.exception.read().decode("utf-8"))
-        self.assertEqual("concurrency_limit", payload["error_code"])
-        self.assertEqual(server.max_concurrent_jobs(), len(payload["active_jobs"]))
+        sixth = catalog[server.max_concurrent_jobs()]
+        with patch.object(server, "run_push_job"):
+            with self._open(
+                "/api/push",
+                data=json.dumps({"items": [{"service_id": sixth, "branch": "main"}]}).encode(),
+                method="POST",
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(payload.get("job_id"))
+        with server._jobs_lock:
+            created = server._jobs[payload["job_id"]]
+        self.assertEqual(sixth, created["service_id"])
+        self.assertIn(created["status"], ("running", "queued"))
 
     def test_push_hits_mattermost_service_busy(self) -> None:
         job = make_job("mm-active", service_id="mattermost")
         self.assertIsNone(server.register_job_if_idle(job))
-        request = Request(
-            self.base_url + "/api/push",
-            data=json.dumps({"items": [{"service_id": "mattermost", "branch": "main"}]}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         with patch.object(server, "check_docker", return_value={"ok": True, "detail": ""}):
             with self.assertRaises(HTTPError) as raised:
-                self.opener.open(request, timeout=2)
+                self._open(
+                    "/api/push",
+                    data=json.dumps({"items": [{"service_id": "mattermost", "branch": "main"}]}).encode(),
+                    method="POST",
+                )
         self.assertEqual(409, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual("service_busy", payload["error_code"])
         self.assertEqual("mattermost", payload["service"])
 
     def test_multica_server_version_is_validated_before_build(self) -> None:
-        request = Request(
-            self.base_url + "/api/push",
-            data=json.dumps(
-                {"items": [{"service_id": "multica-server", "branch": "main", "version": "1.2.3"}]}
-            ).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         with patch.object(server, "save_last_daemon_version") as save_version:
             with self.assertRaises(HTTPError) as raised:
-                self.opener.open(request, timeout=2)
+                self._open(
+                    "/api/push",
+                    data=json.dumps(
+                        {"items": [{"service_id": "multica-server", "branch": "main", "version": "1.2.3"}]}
+                    ).encode(),
+                    method="POST",
+                )
             save_version.assert_not_called()
         self.assertEqual(400, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertIn("vMAJOR.MINOR.PATCH", payload["error"])
 
     def test_services_expose_version_and_archive_capabilities(self) -> None:
-        with self.opener.open(self.base_url + "/api/services", timeout=2) as response:
+        with self._open("/api/services") as response:
             payload = json.loads(response.read().decode("utf-8"))
         services = {item["id"]: item for item in payload["services"]}
         self.assertTrue(services["multica-server"]["requires_version"])
@@ -892,7 +1138,7 @@ class JobEndpointTests(unittest.TestCase):
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
     def test_branch_lookup_failure_is_explicit_service_error(self, lookup) -> None:
         with self.assertRaises(HTTPError) as raised:
-            self.opener.open(self.base_url + "/api/services/memory-service/branches", timeout=2)
+            self._open("/api/services/memory-service/branches")
         self.assertEqual(503, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual("branch lookup failed", payload["error"])
@@ -901,11 +1147,10 @@ class JobEndpointTests(unittest.TestCase):
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
     def test_branch_retry_forces_backend_refresh(self, lookup) -> None:
-        with self.opener.open(
-            self.base_url + "/api/services/memory-service/branches?refresh=1", timeout=2
-        ) as response:
+        with self._open("/api/services/memory-service/branches?refresh=1") as response:
             payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(["main", "feature/latest"], payload["branches"])
+        self.assertEqual("main", payload["selected_branch"])
         lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
 
 
@@ -1026,6 +1271,11 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertEqual("old-svc", page2["artifacts"][0]["service_id"])
         self.assertTrue(page2["artifacts"][0]["expired"])
         self.assertEqual("", page2["artifacts"][0]["download_url"])
+
+        filtered = server.list_build_artifacts(page=1, page_size=10, service_id="old-svc")
+        self.assertEqual(1, filtered["total"])
+        self.assertEqual("old-svc", filtered["artifacts"][0]["service_id"])
+        self.assertEqual("old-svc", filtered["service_id"])
 
     def test_prune_expires_artifact_records(self) -> None:
         old = self._stamp_dir("20260801000000", "old.tar")
@@ -1200,7 +1450,14 @@ class BuildHistoryTests(unittest.TestCase):
             server._jobs.update(self.saved_jobs)
         self.tmp.cleanup()
 
-    def _write_meta(self, job_id: str, client_id: str, created_at: str, service_id: str = "temporal") -> None:
+    def _write_meta(
+        self,
+        job_id: str,
+        client_id: str,
+        created_at: str,
+        service_id: str = "temporal",
+        finished_at: str = "",
+    ) -> None:
         payload = {
             "id": job_id,
             "client_id": client_id,
@@ -1210,6 +1467,8 @@ class BuildHistoryTests(unittest.TestCase):
             "branch": "main",
             "status": "ok",
         }
+        if finished_at:
+            payload["finished_at"] = finished_at
         (self.log_dir / f"job-{job_id}.json").write_text(
             json.dumps(payload, ensure_ascii=False), encoding="utf-8"
         )
@@ -1221,8 +1480,8 @@ class BuildHistoryTests(unittest.TestCase):
         self._write_meta("bbbbbbbbbbbb", mine, "2026-08-15 11:00:00", "agentlink")
         self._write_meta("cccccccccccc", other, "2026-08-15 12:00:00", "mattermost")
         empty = server.list_build_history(client_id="", page=1, page_size=10)
-        self.assertEqual(0, empty["total"])
-        self.assertEqual([], empty["jobs"])
+        self.assertEqual(3, empty["total"])
+        self.assertEqual("cccccccccccc", empty["jobs"][0]["id"])
         page = server.list_build_history(client_id=mine, page=1, page_size=1)
         self.assertEqual(2, page["total"])
         self.assertEqual(2, page["page_count"])
@@ -1230,6 +1489,26 @@ class BuildHistoryTests(unittest.TestCase):
         self.assertEqual("agentlink", page["jobs"][0]["service_id"])
         page2 = server.list_build_history(client_id=mine, page=2, page_size=1)
         self.assertEqual("aaaaaaaaaaaa", page2["jobs"][0]["id"])
+
+    def test_history_is_filtered_by_service_id(self) -> None:
+        mine = "cmsqxcxcesgairws0"
+        self._write_meta("aaaaaaaaaaaa", mine, "2026-08-15 10:00:00", "temporal")
+        self._write_meta("bbbbbbbbbbbb", mine, "2026-08-15 11:00:00", "agentlink")
+        page = server.list_build_history(page=1, page_size=10, service_id="agentlink")
+        self.assertEqual(1, page["total"])
+        self.assertEqual("bbbbbbbbbbbb", page["jobs"][0]["id"])
+        self.assertEqual("agentlink", page["service_id"])
+
+    def test_history_row_includes_duration_for_finished_jobs(self) -> None:
+        self._write_meta(
+            "aaaaaaaaaaaa",
+            "cmsqxcxcesgairws0",
+            "2026-08-15 10:00:00",
+            "temporal",
+            finished_at="2026-08-15 10:05:30",
+        )
+        page = server.list_build_history(page=1, page_size=10)
+        self.assertEqual(330, page["jobs"][0]["duration_sec"])
 
     def test_history_includes_in_memory_running_job(self) -> None:
         mine = "cmsqxcxcesgairws0"
@@ -1243,6 +1522,7 @@ class BuildHistoryTests(unittest.TestCase):
         self.assertEqual(1, page["total"])
         self.assertEqual("dddddddddddd", page["jobs"][0]["id"])
         self.assertEqual("running", page["jobs"][0]["status"])
+        self.assertIsNone(page["jobs"][0]["duration_sec"])
 
     def test_reap_orphaned_running_jobs_marks_disk_jobs_failed(self) -> None:
         running = {
@@ -1270,6 +1550,7 @@ class BuildHistoryTests(unittest.TestCase):
         kept = json.loads((self.log_dir / "job-ffffffffffff.json").read_text(encoding="utf-8"))
         self.assertEqual("failed", dead["status"])
         self.assertEqual("interrupted", dead["stage"])
+        self.assertEqual("building", dead["stage_before_stop"])
         self.assertEqual(server.INTERRUPTED_JOB_ERROR, dead["error"])
         self.assertEqual("ok", kept["status"])
         log_text = (self.log_dir / "job-eeeeeeeeeeee.log").read_text(encoding="utf-8")
@@ -1291,13 +1572,13 @@ class BuildHistoryTests(unittest.TestCase):
             )
             (self.log_dir / f"job-{job_id}.log").write_text("log\n", encoding="utf-8")
         removed = server.prune_build_history(mine)
-        self.assertEqual(51, removed)
+        self.assertEqual(0, removed)
         remaining = sorted(path.stem.replace("job-", "") for path in self.log_dir.glob("job-*.json"))
-        self.assertEqual(50, len(remaining))
-        self.assertNotIn("000000000000", remaining)
+        self.assertEqual(101, len(remaining))
+        self.assertIn("000000000000", remaining)
         self.assertIn("000000000100", remaining)
 
-    def test_record_build_artifact_trims_to_50_when_over_100(self) -> None:
+    def test_record_build_artifact_keeps_full_history(self) -> None:
         path = server.artifacts_log_path()
         for index in range(101):
             server.record_build_artifact(
@@ -1305,12 +1586,14 @@ class BuildHistoryTests(unittest.TestCase):
                     "created_at": f"2026-08-01 {index:02d}:00:00",
                     "service_id": f"svc-{index}",
                     "archive": f"/tmp/{index}.tar",
+                    "operator": "l30042018",
                 }
             )
         entries = server._parse_artifact_entries(path.read_text(encoding="utf-8"))
-        self.assertEqual(50, len(entries))
-        self.assertEqual("svc-51", entries[0]["service_id"])
+        self.assertEqual(101, len(entries))
+        self.assertEqual("svc-0", entries[0]["service_id"])
         self.assertEqual("svc-100", entries[-1]["service_id"])
+        self.assertEqual("l30042018", entries[-1]["operator"])
 
 
 class BusinessImageAndTmpTests(unittest.TestCase):
@@ -1369,6 +1652,137 @@ class BusinessImageAndTmpTests(unittest.TestCase):
             self.assertEqual(env["GOTMPDIR"], str(root))
             self.assertEqual(env["DOCKER_TMPDIR"], str(root))
             self.assertTrue(root.is_dir())
+
+
+class DockerReadyForPushTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.saved_cache = server._docker_cache
+        server._docker_cache = None
+        with server._jobs_lock:
+            self.saved_jobs = dict(server._jobs)
+            server._jobs.clear()
+
+    def tearDown(self) -> None:
+        server._docker_cache = self.saved_cache
+        with server._jobs_lock:
+            server._jobs.clear()
+            server._jobs.update(self.saved_jobs)
+
+    def test_running_job_ignores_failed_docker_cache(self) -> None:
+        server._docker_cache = (time.time(), {"ok": False, "detail": "timeout"})
+        self.assertIsNone(server.register_job_if_idle(make_job("job-a")))
+        with patch.object(server, "check_docker") as probe:
+            ready = server.docker_ready_for_push()
+            probe.assert_not_called()
+        self.assertTrue(ready["ok"])
+
+    def test_missing_docker_binary_is_still_rejected(self) -> None:
+        server._docker_cache = (time.time(), {"ok": False, "detail": "docker not installed"})
+        ready = server.docker_ready_for_push()
+        self.assertFalse(ready["ok"])
+
+    def test_failed_cache_does_not_block_when_idle(self) -> None:
+        server._docker_cache = (time.time(), {"ok": False, "detail": "busy"})
+        with patch.object(server, "schedule_docker_probe") as sched:
+            ready = server.docker_ready_for_push()
+            sched.assert_called()
+        self.assertTrue(ready["ok"])
+
+
+class PublicServiceReuseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.saved_ready = server._public_service_ready_at
+        server._public_service_ready_at = 0.0
+        with server._jobs_lock:
+            self.saved_jobs = dict(server._jobs)
+            server._jobs.clear()
+
+    def tearDown(self) -> None:
+        server._public_service_ready_at = self.saved_ready
+        with server._jobs_lock:
+            server._jobs.clear()
+            server._jobs.update(self.saved_jobs)
+
+    def _tree(self, tmp: str) -> server.Path:
+        dest = server.Path(tmp) / "public-service"
+        (dest / ".git").mkdir(parents=True)
+        rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
+        rrd.parent.mkdir(parents=True)
+        rrd.write_text("ok", encoding="utf-8")
+        return dest
+
+    def test_reuses_existing_tree_when_fetch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._tree(tmp)
+            with patch.dict(server.CFG, {"workspace_root": tmp}):
+                with patch.object(server, "run_stream", return_value=1):
+                    with patch.object(server, "run_cmd", return_value=(0, "abc1234")):
+                        with patch.object(server, "append_job_log"):
+                            ok, detail = server.ensure_public_service("ps-job")
+            self.assertTrue(ok)
+            self.assertEqual(str(dest), detail)
+
+    def test_skips_fetch_when_recently_ready(self) -> None:
+        server._public_service_ready_at = time.time()
+        with tempfile.TemporaryDirectory() as tmp:
+            self._tree(tmp)
+            with patch.dict(server.CFG, {"workspace_root": tmp}):
+                with patch.object(server, "run_stream") as stream:
+                    with patch.object(server, "run_cmd", return_value=(0, "abc1234")):
+                        with patch.object(server, "append_job_log"):
+                            ok, _detail = server.ensure_public_service("ps-job")
+            self.assertTrue(ok)
+            stream.assert_not_called()
+
+
+class ConcurrentPrepareTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with server._jobs_lock:
+            self.saved_jobs = dict(server._jobs)
+            server._jobs.clear()
+
+    def tearDown(self) -> None:
+        with server._jobs_lock:
+            server._jobs.clear()
+            server._jobs.update(self.saved_jobs)
+
+    def test_append_job_log_writes_file_outside_jobs_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = server.Path(tmp) / "job-aa.log"
+            job = make_job("logjob00aaaa")
+            job["log_file"] = str(log_path)
+            job["step_logs"] = {}
+            with server._jobs_lock:
+                server._jobs[job["id"]] = job
+            server.append_job_log(job["id"], "hello from build")
+            self.assertIn("hello from build", log_path.read_text(encoding="utf-8"))
+
+    def test_running_job_meta_omits_step_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = server.Path(tmp)
+            with patch.object(server, "LOG_DIR", log_dir):
+                job = make_job("persistjobaaa")
+                job["step_logs"] = {"prepare": ["line"]}
+                with server._jobs_lock:
+                    server._jobs[job["id"]] = job
+                server.persist_job_meta(job["id"])
+                meta = json.loads((log_dir / f"job-{job['id']}.json").read_text(encoding="utf-8"))
+                self.assertNotIn("step_logs", meta)
+                job["status"] = "ok"
+                server.persist_job_meta(job["id"])
+                meta = json.loads((log_dir / f"job-{job['id']}.json").read_text(encoding="utf-8"))
+                self.assertEqual({"prepare": ["line"]}, meta.get("step_logs"))
+
+    def test_ensure_swr_login_continues_when_probe_fails_but_local_auth_exists(self) -> None:
+        job = make_job("swr-job")
+        with server._jobs_lock:
+            server._jobs[job["id"]] = job
+        with patch.object(server, "check_login_detail", return_value=(False, "timeout")):
+            with patch.object(server, "docker_config_has_swr_auth", return_value=True):
+                with patch.object(server, "append_job_log"):
+                    with patch.object(server, "set_job") as set_job:
+                        self.assertTrue(server.ensure_swr_login("swr-job"))
+                        set_job.assert_not_called()
 
 
 if __name__ == "__main__":

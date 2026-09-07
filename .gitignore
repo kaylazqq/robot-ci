@@ -3,7 +3,10 @@
 logs/
 dist/
 config.json
+data/
+users.json
 .workspaces/
+.local/
 *.log
 .DS_Store
 Thumbs.db

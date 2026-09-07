@@ -286,9 +286,16 @@ def build_test_environment(repo_dir: Path, report_dir: Path) -> dict[str, str]:
         Path(env[name]).mkdir(parents=True, exist_ok=True)
     tmp_root = env.get("TMPDIR") or env.get("SWR_CI_TMP") or env.get("GOTMPDIR")
     if tmp_root:
-        for key in ("TMPDIR", "TMP", "TEMP", "GOTMPDIR", "DOCKER_TMPDIR", "NPM_CONFIG_TMP"):
-            env.setdefault(key, tmp_root)
-        Path(tmp_root).mkdir(parents=True, exist_ok=True)
+        try:
+            Path(tmp_root).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            tmp_root = str((report_dir / "tmp").resolve())
+            Path(tmp_root).mkdir(parents=True, exist_ok=True)
+            for key in ("TMPDIR", "TMP", "TEMP", "GOTMPDIR", "DOCKER_TMPDIR", "NPM_CONFIG_TMP"):
+                env[key] = tmp_root
+        else:
+            for key in ("TMPDIR", "TMP", "TEMP", "GOTMPDIR", "DOCKER_TMPDIR", "NPM_CONFIG_TMP"):
+                env.setdefault(key, tmp_root)
     env.update(
         {
             "REPO_DIR": str(repo_dir),
@@ -375,7 +382,11 @@ def main() -> int:
     started = time.monotonic()
     for command in profile.get("commands") or []:
         name = command.get("name") or command.get("command") or "test command"
-        print("@@TEST_STEP@@ " + name, flush=True)
+        test_type = str(command.get("test_type") or "").strip().lower()
+        marker = "@@TEST_STEP@@ " + name
+        if test_type in {"ut", "dt"}:
+            marker += " @@TEST_TYPE@@ " + test_type
+        print(marker, flush=True)
         code, output, elapsed = run_command(command, args.repo, args.report_dir)
         parser_name = command.get("parser") or "shell"
         if parser_name == "go-json":
@@ -409,10 +420,18 @@ def main() -> int:
         summary["failed"] += failed
         summary["errors"] += sum(item.get("status") == "error" for item in cases)
         summary["skipped"] += sum(item.get("status") == "skipped" for item in cases)
-        summary["commands"].append({"name": name, "exit_code": code, "duration_ms": elapsed, "total": total})
+        summary["commands"].append({
+            "name": name,
+            "exit_code": code,
+            "duration_ms": elapsed,
+            "total": total,
+            "test_type": str(command.get("test_type") or ""),
+        })
         summary["failures"].extend(failures)
         for case in cases:
             case["command"] = name
+            if command.get("test_type"):
+                case["test_type"] = str(command.get("test_type") or "")
         summary["test_cases"].extend(cases)
     summary["duration_ms"] = int((time.monotonic() - started) * 1000)
     (args.report_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
