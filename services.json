@@ -11,7 +11,7 @@
 
   {"id": "skills-market", "title": "skills-market", "image": "skills-market", "repo": "rollingfruit/skills-market", "github": "https://github.com/rollingfruit/skills-market.git", "default_branch": "main", "tar_prefix": "skills-market_"},
   {"id": "semantic-schedule", "title": "semantic-schedule", "image": "semantic-schedule", "repo": "rollingfruit/semantic-schedule", "github": "https://github.com/rollingfruit/semantic-schedule.git", "default_branch": "main", "tar_prefix": "semantic-schedule_"},
-  {"id": "gmagent", "title": "gmagent", "image": "gmagent", "repo": "rollingfruit/gmagent", "github": "https://github.com/rollingfruit/gmagent.git", "default_branch": "codex/cloud-im-orchestration", "tar_prefix": "gmagent_", "prefer_token_https": true},
+  {"id": "gmagent", "title": "gmagent", "image": "gmagent", "repo": "rollingfruit/gmagent", "github": "https://github.com/rollingfruit/gmagent.git", "default_branch": "main", "tar_prefix": "gmagent_", "prefer_token_https": true},
   {"id": "agent-governance-gw", "title": "agent-governance-gw", "image": "agent-governance-gw", "repo": "rollingfruit/agent-governance-gw", "github": "https://github.com/rollingfruit/agent-governance-gw.git", "default_branch": "main", "tar_prefix": "agent-governance-gw_"},
   {"id": "config-service", "title": "config-service", "image": "config-service", "repo": "censong574-spec/ConfigService", "github": "https://github.com/censong574-spec/ConfigService.git", "default_branch": "main", "tar_prefix": "config-service_"},
   {"id": "agentops", "title": "AgentOps", "image": "agentops", "repo": "censong574-spec/AgentOps", "github": "https://github.com/censong574-spec/AgentOps.git", "default_branch": "main", "tar_prefix": "agentops_"},

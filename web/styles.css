@@ -40,7 +40,7 @@ code, .mono { font-family: var(--mono); font-size: 14px; }
   width: 100%;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
-  background: #fff;
+  background: var(--surface);
   color: var(--text);
   padding: 9px 12px;
 }
@@ -77,7 +77,7 @@ textarea { resize: vertical; min-height: 88px; }
 
 .btn {
   border: 1px solid var(--line-strong);
-  background: #fff;
+  background: var(--surface);
   color: var(--text);
   border-radius: 6px;
   padding: 8px 14px;
@@ -96,7 +96,7 @@ textarea { resize: vertical; min-height: 88px; }
   border-radius: 999px;
   border: 1px solid var(--line);
   color: var(--muted);
-  background: #fff;
+  background: var(--surface);
 }
 .pill.ok { color: var(--green); border-color: #b7ebc6; background: #f6ffed; }
 .pill.bad { color: var(--danger); border-color: #ffccc7; background: #fff2f0; }
@@ -141,8 +141,8 @@ textarea { resize: vertical; min-height: 88px; }
   color: var(--text);
   line-height: 1.25;
 }
-.login-card .brand-name { font-size: 19px; }
-.login-card h1 { margin: 16px 0 0; font-size: 24px; font-weight: 650; }
+.login-card .brand-lockup { margin-bottom: 18px; }
+.login-card .brand-name { font-size: 20px; }
 .login-card .btn { width: 100%; margin-top: 18px; }
 
 .app {
@@ -195,7 +195,7 @@ textarea { resize: vertical; min-height: 88px; }
   align-items: center;
   gap: 8px;
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--surface);
   border-radius: 999px;
   padding: 4px 10px 4px 4px;
   cursor: pointer;
@@ -215,7 +215,7 @@ textarea { resize: vertical; min-height: 88px; }
   position: absolute;
   right: 0;
   top: calc(100% + 6px);
-  background: #fff;
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 6px;
   min-width: 140px;
@@ -228,7 +228,7 @@ textarea { resize: vertical; min-height: 88px; }
   gap: 8px;
   width: 100%;
   border: none;
-  background: #fff;
+  background: var(--surface);
   text-align: left;
   padding: 10px 14px;
   cursor: pointer;
@@ -267,7 +267,7 @@ textarea { resize: vertical; min-height: 88px; }
   align-items: center;
   gap: 12px;
   padding: 8px 20px;
-  background: #fff;
+  background: var(--surface);
   border-bottom: 1px solid var(--line);
   flex-wrap: wrap;
 }
@@ -302,7 +302,7 @@ textarea { resize: vertical; min-height: 88px; }
   gap: 8px;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
-  background: #fff;
+  background: var(--surface);
   padding: 8px 12px;
   cursor: pointer;
   color: var(--text);
@@ -314,7 +314,7 @@ textarea { resize: vertical; min-height: 88px; }
   left: 52px;
   top: calc(100% + 10px);
   width: 320px;
-  background: #fff;
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 8px;
   z-index: 16;
@@ -327,7 +327,7 @@ textarea { resize: vertical; min-height: 88px; }
   display: block;
   width: 100%;
   border: none;
-  background: #fff;
+  background: var(--surface);
   text-align: left;
   padding: 9px 12px;
   cursor: pointer;
@@ -426,7 +426,7 @@ textarea { resize: vertical; min-height: 88px; }
   margin: 0;
   border: 1px dashed var(--line);
   border-radius: 8px;
-  background: #fff;
+  background: var(--surface);
   color: var(--muted);
   font-size: 24px;
   font-weight: 600;
@@ -445,7 +445,7 @@ textarea { resize: vertical; min-height: 88px; }
   overflow-x: auto;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #fff;
+  background: var(--surface);
 }
 .art-table {
   width: 100%;
@@ -566,7 +566,7 @@ textarea { resize: vertical; min-height: 88px; }
   position: relative;
   width: min(1080px, calc(100vw - 48px));
   max-height: calc(100vh - 48px);
-  background: #fff;
+  background: var(--surface);
   border-radius: 8px;
   border: 1px solid var(--line);
   display: flex;
@@ -652,7 +652,7 @@ textarea { resize: vertical; min-height: 88px; }
 .step-log-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .step-tests {
   padding: 12px 16px;
-  background: #fff;
+  background: var(--surface);
   flex: 1;
   min-height: 0;
   overflow: auto;
@@ -685,7 +685,7 @@ textarea { resize: vertical; min-height: 88px; }
   min-height: 28rem;
   border: none;
   border-radius: 0;
-  background: #fff;
+  background: var(--surface);
 }
 .pl-head { margin: 0 0 10px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
 .pl-head-left { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 16px; }
@@ -704,13 +704,13 @@ textarea { resize: vertical; min-height: 88px; }
   display: flex;
   align-items: flex-start;
   min-width: max-content;
-  width: 100%;
+  width: 80%;
   padding: 4px 0 28px;
 }
 .pl-col, .pl-end {
   --pl-task-h: 1.75rem;
   flex: 1 0 auto;
-  width: 16rem;
+  width: 12.8rem;
   display: grid;
   grid-template-rows: 2.6rem 1.3rem auto;
   align-items: stretch;
@@ -768,18 +768,18 @@ textarea { resize: vertical; min-height: 88px; }
 .pl-stage-icon.is-failed, .pl-task-icon.is-failed,
 .pl-stage-icon.is-warn, .pl-task-icon.is-warn { background: var(--danger); border-color: var(--danger); }
 .pl-stage-icon.is-running, .pl-task-icon.is-running {
-  background: #fff;
+  background: var(--surface);
   border-color: var(--blue);
   color: var(--blue);
 }
 .pl-stage-icon.is-queued, .pl-task-icon.is-queued {
-  background: #fff;
+  background: var(--surface);
   border-color: #e2b203;
   color: #c98900;
   box-shadow: 0 0 0 3px rgba(233, 176, 0, 0.18);
 }
 .pl-stage-icon.is-pending, .pl-task-icon.is-pending {
-  background: #fff;
+  background: var(--surface);
   border-color: #c5ccd6;
   color: #9aa3af;
 }
@@ -822,11 +822,12 @@ textarea { resize: vertical; min-height: 88px; }
   content: "";
   position: absolute;
   inset: 0;
-  background: #fff;
+  background: var(--surface);
   border: 1.5px solid #c5ccd6;
   transform: rotate(45deg);
 }
 .pl-col.is-done .pl-diamond::before, .pl-col.is-running .pl-diamond::before { border-color: var(--green); }
+.pl-col.is-failed .pl-diamond::before, .pl-col.is-warn .pl-diamond::before { border-color: var(--danger); }
 .pl-tree { position: relative; z-index: 1; display: flex; flex-direction: column; gap: 14px; padding: 4px 0 0; }
 .pl-task {
   position: relative;

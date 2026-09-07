@@ -43,9 +43,10 @@ USERS_PATH = ROOT / "users.json"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_COOKIE = "robot_ci_session"
 SESSION_MAX_AGE_SEC = 7 * 24 * 3600
+SESSION_SLIDE_PERSIST_SEC = 60
 PBKDF2_ROUNDS = 120_000
 DEFAULT_USERNAME = "l30042018"
-DEFAULT_PASSWORD = "@l30042018"
+DEFAULT_PASSWORD = "l30042018"
 DEFAULT_USERNAMES = (
     "c50065452",
     "g50065646",
@@ -68,7 +69,7 @@ DEFAULT_USERNAMES = (
     "z00982866",
     "z00987657",
 )
-DEFAULT_USERS = tuple((name, f"@{name}") for name in DEFAULT_USERNAMES)
+DEFAULT_USERS = tuple((name, name) for name in DEFAULT_USERNAMES)
 AUTH_PUBLIC_GET = {"/api/auth/me", "/api/health"}
 AUTH_PUBLIC_POST = {"/api/auth/login"}
 _sessions: dict[str, dict[str, Any]] = {}
@@ -376,6 +377,7 @@ def ensure_default_users() -> None:
     init_store()
     users = _load_users()
     names = {str(item.get("username") or "").strip() for item in users}
+    roster = {username: password for username, password in DEFAULT_USERS}
     changed = False
     for username, password in DEFAULT_USERS:
         if username in names:
@@ -384,6 +386,18 @@ def ensure_default_users() -> None:
         users.append({"username": username, "salt": salt, "password_hash": digest})
         names.add(username)
         changed = True
+    for item in users:
+        username = str(item.get("username") or "").strip()
+        password = roster.get(username)
+        if not password:
+            continue
+        salt = str(item.get("salt") or "")
+        digest = str(item.get("password_hash") or "")
+        if _password_ok(password, salt, digest):
+            continue
+        if _password_ok("@" + username, salt, digest):
+            item["salt"], item["password_hash"] = _hash_password(password)
+            changed = True
     if changed:
         _save_users(users)
 
@@ -426,7 +440,7 @@ def create_session(username: str) -> str:
     token = secrets.token_urlsafe(32)
     expires = time.time() + SESSION_MAX_AGE_SEC
     with _sessions_lock:
-        _sessions[token] = {"username": username, "expires": expires}
+        _sessions[token] = {"username": username, "expires": expires, "persisted_at": time.time()}
     _persist_session(token, username, expires)
     return token
 
@@ -437,27 +451,48 @@ def destroy_session(token: str) -> None:
     _delete_persisted_session(token)
 
 
+def session_cookie_name() -> str:
+    """Cookies are host-scoped, not port-scoped. Isolate :18889 from :80."""
+    try:
+        port = int(CFG.get("port") or 80)
+    except (TypeError, ValueError, NameError):
+        port = 80
+    if port in (80, 443):
+        return SESSION_COOKIE
+    return f"{SESSION_COOKIE}_{port}"
+
+
 def session_username(token: str) -> str:
     if not token:
         return ""
     now = time.time()
+    persist: tuple[str, str, float] | None = None
+    username = ""
     with _sessions_lock:
         item = _sessions.get(token)
         if item:
             if float(item.get("expires") or 0) < now:
                 _sessions.pop(token, None)
-                item = None
             else:
                 item["expires"] = now + SESSION_MAX_AGE_SEC
-                return str(item.get("username") or "")
+                username = str(item.get("username") or "")
+                last = float(item.get("persisted_at") or 0)
+                if now - last >= SESSION_SLIDE_PERSIST_SEC:
+                    item["persisted_at"] = now
+                    persist = (token, username, float(item["expires"]))
+    if username:
+        if persist:
+            _persist_session(*persist)
+        return username
     loaded = _load_persisted_session(token)
     if not loaded or float(loaded.get("expires") or 0) < now:
         _delete_persisted_session(token)
         return ""
     username = str(loaded.get("username") or "")
+    expires = now + SESSION_MAX_AGE_SEC
     with _sessions_lock:
-        loaded["expires"] = now + SESSION_MAX_AGE_SEC
-        _sessions[token] = loaded
+        _sessions[token] = {"username": username, "expires": expires, "persisted_at": now}
+    _persist_session(token, username, expires)
     return username
 
 
@@ -1738,7 +1773,7 @@ def resolve_archive_file(rel_or_abs: str) -> Path | None:
 
 
 def public_archive_url(archive_path: str) -> str:
-    """Download URL served by this helper on :18888 (not nginx :80)."""
+    """Download URL served by this helper (not nginx static files)."""
     resolved = resolve_archive_file(archive_path)
     if resolved is None:
         return ""
@@ -2195,7 +2230,7 @@ def load_config() -> dict[str, Any]:
             cfg["workspace_root"] = str((ROOT / "workspaces").resolve())
     Path(cfg["workspace_root"]).mkdir(parents=True, exist_ok=True)
     cfg["host"] = cfg.get("host") or "127.0.0.1"
-    cfg["port"] = int(cfg.get("port") or 18888)
+    cfg["port"] = int(cfg.get("port") or 80)
     cfg["allow_remote"] = bool(cfg.get("allow_remote")) or str(
         os.environ.get("SWR_ALLOW_REMOTE") or ""
     ).lower() in ("1", "true", "yes")
@@ -5184,7 +5219,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
-    def _json(self, code: int, payload: Any, extra_headers: dict[str, str] | None = None) -> None:
+    def _json(self, code: int, payload: Any, extra_headers: dict[str, Any] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -5192,7 +5227,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         if extra_headers:
             for key, value in extra_headers.items():
-                self.send_header(key, value)
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        self.send_header(key, str(item))
+                else:
+                    self.send_header(key, str(value))
         self.end_headers()
         self.wfile.write(body)
 
@@ -5203,19 +5242,30 @@ class Handler(SimpleHTTPRequestHandler):
             cookies.load(raw)
         except Exception:
             return ""
-        morsel = cookies.get(SESSION_COOKIE)
-        return morsel.value if morsel else ""
+        for name in (session_cookie_name(), SESSION_COOKIE):
+            morsel = cookies.get(name)
+            if morsel and morsel.value:
+                return morsel.value
+        return ""
 
     def _current_user(self) -> str:
         return session_username(self._session_token())
 
-    def _session_cookie_header(self, token: str, *, clear: bool = False) -> str:
+    def _session_cookie_header(self, token: str, *, clear: bool = False, name: str = "") -> str:
+        cookie = name or session_cookie_name()
         if clear:
-            return f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+            return f"{cookie}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
         return (
-            f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; "
+            f"{cookie}={token}; Path=/; HttpOnly; SameSite=Lax; "
             f"Max-Age={SESSION_MAX_AGE_SEC}"
         )
+
+    def _session_cookie_headers(self, token: str, *, clear: bool = False) -> list[str]:
+        headers = [self._session_cookie_header(token, clear=clear)]
+        # Stop sharing the default cookie with other ports on the same host.
+        if session_cookie_name() != SESSION_COOKIE:
+            headers.append(self._session_cookie_header("", clear=True, name=SESSION_COOKIE))
+        return headers
 
     def _require_api_user(self, path: str, method: str) -> str | None:
         if not path.startswith("/api/"):
@@ -5568,7 +5618,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(
                 200,
                 {"ok": True, "username": username, "user": username},
-                extra_headers={"Set-Cookie": self._session_cookie_header(token)},
+                extra_headers={"Set-Cookie": self._session_cookie_headers(token)},
             )
             return
 
@@ -5577,7 +5627,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(
                 200,
                 {"ok": True},
-                extra_headers={"Set-Cookie": self._session_cookie_header("", clear=True)},
+                extra_headers={"Set-Cookie": self._session_cookie_headers("", clear=True)},
             )
             return
 

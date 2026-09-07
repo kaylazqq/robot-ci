@@ -12,12 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GmAgentServiceTests(unittest.TestCase):
-    def test_catalog_uses_cloud_orchestration_branch_and_image(self) -> None:
+    def test_catalog_uses_main_branch_and_image(self) -> None:
         services = json.loads((ROOT / "services.json").read_text(encoding="utf-8"))
         gmagent = next(service for service in services if service["id"] == "gmagent")
         self.assertEqual("rollingfruit/gmagent", gmagent["repo"])
         self.assertEqual("https://github.com/rollingfruit/gmagent.git", gmagent["github"])
-        self.assertEqual("codex/cloud-im-orchestration", gmagent["default_branch"])
+        self.assertEqual("main", gmagent["default_branch"])
         self.assertEqual("gmagent", gmagent["image"])
         self.assertEqual("gmagent_", gmagent["tar_prefix"])
         self.assertTrue(gmagent["prefer_token_https"])

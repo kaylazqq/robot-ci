@@ -15,8 +15,11 @@ class AuthApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "robot-ci.db"
+        self.users_path = Path(self.tmp.name) / "users.json"
         self.db_patch = patch.object(server, "DB_PATH", self.db_path)
+        self.users_patch = patch.object(server, "USERS_PATH", self.users_path)
         self.db_patch.start()
+        self.users_patch.start()
         with server._sessions_lock:
             server._sessions.clear()
         server.ensure_default_users()
@@ -30,6 +33,7 @@ class AuthApiTests(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
         self.thread.join(timeout=2)
+        self.users_patch.stop()
         self.db_patch.stop()
         self.tmp.cleanup()
 
@@ -77,7 +81,7 @@ class AuthApiTests(unittest.TestCase):
             payload = json.loads(response.read().decode("utf-8"))
             cookie = (response.headers.get("Set-Cookie") or "").split(";", 1)[0]
         self.assertEqual("l30042018", payload["username"])
-        self.assertTrue(cookie.startswith(server.SESSION_COOKIE + "="))
+        self.assertTrue(cookie.startswith(server.session_cookie_name() + "="))
 
         with self._open("/api/auth/me", cookie=cookie) as response:
             me = json.loads(response.read().decode("utf-8"))
@@ -99,10 +103,10 @@ class AuthApiTests(unittest.TestCase):
         )
 
     def test_second_default_user_can_login(self) -> None:
-        self.assertEqual("l00855954", server.authenticate_user("l00855954", "@l00855954"))
+        self.assertEqual("l00855954", server.authenticate_user("l00855954", "l00855954"))
         with self._open(
             "/api/auth/login",
-            data=json.dumps({"username": "l00855954", "password": "@l00855954"}).encode(),
+            data=json.dumps({"username": "l00855954", "password": "l00855954"}).encode(),
             method="POST",
         ) as response:
             payload = json.loads(response.read().decode("utf-8"))
@@ -114,9 +118,23 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(20, len(server.DEFAULT_USERNAMES))
         self.assertEqual(len(set(server.DEFAULT_USERNAMES)), len(server.DEFAULT_USERNAMES))
         for username, password in server.DEFAULT_USERS:
-            self.assertEqual("@" + username, password)
+            self.assertEqual(username, password)
             self.assertEqual(username, server.authenticate_user(username, password))
-        self.assertEqual("c50065452", server.authenticate_user("c50065452", "@c50065452"))
+        self.assertEqual("c50065452", server.authenticate_user("c50065452", "c50065452"))
+
+    def test_old_at_sign_default_password_is_migrated(self) -> None:
+        users = []
+        for username in ("l30042018", "l00855954"):
+            salt, digest = server._hash_password("@" + username)
+            users.append({"username": username, "salt": salt, "password_hash": digest})
+        server._save_users(users)
+        self.assertEqual("", server.authenticate_user("l30042018", "l30042018"))
+        self.assertEqual("l30042018", server.authenticate_user("l30042018", "@l30042018"))
+        server.ensure_default_users()
+        self.assertEqual("l30042018", server.authenticate_user("l30042018", "l30042018"))
+        self.assertEqual("", server.authenticate_user("l30042018", "@l30042018"))
+        self.assertEqual("l00855954", server.authenticate_user("l00855954", "l00855954"))
+        self.assertEqual("c50065452", server.authenticate_user("c50065452", "c50065452"))
 
     def test_session_survives_in_memory_restart(self) -> None:
         cookie = self._login()
@@ -132,6 +150,16 @@ class AuthApiTests(unittest.TestCase):
         with server._sessions_lock:
             server._sessions.clear()
         self.assertEqual("", server.session_username(token))
+
+    def test_session_cookie_name_isolates_non_80_ports(self) -> None:
+        with patch.dict(server.CFG, {"port": 80}, clear=False):
+            self.assertEqual("robot_ci_session", server.session_cookie_name())
+        with patch.dict(server.CFG, {"port": 18889}, clear=False):
+            self.assertEqual("robot_ci_session_18889", server.session_cookie_name())
+            cookie = self._login()
+        self.assertTrue(cookie.startswith("robot_ci_session_18889="))
+        token = cookie.split("=", 1)[-1]
+        self.assertEqual("l30042018", server.session_username(token))
 
     def test_run_template_is_saved_per_user_and_service(self) -> None:
         cookie = self._login()
@@ -177,6 +205,7 @@ class AuthApiTests(unittest.TestCase):
         )
 
     def test_legacy_users_json_is_imported_into_sqlite(self) -> None:
+        self.users_patch.stop()
         self.db_patch.stop()
         self.tmp.cleanup()
         self.tmp = tempfile.TemporaryDirectory()
@@ -191,13 +220,10 @@ class AuthApiTests(unittest.TestCase):
         self.users_patch = patch.object(server, "USERS_PATH", users_path)
         self.db_patch.start()
         self.users_patch.start()
-        try:
-            server.init_store()
-            self.assertEqual("imported-user", server.authenticate_user("imported-user", "imported-pass-1"))
-            server.ensure_default_users()
-            self.assertEqual(
-                server.DEFAULT_USERNAME,
-                server.authenticate_user(server.DEFAULT_USERNAME, server.DEFAULT_PASSWORD),
-            )
-        finally:
-            self.users_patch.stop()
+        server.init_store()
+        self.assertEqual("imported-user", server.authenticate_user("imported-user", "imported-pass-1"))
+        server.ensure_default_users()
+        self.assertEqual(
+            server.DEFAULT_USERNAME,
+            server.authenticate_user(server.DEFAULT_USERNAME, server.DEFAULT_PASSWORD),
+        )

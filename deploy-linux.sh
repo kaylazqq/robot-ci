@@ -4,7 +4,7 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/swr-push-helper}"
-PORT="${SWR_PORT:-18888}"
+PORT="${SWR_PORT:-80}"
 KEY="${GITHUB_SSH_KEY:-/root/.ssh/id_ed25519_github}"
 ARCHIVE_ROOT="${SWR_ARCHIVE_ROOT:-/usr/share/nginx/html/images}"
 
@@ -94,7 +94,7 @@ from pathlib import Path
 app_dir = Path(os.environ["APP_DIR"])
 cfg = {
     "host": "0.0.0.0",
-    "port": int(os.environ.get("PORT") or 18888),
+    "port": int(os.environ.get("PORT") or 80),
     "allow_remote": True,
     "swr_registry": "swr.cn-southwest-2.myhuaweicloud.com",
     "swr_org": "public_ai",
@@ -157,5 +157,9 @@ echo
 echo "===================================================="
 echo "Then test: ssh -T git@github.com"
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-echo "Web UI: http://${IP:-YOUR_SERVER_IP}:${PORT}/"
+if [[ "$PORT" == "80" ]]; then
+  echo "Web UI: http://${IP:-YOUR_SERVER_IP}/"
+else
+  echo "Web UI: http://${IP:-YOUR_SERVER_IP}:${PORT}/"
+fi
 echo "Image archive: ${ARCHIVE_ROOT}/YYYYMMDDHHMMSS/<image>_<tag>.tar"

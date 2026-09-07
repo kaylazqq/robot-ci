@@ -20,7 +20,7 @@ export GH_TOKEN=ghp_你的PAT
 bash deploy-linux.sh
 ```
 
-4. 浏览器打开 `http://服务器IP:18888/`
+4. 浏览器打开 `http://服务器IP/`
 5. 别人只需粘贴**自己的 SWR 临时登录指令**；拉私有 GitHub 代码用服务器上的 Token，无需再登 GitHub
 
 ## 第一阶段测试
