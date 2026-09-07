@@ -34,7 +34,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*swr-push-helper*server.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Get-NetTCPConnection -LocalPort 18888 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*swr-push-helper*server.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
 ping -n 2 127.0.0.1 >nul
 
 start "swr-push-helper" /MIN cmd /c ""%PY%" -u "%CD%\server.py" > "%CD%\logs\out.txt" 2> "%CD%\logs\err.txt""
@@ -42,7 +42,7 @@ start "swr-push-helper" /MIN cmd /c ""%PY%" -u "%CD%\server.py" > "%CD%\logs\out
 set /a n=0
 :wait
 set /a n+=1
-powershell -NoProfile -Command "try { $r=Invoke-WebRequest -Uri 'http://127.0.0.1:18888/api/health' -UseBasicParsing -TimeoutSec 2; if($r.StatusCode -eq 200){exit 0}else{exit 1} } catch { exit 1 }"
+powershell -NoProfile -Command "try { $r=Invoke-WebRequest -Uri 'http://127.0.0.1/api/health' -UseBasicParsing -TimeoutSec 2; if($r.StatusCode -eq 200){exit 0}else{exit 1} } catch { exit 1 }"
 if %ERRORLEVEL%==0 goto ok
 if %n% GEQ 30 goto fail
 ping -n 2 127.0.0.1 >nul
@@ -55,6 +55,6 @@ pause
 exit /b 1
 
 :ok
-echo OK  http://127.0.0.1:18888/
-start "" "http://127.0.0.1:18888/"
+echo OK  http://127.0.0.1/
+start "" "http://127.0.0.1/"
 exit /b 0
