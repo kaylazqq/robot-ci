@@ -562,18 +562,13 @@ function buildPipelineStages(pipeline, jobStatus) {
   }
   return stages;
 }
-function railClass(status) {
-  if (status === "done" || status === "running" || status === "queued") return "is-ok";
-  if (status === "failed" || status === "warn") return "is-fail";
-  return "is-wait";
-}
 function createStatusIcon(status, kind) {
   const icon = document.createElement("span");
   icon.className = (kind || "pl-icon") + " is-" + (status || "pending");
   icon.textContent = status === "done" ? "✓" : (status === "failed" || status === "warn") ? "✕" : status === "skipped" ? "–" : (status === "running" || status === "queued") ? "●" : "";
   return icon;
 }
-function createStageColumn(stage, incomingOk, onStep) {
+function createStageColumn(stage, incomingComplete, outgoingComplete, onStep) {
   const status = stage.status || "pending";
   const col = document.createElement("div");
   col.className = "pl-col is-" + status;
@@ -591,9 +586,9 @@ function createStageColumn(stage, incomingOk, onStep) {
   const spine = document.createElement("div");
   spine.className = "pl-spine";
   const left = document.createElement("div");
-  left.className = "pl-rail left " + (incomingOk ? "is-ok" : "is-wait");
+  left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
   const right = document.createElement("div");
-  right.className = "pl-rail right " + railClass(status);
+  right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
   spine.append(left, createStatusIcon(status, "pl-stage-icon"), right);
   col.appendChild(spine);
   const drop = document.createElement("div");
@@ -696,13 +691,19 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep) {
   scroll.className = "pl-scroll";
   const graph = document.createElement("div");
   graph.className = "pl-graph";
-  graph.appendChild(createEndpoint("start", true));
-  let incomingOk = true;
-  stages.forEach((stage) => {
-    graph.appendChild(createStageColumn(stage, incomingOk, onStep));
-    incomingOk = ["done", "running", "failed", "warn"].includes(stage.status);
+  const isComplete = (stage) => Boolean(stage && stage.status === "done");
+  const hasCompleteLink = (left, right) => isComplete(left) && isComplete(right);
+  graph.appendChild(createEndpoint("start", isComplete(stages[0])));
+  stages.forEach((stage, index) => {
+    const previous = stages[index - 1];
+    const next = stages[index + 1];
+    const incomingComplete = index === 0 ? isComplete(stage) : hasCompleteLink(previous, stage);
+    const outgoingComplete = next
+      ? hasCompleteLink(stage, next)
+      : isComplete(stage) && status === "ok";
+    graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep));
   });
-  graph.appendChild(createEndpoint("end", status === "ok"));
+  graph.appendChild(createEndpoint("end", isComplete(stages[stages.length - 1]) && status === "ok"));
   scroll.appendChild(graph);
   root.appendChild(scroll);
 }
