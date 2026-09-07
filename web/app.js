@@ -1299,17 +1299,69 @@ function fetchServiceBranches(serviceId, force, priority) {
   branchLoads[serviceId] = req;
   return req;
 }
-function fillBranchSelect(selectEl, branches, selectedBranch, fallback) {
-  selectEl.innerHTML = "";
-  const list = branches && branches.length ? branches : [selectedBranch || fallback || "main"];
-  const wanted = list.includes(selectedBranch) ? selectedBranch : (list.includes(fallback) ? fallback : list[0]);
-  list.forEach((name) => {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = name;
-    if (name === wanted) opt.selected = true;
-    selectEl.appendChild(opt);
+function createBranchPicker(root) {
+  const trigger = root.querySelector("#runBranch");
+  const label = root.querySelector("#runBranchValue");
+  const menu = root.querySelector("#runBranchMenu");
+  let value = "";
+  const close = () => {
+    menu.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+  };
+  const setValue = (next) => {
+    value = next;
+    label.textContent = next;
+    menu.querySelectorAll(".branch-option").forEach((option) => {
+      const active = option.dataset.value === next;
+      option.classList.toggle("active", active);
+      option.setAttribute("aria-selected", String(active));
+    });
+  };
+  trigger.addEventListener("click", () => {
+    if (trigger.disabled) return;
+    const opening = menu.hidden;
+    menu.hidden = !opening;
+    trigger.setAttribute("aria-expanded", String(opening));
   });
+  root.addEventListener("focusout", () => {
+    setTimeout(() => {
+      if (!root.contains(document.activeElement)) close();
+    }, 0);
+  });
+  root.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      close();
+      trigger.focus();
+    }
+  });
+  return {
+    setOptions(branches, selectedBranch, fallback) {
+      const list = branches && branches.length ? branches : [selectedBranch || fallback || "main"];
+      const wanted = list.includes(selectedBranch) ? selectedBranch : (list.includes(fallback) ? fallback : list[0]);
+      menu.replaceChildren();
+      list.forEach((name) => {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "branch-option";
+        option.dataset.value = name;
+        option.setAttribute("role", "option");
+        option.textContent = name;
+        option.addEventListener("click", () => {
+          setValue(name);
+          close();
+          trigger.focus();
+        });
+        menu.appendChild(option);
+      });
+      setValue(wanted);
+    },
+    setDisabled(disabled) {
+      trigger.disabled = disabled;
+      if (disabled) close();
+    },
+    get value() { return value; },
+  };
 }
 
 async function preferredTemplateBranch(serviceId, fallback) {
@@ -1333,7 +1385,13 @@ async function openRunDialog() {
     '<p class="run-repo" id="runRepo">' + esc(svc.github || svc.repo || "") + '</p>' +
     '<label class="label" for="runBranch">分支</label>' +
     '<div class="run-branch-row">' +
-    '<select class="input" id="runBranch"></select>' +
+    '<div class="branch-picker" id="runBranchPicker">' +
+    '<button type="button" class="input branch-trigger" id="runBranch" aria-haspopup="listbox" aria-expanded="false">' +
+    '<span id="runBranchValue"></span>' +
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+    '</button>' +
+    '<div class="branch-menu" id="runBranchMenu" role="listbox" hidden></div>' +
+    '</div>' +
     '<button type="button" class="icon-btn" id="btnRefreshBranches" title="刷新" aria-label="刷新">' +
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
     '</button>' +
@@ -1343,7 +1401,7 @@ async function openRunDialog() {
     '<p class="hint run-template-hint" id="runTemplateHint"></p>' +
     '<div class="row"><button type="button" class="btn ghost" data-close-modal>取消</button>' +
     '<button type="button" class="btn primary" id="btnRunConfirm">确定</button></div>';
-  const select = wrap.querySelector("#runBranch");
+  const branchPicker = createBranchPicker(wrap.querySelector("#runBranchPicker"));
   const statusEl = wrap.querySelector("#runBranchStatus");
   const retryBtn = wrap.querySelector("#btnRefreshBranches");
   const hint = wrap.querySelector("#runTemplateHint");
@@ -1352,24 +1410,23 @@ async function openRunDialog() {
   const alreadyLoaded = !!(cached && cached.loaded);
   let selected = (cached && cached.selected_branch) || fallbackBranch;
   if (alreadyLoaded) selected = await preferredTemplateBranch(svc.id, selected);
-  fillBranchSelect(select, cached && cached.branches, selected, (cached && cached.default_branch) || fallbackBranch);
+  branchPicker.setOptions(cached && cached.branches, selected, (cached && cached.default_branch) || fallbackBranch);
   openModal("运行流水线", wrap, { narrow: true });
   if (!alreadyLoaded) {
     statusEl.textContent = "正在加载中";
     retryBtn.classList.add("loading");
-    select.disabled = true;
+    branchPicker.setDisabled(true);
   }
   const setLoading = (loading) => {
     retryBtn.classList.toggle("loading", loading);
-    select.disabled = loading;
+    branchPicker.setDisabled(loading);
     if (loading) {
       statusEl.textContent = "正在加载中";
       statusEl.className = "branch-status";
     }
   };
   const applyCached = (data, updated) => {
-    fillBranchSelect(
-      select,
+    branchPicker.setOptions(
       data.branches,
       data.selected_branch || fallbackBranch,
       data.default_branch || fallbackBranch
@@ -1389,13 +1446,13 @@ async function openRunDialog() {
       const data = await fetchServiceBranches(svc.id, force, true);
       applyCached(data, true);
     } catch (e) {
-      fillBranchSelect(select, [fallbackBranch], fallbackBranch, fallbackBranch);
+      branchPicker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
       statusEl.textContent = e.message || "加载分支失败";
       statusEl.className = "branch-status error";
       delete branchCache[svc.id];
     } finally {
       retryBtn.classList.remove("loading");
-      select.disabled = false;
+      branchPicker.setDisabled(false);
     }
   };
   wrap.querySelector("#btnRefreshBranches").addEventListener("click", () => {
@@ -1405,16 +1462,16 @@ async function openRunDialog() {
     try {
       await api("/api/run-templates", {
         method: "POST",
-        body: JSON.stringify({ service_id: svc.id, branch: select.value }),
+        body: JSON.stringify({ service_id: svc.id, branch: branchPicker.value }),
       });
-      if (branchCache[svc.id]) branchCache[svc.id].selected_branch = select.value;
-      hint.textContent = "已保存 " + svc.title + " @ " + select.value;
+      if (branchCache[svc.id]) branchCache[svc.id].selected_branch = branchPicker.value;
+      hint.textContent = "已保存 " + svc.title + " @ " + branchPicker.value;
     } catch (e) {
       hint.textContent = e.message || "保存模板失败";
     }
   });
   loadBranches(false);
-  wrap.querySelector("#btnRunConfirm").addEventListener("click", () => startRun(select.value));
+  wrap.querySelector("#btnRunConfirm").addEventListener("click", () => startRun(branchPicker.value));
 }
 
 async function startRun(branch) {

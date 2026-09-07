@@ -5219,6 +5219,12 @@ class Handler(SimpleHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
+    def end_headers(self) -> None:
+        """Prevent browsers from retaining stale HTML, CSS, and JavaScript releases."""
+        if not self.path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
     def _json(self, code: int, payload: Any, extra_headers: dict[str, Any] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
