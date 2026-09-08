@@ -1442,6 +1442,17 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertFalse(leftover_tmp.exists())
         self.assertTrue(keep_tmp.is_dir())
 
+    def test_gc_keeps_workspaces_marked_live_by_other_instance(self) -> None:
+        other = self.workspace_root / "mattermost--otherinst01bbbb"
+        idle = self.workspace_root / "mattermost--deadjob02cccc"
+        other.mkdir(parents=True)
+        idle.mkdir(parents=True)
+        server.register_live_job_marker("otherinst01bbbb", ["mattermost"])
+        server.gc_all_idle_clone_dirs("livejob00aaaa")
+        self.assertTrue(other.is_dir())
+        self.assertFalse(idle.exists())
+        server.unregister_live_job_marker("otherinst01bbbb")
+
 
 class BuildHistoryTests(unittest.TestCase):
     def setUp(self) -> None:

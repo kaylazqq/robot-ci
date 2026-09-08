@@ -22,9 +22,14 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows dev hosts
+    fcntl = None  # type: ignore[assignment]
 
 import huawei_cce
 from cid_config import CidConfigError, build_test_plan, enabled_build_step, load_cid_config
@@ -123,6 +128,9 @@ CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
 WORKSPACE_KEEP_NAMES = ("public-service", ".robot-ci-cache")
+LIVE_JOB_MARKERS_DIRNAME = "live-jobs"
+LIVE_JOB_MARKER_MAX_AGE_SEC = 6 * 3600
+HOST_SERVICE_LOCK_NAMES = ("mattermost",)
 CI_TMP_GC_PREFIXES = (
     "runtime-apt-debs.",
     "mattermost-build-cache.",
@@ -1356,12 +1364,13 @@ def service_concurrency_cap(service_id: str) -> int | None:
 def other_job_uses_build_swap(job_id: str) -> bool:
     """True if another running job still needs the shared compile swap."""
     with _jobs_lock:
-        return any(
+        local = any(
             str(job.get("id") or "") != str(job_id)
             and job.get("status") == "running"
             and "mattermost" in _job_service_ids(job)
             for job in _jobs.values()
         )
+    return local or shared_live_mattermost_jobs(job_id)
 
 
 def _running_jobs_locked() -> list[dict[str, Any]]:
@@ -3212,12 +3221,147 @@ def existing_clone_dirs(svc: dict[str, Any]) -> list[Path]:
     return found
 
 
+def live_job_markers_dir() -> Path:
+    """Host-shared markers so :80 and :18889 do not GC each other's checkouts."""
+    return Path(CFG.get("workspace_root") or "") / ".robot-ci-cache" / LIVE_JOB_MARKERS_DIRNAME
+
+
+def register_live_job_marker(job_id: str, service_ids: list[str] | tuple[str, ...] = ()) -> None:
+    jid = job_workspace_suffix(job_id)
+    if not jid:
+        return
+    root = live_job_markers_dir()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": jid,
+            "pid": os.getpid(),
+            "services": [str(s) for s in service_ids if str(s).strip()],
+            "updated_at": time.time(),
+        }
+        target = root / jid
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(target)
+    except OSError:
+        return
+
+
+def unregister_live_job_marker(job_id: str) -> None:
+    jid = job_workspace_suffix(job_id)
+    if not jid:
+        return
+    path = live_job_markers_dir() / jid
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+def shared_live_job_suffixes() -> set[str]:
+    """Job ids published by every robot-ci instance on this host."""
+    root = live_job_markers_dir()
+    if not root.is_dir():
+        return set()
+    now = time.time()
+    keep: set[str] = set()
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return set()
+    for path in children:
+        if not path.is_file() or path.name.endswith(".tmp"):
+            continue
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age > LIVE_JOB_MARKER_MAX_AGE_SEC:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        keep.add(path.name)
+    return keep
+
+
+def shared_live_mattermost_jobs(job_id: str) -> bool:
+    """True if another host-wide live marker still owns a mattermost compile."""
+    root = live_job_markers_dir()
+    if not root.is_dir():
+        return False
+    me = job_workspace_suffix(job_id)
+    now = time.time()
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return False
+    for path in children:
+        if not path.is_file() or path.name.endswith(".tmp") or path.name == me:
+            continue
+        try:
+            if now - path.stat().st_mtime > LIVE_JOB_MARKER_MAX_AGE_SEC:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        services = payload.get("services") if isinstance(payload, dict) else None
+        if isinstance(services, list) and any(str(s) == "mattermost" for s in services):
+            return True
+    return False
+
+
 def _kept_workspace_suffixes(job_id: str) -> set[str]:
     keep = {job_workspace_suffix(job_id)}
     with _jobs_lock:
         keep.update(job_workspace_suffix(str(item.get("id") or "")) for item in _live_jobs_locked())
+    keep.update(shared_live_job_suffixes())
     keep.discard("")
     return keep
+
+
+@contextmanager
+def host_service_compile_lock(job_id: str, service_ids: list[str] | tuple[str, ...]) -> Iterator[None]:
+    """Serialize host-shared compiles (Mattermost swap/npm) across :80 and :18889."""
+    wanted = [sid for sid in service_ids if sid in HOST_SERVICE_LOCK_NAMES]
+    if not wanted or fcntl is None or os.name == "nt":
+        yield
+        return
+    lock_root = Path(CFG.get("workspace_root") or "") / ".robot-ci-cache" / "service-locks"
+    handles: list[Any] = []
+    try:
+        lock_root.mkdir(parents=True, exist_ok=True)
+        for sid in wanted:
+            path = lock_root / f"{sid}.lock"
+            fh = path.open("a+", encoding="utf-8")
+            append_job_log(job_id, f"waiting for host-wide {sid} compile lock…")
+            while True:
+                if job_cancel_requested(job_id):
+                    fh.close()
+                    raise JobStopped()
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(1.0)
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{job_id} pid={os.getpid()} at={time.time()}\n")
+            fh.flush()
+            handles.append(fh)
+            append_job_log(job_id, f"acquired host-wide {sid} compile lock")
+        yield
+    finally:
+        for fh in reversed(handles):
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                fh.close()
+            except OSError:
+                pass
 
 
 def gc_idle_clone_dirs(job_id: str, svc: dict[str, Any]) -> None:
@@ -5160,6 +5304,9 @@ def run_push_job(
         if not wait_for_build_slot(job_id):
             raise JobStopped()
 
+        service_ids = [str(svc.get("id") or "") for svc, _, _ in resolved]
+        register_live_job_marker(job_id, service_ids)
+
         needs_swr = any(not svc.get("archive_only") for svc, _, _ in resolved)
         if needs_swr and not ensure_swr_login(job_id, login_command):
             return
@@ -5201,37 +5348,40 @@ def run_push_job(
 
         results: list[dict[str, Any]] = []
         total = len(resolved)
-        for idx, (svc, br, version) in enumerate(resolved, 1):
-            if job_cancel_requested(job_id):
-                raise JobStopped()
-            append_job_log(job_id, f"===== [{idx}/{total}] {svc['id']} @ {br} =====")
-            set_job(job_id, stage="syncing", current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
-            result = push_one_service(job_id, svc, br, archive_dir, version)
-            results.append(result)
-            set_job(job_id, results=results)
-            if result.get("error_code") == "swr_auth_failed":
-                append_job_log(job_id, "SWR authentication failed; stopping remaining SWR operations")
-                for pending_svc, pending_br, pending_version in resolved[idx:]:
-                    pending = {
-                        "service_id": pending_svc["id"],
-                        "title": pending_svc.get("title") or pending_svc["id"],
-                        "branch": pending_br,
-                        "version": pending_version,
-                        "ok": False,
-                        "remote": "",
-                        "archive": "",
-                        "error": "not attempted: SWR authentication failed",
-                        "error_code": "swr_auth_failed",
-                        "test_status": None,
-                        "test_summary": None,
-                    }
-                    results.append(pending)
-                    append_job_log(
-                        job_id,
-                        f"FAILED service={pending_svc['id']} reason={pending['error']}",
-                    )
+        with host_service_compile_lock(job_id, service_ids):
+            for idx, (svc, br, version) in enumerate(resolved, 1):
+                if job_cancel_requested(job_id):
+                    raise JobStopped()
+                append_job_log(job_id, f"===== [{idx}/{total}] {svc['id']} @ {br} =====")
+                set_job(job_id, stage="syncing", current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
+                # Refresh marker mtime while long compiles run.
+                register_live_job_marker(job_id, service_ids)
+                result = push_one_service(job_id, svc, br, archive_dir, version)
+                results.append(result)
                 set_job(job_id, results=results)
-                break
+                if result.get("error_code") == "swr_auth_failed":
+                    append_job_log(job_id, "SWR authentication failed; stopping remaining SWR operations")
+                    for pending_svc, pending_br, pending_version in resolved[idx:]:
+                        pending = {
+                            "service_id": pending_svc["id"],
+                            "title": pending_svc.get("title") or pending_svc["id"],
+                            "branch": pending_br,
+                            "version": pending_version,
+                            "ok": False,
+                            "remote": "",
+                            "archive": "",
+                            "error": "not attempted: SWR authentication failed",
+                            "error_code": "swr_auth_failed",
+                            "test_status": None,
+                            "test_summary": None,
+                        }
+                        results.append(pending)
+                        append_job_log(
+                            job_id,
+                            f"FAILED service={pending_svc['id']} reason={pending['error']}",
+                        )
+                    set_job(job_id, results=results)
+                    break
 
         if job_cancel_requested(job_id):
             raise JobStopped()
@@ -5287,6 +5437,7 @@ def run_push_job(
         release_build_slot(job_id)
         _job_ctx.job_id = None
         reclaim_ci_disk(job_id)
+        unregister_live_job_marker(job_id)
         with _ci_disk_reclaim_lock:
             _ci_disk_reclaimed_jobs.discard(job_id)
 
