@@ -3990,21 +3990,70 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
         return True, str(dest)
 
 
-def ensure_versioned_base_images(job_id: str) -> tuple[bool, str]:
-    """Verify the public-service image contract once before a job builds services."""
+def ensure_versioned_base_images(
+    job_id: str,
+    targets: list[str] | tuple[str, ...] | None = None,
+) -> tuple[bool, str]:
+    """Verify only the shared bases required by the selected services."""
     script = public_service_dir() / "scripts" / "build-versioned-base-images.sh"
     if not script.is_file():
         return False, f"missing shared base-image builder: {script}"
-    append_job_log(job_id, "base images: verifying immutable labels (HIT/MISS follows)")
+    selected = normalize_base_image_targets(targets)
+    if not selected:
+        append_job_log(job_id, "base images: no shared targets required; skip")
+        return True, ""
+    target_args = " ".join(shlex.quote(item) for item in selected)
+    append_job_log(
+        job_id,
+        f"base images: verifying targets [{', '.join(selected)}] (HIT/MISS follows)",
+    )
     code = run_stream(
         job_id,
-        bash_lc(f"bash {shlex.quote(host_path(script))} all"),
+        bash_lc(f"bash {shlex.quote(host_path(script))} {target_args}"),
         timeout=3600,
     )
     if code != 0:
         return False, "shared base-image verification/build failed"
-    append_job_log(job_id, "base images: contract verified")
+    append_job_log(job_id, f"base images: contract verified for [{', '.join(selected)}]")
     return True, ""
+
+
+KNOWN_BASE_IMAGE_TARGETS = ("ubuntu", "openresty", "observability")
+
+
+def normalize_base_image_targets(raw: Any) -> list[str]:
+    """Keep script-supported targets in stable order; drop unknowns/duplicates."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [part.strip().lower() for part in raw.replace(",", " ").split() if part.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(part).strip().lower() for part in raw if str(part).strip()]
+    else:
+        return []
+    ordered: list[str] = []
+    for target in KNOWN_BASE_IMAGE_TARGETS:
+        if target in values and target not in ordered:
+            ordered.append(target)
+    return ordered
+
+
+def base_image_targets_for_service(svc: dict[str, Any] | None) -> list[str]:
+    """Map one service to the public-service base targets it needs."""
+    if not svc or svc.get("skip_public_service"):
+        return []
+    if "base_image_targets" in svc:
+        return normalize_base_image_targets(svc.get("base_image_targets"))
+    return ["ubuntu"]
+
+
+def base_image_targets_for_services(services: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> list[str]:
+    selected: list[str] = []
+    for svc in services:
+        for target in base_image_targets_for_service(svc):
+            if target not in selected:
+                selected.append(target)
+    return normalize_base_image_targets(selected)
 
 
 def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None, str | None]:
@@ -5120,7 +5169,8 @@ def run_push_job(
                 set_job(job_id, status="failed", error=detail_ps)
                 append_job_log(job_id, f"ERROR {detail_ps}")
                 return
-            ok_bases, detail_bases = ensure_versioned_base_images(job_id)
+            base_targets = base_image_targets_for_services([svc for svc, _, _ in resolved])
+            ok_bases, detail_bases = ensure_versioned_base_images(job_id, base_targets)
             if not ok_bases:
                 set_job(job_id, status="failed", error=detail_bases)
                 append_job_log(job_id, f"ERROR {detail_bases}")

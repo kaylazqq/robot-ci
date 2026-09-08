@@ -1745,6 +1745,59 @@ class PublicServiceReuseTests(unittest.TestCase):
             stream.assert_not_called()
 
 
+class BaseImageTargetTests(unittest.TestCase):
+    def test_normalize_keeps_known_order(self) -> None:
+        self.assertEqual(
+            ["ubuntu", "openresty", "observability"],
+            server.normalize_base_image_targets(["observability", "openresty", "ubuntu", "openresty", "bogus"]),
+        )
+
+    def test_service_defaults_and_skips(self) -> None:
+        self.assertEqual(["ubuntu"], server.base_image_targets_for_service({"id": "agentlink"}))
+        self.assertEqual(
+            ["openresty"],
+            server.base_image_targets_for_service({"id": "service-router", "base_image_targets": ["openresty"]}),
+        )
+        self.assertEqual([], server.base_image_targets_for_service({"id": "llm-gateway", "skip_public_service": True}))
+
+    def test_union_for_batch(self) -> None:
+        targets = server.base_image_targets_for_services(
+            [
+                {"id": "semantic-schedule", "base_image_targets": ["ubuntu"]},
+                {"id": "service-router", "base_image_targets": ["openresty"]},
+                {"id": "es-service", "base_image_targets": ["observability"]},
+                {"id": "llm-gateway", "skip_public_service": True},
+            ]
+        )
+        self.assertEqual(["ubuntu", "openresty", "observability"], targets)
+
+    def test_ensure_versioned_base_images_passes_selected_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = server.Path(tmp)
+            script = root / "public-service" / "scripts" / "build-versioned-base-images.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/bash\n", encoding="utf-8")
+            captured: list[str] = []
+
+            def fake_run_stream(job_id, cmd, **kwargs):
+                del job_id, kwargs
+                captured.append(" ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd))
+                return 0
+
+            with patch.dict(server.CFG, {"workspace_root": tmp}):
+                with patch.object(server, "run_stream", side_effect=fake_run_stream):
+                    with patch.object(server, "append_job_log"):
+                        with patch.object(server, "bash_lc", side_effect=lambda s: ["bash", "-lc", s]):
+                            with patch.object(server, "host_path", side_effect=lambda p: str(p)):
+                                ok, detail = server.ensure_versioned_base_images("job-base", ["ubuntu", "openresty"])
+            self.assertTrue(ok)
+            self.assertEqual("", detail)
+            self.assertEqual(1, len(captured))
+            self.assertIn("build-versioned-base-images.sh", captured[0])
+            self.assertIn(" ubuntu openresty", captured[0])
+            self.assertNotIn(" all", captured[0])
+
+
 class ConcurrentPrepareTests(unittest.TestCase):
     def setUp(self) -> None:
         with server._jobs_lock:
