@@ -192,13 +192,13 @@ textarea { resize: vertical; min-height: 88px; }
 .topbar {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 16px;
   padding: 10px 20px;
   background: var(--top);
   border-bottom: 1px solid var(--line);
 }
-.user-wrap { position: relative; margin-left: auto; }
+.user-wrap { position: relative; margin-top: 4px; margin-left: auto; align-self: flex-start; }
 .user-btn {
   display: flex;
   align-items: center;

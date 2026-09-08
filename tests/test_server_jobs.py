@@ -687,12 +687,17 @@ class SwrLoginProbeTests(unittest.TestCase):
 
 class BranchLookupTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_patch = patch.object(server, "DB_PATH", server.Path(self.tmp.name) / "robot-ci.db")
+        self.db_patch.start()
         with server._branch_cache_lock:
             server._branch_cache.clear()
 
     def tearDown(self) -> None:
         with server._branch_cache_lock:
             server._branch_cache.clear()
+        self.db_patch.stop()
+        self.tmp.cleanup()
 
     @patch.object(server, "gh_token", return_value="")
     @patch.object(server, "run_cmd", return_value=(0, ""))
@@ -1184,13 +1189,12 @@ class JobEndpointTests(unittest.TestCase):
 
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
     def test_branch_lookup_uses_default_until_user_refreshes(self, lookup) -> None:
-        with server._branch_cache_lock:
-            server._branch_cache.pop("rollingfruit/CellMem", None)
-        with self._open("/api/services/memory-service/branches") as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        self.assertEqual(["main"], payload["branches"])
-        self.assertFalse(payload["cached"])
-        lookup.assert_not_called()
+        with patch.object(server, "cached_branches", return_value=[]):
+            with self._open("/api/services/memory-service/branches") as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(["main"], payload["branches"])
+            self.assertFalse(payload["cached"])
+            lookup.assert_not_called()
 
         with self.assertRaises(HTTPError) as raised:
             self._open("/api/services/memory-service/branches?refresh=1")

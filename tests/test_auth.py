@@ -219,6 +219,13 @@ class AuthApiTests(unittest.TestCase):
         self.assertFalse(removed["favorited"])
         self.assertEqual([second], removed["service_ids"])
 
+    def test_branch_cache_survives_memory_reset(self) -> None:
+        repo = "example/service"
+        server._cache_branches(repo, ["release", "main"])
+        with server._branch_cache_lock:
+            server._branch_cache.clear()
+        self.assertEqual(["main", "release"], server.cached_branches(repo))
+
     def test_missing_template_branch_falls_back_to_default(self) -> None:
         self.assertEqual(
             "main",

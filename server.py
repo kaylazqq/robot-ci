@@ -250,6 +250,11 @@ def init_store() -> None:
                     created_at REAL NOT NULL,
                     PRIMARY KEY (username, service_id)
                 );
+                CREATE TABLE IF NOT EXISTS branch_caches (
+                    repo TEXT PRIMARY KEY,
+                    branches_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -4032,15 +4037,58 @@ def summarize_command_failure(lines: list[str], fallback: str) -> str:
 def _cache_branches(repo: str, names: list[str]) -> list[str]:
     unique = sorted({name.strip() for name in names if name and name.strip()})
     if unique:
+        updated_at = time.time()
         with _branch_cache_lock:
-            _branch_cache[repo] = (time.time(), unique)
+            _branch_cache[repo] = (updated_at, unique)
+        init_store()
+        with _db_lock:
+            conn = _connect_db()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO branch_caches (repo, branches_json, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(repo) DO UPDATE SET
+                      branches_json = excluded.branches_json,
+                      updated_at = excluded.updated_at
+                    """,
+                    (repo, json.dumps(unique, ensure_ascii=False), updated_at),
+                )
+                conn.commit()
+            finally:
+                conn.close()
     return unique
 
 
 def cached_branches(repo: str) -> list[str]:
     with _branch_cache_lock:
         cached = _branch_cache.get(repo)
-    return list(cached[1]) if cached else []
+    if cached:
+        return list(cached[1])
+    if not repo:
+        return []
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute(
+                "SELECT branches_json, updated_at FROM branch_caches WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+        finally:
+            conn.close()
+    if not row:
+        return []
+    try:
+        names = json.loads(str(row["branches_json"] or "[]"))
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(names, list):
+        return []
+    unique = sorted({str(name).strip() for name in names if str(name).strip()})
+    if unique:
+        with _branch_cache_lock:
+            _branch_cache[repo] = (float(row["updated_at"] or time.time()), unique)
+    return unique
 
 
 def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] | str]:
