@@ -1651,9 +1651,9 @@ class BuildHistoryTests(unittest.TestCase):
         log_text = (self.log_dir / "job-eeeeeeeeeeee.log").read_text(encoding="utf-8")
         self.assertIn(server.INTERRUPTED_JOB_ERROR, log_text)
 
-    def test_prune_build_history_trims_to_50_when_over_100(self) -> None:
+    def test_prune_build_history_trims_to_250_when_over_500(self) -> None:
         mine = "cmsqxcxcesgairws0"
-        for index in range(101):
+        for index in range(501):
             job_id = f"{index:012d}"
             payload = {
                 "id": job_id,
@@ -1667,12 +1667,12 @@ class BuildHistoryTests(unittest.TestCase):
             )
             (self.log_dir / f"job-{job_id}.log").write_text("log\n", encoding="utf-8")
         removed = server.prune_build_history(mine)
-        self.assertEqual(51, removed)
+        self.assertEqual(251, removed)
         remaining = sorted(path.stem.replace("job-", "") for path in self.log_dir.glob("job-*.json"))
-        self.assertEqual(50, len(remaining))
+        self.assertEqual(250, len(remaining))
         self.assertNotIn("000000000000", remaining)
-        self.assertIn("000000000051", remaining)
-        self.assertIn("000000000100", remaining)
+        self.assertIn("000000000251", remaining)
+        self.assertIn("000000000500", remaining)
 
     def test_record_build_artifact_keeps_full_history(self) -> None:
         path = server.artifacts_log_path()

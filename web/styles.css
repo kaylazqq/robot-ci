@@ -198,7 +198,7 @@ textarea { resize: vertical; min-height: 88px; }
   background: var(--top);
   border-bottom: 1px solid var(--line);
 }
-.user-wrap { position: relative; }
+.user-wrap { position: relative; margin-left: auto; }
 .user-btn {
   display: flex;
   align-items: center;
@@ -534,8 +534,8 @@ textarea { resize: vertical; min-height: 88px; }
 .history-table:not(.show-service-column) .hist-col-status { width: 8%; }
 .history-table:not(.show-service-column) .hist-col-sha { width: 11%; }
 .history-table:not(.show-service-column) .hist-col-dur { width: 9%; }
-.history-table:not(.show-service-column) .hist-col-op { width: 16%; }
-.history-table:not(.show-service-column) .hist-col-act { width: 13%; }
+.history-table:not(.show-service-column) .hist-col-op { width: 19%; }
+.history-table:not(.show-service-column) .hist-col-act { width: 10%; }
 .artifacts-table.show-service-column .art-col-time { width: 10%; }
 .artifacts-table.show-service-column .art-col-svc { width: 13%; }
 .artifacts-table.show-service-column .art-col-branch { width: 14%; }
@@ -919,6 +919,7 @@ textarea { resize: vertical; min-height: 88px; }
   gap: 10px;
   padding: 4px 0;
 }
+.favorite-services[hidden] { display: none; }
 .favorite-service-chip {
   display: inline-flex;
   align-items: center;
