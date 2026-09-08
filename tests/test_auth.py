@@ -115,12 +115,15 @@ class AuthApiTests(unittest.TestCase):
     def test_preset_roster_accounts_are_seeded(self) -> None:
         self.assertIn("c50065452", server.DEFAULT_USERNAMES)
         self.assertIn("z00987657", server.DEFAULT_USERNAMES)
-        self.assertEqual(20, len(server.DEFAULT_USERNAMES))
+        self.assertEqual(23, len(server.DEFAULT_USERNAMES))
         self.assertEqual(len(set(server.DEFAULT_USERNAMES)), len(server.DEFAULT_USERNAMES))
         for username, password in server.DEFAULT_USERS:
             self.assertEqual(username, password)
             self.assertEqual(username, server.authenticate_user(username, password))
         self.assertEqual("c50065452", server.authenticate_user("c50065452", "c50065452"))
+        self.assertEqual("00985499", server.authenticate_user("00985499", "00985499"))
+        self.assertEqual("00985465", server.authenticate_user("00985465", "00985465"))
+        self.assertEqual("50060857", server.authenticate_user("50060857", "50060857"))
 
     def test_old_at_sign_default_password_is_migrated(self) -> None:
         users = []
