@@ -4007,11 +4007,14 @@ def ensure_versioned_base_images(
         job_id,
         f"base images: verifying targets [{', '.join(selected)}] (HIT/MISS follows)",
     )
-    code = run_stream(
-        job_id,
-        bash_lc(f"bash {shlex.quote(host_path(script))} {target_args}"),
-        timeout=3600,
-    )
+    # Serialize across jobs so concurrent Python/OpenResty cold builds cannot race
+    # on the same local/ai-* tags (e.g. agentlink vs semantic-gateway).
+    with _public_service_lock:
+        code = run_stream(
+            job_id,
+            bash_lc(f"bash {shlex.quote(host_path(script))} {target_args}"),
+            timeout=3600,
+        )
     if code != 0:
         return False, "shared base-image verification/build failed"
     append_job_log(job_id, f"base images: contract verified for [{', '.join(selected)}]")
