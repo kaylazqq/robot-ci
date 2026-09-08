@@ -839,6 +839,64 @@ def _sync_fail_index(
     return len(ids) - 1
 
 
+def _build_fail_index(
+    defs: tuple[tuple[str, str], ...],
+    job: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+) -> int:
+    """Map build failures to script / docker / verify instead of always the last subtask."""
+    ids = [item[0] for item in defs]
+    if not ids:
+        return 0
+    err = str((result or {}).get("error") or (job or {}).get("error") or "").lower()
+
+    def _idx(name: str) -> int:
+        return ids.index(name) if name in ids else max(0, len(ids) - 1)
+
+    if any(
+        token in err
+        for token in (
+            "image inspect",
+            "did not produce",
+            "missing tag",
+            "产物",
+            "archive export",
+            "sha256 mismatch",
+        )
+    ):
+        return _idx("verify")
+    if any(
+        token in err
+        for token in (
+            "failed to solve",
+            "dockerfile",
+            "docker build",
+            "buildx",
+            "copy failed",
+            "target stage",
+        )
+    ):
+        return _idx("docker")
+    if any(
+        token in err
+        for token in (
+            "bases missing",
+            "base image",
+            "base-images",
+            "build-bases",
+            "jdk bases",
+            "python base",
+            "node runtime tarball",
+            "ops-helpers",
+            "syntax error",
+            "shared base-image",
+        )
+    ):
+        return _idx("script")
+    # Unknown build-stage failures usually die inside the service build script.
+    return _idx("script")
+
+
 def _subtask_rows(
     step_id: str,
     status: str,
@@ -852,6 +910,8 @@ def _subtask_rows(
         fail_index = _test_fail_index(defs, job)
     elif step_id == "sync":
         fail_index = _sync_fail_index(defs, job, result)
+    elif step_id == "build":
+        fail_index = _build_fail_index(defs, job, result)
     else:
         fail_index = len(defs) - 1
     statuses = _spread_status_to_subtasks(status, len(defs), fail_index=fail_index)

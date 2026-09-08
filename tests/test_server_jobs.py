@@ -588,6 +588,25 @@ class JobPipelineTests(unittest.TestCase):
         failed = {item["id"]: item["status"] for item in server._subtask_rows("test", "failed", job)}
         self.assertEqual("done", failed["ut-cases"])
 
+    def test_build_fail_subtask_follows_error_class(self) -> None:
+        jdk = {"error": "[es-build] ERROR: JDK bases missing"}
+        rows = {item["id"]: item["status"] for item in server._subtask_rows("build", "failed", result=jdk)}
+        self.assertEqual("failed", rows["script"])
+        self.assertEqual("skipped", rows["docker"])
+        self.assertEqual("skipped", rows["verify"])
+
+        docker = {"error": "ERROR: failed to solve: process \"/bin/sh -c command -v logrotate\" exit code: 127"}
+        rows = {item["id"]: item["status"] for item in server._subtask_rows("build", "failed", result=docker)}
+        self.assertEqual("done", rows["script"])
+        self.assertEqual("failed", rows["docker"])
+        self.assertEqual("skipped", rows["verify"])
+
+        verify = {"error": "build/package/build-image.sh did not produce local/mattermost:tag"}
+        rows = {item["id"]: item["status"] for item in server._subtask_rows("build", "failed", result=verify)}
+        self.assertEqual("done", rows["script"])
+        self.assertEqual("done", rows["docker"])
+        self.assertEqual("failed", rows["verify"])
+
     def test_pipeline_includes_meta_and_summary(self) -> None:
         job = make_job("pipe-meta")
         job["id"] = "pipe-meta"
