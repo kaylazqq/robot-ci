@@ -3472,8 +3472,32 @@ def gc_all_idle_clone_dirs(job_id: str) -> None:
         wipe_workspace_dir(job_id, path, label=f"idle workspace {path.name}")
 
 
+def other_live_jobs_exist(job_id: str) -> bool:
+    """True when another job (this process or peer instance) is still live."""
+    jid = str(job_id or "")
+    with _jobs_lock:
+        local = any(
+            str(job.get("id") or "") != jid and job.get("status") in ("running", "queued")
+            for job in _jobs.values()
+        )
+    if local:
+        return True
+    mine = job_workspace_suffix(jid)
+    return any(suffix != mine for suffix in shared_live_job_suffixes())
+
+
 def reclaim_ci_tmp_leftovers(job_id: str) -> None:
-    """Remove leftover compile scratch dirs under /home/ci. Keep the tmp root."""
+    """Remove leftover compile scratch dirs under /home/ci. Keep the tmp root.
+
+    Skip while other jobs are live: Go `$WORK` (`go-build*`) and fixed trees
+    like `ops-router-build` live here; wiping them mid-compile races concurrent jobs.
+    """
+    if other_live_jobs_exist(job_id):
+        append_job_log(
+            job_id,
+            "skipping ci tmp leftover reclaim: other live job(s) still using /home/ci",
+        )
+        return
     root = ci_tmp_root()
     if not root.is_dir():
         return

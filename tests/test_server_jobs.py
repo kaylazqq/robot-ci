@@ -1461,6 +1461,24 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertFalse(leftover_tmp.exists())
         self.assertTrue(keep_tmp.is_dir())
 
+    def test_reclaim_ci_tmp_skips_when_other_job_live(self) -> None:
+        go_work = self.ci_tmp_root / "go-build12345"
+        ops_build = self.ci_tmp_root / "ops-router-build"
+        go_work.mkdir()
+        ops_build.mkdir()
+        with server._jobs_lock:
+            saved = dict(server._jobs)
+            server._jobs.clear()
+            server._jobs["other"] = make_job("other", service_id="temporal")
+        try:
+            server.reclaim_ci_tmp_leftovers("finishing-job")
+            self.assertTrue(go_work.is_dir())
+            self.assertTrue(ops_build.is_dir())
+        finally:
+            with server._jobs_lock:
+                server._jobs.clear()
+                server._jobs.update(saved)
+
     def test_gc_keeps_workspaces_marked_live_by_other_instance(self) -> None:
         other = self.workspace_root / "mattermost--otherinst01bbbb"
         idle = self.workspace_root / "mattermost--deadjob02cccc"
