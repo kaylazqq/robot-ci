@@ -343,6 +343,19 @@ textarea { resize: vertical; min-height: 88px; }
 }
 .svc-menu-list button:hover, .svc-menu-list button.active { background: var(--blue-bg); color: var(--blue); }
 .svc-menu-list button.is-all { font-weight: 600; border-bottom: 1px solid var(--line); }
+.svc-menu-item { display: flex; align-items: center; }
+.svc-menu-item .svc-menu-service { flex: 1; min-width: 0; }
+.svc-menu-item .svc-favorite-button {
+  width: 34px;
+  min-width: 34px;
+  margin-right: 4px;
+  padding: 7px;
+  color: var(--muted);
+  text-align: center;
+}
+.svc-menu-item .svc-favorite-button:hover,
+.svc-menu-item .svc-favorite-button.is-favorite { color: #d39b20; background: #fff7df; }
+.svc-favorite-button svg { width: 17px; height: 17px; display: block; margin: 0 auto; }
 .svc-menu .empty { padding: 12px; color: var(--muted); }
 .svc-pager {
   display: flex;
@@ -504,12 +517,11 @@ textarea { resize: vertical; min-height: 88px; }
 .hist-col-op { width: 11%; }
 .hist-col-act { width: 10%; }
 .art-col-time { width: 11%; }
-.art-col-svc { width: 11%; }
 .art-col-branch { width: 16%; }
-.art-col-sha { width: 8%; }
+.art-col-sha { width: 10%; }
 .art-col-image { width: 25%; }
-.art-col-pkg { width: 23%; }
-.art-col-op { width: 6%; }
+.art-col-pkg { width: 26%; }
+.art-col-op { width: 12%; }
 .history-table .hist-dur {
   font-variant-numeric: tabular-nums;
   color: var(--muted);
@@ -878,6 +890,32 @@ textarea { resize: vertical; min-height: 88px; }
   cursor: pointer;
   text-align: left;
 }
+.favorite-services {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.favorite-service-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  max-width: 100%;
+  border: 1px solid #c9d9ef;
+  border-radius: 999px;
+  padding: 7px 14px;
+  background: var(--blue-bg);
+  color: var(--blue);
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.favorite-service-chip:hover { border-color: var(--blue); filter: brightness(0.98); }
+.favorite-service-chip.active { background: var(--blue); border-color: var(--blue); color: var(--on-primary); }
 .branch-trigger svg { width: 16px; height: 16px; flex: none; color: var(--muted); }
 .branch-trigger:disabled { cursor: not-allowed; opacity: 0.55; }
 .branch-menu {

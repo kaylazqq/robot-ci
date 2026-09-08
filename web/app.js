@@ -9,6 +9,7 @@ let currentUser = "";
 let nav = "build";
 let tab = "pipeline";
 let services = [];
+let favoriteServiceIds = [];
 let currentServiceId = "";
 let currentJobId = "";
 let currentJob = null;
@@ -204,6 +205,7 @@ function endSession() {
   branchLoadQueue.length = 0;
   currentJob = null;
   currentJobId = "";
+  favoriteServiceIds = [];
   closeModal();
 }
 
@@ -657,36 +659,6 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep) {
   const meta = pipeline.meta || {};
   const status = jobStatus || meta.status || "";
   const stages = buildPipelineStages(pipeline, status);
-  const head = document.createElement("div");
-  head.className = "pl-head";
-  const line = document.createElement("div");
-  line.className = "pl-head-left";
-  line.append("执行流水线 ");
-  const svc = document.createElement("strong");
-  const focus = (pipeline.services || [])[0];
-  const title = focus ? (focus.title || focus.service_id) : ((currentService() && currentService().title) || "");
-  const branch = (currentJob && currentJob.branch) || meta.branch || "";
-  svc.textContent = title + (branch ? "@" + branch : "");
-  line.appendChild(svc);
-  const st = document.createElement("em");
-  st.className = "pl-job-status is-" + (status || "unknown");
-  st.textContent = " " + (pipelineJobStatusLabel(status, currentJob && currentJob.stage, currentJob && currentJob.cancel_requested) || (status ? "执行中" : "未运行"));
-  line.appendChild(st);
-  head.appendChild(line);
-  const arts = (pipeline && pipeline.artifacts) || {};
-  if (arts.image && arts.tag) {
-    const art = document.createElement("div");
-    art.className = "pl-artifact";
-    art.append("镜像 " + arts.image + " " + arts.tag + " ");
-    if (arts.download_url) {
-      const link = document.createElement("a");
-      link.href = arts.download_url;
-      link.textContent = "下载";
-      art.appendChild(link);
-    }
-    head.appendChild(art);
-  }
-  root.appendChild(head);
   const scroll = document.createElement("div");
   scroll.className = "pl-scroll";
   const graph = document.createElement("div");
@@ -789,7 +761,7 @@ function renderArtifacts(items, meta) {
   const body = $("artifactsBody");
   if (!body) return;
   if (!items.length) {
-    body.innerHTML = '<tr><td colspan="7" class="hint">暂无产物。</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="hint">暂无产物。</td></tr>';
   } else {
     body.innerHTML = items.map((item) => {
       const expired = item.expired;
@@ -799,7 +771,6 @@ function renderArtifacts(items, meta) {
       return (
         '<tr class="' + (expired ? "expired" : "") + '">' +
         "<td>" + esc(item.created_at || "—") + "</td>" +
-        "<td>" + esc(item.title || item.service_id || "—") + "</td>" +
         clipTd(item.branch, "art-branch") +
         '<td class="mono">' + esc(shortSha(item.commit_sha)) + "</td>" +
         clipTd(item.image_ref || item.image, "art-image mono") +
@@ -844,7 +815,7 @@ async function refreshArtifacts() {
       renderArtifacts(data.artifacts || [], data);
     } catch (_) {
       if (!viewIsCurrent(gen, sid)) return;
-      if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="7" class="hint">加载失败，请刷新。</td></tr>';
+      if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="6" class="hint">加载失败，请刷新。</td></tr>';
     }
   });
 }
@@ -864,6 +835,36 @@ async function refreshPipeline() {
 
 function serviceTitle(item) {
   return (item && (item.title || item.id)) || "";
+}
+function isFavoriteService(id) {
+  return favoriteServiceIds.includes(id);
+}
+function renderFavoriteServices() {
+  const container = $("favoriteServices");
+  if (!container) return;
+  const favorites = favoriteServiceIds
+    .map((id) => services.find((item) => item.id === id))
+    .filter(Boolean);
+  container.hidden = !favorites.length;
+  container.replaceChildren();
+  favorites.forEach((item) => {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "favorite-service-chip" + (item.id === currentServiceId ? " active" : "");
+    chip.title = serviceTitle(item);
+    chip.textContent = serviceTitle(item);
+    chip.addEventListener("click", () => selectService(item.id));
+    container.appendChild(chip);
+  });
+}
+async function toggleServiceFavorite(serviceId) {
+  const data = await api("/api/service-favorites", {
+    method: "POST",
+    body: JSON.stringify({ service_id: serviceId }),
+  });
+  if (Array.isArray(data.service_ids)) favoriteServiceIds = data.service_ids;
+  renderFavoriteServices();
+  renderServiceMenu();
 }
 function sortedServices() {
   return services.slice().sort((a, b) =>
@@ -923,16 +924,30 @@ function renderServiceMenu() {
     list.appendChild(empty);
   } else {
     pageItems.forEach((item) => {
+      const row = document.createElement("div");
+      row.className = "svc-menu-item";
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = item.id === currentServiceId ? "active" : "";
+      btn.className = "svc-menu-service" + (item.id === currentServiceId ? " active" : "");
       btn.textContent = serviceTitle(item);
       btn.addEventListener("mousedown", (ev) => ev.preventDefault());
       btn.addEventListener("click", () => {
         selectService(item.id);
         hideServiceMenu();
       });
-      list.appendChild(btn);
+      const favorite = document.createElement("button");
+      favorite.type = "button";
+      favorite.className = "svc-favorite-button" + (isFavoriteService(item.id) ? " is-favorite" : "");
+      favorite.title = isFavoriteService(item.id) ? "取消收藏" : "收藏微服务";
+      favorite.setAttribute("aria-label", favorite.title);
+      favorite.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.8l2.5 5.1 5.6.8-4.1 4 .9 5.6-4.9-2.6-4.9 2.6.9-5.6-4.1-4 5.6-.8L12 3.8z" fill="currentColor" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+      favorite.addEventListener("mousedown", (ev) => ev.preventDefault());
+      favorite.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        toggleServiceFavorite(item.id).catch(() => {});
+      });
+      row.append(btn, favorite);
+      list.appendChild(row);
     });
   }
   if (pager) {
@@ -972,10 +987,11 @@ function fillServiceSelect() {
       ? "全部微服务"
       : (currentService() ? serviceTitle(currentService()) : "选择微服务");
   }
+  renderFavoriteServices();
 }
 function clearStaleLists() {
   if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="8" class="hint">加载中…</td></tr>';
-  if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="7" class="hint">加载中…</td></tr>';
+  if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="6" class="hint">加载中…</td></tr>';
   const histPager = $("historyPager");
   const artPager = $("artifactsPager");
   if (histPager) histPager.hidden = true;
@@ -1088,6 +1104,7 @@ function bindServicePicker() {
 async function refreshServices() {
   const data = await api("/api/services");
   services = data.services || [];
+  favoriteServiceIds = Array.isArray(data.favorites) ? data.favorites : [];
   if ($("targetRepo") && data.registry) $("targetRepo").textContent = data.registry + "/" + data.org;
   if (!isKnownServiceId(currentServiceId)) {
     try { currentServiceId = localStorage.getItem(SERVICE_KEY) || ""; } catch (_) {}
@@ -1287,6 +1304,7 @@ function fetchServiceBranches(serviceId, force, priority) {
       branches: data.branches || [],
       selected_branch: data.selected_branch || data.preferred_branch || "",
       default_branch: data.default_branch || "",
+      cached: data.cached === true,
     };
     branchCache[serviceId] = cached;
     delete branchLoads[serviceId];
@@ -1445,7 +1463,11 @@ async function openRunDialog() {
       data.default_branch || fallbackBranch
     );
     const n = (data.branches || []).length;
-    statusEl.textContent = updated ? ("已更新" + n + "个分支") : ("已加载" + n + "个分支");
+    statusEl.textContent = updated
+      ? ("已更新" + n + "个分支")
+      : data.cached
+        ? ("已读取服务器缓存 " + n + " 个分支")
+        : "服务器暂无分支缓存，当前使用默认分支；点击刷新加载";
     statusEl.className = "branch-status ok";
   };
   const loadBranches = async (force) => {
@@ -1457,7 +1479,7 @@ async function openRunDialog() {
     setLoading(true);
     try {
       const data = await fetchServiceBranches(svc.id, force, true);
-      applyCached(data, true);
+      applyCached(data, force);
     } catch (e) {
       branchPicker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
       statusEl.textContent = e.message || "加载分支失败";

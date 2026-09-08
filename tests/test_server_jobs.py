@@ -1183,14 +1183,22 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual("censong574-spec/multica-fleet", services["multica-fleet"]["repo"])
 
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
-    def test_branch_lookup_failure_is_explicit_service_error(self, lookup) -> None:
+    def test_branch_lookup_uses_default_until_user_refreshes(self, lookup) -> None:
+        with server._branch_cache_lock:
+            server._branch_cache.pop("rollingfruit/CellMem", None)
+        with self._open("/api/services/memory-service/branches") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(["main"], payload["branches"])
+        self.assertFalse(payload["cached"])
+        lookup.assert_not_called()
+
         with self.assertRaises(HTTPError) as raised:
-            self._open("/api/services/memory-service/branches")
+            self._open("/api/services/memory-service/branches?refresh=1")
         self.assertEqual(503, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual("branch lookup failed", payload["error"])
         self.assertEqual("SSH timeout", payload["detail"])
-        lookup.assert_called_once_with("rollingfruit/CellMem", force=False)
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
     def test_branch_retry_forces_backend_refresh(self, lookup) -> None:
@@ -1508,15 +1516,16 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server._jobs.update(saved)
 
     def test_gc_keeps_workspaces_marked_live_by_other_instance(self) -> None:
-        other = self.workspace_root / "mattermost--otherinst01bbbb"
+        other_job_id = "abcdef01bbbb"
+        other = self.workspace_root / ("mattermost--" + other_job_id)
         idle = self.workspace_root / "mattermost--deadjob02cccc"
         other.mkdir(parents=True)
         idle.mkdir(parents=True)
-        server.register_live_job_marker("otherinst01bbbb", ["mattermost"])
+        server.register_live_job_marker(other_job_id, ["mattermost"])
         server.gc_all_idle_clone_dirs("livejob00aaaa")
         self.assertTrue(other.is_dir())
         self.assertFalse(idle.exists())
-        server.unregister_live_job_marker("otherinst01bbbb")
+        server.unregister_live_job_marker(other_job_id)
 
 
 class BuildHistoryTests(unittest.TestCase):

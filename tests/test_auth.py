@@ -192,6 +192,33 @@ class AuthApiTests(unittest.TestCase):
             overwritten = json.loads(response.read().decode("utf-8"))
         self.assertEqual("release", overwritten["branch"])
 
+    def test_service_favorites_are_saved_in_user_selected_order(self) -> None:
+        cookie = self._login()
+        first, second = (item["id"] for item in server.load_services()[:2])
+        for service_id in (first, second):
+            with self._open(
+                "/api/service-favorites",
+                data=json.dumps({"service_id": service_id}).encode(),
+                method="POST",
+                cookie=cookie,
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(payload["favorited"])
+
+        with self._open("/api/services", cookie=cookie) as response:
+            services = json.loads(response.read().decode("utf-8"))
+        self.assertEqual([first, second], services["favorites"])
+
+        with self._open(
+            "/api/service-favorites",
+            data=json.dumps({"service_id": first}).encode(),
+            method="POST",
+            cookie=cookie,
+        ) as response:
+            removed = json.loads(response.read().decode("utf-8"))
+        self.assertFalse(removed["favorited"])
+        self.assertEqual([second], removed["service_ids"])
+
     def test_missing_template_branch_falls_back_to_default(self) -> None:
         self.assertEqual(
             "main",

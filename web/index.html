@@ -87,6 +87,7 @@
       </section>
 
       <section class="page" id="pageBuild">
+        <div class="favorite-services" id="favoriteServices" aria-label="已收藏微服务" hidden></div>
         <div class="toolbar toolbar-1">
           <div class="svc-picker" id="svcPicker">
             <span class="svc-select-label">微服务</span>
@@ -188,7 +189,6 @@
             <table class="art-table artifacts-table">
               <colgroup>
                 <col class="art-col-time" />
-                <col class="art-col-svc" />
                 <col class="art-col-branch" />
                 <col class="art-col-sha" />
                 <col class="art-col-image" />
@@ -198,7 +198,6 @@
               <thead>
                 <tr>
                   <th>时间</th>
-                  <th>微服务</th>
                   <th>分支</th>
                   <th>Commit</th>
                   <th>镜像名</th>

@@ -244,6 +244,12 @@ def init_store() -> None:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (username, service_id)
                 );
+                CREATE TABLE IF NOT EXISTS service_favorites (
+                    username TEXT NOT NULL,
+                    service_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (username, service_id)
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -387,6 +393,58 @@ def resolve_template_branch(
     if fallback in names:
         return fallback
     return names[0] if names else fallback
+
+
+def get_service_favorites(username: str) -> list[str]:
+    user = str(username or "").strip()
+    if not user:
+        return []
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT service_id FROM service_favorites WHERE username = ? ORDER BY rowid ASC",
+                (user,),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [str(row["service_id"] or "").strip() for row in rows if str(row["service_id"] or "").strip()]
+
+
+def toggle_service_favorite(username: str, service_id: str) -> tuple[bool, list[str], str]:
+    user = str(username or "").strip()
+    sid = str(service_id or "").strip()
+    if not user:
+        return False, [], "未登录"
+    if not sid:
+        return False, [], "缺少微服务"
+    if sid not in {str(item.get("id") or "") for item in load_services()}:
+        return False, [], "未知微服务"
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM service_favorites WHERE username = ? AND service_id = ?",
+                (user, sid),
+            ).fetchone()
+            if exists:
+                conn.execute(
+                    "DELETE FROM service_favorites WHERE username = ? AND service_id = ?",
+                    (user, sid),
+                )
+                favorited = False
+            else:
+                conn.execute(
+                    "INSERT INTO service_favorites (username, service_id, created_at) VALUES (?, ?, ?)",
+                    (user, sid, time.time()),
+                )
+                favorited = True
+            conn.commit()
+        finally:
+            conn.close()
+    return favorited, get_service_favorites(user), ""
 
 
 def ensure_default_users() -> None:
@@ -3931,15 +3989,20 @@ def _cache_branches(repo: str, names: list[str]) -> list[str]:
     return unique
 
 
+def cached_branches(repo: str) -> list[str]:
+    with _branch_cache_lock:
+        cached = _branch_cache.get(repo)
+    return list(cached[1]) if cached else []
+
+
 def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] | str]:
     if not repo:
         return False, "missing repo"
 
     if not force:
-        with _branch_cache_lock:
-            cached = _branch_cache.get(repo)
-        if cached and time.time() - cached[0] < 60:
-            return True, list(cached[1])
+        cached = cached_branches(repo)
+        if cached:
+            return True, cached
 
     # 1) SSH ls-remote (preferred on shared server)
     if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
@@ -5721,7 +5784,15 @@ class Handler(SimpleHTTPRequestHandler):
                         "last_version": load_last_daemon_version() if svc.get("requires_version") else "",
                     }
                 )
-            self._json(200, {"services": items, "registry": CFG["swr_registry"], "org": CFG["swr_org"]})
+            self._json(
+                200,
+                {
+                    "services": items,
+                    "favorites": get_service_favorites(user or ""),
+                    "registry": CFG["swr_registry"],
+                    "org": CFG["swr_org"],
+                },
+            )
             return
 
         if path == "/api/artifacts":
@@ -5778,8 +5849,16 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             repo = repo_full_name(svc)
             force_refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
-            ok, result = list_branches_api(repo, force=force_refresh)
             default = svc.get("default_branch") or "main"
+            if force_refresh:
+                ok, result = list_branches_api(repo, force=True)
+                from_cache = False
+            else:
+                result = cached_branches(repo)
+                ok = True
+                from_cache = bool(result)
+                if not result:
+                    result = [default]
             if not ok:
                 self._json(
                     503,
@@ -5803,6 +5882,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "default_branch": default,
                     "preferred_branch": preferred or None,
                     "selected_branch": selected,
+                    "cached": from_cache,
                 },
             )
             return
@@ -5983,6 +6063,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": err})
                 return
             self._json(200, {"ok": True})
+            return
+
+        if path == "/api/service-favorites":
+            service_id = str(data.get("service_id") or "").strip()
+            favorited, service_ids, err = toggle_service_favorite(user, service_id)
+            if err:
+                self._json(404 if err == "未知微服务" else 400, {"ok": False, "error": err})
+                return
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "service_id": service_id,
+                    "favorited": favorited,
+                    "service_ids": service_ids,
+                },
+            )
             return
 
         if path == "/api/run-templates":
