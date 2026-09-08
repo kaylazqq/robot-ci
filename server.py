@@ -1029,6 +1029,8 @@ def _pipeline_step_rows(
 
 def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
     err = str(result.get("error") or "").lower()
+    # Do not match the substring "repo" — build errors like `/out/repo` would
+    # otherwise be painted as 前置准备 / 克隆仓库.
     if any(
         token in err
         for token in (
@@ -1040,7 +1042,7 @@ def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
             "build-image.sh",
             "build.yaml",
             "unknown service",
-            "repo",
+            "repository not found",
             "missing deploy",
         )
     ):

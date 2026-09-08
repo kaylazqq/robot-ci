@@ -538,6 +538,34 @@ class JobPipelineTests(unittest.TestCase):
         self.assertEqual("failed", sub["clone"])
         self.assertEqual("skipped", sub["sha"])
 
+    def test_failed_build_out_repo_is_not_prepare(self) -> None:
+        job = make_job("pipe-out-repo", status="failed", service_id="agentlink")
+        job["stage"] = "done"
+        job["error"] = "1/1 failed: agentlink:mkdir: cannot create directory '/out/repo': No such file or directory"
+        job["commit_sha"] = "f554aa18d5d60b35dd1c80ab4710e57fe6ae306e"
+        job["test_status"] = "passed"
+        job["results"] = [
+            {
+                "service_id": "agentlink",
+                "ok": False,
+                "error": "mkdir: cannot create directory '/out/repo': No such file or directory",
+                "commit_sha": "f554aa18d5d60b35dd1c80ab4710e57fe6ae306e",
+                "test_status": "passed",
+            }
+        ]
+        payload = server.job_payload(job, compact=True)
+        statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
+        self.assertEqual("done", statuses["sync"])
+        self.assertEqual("done", statuses["test"])
+        self.assertEqual("failed", statuses["build"])
+        self.assertEqual("skipped", statuses["push"])
+        prepare = {item["id"]: item["status"] for item in payload["pipeline"]["prepare"]}
+        self.assertEqual("done", prepare["env"])
+        sync = next(step for step in payload["pipeline"]["steps"] if step["id"] == "sync")
+        sub = {item["id"]: item["status"] for item in sync["subtasks"]}
+        self.assertEqual("done", sub["clone"])
+        self.assertEqual("done", sub["sha"])
+
     def test_failed_job_without_results_marks_active_step(self) -> None:
         job = make_job("pipe-interrupt", status="failed")
         job["stage"] = "interrupted"
