@@ -22,9 +22,14 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows dev hosts
+    fcntl = None  # type: ignore[assignment]
 
 import huawei_cce
 from cid_config import CidConfigError, build_test_plan, enabled_build_step, load_cid_config
@@ -48,7 +53,9 @@ PBKDF2_ROUNDS = 120_000
 DEFAULT_USERNAME = "l30042018"
 DEFAULT_PASSWORD = "l30042018"
 DEFAULT_USERNAMES = (
+    "c00985465",
     "c50065452",
+    "d00985499",
     "g50065646",
     "h00858007",
     "h00970575",
@@ -59,7 +66,9 @@ DEFAULT_USERNAMES = (
     "l00987661",
     "l30042018",
     "l50059896",
+    "l50060857",
     "w00938605",
+    "w00985465",
     "w30033098",
     "w50062658",
     "y00895149",
@@ -105,6 +114,8 @@ PUBLIC_SERVICE_REUSE_SEC = 120
 _history_disk_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
 _history_disk_cache_lock = threading.Lock()
 _fleet_cache_lock = threading.Lock()
+_ci_disk_reclaim_lock = threading.Lock()
+_ci_disk_reclaimed_jobs: set[str] = set()
 _slot_lock = threading.Lock()
 _slot_cond = threading.Condition(_slot_lock)
 _slot_queue: list[str] = []
@@ -115,10 +126,15 @@ HISTORY_DEFAULT_PAGE_SIZE = 10
 HISTORY_MAX_ENTRIES = 100
 HISTORY_TRIM_TO = 50
 DISK_USAGE_PRUNE_RATIO = 0.80
+BUILDKIT_CACHE_MAX_AGE = "168h"
+BUILDKIT_CACHE_KEEP_STORAGE = "50GB"
 CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
 WORKSPACE_KEEP_NAMES = ("public-service", ".robot-ci-cache")
+LIVE_JOB_MARKERS_DIRNAME = "live-jobs"
+LIVE_JOB_MARKER_MAX_AGE_SEC = 6 * 3600
+HOST_SERVICE_LOCK_NAMES = ("mattermost",)
 CI_TMP_GC_PREFIXES = (
     "runtime-apt-debs.",
     "mattermost-build-cache.",
@@ -827,6 +843,64 @@ def _sync_fail_index(
     return len(ids) - 1
 
 
+def _build_fail_index(
+    defs: tuple[tuple[str, str], ...],
+    job: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+) -> int:
+    """Map build failures to script / docker / verify instead of always the last subtask."""
+    ids = [item[0] for item in defs]
+    if not ids:
+        return 0
+    err = str((result or {}).get("error") or (job or {}).get("error") or "").lower()
+
+    def _idx(name: str) -> int:
+        return ids.index(name) if name in ids else max(0, len(ids) - 1)
+
+    if any(
+        token in err
+        for token in (
+            "image inspect",
+            "did not produce",
+            "missing tag",
+            "产物",
+            "archive export",
+            "sha256 mismatch",
+        )
+    ):
+        return _idx("verify")
+    if any(
+        token in err
+        for token in (
+            "failed to solve",
+            "dockerfile",
+            "docker build",
+            "buildx",
+            "copy failed",
+            "target stage",
+        )
+    ):
+        return _idx("docker")
+    if any(
+        token in err
+        for token in (
+            "bases missing",
+            "base image",
+            "base-images",
+            "build-bases",
+            "jdk bases",
+            "python base",
+            "node runtime tarball",
+            "ops-helpers",
+            "syntax error",
+            "shared base-image",
+        )
+    ):
+        return _idx("script")
+    # Unknown build-stage failures usually die inside the service build script.
+    return _idx("script")
+
+
 def _subtask_rows(
     step_id: str,
     status: str,
@@ -840,6 +914,8 @@ def _subtask_rows(
         fail_index = _test_fail_index(defs, job)
     elif step_id == "sync":
         fail_index = _sync_fail_index(defs, job, result)
+    elif step_id == "build":
+        fail_index = _build_fail_index(defs, job, result)
     else:
         fail_index = len(defs) - 1
     statuses = _spread_status_to_subtasks(status, len(defs), fail_index=fail_index)
@@ -1354,12 +1430,13 @@ def service_concurrency_cap(service_id: str) -> int | None:
 def other_job_uses_build_swap(job_id: str) -> bool:
     """True if another running job still needs the shared compile swap."""
     with _jobs_lock:
-        return any(
+        local = any(
             str(job.get("id") or "") != str(job_id)
             and job.get("status") == "running"
             and "mattermost" in _job_service_ids(job)
             for job in _jobs.values()
         )
+    return local or shared_live_mattermost_jobs(job_id)
 
 
 def _running_jobs_locked() -> list[dict[str, Any]]:
@@ -3210,12 +3287,147 @@ def existing_clone_dirs(svc: dict[str, Any]) -> list[Path]:
     return found
 
 
+def live_job_markers_dir() -> Path:
+    """Host-shared markers so :80 and :18889 do not GC each other's checkouts."""
+    return Path(CFG.get("workspace_root") or "") / ".robot-ci-cache" / LIVE_JOB_MARKERS_DIRNAME
+
+
+def register_live_job_marker(job_id: str, service_ids: list[str] | tuple[str, ...] = ()) -> None:
+    jid = job_workspace_suffix(job_id)
+    if not jid:
+        return
+    root = live_job_markers_dir()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": jid,
+            "pid": os.getpid(),
+            "services": [str(s) for s in service_ids if str(s).strip()],
+            "updated_at": time.time(),
+        }
+        target = root / jid
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(target)
+    except OSError:
+        return
+
+
+def unregister_live_job_marker(job_id: str) -> None:
+    jid = job_workspace_suffix(job_id)
+    if not jid:
+        return
+    path = live_job_markers_dir() / jid
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+def shared_live_job_suffixes() -> set[str]:
+    """Job ids published by every robot-ci instance on this host."""
+    root = live_job_markers_dir()
+    if not root.is_dir():
+        return set()
+    now = time.time()
+    keep: set[str] = set()
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return set()
+    for path in children:
+        if not path.is_file() or path.name.endswith(".tmp"):
+            continue
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            continue
+        if age > LIVE_JOB_MARKER_MAX_AGE_SEC:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        keep.add(path.name)
+    return keep
+
+
+def shared_live_mattermost_jobs(job_id: str) -> bool:
+    """True if another host-wide live marker still owns a mattermost compile."""
+    root = live_job_markers_dir()
+    if not root.is_dir():
+        return False
+    me = job_workspace_suffix(job_id)
+    now = time.time()
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return False
+    for path in children:
+        if not path.is_file() or path.name.endswith(".tmp") or path.name == me:
+            continue
+        try:
+            if now - path.stat().st_mtime > LIVE_JOB_MARKER_MAX_AGE_SEC:
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        services = payload.get("services") if isinstance(payload, dict) else None
+        if isinstance(services, list) and any(str(s) == "mattermost" for s in services):
+            return True
+    return False
+
+
 def _kept_workspace_suffixes(job_id: str) -> set[str]:
     keep = {job_workspace_suffix(job_id)}
     with _jobs_lock:
         keep.update(job_workspace_suffix(str(item.get("id") or "")) for item in _live_jobs_locked())
+    keep.update(shared_live_job_suffixes())
     keep.discard("")
     return keep
+
+
+@contextmanager
+def host_service_compile_lock(job_id: str, service_ids: list[str] | tuple[str, ...]) -> Iterator[None]:
+    """Serialize host-shared compiles (Mattermost swap/npm) across :80 and :18889."""
+    wanted = [sid for sid in service_ids if sid in HOST_SERVICE_LOCK_NAMES]
+    if not wanted or fcntl is None or os.name == "nt":
+        yield
+        return
+    lock_root = Path(CFG.get("workspace_root") or "") / ".robot-ci-cache" / "service-locks"
+    handles: list[Any] = []
+    try:
+        lock_root.mkdir(parents=True, exist_ok=True)
+        for sid in wanted:
+            path = lock_root / f"{sid}.lock"
+            fh = path.open("a+", encoding="utf-8")
+            append_job_log(job_id, f"waiting for host-wide {sid} compile lock…")
+            while True:
+                if job_cancel_requested(job_id):
+                    fh.close()
+                    raise JobStopped()
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(1.0)
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{job_id} pid={os.getpid()} at={time.time()}\n")
+            fh.flush()
+            handles.append(fh)
+            append_job_log(job_id, f"acquired host-wide {sid} compile lock")
+        yield
+    finally:
+        for fh in reversed(handles):
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                fh.close()
+            except OSError:
+                pass
 
 
 def gc_idle_clone_dirs(job_id: str, svc: dict[str, Any]) -> None:
@@ -3262,8 +3474,32 @@ def gc_all_idle_clone_dirs(job_id: str) -> None:
         wipe_workspace_dir(job_id, path, label=f"idle workspace {path.name}")
 
 
+def other_live_jobs_exist(job_id: str) -> bool:
+    """True when another job (this process or peer instance) is still live."""
+    jid = str(job_id or "")
+    with _jobs_lock:
+        local = any(
+            str(job.get("id") or "") != jid and job.get("status") in ("running", "queued")
+            for job in _jobs.values()
+        )
+    if local:
+        return True
+    mine = job_workspace_suffix(jid)
+    return any(suffix != mine for suffix in shared_live_job_suffixes())
+
+
 def reclaim_ci_tmp_leftovers(job_id: str) -> None:
-    """Remove leftover compile scratch dirs under /home/ci. Keep the tmp root."""
+    """Remove leftover compile scratch dirs under /home/ci. Keep the tmp root.
+
+    Skip while other jobs are live: Go `$WORK` (`go-build*`) and fixed trees
+    like `ops-router-build` live here; wiping them mid-compile races concurrent jobs.
+    """
+    if other_live_jobs_exist(job_id):
+        append_job_log(
+            job_id,
+            "skipping ci tmp leftover reclaim: other live job(s) still using /home/ci",
+        )
+        return
     root = ci_tmp_root()
     if not root.is_dir():
         return
@@ -3988,6 +4224,75 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
         return True, str(dest)
 
 
+def ensure_versioned_base_images(
+    job_id: str,
+    targets: list[str] | tuple[str, ...] | None = None,
+) -> tuple[bool, str]:
+    """Verify only the shared bases required by the selected services."""
+    script = public_service_dir() / "scripts" / "build-versioned-base-images.sh"
+    if not script.is_file():
+        return False, f"missing shared base-image builder: {script}"
+    selected = normalize_base_image_targets(targets)
+    if not selected:
+        append_job_log(job_id, "base images: no shared targets required; skip")
+        return True, ""
+    target_args = " ".join(shlex.quote(item) for item in selected)
+    append_job_log(
+        job_id,
+        f"base images: verifying targets [{', '.join(selected)}] (HIT/MISS follows)",
+    )
+    # Serialize across jobs so concurrent Python/OpenResty cold builds cannot race
+    # on the same local/ai-* tags (e.g. agentlink vs semantic-gateway).
+    with _public_service_lock:
+        code = run_stream(
+            job_id,
+            bash_lc(f"bash {shlex.quote(host_path(script))} {target_args}"),
+            timeout=3600,
+        )
+    if code != 0:
+        return False, "shared base-image verification/build failed"
+    append_job_log(job_id, f"base images: contract verified for [{', '.join(selected)}]")
+    return True, ""
+
+
+KNOWN_BASE_IMAGE_TARGETS = ("ubuntu", "openresty", "observability", "python")
+
+
+def normalize_base_image_targets(raw: Any) -> list[str]:
+    """Keep script-supported targets in stable order; drop unknowns/duplicates."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [part.strip().lower() for part in raw.replace(",", " ").split() if part.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(part).strip().lower() for part in raw if str(part).strip()]
+    else:
+        return []
+    ordered: list[str] = []
+    for target in KNOWN_BASE_IMAGE_TARGETS:
+        if target in values and target not in ordered:
+            ordered.append(target)
+    return ordered
+
+
+def base_image_targets_for_service(svc: dict[str, Any] | None) -> list[str]:
+    """Map one service to the public-service base targets it needs."""
+    if not svc or svc.get("skip_public_service"):
+        return []
+    if "base_image_targets" in svc:
+        return normalize_base_image_targets(svc.get("base_image_targets"))
+    return ["ubuntu"]
+
+
+def base_image_targets_for_services(services: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> list[str]:
+    selected: list[str] = []
+    for svc in services:
+        for target in base_image_targets_for_service(svc):
+            if target not in selected:
+                selected.append(target)
+    return normalize_base_image_targets(selected)
+
+
 def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None, str | None]:
     """Pick newest local/<image>:*_<git_hash> after a fresh build (tag is YYYYMMDDHHMM_<hash>)."""
     if not image or not git_hash or git_hash.startswith("0000"):
@@ -4437,9 +4742,22 @@ def reclaim_build_swap(job_id: str) -> int:
 
 
 def reclaim_docker_builder_cache(job_id: str) -> None:
-    """Free unused BuildKit layer cache. This is the usual 100G+ leak on the CI host."""
-    append_job_log(job_id, "pruning docker builder cache")
-    code, out = docker_cmd("builder", "prune", "-af", timeout=1800)
+    """Reclaim stale BuildKit entries only after the CI host crosses its disk limit."""
+    append_job_log(
+        job_id,
+        "disk threshold reached; pruning BuildKit cache older than "
+        f"{BUILDKIT_CACHE_MAX_AGE} (keeping at least {BUILDKIT_CACHE_KEEP_STORAGE})",
+    )
+    code, out = docker_cmd(
+        "builder",
+        "prune",
+        "-af",
+        "--filter",
+        f"until={BUILDKIT_CACHE_MAX_AGE}",
+        "--keep-storage",
+        BUILDKIT_CACHE_KEEP_STORAGE,
+        timeout=1800,
+    )
     for line in (out or "").splitlines()[-8:]:
         append_job_log(job_id, line)
     if code != 0:
@@ -4453,19 +4771,15 @@ def reclaim_ci_disk(
     max_usage_ratio: float = DISK_USAGE_PRUNE_RATIO,
     keep_refs: list[str] | tuple[str, ...] = (),
 ) -> None:
-    """CI disk reclaim used before archive and at job end.
-
-    Always drop leftover build.swap, idle git workspaces, /home/ci scratch
-    dirs, and unused BuildKit cache. Those are what filled the CI disk even
-    while usage stayed under the 80% archive/image prune threshold.
-
-    When usage is still >= 80% after that, prune nginx timestamp archives
-    and unused docker images. Protected local/ai-* tags are never removed.
-    """
+    """Run one disk check per job and preserve warm BuildKit caches below 80%."""
+    with _ci_disk_reclaim_lock:
+        if job_id in _ci_disk_reclaimed_jobs:
+            append_job_log(job_id, "disk reclaim already checked for this job; preserving BuildKit cache")
+            return
+        _ci_disk_reclaimed_jobs.add(job_id)
     reclaim_build_swap(job_id)
     gc_all_idle_clone_dirs(job_id)
     reclaim_ci_tmp_leftovers(job_id)
-    reclaim_docker_builder_cache(job_id)
     probe = Path((CFG.get("archive_root") or "/").rstrip("/") or "/")
     stats = disk_usage_ratio(probe)
     if stats is None:
@@ -4474,10 +4788,15 @@ def reclaim_ci_disk(
     if ratio < max_usage_ratio:
         append_job_log(
             job_id,
-            f"disk after routine reclaim: usage={ratio:.0%} "
-            f"free={free // (1024**2)}MB",
+            f"disk usage={ratio:.0%} free={free // (1024**2)}MB; "
+            "below threshold, preserving BuildKit cache",
         )
         return
+    reclaim_docker_builder_cache(job_id)
+    stats = disk_usage_ratio(probe)
+    if stats is None:
+        return
+    ratio, total, free = stats
     append_job_log(
         job_id,
         f"disk usage={ratio:.0%} >= {max_usage_ratio:.0%} "
@@ -5075,6 +5394,9 @@ def run_push_job(
         if not wait_for_build_slot(job_id):
             raise JobStopped()
 
+        service_ids = [str(svc.get("id") or "") for svc, _, _ in resolved]
+        register_live_job_marker(job_id, service_ids)
+
         needs_swr = any(not svc.get("archive_only") for svc, _, _ in resolved)
         if needs_swr and not ensure_swr_login(job_id, login_command):
             return
@@ -5086,6 +5408,12 @@ def run_push_job(
             if not ok_ps:
                 set_job(job_id, status="failed", error=detail_ps)
                 append_job_log(job_id, f"ERROR {detail_ps}")
+                return
+            base_targets = base_image_targets_for_services([svc for svc, _, _ in resolved])
+            ok_bases, detail_bases = ensure_versioned_base_images(job_id, base_targets)
+            if not ok_bases:
+                set_job(job_id, status="failed", error=detail_bases)
+                append_job_log(job_id, f"ERROR {detail_bases}")
                 return
         else:
             append_job_log(job_id, "shared public-service skipped: not required by selected services")
@@ -5110,37 +5438,40 @@ def run_push_job(
 
         results: list[dict[str, Any]] = []
         total = len(resolved)
-        for idx, (svc, br, version) in enumerate(resolved, 1):
-            if job_cancel_requested(job_id):
-                raise JobStopped()
-            append_job_log(job_id, f"===== [{idx}/{total}] {svc['id']} @ {br} =====")
-            set_job(job_id, stage="syncing", current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
-            result = push_one_service(job_id, svc, br, archive_dir, version)
-            results.append(result)
-            set_job(job_id, results=results)
-            if result.get("error_code") == "swr_auth_failed":
-                append_job_log(job_id, "SWR authentication failed; stopping remaining SWR operations")
-                for pending_svc, pending_br, pending_version in resolved[idx:]:
-                    pending = {
-                        "service_id": pending_svc["id"],
-                        "title": pending_svc.get("title") or pending_svc["id"],
-                        "branch": pending_br,
-                        "version": pending_version,
-                        "ok": False,
-                        "remote": "",
-                        "archive": "",
-                        "error": "not attempted: SWR authentication failed",
-                        "error_code": "swr_auth_failed",
-                        "test_status": None,
-                        "test_summary": None,
-                    }
-                    results.append(pending)
-                    append_job_log(
-                        job_id,
-                        f"FAILED service={pending_svc['id']} reason={pending['error']}",
-                    )
+        with host_service_compile_lock(job_id, service_ids):
+            for idx, (svc, br, version) in enumerate(resolved, 1):
+                if job_cancel_requested(job_id):
+                    raise JobStopped()
+                append_job_log(job_id, f"===== [{idx}/{total}] {svc['id']} @ {br} =====")
+                set_job(job_id, stage="syncing", current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
+                # Refresh marker mtime while long compiles run.
+                register_live_job_marker(job_id, service_ids)
+                result = push_one_service(job_id, svc, br, archive_dir, version)
+                results.append(result)
                 set_job(job_id, results=results)
-                break
+                if result.get("error_code") == "swr_auth_failed":
+                    append_job_log(job_id, "SWR authentication failed; stopping remaining SWR operations")
+                    for pending_svc, pending_br, pending_version in resolved[idx:]:
+                        pending = {
+                            "service_id": pending_svc["id"],
+                            "title": pending_svc.get("title") or pending_svc["id"],
+                            "branch": pending_br,
+                            "version": pending_version,
+                            "ok": False,
+                            "remote": "",
+                            "archive": "",
+                            "error": "not attempted: SWR authentication failed",
+                            "error_code": "swr_auth_failed",
+                            "test_status": None,
+                            "test_summary": None,
+                        }
+                        results.append(pending)
+                        append_job_log(
+                            job_id,
+                            f"FAILED service={pending_svc['id']} reason={pending['error']}",
+                        )
+                    set_job(job_id, results=results)
+                    break
 
         if job_cancel_requested(job_id):
             raise JobStopped()
@@ -5196,6 +5527,9 @@ def run_push_job(
         release_build_slot(job_id)
         _job_ctx.job_id = None
         reclaim_ci_disk(job_id)
+        unregister_live_job_marker(job_id)
+        with _ci_disk_reclaim_lock:
+            _ci_disk_reclaimed_jobs.discard(job_id)
 
 
 def push_service(

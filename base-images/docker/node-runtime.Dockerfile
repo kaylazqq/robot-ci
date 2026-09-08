@@ -1,5 +1,5 @@
-ARG BUILD_BASE_IMAGE=local/ai-ubuntu-build:22.04
-ARG RUNTIME_BASE_IMAGE=local/ai-ubuntu-runtime:22.04
+ARG BUILD_BASE_IMAGE=local/ai-ubuntu-build:22.04-v1
+ARG RUNTIME_BASE_IMAGE=local/ai-ubuntu-runtime:22.04-apt-v1
 ARG UBUNTU_APT_MIRROR=repo.huaweicloud.com
 
 # Official Node linux-x64 binary. Do not compile from source on Ubuntu 22.04/GCC 11.

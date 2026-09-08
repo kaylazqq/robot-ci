@@ -616,6 +616,25 @@ class JobPipelineTests(unittest.TestCase):
         failed = {item["id"]: item["status"] for item in server._subtask_rows("test", "failed", job)}
         self.assertEqual("done", failed["ut-cases"])
 
+    def test_build_fail_subtask_follows_error_class(self) -> None:
+        jdk = {"error": "[es-build] ERROR: JDK bases missing"}
+        rows = {item["id"]: item["status"] for item in server._subtask_rows("build", "failed", result=jdk)}
+        self.assertEqual("failed", rows["script"])
+        self.assertEqual("skipped", rows["docker"])
+        self.assertEqual("skipped", rows["verify"])
+
+        docker = {"error": "ERROR: failed to solve: process \"/bin/sh -c command -v logrotate\" exit code: 127"}
+        rows = {item["id"]: item["status"] for item in server._subtask_rows("build", "failed", result=docker)}
+        self.assertEqual("done", rows["script"])
+        self.assertEqual("failed", rows["docker"])
+        self.assertEqual("skipped", rows["verify"])
+
+        verify = {"error": "build/package/build-image.sh did not produce local/mattermost:tag"}
+        rows = {item["id"]: item["status"] for item in server._subtask_rows("build", "failed", result=verify)}
+        self.assertEqual("done", rows["script"])
+        self.assertEqual("done", rows["docker"])
+        self.assertEqual("failed", rows["verify"])
+
     def test_pipeline_includes_meta_and_summary(self) -> None:
         job = make_job("pipe-meta")
         job["id"] = "pipe-meta"
@@ -1184,6 +1203,8 @@ class JobEndpointTests(unittest.TestCase):
 
 class DiskPruneAndArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
+        with server._ci_disk_reclaim_lock:
+            server._ci_disk_reclaimed_jobs.clear()
         with server._jobs_lock:
             self.saved_jobs = dict(server._jobs)
             server._jobs.clear()
@@ -1389,12 +1410,12 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server._jobs.update(saved)
 
     @patch.object(server, "docker_cmd", return_value=(0, "Total: 1GB"))
-    def test_reclaim_always_prunes_builder_cache_below_80_percent(self, docker_cmd) -> None:
+    def test_reclaim_preserves_builder_cache_below_80_percent(self, docker_cmd) -> None:
         with patch.object(server.shutil, "disk_usage", return_value=self._disk(700)):
             with patch.object(server, "reclaim_build_swap", return_value=0):
                 server.reclaim_ci_disk("job-1")
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
-        self.assertIn(("builder", "prune", "-af"), prune_args)
+        self.assertNotIn(("builder", "prune", "-af"), prune_args)
         self.assertNotIn(("image", "prune", "-af"), prune_args)
 
     @patch.object(server, "ensure_protected_image_holds")
@@ -1409,8 +1430,13 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         ensure_holds.assert_called()
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
         self.assertIn(("image", "prune", "-af"), prune_args)
-        self.assertIn(("builder", "prune", "-af"), prune_args)
-        builder_index = prune_args.index(("builder", "prune", "-af"))
+        self.assertIn(
+            ("builder", "prune", "-af", "--filter", "until=168h", "--keep-storage", "50GB"),
+            prune_args,
+        )
+        builder_index = prune_args.index(
+            ("builder", "prune", "-af", "--filter", "until=168h", "--keep-storage", "50GB")
+        )
         image_index = prune_args.index(("image", "prune", "-af"))
         self.assertLess(builder_index, image_index)
 
@@ -1432,7 +1458,10 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server.reclaim_ci_disk("job-1")
         ensure_holds.assert_called()
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
-        self.assertIn(("builder", "prune", "-af"), prune_args)
+        self.assertIn(
+            ("builder", "prune", "-af", "--filter", "until=168h", "--keep-storage", "50GB"),
+            prune_args,
+        )
         self.assertIn(("image", "prune", "-af"), prune_args)
 
     def test_gc_all_idle_clone_dirs_keeps_public_service_and_running_jobs(self) -> None:
@@ -1459,6 +1488,35 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertFalse(idle.exists())
         self.assertFalse(leftover_tmp.exists())
         self.assertTrue(keep_tmp.is_dir())
+
+    def test_reclaim_ci_tmp_skips_when_other_job_live(self) -> None:
+        go_work = self.ci_tmp_root / "go-build12345"
+        ops_build = self.ci_tmp_root / "ops-router-build"
+        go_work.mkdir()
+        ops_build.mkdir()
+        with server._jobs_lock:
+            saved = dict(server._jobs)
+            server._jobs.clear()
+            server._jobs["other"] = make_job("other", service_id="temporal")
+        try:
+            server.reclaim_ci_tmp_leftovers("finishing-job")
+            self.assertTrue(go_work.is_dir())
+            self.assertTrue(ops_build.is_dir())
+        finally:
+            with server._jobs_lock:
+                server._jobs.clear()
+                server._jobs.update(saved)
+
+    def test_gc_keeps_workspaces_marked_live_by_other_instance(self) -> None:
+        other = self.workspace_root / "mattermost--otherinst01bbbb"
+        idle = self.workspace_root / "mattermost--deadjob02cccc"
+        other.mkdir(parents=True)
+        idle.mkdir(parents=True)
+        server.register_live_job_marker("otherinst01bbbb", ["mattermost"])
+        server.gc_all_idle_clone_dirs("livejob00aaaa")
+        self.assertTrue(other.is_dir())
+        self.assertFalse(idle.exists())
+        server.unregister_live_job_marker("otherinst01bbbb")
 
 
 class BuildHistoryTests(unittest.TestCase):
@@ -1761,6 +1819,65 @@ class PublicServiceReuseTests(unittest.TestCase):
                             ok, _detail = server.ensure_public_service("ps-job")
             self.assertTrue(ok)
             stream.assert_not_called()
+
+
+class BaseImageTargetTests(unittest.TestCase):
+    def test_normalize_keeps_known_order(self) -> None:
+        self.assertEqual(
+            ["ubuntu", "openresty", "observability", "python"],
+            server.normalize_base_image_targets(
+                ["python", "observability", "openresty", "ubuntu", "openresty", "bogus", "python"]
+            ),
+        )
+
+    def test_service_defaults_and_skips(self) -> None:
+        self.assertEqual(["ubuntu"], server.base_image_targets_for_service({"id": "agentlink"}))
+        self.assertEqual(
+            ["python"],
+            server.base_image_targets_for_service({"id": "agentlink", "base_image_targets": ["python"]}),
+        )
+        self.assertEqual(
+            ["openresty"],
+            server.base_image_targets_for_service({"id": "service-router", "base_image_targets": ["openresty"]}),
+        )
+        self.assertEqual([], server.base_image_targets_for_service({"id": "llm-gateway", "skip_public_service": True}))
+
+    def test_union_for_batch(self) -> None:
+        targets = server.base_image_targets_for_services(
+            [
+                {"id": "semantic-schedule", "base_image_targets": ["python"]},
+                {"id": "service-router", "base_image_targets": ["openresty"]},
+                {"id": "es-service", "base_image_targets": ["observability"]},
+                {"id": "llm-gateway", "skip_public_service": True},
+            ]
+        )
+        self.assertEqual(["openresty", "observability", "python"], targets)
+
+    def test_ensure_versioned_base_images_passes_selected_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = server.Path(tmp)
+            script = root / "public-service" / "scripts" / "build-versioned-base-images.sh"
+            script.parent.mkdir(parents=True)
+            script.write_text("#!/bin/bash\n", encoding="utf-8")
+            captured: list[str] = []
+
+            def fake_run_stream(job_id, cmd, **kwargs):
+                del job_id, kwargs
+                captured.append(" ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd))
+                return 0
+
+            with patch.dict(server.CFG, {"workspace_root": tmp}):
+                with patch.object(server, "run_stream", side_effect=fake_run_stream):
+                    with patch.object(server, "append_job_log"):
+                        with patch.object(server, "bash_lc", side_effect=lambda s: ["bash", "-lc", s]):
+                            with patch.object(server, "host_path", side_effect=lambda p: str(p)):
+                                ok, detail = server.ensure_versioned_base_images("job-base", ["ubuntu", "openresty"])
+            self.assertTrue(ok)
+            self.assertEqual("", detail)
+            self.assertEqual(1, len(captured))
+            self.assertIn("build-versioned-base-images.sh", captured[0])
+            self.assertIn(" ubuntu openresty", captured[0])
+            self.assertNotIn(" all", captured[0])
 
 
 class ConcurrentPrepareTests(unittest.TestCase):
