@@ -4018,7 +4018,7 @@ def ensure_versioned_base_images(
     return True, ""
 
 
-KNOWN_BASE_IMAGE_TARGETS = ("ubuntu", "openresty", "observability")
+KNOWN_BASE_IMAGE_TARGETS = ("ubuntu", "openresty", "observability", "python")
 
 
 def normalize_base_image_targets(raw: Any) -> list[str]:

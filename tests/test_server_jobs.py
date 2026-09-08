@@ -1748,12 +1748,18 @@ class PublicServiceReuseTests(unittest.TestCase):
 class BaseImageTargetTests(unittest.TestCase):
     def test_normalize_keeps_known_order(self) -> None:
         self.assertEqual(
-            ["ubuntu", "openresty", "observability"],
-            server.normalize_base_image_targets(["observability", "openresty", "ubuntu", "openresty", "bogus"]),
+            ["ubuntu", "openresty", "observability", "python"],
+            server.normalize_base_image_targets(
+                ["python", "observability", "openresty", "ubuntu", "openresty", "bogus", "python"]
+            ),
         )
 
     def test_service_defaults_and_skips(self) -> None:
         self.assertEqual(["ubuntu"], server.base_image_targets_for_service({"id": "agentlink"}))
+        self.assertEqual(
+            ["python"],
+            server.base_image_targets_for_service({"id": "agentlink", "base_image_targets": ["python"]}),
+        )
         self.assertEqual(
             ["openresty"],
             server.base_image_targets_for_service({"id": "service-router", "base_image_targets": ["openresty"]}),
@@ -1763,13 +1769,13 @@ class BaseImageTargetTests(unittest.TestCase):
     def test_union_for_batch(self) -> None:
         targets = server.base_image_targets_for_services(
             [
-                {"id": "semantic-schedule", "base_image_targets": ["ubuntu"]},
+                {"id": "semantic-schedule", "base_image_targets": ["python"]},
                 {"id": "service-router", "base_image_targets": ["openresty"]},
                 {"id": "es-service", "base_image_targets": ["observability"]},
                 {"id": "llm-gateway", "skip_public_service": True},
             ]
         )
-        self.assertEqual(["ubuntu", "openresty", "observability"], targets)
+        self.assertEqual(["openresty", "observability", "python"], targets)
 
     def test_ensure_versioned_base_images_passes_selected_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
