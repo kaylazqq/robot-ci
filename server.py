@@ -105,6 +105,8 @@ PUBLIC_SERVICE_REUSE_SEC = 120
 _history_disk_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
 _history_disk_cache_lock = threading.Lock()
 _fleet_cache_lock = threading.Lock()
+_ci_disk_reclaim_lock = threading.Lock()
+_ci_disk_reclaimed_jobs: set[str] = set()
 _slot_lock = threading.Lock()
 _slot_cond = threading.Condition(_slot_lock)
 _slot_queue: list[str] = []
@@ -115,6 +117,8 @@ HISTORY_DEFAULT_PAGE_SIZE = 10
 HISTORY_MAX_ENTRIES = 100
 HISTORY_TRIM_TO = 50
 DISK_USAGE_PRUNE_RATIO = 0.80
+BUILDKIT_CACHE_MAX_AGE = "168h"
+BUILDKIT_CACHE_KEEP_STORAGE = "50GB"
 CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
@@ -3986,6 +3990,23 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
         return True, str(dest)
 
 
+def ensure_versioned_base_images(job_id: str) -> tuple[bool, str]:
+    """Verify the public-service image contract once before a job builds services."""
+    script = public_service_dir() / "scripts" / "build-versioned-base-images.sh"
+    if not script.is_file():
+        return False, f"missing shared base-image builder: {script}"
+    append_job_log(job_id, "base images: verifying immutable labels (HIT/MISS follows)")
+    code = run_stream(
+        job_id,
+        bash_lc(f"bash {shlex.quote(host_path(script))} all"),
+        timeout=3600,
+    )
+    if code != 0:
+        return False, "shared base-image verification/build failed"
+    append_job_log(job_id, "base images: contract verified")
+    return True, ""
+
+
 def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None, str | None]:
     """Pick newest local/<image>:*_<git_hash> after a fresh build (tag is YYYYMMDDHHMM_<hash>)."""
     if not image or not git_hash or git_hash.startswith("0000"):
@@ -4435,9 +4456,22 @@ def reclaim_build_swap(job_id: str) -> int:
 
 
 def reclaim_docker_builder_cache(job_id: str) -> None:
-    """Free unused BuildKit layer cache. This is the usual 100G+ leak on the CI host."""
-    append_job_log(job_id, "pruning docker builder cache")
-    code, out = docker_cmd("builder", "prune", "-af", timeout=1800)
+    """Reclaim stale BuildKit entries only after the CI host crosses its disk limit."""
+    append_job_log(
+        job_id,
+        "disk threshold reached; pruning BuildKit cache older than "
+        f"{BUILDKIT_CACHE_MAX_AGE} (keeping at least {BUILDKIT_CACHE_KEEP_STORAGE})",
+    )
+    code, out = docker_cmd(
+        "builder",
+        "prune",
+        "-af",
+        "--filter",
+        f"until={BUILDKIT_CACHE_MAX_AGE}",
+        "--keep-storage",
+        BUILDKIT_CACHE_KEEP_STORAGE,
+        timeout=1800,
+    )
     for line in (out or "").splitlines()[-8:]:
         append_job_log(job_id, line)
     if code != 0:
@@ -4451,19 +4485,15 @@ def reclaim_ci_disk(
     max_usage_ratio: float = DISK_USAGE_PRUNE_RATIO,
     keep_refs: list[str] | tuple[str, ...] = (),
 ) -> None:
-    """CI disk reclaim used before archive and at job end.
-
-    Always drop leftover build.swap, idle git workspaces, /home/ci scratch
-    dirs, and unused BuildKit cache. Those are what filled the CI disk even
-    while usage stayed under the 80% archive/image prune threshold.
-
-    When usage is still >= 80% after that, prune nginx timestamp archives
-    and unused docker images. Protected local/ai-* tags are never removed.
-    """
+    """Run one disk check per job and preserve warm BuildKit caches below 80%."""
+    with _ci_disk_reclaim_lock:
+        if job_id in _ci_disk_reclaimed_jobs:
+            append_job_log(job_id, "disk reclaim already checked for this job; preserving BuildKit cache")
+            return
+        _ci_disk_reclaimed_jobs.add(job_id)
     reclaim_build_swap(job_id)
     gc_all_idle_clone_dirs(job_id)
     reclaim_ci_tmp_leftovers(job_id)
-    reclaim_docker_builder_cache(job_id)
     probe = Path((CFG.get("archive_root") or "/").rstrip("/") or "/")
     stats = disk_usage_ratio(probe)
     if stats is None:
@@ -4472,10 +4502,15 @@ def reclaim_ci_disk(
     if ratio < max_usage_ratio:
         append_job_log(
             job_id,
-            f"disk after routine reclaim: usage={ratio:.0%} "
-            f"free={free // (1024**2)}MB",
+            f"disk usage={ratio:.0%} free={free // (1024**2)}MB; "
+            "below threshold, preserving BuildKit cache",
         )
         return
+    reclaim_docker_builder_cache(job_id)
+    stats = disk_usage_ratio(probe)
+    if stats is None:
+        return
+    ratio, total, free = stats
     append_job_log(
         job_id,
         f"disk usage={ratio:.0%} >= {max_usage_ratio:.0%} "
@@ -5085,6 +5120,11 @@ def run_push_job(
                 set_job(job_id, status="failed", error=detail_ps)
                 append_job_log(job_id, f"ERROR {detail_ps}")
                 return
+            ok_bases, detail_bases = ensure_versioned_base_images(job_id)
+            if not ok_bases:
+                set_job(job_id, status="failed", error=detail_bases)
+                append_job_log(job_id, f"ERROR {detail_bases}")
+                return
         else:
             append_job_log(job_id, "shared public-service skipped: not required by selected services")
 
@@ -5194,6 +5234,8 @@ def run_push_job(
         release_build_slot(job_id)
         _job_ctx.job_id = None
         reclaim_ci_disk(job_id)
+        with _ci_disk_reclaim_lock:
+            _ci_disk_reclaimed_jobs.discard(job_id)
 
 
 def push_service(

@@ -1156,6 +1156,8 @@ class JobEndpointTests(unittest.TestCase):
 
 class DiskPruneAndArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
+        with server._ci_disk_reclaim_lock:
+            server._ci_disk_reclaimed_jobs.clear()
         with server._jobs_lock:
             self.saved_jobs = dict(server._jobs)
             server._jobs.clear()
@@ -1361,12 +1363,12 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server._jobs.update(saved)
 
     @patch.object(server, "docker_cmd", return_value=(0, "Total: 1GB"))
-    def test_reclaim_always_prunes_builder_cache_below_80_percent(self, docker_cmd) -> None:
+    def test_reclaim_preserves_builder_cache_below_80_percent(self, docker_cmd) -> None:
         with patch.object(server.shutil, "disk_usage", return_value=self._disk(700)):
             with patch.object(server, "reclaim_build_swap", return_value=0):
                 server.reclaim_ci_disk("job-1")
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
-        self.assertIn(("builder", "prune", "-af"), prune_args)
+        self.assertNotIn(("builder", "prune", "-af"), prune_args)
         self.assertNotIn(("image", "prune", "-af"), prune_args)
 
     @patch.object(server, "ensure_protected_image_holds")
@@ -1381,8 +1383,13 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         ensure_holds.assert_called()
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
         self.assertIn(("image", "prune", "-af"), prune_args)
-        self.assertIn(("builder", "prune", "-af"), prune_args)
-        builder_index = prune_args.index(("builder", "prune", "-af"))
+        self.assertIn(
+            ("builder", "prune", "-af", "--filter", "until=168h", "--keep-storage", "50GB"),
+            prune_args,
+        )
+        builder_index = prune_args.index(
+            ("builder", "prune", "-af", "--filter", "until=168h", "--keep-storage", "50GB")
+        )
         image_index = prune_args.index(("image", "prune", "-af"))
         self.assertLess(builder_index, image_index)
 
@@ -1404,7 +1411,10 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
                 server.reclaim_ci_disk("job-1")
         ensure_holds.assert_called()
         prune_args = [call.args for call in docker_cmd.call_args_list if len(call.args) >= 3]
-        self.assertIn(("builder", "prune", "-af"), prune_args)
+        self.assertIn(
+            ("builder", "prune", "-af", "--filter", "until=168h", "--keep-storage", "50GB"),
+            prune_args,
+        )
         self.assertIn(("image", "prune", "-af"), prune_args)
 
     def test_gc_all_idle_clone_dirs_keeps_public_service_and_running_jobs(self) -> None:
