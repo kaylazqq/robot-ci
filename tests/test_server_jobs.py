@@ -1667,10 +1667,11 @@ class BuildHistoryTests(unittest.TestCase):
             )
             (self.log_dir / f"job-{job_id}.log").write_text("log\n", encoding="utf-8")
         removed = server.prune_build_history(mine)
-        self.assertEqual(0, removed)
+        self.assertEqual(51, removed)
         remaining = sorted(path.stem.replace("job-", "") for path in self.log_dir.glob("job-*.json"))
-        self.assertEqual(101, len(remaining))
-        self.assertIn("000000000000", remaining)
+        self.assertEqual(50, len(remaining))
+        self.assertNotIn("000000000000", remaining)
+        self.assertIn("000000000051", remaining)
         self.assertIn("000000000100", remaining)
 
     def test_record_build_artifact_keeps_full_history(self) -> None:

@@ -273,12 +273,16 @@ function setNav(next, skipHash) {
   $("pageSwr").hidden = nav !== "swr";
   $("pageBuild").hidden = nav !== "build";
   $("pageCce").hidden = nav !== "cce";
+  renderFavoriteServices();
   if (nav === "cce") initCceView().catch(() => {});
   if (!skipHash) writeHash();
 }
 
 function applyServiceChrome() {
   const all = isAllServices();
+  document.querySelectorAll(".history-table, .artifacts-table").forEach((table) => {
+    table.classList.toggle("show-service-column", all);
+  });
   const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
   if (pipeBtn) pipeBtn.hidden = all;
   $("viewPipeline").hidden = tab !== "pipeline";
@@ -736,12 +740,12 @@ function renderHistory(items, meta) {
   const body = $("historyBody");
   if (!body) return;
   if (!items.length) {
-    body.innerHTML = '<tr><td colspan="8" class="hint">暂无构建记录。</td></tr>';
+    body.innerHTML = '<tr><td colspan="' + (isAllServices() ? 8 : 7) + '" class="hint">暂无构建记录。</td></tr>';
   } else {
     body.innerHTML = items.map((item) => (
       "<tr>" +
       '<td class="hist-time">' + esc(item.created_at || "—") + "</td>" +
-      "<td>" + esc(item.service_id || "—") + "</td>" +
+      '<td class="hist-service-cell">' + esc(item.service_id || "—") + "</td>" +
       clipTd(item.branch, "hist-branch") +
       '<td class="' + historyStatusClass(item.status) + '">' + esc(historyStatusLabel(item.status)) + "</td>" +
       '<td class="mono">' + esc(shortSha(item.commit_sha)) + "</td>" +
@@ -761,7 +765,7 @@ function renderArtifacts(items, meta) {
   const body = $("artifactsBody");
   if (!body) return;
   if (!items.length) {
-    body.innerHTML = '<tr><td colspan="6" class="hint">暂无产物。</td></tr>';
+    body.innerHTML = '<tr><td colspan="' + (isAllServices() ? 7 : 6) + '" class="hint">暂无产物。</td></tr>';
   } else {
     body.innerHTML = items.map((item) => {
       const expired = item.expired;
@@ -771,6 +775,7 @@ function renderArtifacts(items, meta) {
       return (
         '<tr class="' + (expired ? "expired" : "") + '">' +
         "<td>" + esc(item.created_at || "—") + "</td>" +
+        '<td class="art-service-cell">' + esc(item.title || item.service_id || "—") + "</td>" +
         clipTd(item.branch, "art-branch") +
         '<td class="mono">' + esc(shortSha(item.commit_sha)) + "</td>" +
         clipTd(item.image_ref || item.image, "art-image mono") +
@@ -797,7 +802,7 @@ async function refreshHistory() {
       renderHistory(data.jobs || [], data);
     } catch (_) {
       if (!viewIsCurrent(gen, sid)) return;
-      if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="8" class="hint">加载失败，请刷新。</td></tr>';
+      if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + (isAllServices() ? 8 : 7) + '" class="hint">加载失败，请刷新。</td></tr>';
     }
   });
 }
@@ -815,7 +820,7 @@ async function refreshArtifacts() {
       renderArtifacts(data.artifacts || [], data);
     } catch (_) {
       if (!viewIsCurrent(gen, sid)) return;
-      if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="6" class="hint">加载失败，请刷新。</td></tr>';
+      if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="' + (isAllServices() ? 7 : 6) + '" class="hint">加载失败，请刷新。</td></tr>';
     }
   });
 }
@@ -845,7 +850,7 @@ function renderFavoriteServices() {
   const favorites = favoriteServiceIds
     .map((id) => services.find((item) => item.id === id))
     .filter(Boolean);
-  container.hidden = !favorites.length;
+  container.hidden = nav !== "build" || !favorites.length;
   container.replaceChildren();
   favorites.forEach((item) => {
     const chip = document.createElement("button");
@@ -990,8 +995,10 @@ function fillServiceSelect() {
   renderFavoriteServices();
 }
 function clearStaleLists() {
-  if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="8" class="hint">加载中…</td></tr>';
-  if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="6" class="hint">加载中…</td></tr>';
+  const historyColumns = isAllServices() ? 8 : 7;
+  const artifactColumns = isAllServices() ? 7 : 6;
+  if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + historyColumns + '" class="hint">加载中…</td></tr>';
+  if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="' + artifactColumns + '" class="hint">加载中…</td></tr>';
   const histPager = $("historyPager");
   const artPager = $("artifactsPager");
   if (histPager) histPager.hidden = true;
@@ -1304,7 +1311,7 @@ function fetchServiceBranches(serviceId, force, priority) {
       branches: data.branches || [],
       selected_branch: data.selected_branch || data.preferred_branch || "",
       default_branch: data.default_branch || "",
-      cached: data.cached === true,
+      cached: data.cached === true || force,
     };
     branchCache[serviceId] = cached;
     delete branchLoads[serviceId];

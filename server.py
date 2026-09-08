@@ -1846,12 +1846,60 @@ def _running_job_ids_for_client(client_id: str) -> set[str]:
 
 
 def prune_build_history(client_id: str, keep_job_id: str = "") -> int:
-    """History metadata is kept in full; disk archive cleanup is separate."""
-    return 0
+    """Trim one client's completed job files when its history grows too large."""
+    want = _normalize_client_id(client_id)
+    if not want:
+        return 0
+    return _prune_history_disk_entries(want, keep_job_id)
 
 
 def prune_all_build_histories() -> int:
-    return 0
+    """Apply the same retention limit to all persisted build history."""
+    return _prune_history_disk_entries()
+
+
+def _prune_history_disk_entries(client_id: str = "", keep_job_id: str = "") -> int:
+    """Keep the latest records and never delete a live or current job's files."""
+    entries: list[tuple[str, str, float, str]] = []
+    for path in LOG_DIR.glob("job-*.json"):
+        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
+        if not match:
+            continue
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            mtime = path.stat().st_mtime
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        owner = _normalize_client_id(meta.get("client_id"))
+        if client_id and owner != client_id:
+            continue
+        job_id = match.group(1)
+        entries.append((str(meta.get("created_at") or ""), job_id, mtime, owner))
+    if len(entries) <= HISTORY_MAX_ENTRIES:
+        return 0
+
+    with _jobs_lock:
+        protected = {
+            str(job.get("id") or "")
+            for job in _jobs.values()
+            if str(job.get("status") or "") in ("queued", "running", "stopping")
+        }
+    if keep_job_id:
+        protected.add(str(keep_job_id))
+    entries.sort(key=lambda item: (item[0], item[2], item[1]), reverse=True)
+    protected.update(job_id for _, job_id, _, _ in entries[:HISTORY_TRIM_TO])
+
+    removed = 0
+    for _, job_id, _, _ in entries:
+        if job_id in protected:
+            continue
+        delete_job_disk_files(job_id)
+        with _history_disk_cache_lock:
+            _history_disk_cache.pop(str(job_meta_path(job_id)), None)
+        removed += 1
+    return removed
 
 
 def prune_artifacts_log() -> int:

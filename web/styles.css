@@ -191,7 +191,7 @@ textarea { resize: vertical; min-height: 88px; }
 .workspace { display: flex; flex-direction: column; min-width: 0; }
 .topbar {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
   align-items: center;
   gap: 16px;
   padding: 10px 20px;
@@ -517,11 +517,32 @@ textarea { resize: vertical; min-height: 88px; }
 .hist-col-op { width: 11%; }
 .hist-col-act { width: 10%; }
 .art-col-time { width: 11%; }
+.art-col-svc { width: 13%; }
 .art-col-branch { width: 16%; }
 .art-col-sha { width: 10%; }
 .art-col-image { width: 25%; }
 .art-col-pkg { width: 26%; }
 .art-col-op { width: 12%; }
+.history-table:not(.show-service-column) .hist-col-svc,
+.history-table:not(.show-service-column) .hist-service-column,
+.history-table:not(.show-service-column) .hist-service-cell,
+.artifacts-table:not(.show-service-column) .art-col-svc,
+.artifacts-table:not(.show-service-column) .art-service-column,
+.artifacts-table:not(.show-service-column) .art-service-cell { display: none; }
+.history-table:not(.show-service-column) .hist-col-time { width: 18%; }
+.history-table:not(.show-service-column) .hist-col-branch { width: 25%; }
+.history-table:not(.show-service-column) .hist-col-status { width: 8%; }
+.history-table:not(.show-service-column) .hist-col-sha { width: 11%; }
+.history-table:not(.show-service-column) .hist-col-dur { width: 9%; }
+.history-table:not(.show-service-column) .hist-col-op { width: 16%; }
+.history-table:not(.show-service-column) .hist-col-act { width: 13%; }
+.artifacts-table.show-service-column .art-col-time { width: 10%; }
+.artifacts-table.show-service-column .art-col-svc { width: 13%; }
+.artifacts-table.show-service-column .art-col-branch { width: 14%; }
+.artifacts-table.show-service-column .art-col-sha { width: 9%; }
+.artifacts-table.show-service-column .art-col-image { width: 23%; }
+.artifacts-table.show-service-column .art-col-pkg { width: 22%; }
+.artifacts-table.show-service-column .art-col-op { width: 9%; }
 .history-table .hist-dur {
   font-variant-numeric: tabular-nums;
   color: var(--muted);
@@ -892,11 +913,11 @@ textarea { resize: vertical; min-height: 88px; }
 }
 .favorite-services {
   display: flex;
+  flex: 1;
+  min-width: 0;
   flex-wrap: wrap;
   gap: 10px;
-  padding: 12px 20px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--line);
+  padding: 4px 0;
 }
 .favorite-service-chip {
   display: inline-flex;
