@@ -4515,6 +4515,7 @@ def build_from_source(
         "SEMANTIC_GATEWAY_IMAGE",
         "RAG_SERVICE_IMAGE",
         "MCP_HUB_IMAGE",
+        "PLAN_TICKER_IMAGE",
         "SEMANTIC_SCHEDULE_IMAGE",
         "SEMANTIC_WORKER_IMAGE",
         "AGENTLINK_IMAGE",
