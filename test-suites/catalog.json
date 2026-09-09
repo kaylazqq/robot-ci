@@ -12,6 +12,7 @@
     "agentlink": {"repository": "AgentLink", "scope": "agent/workspace state, event bridge, provisioning and locking", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "unittest"},
     "observability": {"repository": "observability", "scope": "event parsing, redaction, trace aggregation and local HTTP handler", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "unittest"},
     "skills-market": {"repository": "skills-market", "scope": "skills catalog manifests, provider selection and HTTP API", "roots": ["catalog", "internal/httpapi"], "convention": "go"},
+    "plan-ticker": {"repository": "plan-ticker", "scope": "Agent reminder CRUD, due-index ticker and governance delivery", "roots": ["internal/httpapi", "internal/ticker", "internal/deliver"], "convention": "go"},
     "semantic-schedule": {"repository": "semantic-schedule", "scope": "task graph, planner, IM context and fake Redis/Kafka adapters", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "pytest"},
     "gmagent": {"repository": "gmagent", "scope": "orchestration V2 contract, authentication, intent evaluation, task decomposition, model failover and production runtime policy", "roots": ["tests"], "excluded": ["live model calls", "PostgreSQL integration", "external orchestration services"], "convention": "pytest"},
     "agent-governance-gw": {"repository": "agent-governance-gw", "scope": "policy normalization, authorization and dispatcher behavior", "roots": ["internal/governance"], "excluded": ["//go:build integration"], "convention": "go"},
