@@ -315,11 +315,6 @@ function applyServiceChrome() {
   if ($("viewEnvs")) $("viewEnvs").hidden = tab !== "envs";
   if ($("pipelineActions")) $("pipelineActions").hidden = all || tab !== "pipeline";
   if ($("jobMetaBar")) $("jobMetaBar").hidden = all || tab !== "pipeline";
-  if ($("historyHint")) {
-    $("historyHint").textContent = all
-      ? "全量构建记录。点「查看」打开该次流水线。"
-      : "当前微服务的构建记录。点「查看」打开该次流水线。";
-  }
   const createBtn = $("btnEnvCreate");
   if (createBtn) createBtn.hidden = all;
   renderFavoriteServices();
