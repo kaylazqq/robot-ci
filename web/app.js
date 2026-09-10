@@ -784,7 +784,8 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   title.textContent = stage.label || stage.id || "";
   const dur = doc.createElement("div");
   dur.className = "pl-dur is-" + status;
-  dur.textContent = PIPELINE_STATE_LABELS[status] || status;
+  if (preview) dur.innerHTML = "&nbsp;";
+  else dur.textContent = PIPELINE_STATE_LABELS[status] || status;
   cap.append(title, dur);
   col.appendChild(cap);
   const spine = doc.createElement("div");
