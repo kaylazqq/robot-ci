@@ -25,6 +25,7 @@ let environments = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
+let runWindowMode = false;
 let runPreviewSelection = { deploy: false, test: false, environmentId: "" };
 let previewBranchPicker = null;
 let svcMenuPage = 1;
@@ -216,7 +217,7 @@ function endSession() {
 
 function showLogin(message) {
   if (sessionLive) endSession();
-  cancelRunPreview();
+  cancelRunPreview({ keepWindow: true });
   closeEnvConfirm(false);
   closeEnvOverlay();
   $("appShell").hidden = true;
@@ -290,12 +291,12 @@ function setNav(next, skipHash) {
     btn.classList.toggle("active", btn.dataset.nav === nav);
   });
   $("pageSwr").hidden = nav !== "swr";
-  $("pageBuild").hidden = nav !== "build";
   if (nav !== "build" || tab !== "envs") {
     closeEnvConfirm(false);
     closeEnvOverlay();
   }
   if (nav !== "build") cancelRunPreview();
+  applyServiceChrome();
   renderFavoriteServices();
   if (!skipHash) writeHash();
 }
@@ -307,6 +308,17 @@ function applyServiceChrome() {
   });
   const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
   if (pipeBtn) pipeBtn.hidden = all;
+  if (runWindowMode) {
+    if ($("pageSwr")) $("pageSwr").hidden = true;
+    if ($("pageBuild")) $("pageBuild").hidden = true;
+    if ($("pageRun")) $("pageRun").hidden = false;
+    if ($("pipelineActions")) $("pipelineActions").hidden = true;
+    if ($("jobMetaBar")) $("jobMetaBar").hidden = true;
+    renderFavoriteServices();
+    return;
+  }
+  if ($("pageBuild")) $("pageBuild").hidden = nav !== "build";
+  if ($("pageRun")) $("pageRun").hidden = true;
   $("viewPipeline").hidden = tab !== "pipeline";
   $("viewHistory").hidden = tab !== "history";
   $("viewArtifacts").hidden = tab !== "artifacts";
@@ -330,6 +342,7 @@ function applyServiceChrome() {
       ? "环境属于单个微服务。请先在上方选择微服务，再查看或创建它的环境。"
       : "当前微服务的部署环境。构建时只能选用这些环境。";
   }
+  renderFavoriteServices();
 }
 
 function jobIsLive(job) {
@@ -347,7 +360,7 @@ function setTab(next) {
   });
   applyServiceChrome();
   renderFavoriteServices();
-  if (tab !== "pipeline") cancelRunPreview();
+  if (tab !== "pipeline" && !runWindowMode) cancelRunPreview();
   if (tab !== "envs") {
     closeEnvConfirm(false);
     closeEnvOverlay();
@@ -369,7 +382,9 @@ function setTab(next) {
 
 function writeHash() {
   let next;
-  if (nav !== "build") {
+  if (runWindowMode) {
+    next = "#/run/" + encodeURIComponent(currentServiceId || "");
+  } else if (nav !== "build") {
     next = "#/" + nav;
   } else {
     const svc = encodeURIComponent(currentServiceId || "");
@@ -390,6 +405,9 @@ function readHash() {
   const parts = raw.split("/").filter(Boolean);
   if (parts[0] === "cce" || parts[0] === "envs") return { nav: "build", service: "", tab: "envs", job: "" };
   if (parts[0] === "swr") return { nav: "swr", service: "", tab: "pipeline", job: "" };
+  if (parts[0] === "run") {
+    return { nav: "run", service: decodeURIComponent(parts[1] || ""), tab: "pipeline", job: "" };
+  }
   const service = decodeURIComponent(parts[1] || "");
   let nextTab = "pipeline";
   let job = "";
@@ -421,7 +439,7 @@ function updateActionButtons() {
   const svc = currentService();
   const live = jobIsLive(currentJob);
   const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
-  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runPreviewActive;
+  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runWindowMode;
   $("btnStop").disabled = !live || stopping;
   $("btnParams").disabled = !(svc && svc.requires_version);
 }
@@ -565,6 +583,9 @@ function visiblePipelineTasks(step) {
       status: step.status || "pending",
     }, "archive", "archive")];
   }
+  if (step.id === "gamma") {
+    return tasks.filter((task) => task.status !== "skipped");
+  }
   return tasks;
 }
 function buildPipelineStages(pipeline, jobStatus) {
@@ -588,12 +609,14 @@ function buildPipelineStages(pipeline, jobStatus) {
   }
   (pipeline.steps || []).forEach((step) => {
     if (step.id === "sync") return;
+    const tasks = visiblePipelineTasks(step);
+    if (step.id === "gamma" && (step.status === "skipped" || !tasks.length)) return;
     stages.push({
       id: step.id,
       logStep: step.id,
       label: step.label || step.id,
       status: step.status === "warn" ? "failed" : (step.status || "pending"),
-      tasks: visiblePipelineTasks(step),
+      tasks,
     });
   });
   if (jobStatus === "stopped" || jobStatus === "failed") {
@@ -609,7 +632,7 @@ function buildPipelineStages(pipeline, jobStatus) {
   return stages;
 }
 function isSelectablePreviewTask(stageId, taskId) {
-  return runPreviewActive && stageId === "gamma" && (taskId === "deploy" || taskId === "test");
+  return stageId === "gamma" && (taskId === "deploy" || taskId === "test");
 }
 function previewTaskChecked(taskId) {
   return taskId === "deploy" ? !!runPreviewSelection.deploy : !!runPreviewSelection.test;
@@ -619,7 +642,7 @@ function createPreviewCheck(taskId) {
   box.type = "button";
   box.className = "pl-check" + (previewTaskChecked(taskId) ? " is-on" : "");
   box.setAttribute("aria-pressed", previewTaskChecked(taskId) ? "true" : "false");
-  box.setAttribute("aria-label", taskId === "deploy" ? "选择 gamma部署" : "选择 gamma测试");
+  box.setAttribute("aria-label", taskId === "deploy" ? "gamma部署" : "gamma测试");
   box.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17.5 19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   box.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -630,7 +653,10 @@ function createPreviewCheck(taskId) {
 function togglePreviewTask(taskId) {
   if (taskId === "deploy") runPreviewSelection.deploy = !runPreviewSelection.deploy;
   if (taskId === "test") runPreviewSelection.test = !runPreviewSelection.test;
-  renderRunPreview();
+  if (!runPreviewSelection.deploy && !runPreviewSelection.test) {
+    runPreviewSelection.environmentId = "";
+  }
+  renderRunPage();
 }
 function previewPipelineData() {
   const task = (id, label) => ({ id, label, status: "pending" });
@@ -652,12 +678,16 @@ function setPreviewHint(text) {
   el.hidden = !text;
   el.textContent = text || "";
 }
-function renderRunPreview() {
-  const empty = $("pipelineEmpty");
-  const actions = $("pipelineRunActions");
-  if (empty) empty.hidden = true;
-  if (actions) actions.hidden = false;
-  renderJobPipeline("liveJobPipeline", previewPipelineData(), "", null);
+function setPreviewBranchStatus(text, cls) {
+  const el = $("previewBranchStatus");
+  if (!el) return;
+  el.hidden = !text;
+  el.textContent = text || "";
+  el.className = "branch-status" + (cls ? " " + cls : "");
+}
+function renderRunPage() {
+  applyServiceChrome();
+  renderJobPipeline("runJobPipeline", previewPipelineData(), "", null, { preview: true });
 }
 function ensurePreviewBranchPicker() {
   const root = $("previewBranchPicker");
@@ -674,7 +704,6 @@ function ensurePreviewBranchPicker() {
 async function loadPreviewBranches(force) {
   const svc = currentService();
   const picker = ensurePreviewBranchPicker();
-  const statusEl = $("previewBranchStatus");
   const retryBtn = $("btnRefreshPreviewBranches");
   if (!svc || !picker) return;
   const fallbackBranch = svc.default_branch || "main";
@@ -682,72 +711,90 @@ async function loadPreviewBranches(force) {
   const setLoading = (loading) => {
     if (retryBtn) retryBtn.classList.toggle("loading", loading);
     picker.setDisabled(loading);
-    if (loading && statusEl) {
-      statusEl.textContent = "正在加载中";
-      statusEl.className = "branch-status";
-    }
   };
-  const applyCached = (data, updated) => {
+  const applyCached = (data) => {
     picker.setOptions(
       data.branches,
       data.selected_branch || fallbackBranch,
       data.default_branch || fallbackBranch
     );
-    if (!statusEl) return;
-    const n = (data.branches || []).length;
-    statusEl.textContent = updated
-      ? ("已更新" + n + "个分支")
-      : data.cached
-        ? ("已读取服务器缓存 " + n + " 个分支")
-        : "服务器暂无分支缓存，当前使用默认分支；点击刷新加载";
-    statusEl.className = "branch-status ok";
+    setPreviewBranchStatus("");
   };
   if (!force && cached && cached.loaded) {
     const preferred = await preferredTemplateBranch(svc.id, cached.selected_branch || fallbackBranch);
-    applyCached({ ...cached, selected_branch: preferred }, false);
+    applyCached({ ...cached, selected_branch: preferred });
     return;
   }
   setLoading(true);
   try {
     const data = await fetchServiceBranches(svc.id, !!force, true);
-    applyCached(data, !!force);
+    applyCached(data);
   } catch (e) {
     picker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
-    if (statusEl) {
-      statusEl.textContent = e.message || "加载分支失败";
-      statusEl.className = "branch-status error";
-    }
+    setPreviewBranchStatus(e.message || "加载分支失败", "error");
     delete branchCache[svc.id];
   } finally {
     if (retryBtn) retryBtn.classList.remove("loading");
     picker.setDisabled(false);
   }
 }
-function beginRunPreview() {
+function runWindowUrl(serviceId) {
+  return location.origin + location.pathname + "#/run/" + encodeURIComponent(serviceId);
+}
+function openRunWindow() {
   const svc = currentService();
   if (!svc || serviceActiveJobId) return;
-  setTab("pipeline");
+  const width = Math.min(1680, Math.max(1280, (screen.availWidth || 1440) - 32));
+  const height = Math.min(940, Math.max(780, (screen.availHeight || 860) - 32));
+  const left = Math.max(0, Math.floor(((screen.availWidth || width) - width) / 2));
+  const top = Math.max(0, Math.floor(((screen.availHeight || height) - height) / 2));
+  const features = "popup=yes,width=" + width + ",height=" + height + ",left=" + left + ",top=" + top + ",resizable=yes,scrollbars=yes";
+  const win = window.open(runWindowUrl(svc.id), "robot-ci-run-" + svc.id, features);
+  if (!win) {
+    alert("浏览器拦截了新窗口，请允许弹窗后重试");
+    return;
+  }
+  try { win.focus(); } catch (_) {}
+}
+function enterRunPage() {
+  runWindowMode = true;
   runPreviewActive = true;
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+  document.documentElement.classList.add("is-run-window");
+  if ($("appShell")) $("appShell").classList.add("is-run-window");
+  document.title = "运行";
   setPreviewHint("");
-  renderRunPreview();
+  applyServiceChrome();
+  renderRunPage();
   updateActionButtons();
   loadEnvironments().then(() => {
-    if (runPreviewActive) renderRunPreview();
+    if (runPreviewActive) renderRunPage();
   }).catch((e) => setPreviewHint(e.message || "加载环境失败"));
   loadPreviewBranches(false);
 }
-function cancelRunPreview() {
-  if (!runPreviewActive) {
-    if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
+function cancelRunPreview(opts) {
+  if (runWindowMode) {
+    if (!(opts && opts.keepWindow)) window.close();
     return;
   }
+  if (!runPreviewActive) return;
   runPreviewActive = false;
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
   setPreviewHint("");
-  if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
+  applyServiceChrome();
   applyJob(currentJob);
   updateActionButtons();
+}
+function notifyOpenerJobStarted(jobId) {
+  try {
+    if (window.opener && !window.opener.closed) {
+      window.opener.postMessage({
+        type: "robot-ci-job-started",
+        serviceId: currentServiceId,
+        jobId: jobId,
+      }, location.origin);
+    }
+  } catch (_) {}
 }
 function confirmRunPreview() {
   const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
@@ -764,11 +811,13 @@ function createStatusIcon(status, kind) {
   icon.textContent = status === "done" ? "✓" : (status === "failed" || status === "warn") ? "✕" : status === "skipped" ? "–" : (status === "running" || status === "queued") ? "●" : "";
   return icon;
 }
-function createStageColumn(stage, incomingComplete, outgoingComplete, onStep) {
+function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview) {
   const status = stage.status || "pending";
   const col = document.createElement("div");
   col.className = "pl-col is-" + status + (stage.id === "gamma" ? " is-gamma" : "");
-  col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
+  if (!preview) {
+    col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
+  }
   const cap = document.createElement("div");
   cap.className = "pl-caption";
   const title = document.createElement("div");
@@ -795,11 +844,19 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep) {
   drop.appendChild(diamond);
   const tree = document.createElement("div");
   tree.className = "pl-tree";
+  if (preview && stage.id === "gamma") {
+    const envRow = document.createElement("div");
+    envRow.className = "pl-task pl-env-row";
+    envRow.appendChild(document.createElement("span"));
+    envRow.appendChild(createStatusIcon("pending", "pl-task-icon"));
+    envRow.appendChild(createGammaEnvPicker());
+    tree.appendChild(envRow);
+  }
   (stage.tasks || []).forEach((task) => {
     const row = document.createElement("div");
     row.className = "pl-task is-" + (task.status || "pending");
     row.appendChild(document.createElement("span"));
-    if (isSelectablePreviewTask(stage.id, task.id)) {
+    if (preview && isSelectablePreviewTask(stage.id, task.id)) {
       row.classList.add("is-selectable");
       row.appendChild(createPreviewCheck(task.id));
     } else {
@@ -811,7 +868,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep) {
     row.appendChild(name);
     row.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      if (isSelectablePreviewTask(stage.id, task.id)) {
+      if (preview && isSelectablePreviewTask(stage.id, task.id)) {
         togglePreviewTask(task.id);
         return;
       }
@@ -820,39 +877,86 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep) {
     tree.appendChild(row);
   });
   drop.appendChild(tree);
-  if (runPreviewActive && stage.id === "gamma") {
-    drop.appendChild(createGammaEnvPicker());
-  }
   col.appendChild(drop);
   return col;
+}
+function selectedEnvName() {
+  const env = environments.find((item) => item.id === runPreviewSelection.environmentId);
+  return env ? (env.name || "未命名环境") : "";
 }
 function createGammaEnvPicker() {
   const wrap = document.createElement("div");
   wrap.className = "pl-env-pick";
-  const label = document.createElement("div");
-  label.className = "pl-env-pick-label";
-  label.textContent = "选择环境";
-  wrap.appendChild(label);
-  if (!environments.length) {
-    const empty = document.createElement("p");
-    empty.className = "pl-env-pick-empty";
-    empty.textContent = "当前微服务还没有环境，请先到环境管理创建";
-    wrap.appendChild(empty);
-    return wrap;
-  }
+  const picker = document.createElement("div");
+  picker.className = "pl-env-picker";
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "input branch-trigger pl-env-trigger";
+  trigger.setAttribute("aria-haspopup", "listbox");
+  trigger.setAttribute("aria-expanded", "false");
+  const label = document.createElement("span");
+  label.className = "pl-env-trigger-label";
+  const empty = !environments.length;
+  label.textContent = selectedEnvName() || (empty ? "还没有环境" : "选择环境");
+  trigger.disabled = empty;
+  trigger.appendChild(label);
+  const chevron = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  chevron.setAttribute("viewBox", "0 0 24 24");
+  chevron.setAttribute("aria-hidden", "true");
+  chevron.innerHTML = '<path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>';
+  trigger.appendChild(chevron);
+  const menu = document.createElement("div");
+  menu.className = "branch-menu";
+  menu.hidden = true;
+  menu.setAttribute("role", "listbox");
+  const close = () => {
+    menu.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+    if (menu.parentNode) menu.remove();
+  };
+  const positionMenu = () => {
+    const rect = trigger.getBoundingClientRect();
+    const width = Math.max(rect.width, 240);
+    menu.classList.add("branch-menu-portal");
+    menu.style.left = rect.left + "px";
+    menu.style.top = (rect.bottom + 6) + "px";
+    menu.style.width = width + "px";
+    menu.style.maxHeight = Math.max(120, Math.min(280, window.innerHeight - rect.bottom - 12)) + "px";
+    document.body.appendChild(menu);
+  };
   environments.forEach((env) => {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "pl-env-option" + (runPreviewSelection.environmentId === env.id ? " is-on" : "");
-    btn.textContent = env.name || "未命名环境";
-    btn.addEventListener("click", (ev) => {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "branch-option" + (runPreviewSelection.environmentId === env.id ? " active" : "");
+    option.setAttribute("role", "option");
+    option.textContent = env.name || "未命名环境";
+    option.addEventListener("click", (ev) => {
       ev.stopPropagation();
       runPreviewSelection.environmentId = env.id;
+      label.textContent = env.name || "未命名环境";
+      menu.querySelectorAll(".branch-option").forEach((item) => item.classList.toggle("active", item === option));
       setPreviewHint("");
-      renderRunPreview();
+      close();
+      trigger.focus();
     });
-    wrap.appendChild(btn);
+    menu.appendChild(option);
   });
+  trigger.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (trigger.disabled) return;
+    const opening = menu.hidden;
+    if (opening) positionMenu();
+    else close();
+    menu.hidden = !opening;
+    trigger.setAttribute("aria-expanded", String(opening));
+  });
+  picker.addEventListener("focusout", () => {
+    setTimeout(() => {
+      if (!picker.contains(document.activeElement) && !menu.contains(document.activeElement)) close();
+    }, 0);
+  });
+  picker.append(trigger, menu);
+  wrap.appendChild(picker);
   return wrap;
 }
 function createEndpoint(kind, lit) {
@@ -880,9 +984,10 @@ function createEndpoint(kind, lit) {
   col.appendChild(spine);
   return col;
 }
-function renderJobPipeline(containerId, pipeline, jobStatus, onStep) {
+function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   const root = $(containerId);
   if (!root) return;
+  const preview = !!(opts && opts.preview);
   const steps = pipeline && Array.isArray(pipeline.steps) ? pipeline.steps : [];
   if (!pipeline || !steps.length) {
     root.hidden = true;
@@ -899,16 +1004,14 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep) {
   const graph = document.createElement("div");
   graph.className = "pl-graph";
   const isComplete = (stage) => Boolean(stage && stage.status === "done");
-  // Start represents a job that has begun. Every following link represents
-  // a hand-off and is filled only after its source stage has completed.
-  graph.appendChild(createEndpoint("start", !runPreviewActive));
+  graph.appendChild(createEndpoint("start", !preview));
   stages.forEach((stage, index) => {
     const previous = stages[index - 1];
-    const incomingComplete = !runPreviewActive && (index === 0 || isComplete(previous));
-    const outgoingComplete = !runPreviewActive && isComplete(stage);
-    graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep));
+    const incomingComplete = !preview && (index === 0 || isComplete(previous));
+    const outgoingComplete = !preview && isComplete(stage);
+    graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview));
   });
-  graph.appendChild(createEndpoint("end", isComplete(stages[stages.length - 1]) && status === "ok"));
+  graph.appendChild(createEndpoint("end", !preview && isComplete(stages[stages.length - 1]) && status === "ok"));
   scroll.appendChild(graph);
   root.appendChild(scroll);
 }
@@ -1081,7 +1184,7 @@ function renderFavoriteServices() {
   const favorites = favoriteServiceIds
     .map((id) => services.find((item) => item.id === id))
     .filter(Boolean);
-  container.hidden = nav !== "build" || !favorites.length;
+  container.hidden = nav !== "build" || runPreviewActive || !favorites.length;
   container.replaceChildren();
   favorites.forEach((item) => {
     const chip = document.createElement("button");
@@ -1246,6 +1349,7 @@ function activateService(id) {
     applyServiceChrome();
     return false;
   }
+  if (!runWindowMode) cancelRunPreview();
   currentServiceId = id;
   pinnedJobId = "";
   serviceActiveJobId = "";
@@ -1367,7 +1471,6 @@ function stopPolling() {
 }
 
 function applyJob(job, { loading } = {}) {
-  if (runPreviewActive) return;
   if (job && !sessionLive) return;
   if (job && !isAllServices() && currentServiceId && !jobBelongsToService(job, currentServiceId)) return;
   currentJob = job;
@@ -1379,7 +1482,6 @@ function applyJob(job, { loading } = {}) {
   const hasJob = !!(job && job.id);
   if (!hasJob) {
     if (root) { root.hidden = true; root.replaceChildren(); }
-    if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
     if (empty) {
       empty.hidden = false;
       empty.textContent = loading ? "正在加载流水线…" : "当前服务无构建历史记录";
@@ -1777,8 +1879,13 @@ async function startRun(branch) {
       }),
     });
     closeModal();
+    if (runWindowMode) {
+      notifyOpenerJobStarted(resp.job_id);
+      window.close();
+      return;
+    }
     runPreviewActive = false;
-    if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
+    applyServiceChrome();
     pinnedJobId = "";
     setTab("pipeline");
     await openJob(resp.job_id);
@@ -2489,7 +2596,7 @@ document.querySelectorAll(".subtab[data-tab]").forEach((btn) => {
 });
 bindServicePicker();
 bindEyeButtons(document);
-bind("btnRun", () => beginRunPreview());
+bind("btnRun", () => openRunWindow());
 bind("btnRunPreviewConfirm", () => confirmRunPreview());
 bind("btnRunPreviewCancel", () => cancelRunPreview());
 bind("btnRefreshPreviewBranches", () => loadPreviewBranches(true));
@@ -2531,7 +2638,11 @@ document.addEventListener("keydown", (ev) => {
     closeEnvConfirm(false);
     return;
   }
-  if ($("envOverlay") && !$("envOverlay").hidden) closeEnvOverlay();
+  if ($("envOverlay") && !$("envOverlay").hidden) {
+    closeEnvOverlay();
+    return;
+  }
+  if (runPreviewActive) cancelRunPreview();
 });
 document.querySelectorAll("[data-close-modal]").forEach((el) => el.addEventListener("click", closeModal));
 $("modalRoot").addEventListener("click", (ev) => {
@@ -2541,9 +2652,23 @@ document.addEventListener("click", (ev) => {
   if (!ev.target.closest(".user-wrap")) closeUserMenu();
   if (ev.target.isConnected && !ev.target.closest("#svcPicker")) hideServiceMenu();
 });
+window.addEventListener("message", (ev) => {
+  if (runWindowMode) return;
+  if (ev.origin !== location.origin) return;
+  const data = ev.data;
+  if (!data || data.type !== "robot-ci-job-started" || !data.jobId) return;
+  if (data.serviceId && data.serviceId !== currentServiceId && isKnownServiceId(data.serviceId)) {
+    activateService(data.serviceId);
+  }
+  pinnedJobId = data.jobId;
+  setTab("pipeline");
+  openJob(data.jobId).catch(() => {});
+  refreshServiceOccupancy().catch(() => {});
+});
 window.addEventListener("hashchange", async () => {
-  if (!sessionLive) return;
+  if (!sessionLive || runWindowMode) return;
   const parsed = readHash();
+  if (parsed.nav === "run") return;
   if (
     parsed.nav === nav &&
     parsed.service === (currentServiceId || "") &&
@@ -2595,6 +2720,11 @@ async function bootApp(username) {
   const parsed = readHash();
   if (parsed.service) currentServiceId = parsed.service;
   await Promise.all([refreshHealth(), refreshServices()]);
+  if (parsed.nav === "run") {
+    enterRunPage();
+    writeHash();
+    return;
+  }
   setNav(parsed.nav, true);
   if (nav === "build") {
     applyServiceChrome();

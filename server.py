@@ -1362,6 +1362,10 @@ def _subtask_rows(
     result: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     defs = _test_subtask_defs(job) if step_id == "test" else PIPELINE_SUBTASK_DEFS.get(step_id, ())
+    if step_id == "gamma":
+        defs = tuple(item for item in defs if _gamma_selected(job, item[0]))
+        if not defs:
+            return []
     if status != "failed":
         fail_index = None
     elif step_id == "test":
@@ -1782,6 +1786,8 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         svc = catalog.get(service_id)
         title = str((svc or {}).get("title") or service_id)
         step_defs = _pipeline_steps_for_service(svc)
+        if not (_gamma_selected(job, "deploy") or _gamma_selected(job, "test")):
+            step_defs = [item for item in step_defs if item[0] != "gamma"]
         skip_push = _service_skip_push(svc)
 
         if service_id in results_by_id:

@@ -521,11 +521,14 @@ class JobPipelineTests(unittest.TestCase):
         job["results"] = [{"service_id": "memory-service", "ok": True}]
         payload = server.job_payload(job, compact=True)
         steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
-        self.assertIn("gamma", steps)
-        self.assertEqual("skipped", steps["gamma"]["status"])
-        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
-        self.assertEqual("skipped", sub["deploy"])
-        self.assertEqual("skipped", sub["test"])
+        self.assertNotIn("gamma", steps)
+
+    def test_gamma_hidden_while_running_if_not_selected(self) -> None:
+        job = make_job("pipe-gamma-hidden", status="running")
+        job["stage"] = "pushing"
+        payload = server.job_payload(job, compact=True)
+        steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
+        self.assertNotIn("gamma", steps)
 
     def test_gamma_optional_steps_selected_done(self) -> None:
         job = make_job("pipe-gamma-on", status="ok")
@@ -536,8 +539,8 @@ class JobPipelineTests(unittest.TestCase):
         steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
         self.assertEqual("done", steps["gamma"]["status"])
         sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
+        self.assertEqual(["deploy"], list(sub))
         self.assertEqual("done", sub["deploy"])
-        self.assertEqual("skipped", sub["test"])
 
     def test_gamma_running_after_push_results(self) -> None:
         job = make_job("pipe-gamma-live", status="running")
@@ -570,8 +573,8 @@ class JobPipelineTests(unittest.TestCase):
         self.assertEqual("failed", steps["gamma"]["status"])
         self.assertEqual("done", steps["push"]["status"])
         sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
+        self.assertEqual(["deploy"], list(sub))
         self.assertEqual("failed", sub["deploy"])
-        self.assertEqual("skipped", sub["test"])
 
     def test_failed_sync_marks_first_step_failed(self) -> None:
         job = make_job("pipe-fail", status="failed")

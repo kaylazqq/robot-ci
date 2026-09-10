@@ -160,6 +160,11 @@ textarea { resize: vertical; min-height: 88px; }
   grid-template-columns: 221px 1fr;
   min-height: 100vh;
 }
+.app.is-run-window {
+  grid-template-columns: 1fr;
+}
+.app.is-run-window .nav,
+.app.is-run-window .topbar { display: none; }
 .nav {
   background: var(--sidebar);
   border-right: 1px solid var(--line);
@@ -189,7 +194,7 @@ textarea { resize: vertical; min-height: 88px; }
 .nav-item:hover { background: var(--surface-alt); color: var(--text); }
 .nav-item.active { background: var(--blue-bg); color: var(--blue); font-weight: 600; }
 
-.workspace { display: flex; flex-direction: column; min-width: 0; }
+.workspace { display: flex; flex-direction: column; min-width: 0; min-height: 100vh; }
 .topbar {
   display: flex;
   justify-content: space-between;
@@ -762,9 +767,7 @@ textarea { resize: vertical; min-height: 88px; }
 .pl-end.is-start .pl-spine { grid-template-columns: var(--pl-dot) 1fr; }
 .pl-end.is-end .pl-spine { grid-template-columns: 1fr var(--pl-dot); }
 .pl-end.is-start .pl-rail.left,
-.pl-end.is-end .pl-rail.right {
-  display: none;
-}
+.pl-end.is-end .pl-rail.right { display: none; }
 .pl-end.is-start .pl-caption { align-items: flex-start; padding-left: 0; }
 .pl-end.is-end .pl-caption { align-items: flex-end; padding-right: 0; }
 .pl-rail.is-none { background: transparent; }
@@ -875,7 +878,7 @@ textarea { resize: vertical; min-height: 88px; }
 .pl-task {
   position: relative;
   display: grid;
-  grid-template-columns: 1fr var(--pl-dot) 1fr;
+  grid-template-columns: minmax(0, 1fr) var(--pl-dot) minmax(0, 1fr);
   align-items: center;
   height: var(--pl-task-h);
   min-height: var(--pl-task-h);
@@ -889,9 +892,10 @@ textarea { resize: vertical; min-height: 88px; }
   color: var(--text);
   padding-left: 8px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .pl-col, .pl-task { cursor: pointer; }
-.pl-title { overflow-wrap: anywhere; }
 .pl-check {
   grid-column: 2;
   justify-self: center;
@@ -914,62 +918,64 @@ textarea { resize: vertical; min-height: 88px; }
 }
 .pl-check.is-on svg { display: block; }
 .pl-task.is-selectable { cursor: pointer; }
-.pl-run-actions {
+.page-run {
+  flex: 1;
   display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 24px;
-  flex-wrap: wrap;
-  padding: 8px 20px 28px;
+  flex-direction: column;
+  min-height: 0;
+  padding-top: 16px;
+  padding-bottom: 0;
 }
-.pl-run-actions[hidden] { display: none !important; }
-.pl-run-actions-main { min-width: 320px; flex: 1; }
-.pl-run-actions-main .label { margin-top: 0; }
-.pl-run-actions-btns {
-  display: flex;
-  gap: 12px;
-  flex: none;
-}
-.pl-run-actions-btns .btn {
-  min-width: 168px;
-  padding: 12px 36px;
-}
-.pl-col.is-gamma { width: 15.2rem; }
-.pl-env-pick {
-  margin: 12px 0 0 50%;
-  width: calc(50% - 6px);
-  padding: 0;
-  text-align: left;
-}
-.pl-env-pick-label {
-  font-size: 13px;
-  color: #5d7fa3;
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-.pl-env-pick-empty {
-  margin: 0;
-  color: var(--muted);
-  font-size: 13px;
-}
-.pl-env-option {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: 1.5px solid #8eb6e8;
-  background: #fff;
-  border-radius: 6px;
-  padding: 7px 10px;
-  margin-top: 6px;
+.page-run .run-block .label {
+  margin-top: 0;
+  margin-bottom: 10px;
   color: var(--text);
-  cursor: pointer;
+  font-weight: 650;
 }
-.pl-env-option:hover { border-color: var(--blue); color: var(--blue); }
-.pl-env-option.is-on {
-  background: var(--blue-bg);
-  border-color: var(--blue);
-  color: var(--blue);
-  font-weight: 600;
+.page-run .run-branch-row { max-width: 420px; }
+.run-block-tasks { margin-top: 22px; }
+#runJobPipeline { min-height: 280px; }
+.run-page-footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 16px;
+  margin-top: auto;
+  padding: 28px 0 36px;
+}
+.run-page-footer .btn { min-width: 140px; padding: 12px 28px; }
+.pl-col.is-gamma { width: 15.2rem; }
+.pl-env-row { height: auto; min-height: 40px; }
+.pl-env-pick {
+  grid-column: 3;
+  position: relative;
+  z-index: 3;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding-left: 12px;
+}
+.pl-env-pick::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 12px;
+  height: 3px;
+  transform: translateY(-50%);
+  background: var(--rail);
+}
+.pl-env-picker { position: relative; min-width: 0; }
+.pl-env-trigger {
+  width: 100%;
+  min-height: 36px;
+  padding: 7px 10px;
+  background: #fff;
+}
+.pl-env-trigger-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .run-repo {
   margin: 0 0 12px;
