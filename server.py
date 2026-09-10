@@ -31,6 +31,7 @@ try:
 except ImportError:  # pragma: no cover - Windows dev hosts
     fcntl = None  # type: ignore[assignment]
 
+import cce_rollout
 import huawei_cce
 from cid_config import CidConfigError, build_test_plan, enabled_build_step, load_cid_config
 
@@ -270,6 +271,8 @@ def init_store() -> None:
                     cluster_name TEXT NOT NULL,
                     workload_name TEXT NOT NULL,
                     jump_host TEXT NOT NULL,
+                    jump_password TEXT NOT NULL DEFAULT '',
+                    node_password TEXT NOT NULL DEFAULT '',
                     nodes_json TEXT NOT NULL,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -277,6 +280,7 @@ def init_store() -> None:
                 );
                 """
             )
+            _ensure_environment_secret_columns(conn)
             conn.commit()
             try:
                 os.chmod(DB_PATH, 0o600)
@@ -351,6 +355,40 @@ def _save_users(users: list[dict[str, str]]) -> None:
             conn.close()
 
 
+def _ensure_environment_secret_columns(conn: sqlite3.Connection) -> None:
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environments)")}
+    if "jump_password" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN jump_password TEXT NOT NULL DEFAULT ''")
+    if "node_password" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN node_password TEXT NOT NULL DEFAULT ''")
+
+
+def _row_text(row: sqlite3.Row, key: str, default: str = "") -> str:
+    keys = row.keys()
+    if key not in keys:
+        return default
+    return str(row[key] or default)
+
+
+def _secret_text(raw: Any) -> str:
+    return str(raw or "").replace("\r", "").replace("\n", "")
+
+
+def _public_environment(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if item is None:
+        return None
+    jump = _secret_text(item.get("jump_password"))
+    node = _secret_text(item.get("node_password"))
+    out = {
+        key: value
+        for key, value in item.items()
+        if key not in {"jump_password", "node_password"}
+    }
+    out["has_jump_password"] = bool(jump) or bool(item.get("has_jump_password"))
+    out["has_node_password"] = bool(node) or bool(item.get("has_node_password"))
+    return out
+
+
 def _env_region_label(region_id: str) -> str:
     for item in ENV_REGIONS:
         if item["id"] == region_id:
@@ -374,14 +412,16 @@ def _normalize_env_nodes(raw: Any) -> list[str]:
     return []
 
 
-def _environment_from_row(row: sqlite3.Row) -> dict[str, Any]:
+def _environment_from_row(row: sqlite3.Row, *, include_secrets: bool = False) -> dict[str, Any]:
     try:
         nodes = json.loads(row["nodes_json"] or "[]")
     except (TypeError, json.JSONDecodeError):
         nodes = []
     if not isinstance(nodes, list):
         nodes = []
-    return {
+    jump_password = _secret_text(_row_text(row, "jump_password"))
+    node_password = _secret_text(_row_text(row, "node_password"))
+    item = {
         "id": str(row["id"]),
         "name": str(row["name"]),
         "region": str(row["region"]),
@@ -390,18 +430,30 @@ def _environment_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "workload_name": str(row["workload_name"]),
         "jump_host": str(row["jump_host"]),
         "nodes": [str(item) for item in nodes if str(item).strip()],
+        "has_jump_password": bool(jump_password),
+        "has_node_password": bool(node_password),
         "created_by": str(row["created_by"] or ""),
         "created_at": str(row["created_at"] or ""),
         "updated_at": str(row["updated_at"] or ""),
     }
+    if include_secrets:
+        item["jump_password"] = jump_password
+        item["node_password"] = node_password
+    return item
 
 
-def _validate_environment_payload(data: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+def _validate_environment_payload(
+    data: dict[str, Any],
+    *,
+    require_passwords: bool = False,
+) -> tuple[dict[str, Any] | None, str]:
     name = str(data.get("name") or "").strip()
     region = str(data.get("region") or "").strip()
     cluster_name = str(data.get("cluster_name") or "").strip()
     workload_name = str(data.get("workload_name") or "").strip()
     jump_host = str(data.get("jump_host") or "").strip()
+    jump_password = _secret_text(data.get("jump_password"))
+    node_password = _secret_text(data.get("node_password"))
     nodes = _normalize_env_nodes(data.get("nodes"))
     if not name:
         return None, "环境名称必填"
@@ -413,6 +465,10 @@ def _validate_environment_payload(data: dict[str, Any]) -> tuple[dict[str, Any] 
         return None, "负载名称必填"
     if not jump_host:
         return None, "跳板机必填"
+    if require_passwords and not jump_password:
+        return None, "跳板机密码必填"
+    if require_passwords and not node_password:
+        return None, "节点密码必填"
     return {
         "name": name,
         "region": region,
@@ -420,6 +476,8 @@ def _validate_environment_payload(data: dict[str, Any]) -> tuple[dict[str, Any] 
         "cluster_name": cluster_name,
         "workload_name": workload_name,
         "jump_host": jump_host,
+        "jump_password": jump_password,
+        "node_password": node_password,
         "nodes": nodes,
     }, ""
 
@@ -437,7 +495,7 @@ def list_environments() -> list[dict[str, Any]]:
     return [_environment_from_row(row) for row in rows]
 
 
-def get_environment(env_id: str) -> dict[str, Any] | None:
+def get_environment(env_id: str, *, include_secrets: bool = False) -> dict[str, Any] | None:
     eid = str(env_id or "").strip()
     if not eid:
         return None
@@ -448,11 +506,11 @@ def get_environment(env_id: str) -> dict[str, Any] | None:
             row = conn.execute("SELECT * FROM environments WHERE id = ?", (eid,)).fetchone()
         finally:
             conn.close()
-    return _environment_from_row(row) if row else None
+    return _environment_from_row(row, include_secrets=include_secrets) if row else None
 
 
 def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[str, Any] | None, str]:
-    payload, err = _validate_environment_payload(data)
+    payload, err = _validate_environment_payload(data, require_passwords=True)
     if err or payload is None:
         return None, err
     now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -471,8 +529,9 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
                 """
                 INSERT INTO environments (
                     id, name, region, region_label, cluster_name, workload_name,
-                    jump_host, nodes_json, created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    jump_host, jump_password, node_password, nodes_json,
+                    created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
@@ -482,6 +541,8 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
                     item["cluster_name"],
                     item["workload_name"],
                     item["jump_host"],
+                    item["jump_password"],
+                    item["node_password"],
                     json.dumps(item["nodes"], ensure_ascii=False),
                     item["created_by"],
                     item["created_at"],
@@ -491,11 +552,11 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
             conn.commit()
         finally:
             conn.close()
-    return item, ""
+    return _public_environment(item), ""
 
 
 def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-    existing = get_environment(env_id)
+    existing = get_environment(env_id, include_secrets=True)
     if existing is None:
         return None, "环境不存在"
     payload, err = _validate_environment_payload(data)
@@ -503,6 +564,10 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
         return None, err
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     item = {**existing, **payload, "updated_at": now}
+    if not payload.get("jump_password"):
+        item["jump_password"] = existing.get("jump_password") or ""
+    if not payload.get("node_password"):
+        item["node_password"] = existing.get("node_password") or ""
     init_store()
     with _db_lock:
         conn = _connect_db()
@@ -511,7 +576,8 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                 """
                 UPDATE environments SET
                     name = ?, region = ?, region_label = ?, cluster_name = ?,
-                    workload_name = ?, jump_host = ?, nodes_json = ?, updated_at = ?
+                    workload_name = ?, jump_host = ?, jump_password = ?,
+                    node_password = ?, nodes_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -521,6 +587,8 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                     item["cluster_name"],
                     item["workload_name"],
                     item["jump_host"],
+                    item["jump_password"],
+                    item["node_password"],
                     json.dumps(item["nodes"], ensure_ascii=False),
                     item["updated_at"],
                     item["id"],
@@ -529,7 +597,7 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
             conn.commit()
         finally:
             conn.close()
-    return item, ""
+    return _public_environment(item), ""
 
 
 def delete_environment(env_id: str) -> bool:
@@ -1028,11 +1096,18 @@ def _apply_gamma_override(statuses: dict[str, str], job: dict[str, Any] | None, 
     if not selected:
         statuses["gamma"] = "skipped"
         return
-    if live:
-        if statuses.get("push") not in ("done", "skipped"):
+    job_status = str((job or {}).get("status") or "")
+    stage = _effective_pipeline_stage(job or {})
+    if live or job_status in ("running", "queued", "unknown"):
+        if stage == "gamma":
+            statuses["gamma"] = "running"
+        elif statuses.get("push") not in ("done", "skipped"):
             statuses["gamma"] = "pending"
-        elif statuses.get("gamma") == "done":
+        else:
             statuses["gamma"] = "pending"
+        return
+    if job_status == "failed" and stage == "gamma":
+        statuses["gamma"] = "failed"
 
 
 def _service_skip_push(svc: dict[str, Any] | None) -> bool:
@@ -1231,6 +1306,8 @@ def _subtask_rows(
         fail_index = _sync_fail_index(defs, job, result)
     elif step_id == "build":
         fail_index = _build_fail_index(defs, job, result)
+    elif step_id == "gamma":
+        fail_index = 0 if _gamma_selected(job, "deploy") else 1
     else:
         fail_index = len(defs) - 1
     statuses = _spread_status_to_subtasks(status, len(defs), fail_index=fail_index)
@@ -1247,7 +1324,10 @@ def _subtask_rows(
             elif status == "skipped":
                 row["status"] = "skipped"
             elif status == "running":
-                row["status"] = "pending" if row["id"] == "test" else "running"
+                if row["id"] == "deploy":
+                    row["status"] = "running"
+                else:
+                    row["status"] = "pending" if _gamma_selected(job, "deploy") else "running"
         return rows
     if step_id != "test":
         return rows
@@ -1297,6 +1377,11 @@ def _step_detail(step_id: str, status: str, result: dict[str, Any] | None, job: 
         if archive:
             return Path(archive).name
         return "docker save → nginx"
+    if step_id == "gamma":
+        remote = str((result or {}).get("remote") or job.get("remote") or "")
+        if remote and remote != "archive-only":
+            return remote.split("/")[-1]
+        return "跳板机 → kubectl set image"
     return ""
 
 
@@ -1679,7 +1764,24 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             statuses = {step_id: "pending" for step_id, _, _ in step_defs}
             svc_status = "pending"
 
-        _apply_gamma_override(statuses, job, live=is_running and svc_status == "running")
+        _apply_gamma_override(statuses, job, live=is_running)
+        if (
+            (_gamma_selected(job, "deploy") or _gamma_selected(job, "test"))
+            and is_running
+            and stage == "gamma"
+        ):
+            svc_status = "running"
+            if not focus_sid:
+                focus_sid = service_id
+        elif (
+            (_gamma_selected(job, "deploy") or _gamma_selected(job, "test"))
+            and job_status == "failed"
+            and stage == "gamma"
+        ):
+            statuses["gamma"] = "failed"
+            svc_status = "failed"
+            if not focus_sid:
+                focus_sid = service_id
         result_row = results_by_id.get(service_id)
         services_out.append(
             {
@@ -2559,6 +2661,7 @@ def persist_job_meta(job_id: str) -> None:
             "stage_before_stop",
             "slot_held",
             "queue_position",
+            "optional_steps",
         )
         meta = {k: job.get(k) for k in keys}
         # Keep running-job JSON small so history listing stays cheap.
@@ -2762,6 +2865,29 @@ def load_config() -> dict[str, Any]:
         "default_region": (hc.get("default_region") or "cn-southwest-2").strip() or "cn-southwest-2",
         "project_id": (hc.get("project_id") or "").strip(),
     }
+    cfg["cce_namespace"] = (
+        str(cfg.get("cce_namespace") or os.environ.get("CCE_NAMESPACE") or "default").strip() or "default"
+    )
+    cfg["cce_ssh_password"] = (
+        str(os.environ.get("CCE_SSH_PASSWORD") or cfg.get("cce_ssh_password") or "").strip()
+    )
+    cfg["cce_jump_password"] = (
+        str(os.environ.get("CCE_JUMP_PASSWORD") or cfg.get("cce_jump_password") or "").strip()
+    )
+    cfg["cce_node_password"] = (
+        str(os.environ.get("CCE_NODE_PASSWORD") or cfg.get("cce_node_password") or "").strip()
+    )
+    cfg["cce_ssh_key"] = str(os.environ.get("CCE_SSH_KEY") or cfg.get("cce_ssh_key") or "").strip()
+    cfg["cce_node_user"] = (
+        str(os.environ.get("CCE_NODE_USER") or cfg.get("cce_node_user") or "root").strip() or "root"
+    )
+    cfg["cce_secrets_file"] = (
+        str(os.environ.get("CCE_SECRETS_FILE") or cfg.get("cce_secrets_file") or "").strip()
+    )
+    cfg["cce_rollout_timeout"] = (
+        str(cfg.get("cce_rollout_timeout") or os.environ.get("CCE_ROLLOUT_TIMEOUT") or "180s").strip()
+        or "180s"
+    )
     return cfg
 
 
@@ -3395,6 +3521,10 @@ def _infer_pipeline_log_substep(step_id: str, line: str) -> str:
         return "push"
     if step_id == "archive":
         return "save"
+    if step_id == "gamma":
+        if "gamma测试" in text or "gamma test" in lowered:
+            return "test"
+        return "deploy"
     return ""
 
 
@@ -5777,6 +5907,71 @@ def push_one_service(
     return result
 
 
+def _job_copy(job_id: str) -> dict[str, Any]:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return dict(job) if job else {}
+
+
+def maybe_run_gamma_after_build(
+    job_id: str,
+    results: list[dict[str, Any]],
+    *,
+    hop: Any = None,
+) -> tuple[bool, str]:
+    """Run selected gamma steps after a successful push. Returns (ok, error)."""
+    job = _job_copy(job_id)
+    opts = _normalize_optional_steps(job.get("optional_steps"))
+    if not opts.get("gamma_deploy") and not opts.get("gamma_test"):
+        return True, ""
+    if job_cancel_requested(job_id):
+        raise JobStopped()
+    set_job(job_id, stage="gamma")
+    env = None
+    env_id = str(opts.get("environment_id") or "").strip()
+    if env_id:
+        env = get_environment(env_id, include_secrets=True)
+
+    if opts.get("gamma_deploy"):
+        with log_substep("deploy"):
+            if not env_id:
+                append_job_log(job_id, "ERROR gamma部署失败: 未选择环境")
+                return False, "gamma部署失败: 未选择环境"
+            if not env:
+                append_job_log(job_id, f"ERROR gamma部署失败: 环境不存在 ({env_id})")
+                return False, f"gamma部署失败: 环境不存在 ({env_id})"
+            creds = cce_rollout.overlay_environment_passwords(
+                cce_rollout.resolve_credentials(CFG, os.environ),
+                env,
+            )
+            namespace = str(CFG.get("cce_namespace") or "default").strip() or "default"
+            timeout = str(CFG.get("cce_rollout_timeout") or "180s").strip() or "180s"
+            append_job_log(
+                job_id,
+                f"gamma部署开始 env={env.get('name') or env_id} workload={env.get('workload_name')}",
+            )
+            ok, err = cce_rollout.deploy_job_results(
+                environment=env,
+                results=results,
+                creds=creds,
+                namespace=namespace,
+                rollout_timeout=timeout,
+                hop=hop,
+                log=lambda line: append_job_log(job_id, line),
+            )
+            if job_cancel_requested(job_id):
+                raise JobStopped()
+            if not ok:
+                append_job_log(job_id, f"ERROR {err}")
+                return False, err
+            append_job_log(job_id, "gamma部署成功")
+
+    if opts.get("gamma_test"):
+        with log_substep("test"):
+            append_job_log(job_id, "gamma测试尚未接入，已跳过")
+    return True, ""
+
+
 def run_push_job(
     job_id: str,
     items: list[dict[str, str]],
@@ -5905,6 +6100,20 @@ def run_push_job(
         archives = [r["archive"] for r in results if r.get("archive")]
         archive_summary = str(archive_dir) if archive_dir else (archives[0] if archives else "")
         if fail_n == 0:
+            gamma_ok, gamma_err = maybe_run_gamma_after_build(job_id, results)
+            if not gamma_ok:
+                set_job(
+                    job_id,
+                    status="failed",
+                    stage="gamma",
+                    current="",
+                    error=gamma_err,
+                    remote="; ".join(remotes),
+                    archive=archive_summary,
+                    results=results,
+                )
+                append_job_log(job_id, f"BATCH FAILED after push: {gamma_err}")
+                return
             set_job(
                 job_id,
                 status="ok",

@@ -67,6 +67,8 @@ class EnvironmentApiTests(unittest.TestCase):
             "cluster_name": "AgentPlatform",
             "workload_name": "semantic-schedule",
             "jump_host": "root@122.9.139.49",
+            "jump_password": "jump-secret",
+            "node_password": "node-secret",
             "nodes": ["172.31.8.33", "172.31.22.203"],
         }
         with self._open(
@@ -79,6 +81,10 @@ class EnvironmentApiTests(unittest.TestCase):
         self.assertEqual("联调", created["name"])
         self.assertEqual("贵阳一", created["region_label"])
         self.assertEqual(["172.31.8.33", "172.31.22.203"], created["nodes"])
+        self.assertTrue(created["has_jump_password"])
+        self.assertTrue(created["has_node_password"])
+        self.assertNotIn("jump_password", created)
+        self.assertNotIn("node_password", created)
 
         created["workload_name"] = "service-router"
         with self._open(
@@ -89,6 +95,17 @@ class EnvironmentApiTests(unittest.TestCase):
         ) as response:
             updated = json.loads(response.read().decode())["environment"]
         self.assertEqual("service-router", updated["workload_name"])
+        self.assertNotIn("jump_password", updated)
+        self.assertNotIn("node_password", updated)
+        stored = server.get_environment(created["id"], include_secrets=True)
+        self.assertEqual("jump-secret", stored["jump_password"])
+        self.assertEqual("node-secret", stored["node_password"])
+
+        with self._open("/api/environments", cookie=cookie) as response:
+            listed = json.loads(response.read().decode())["environments"]
+        self.assertEqual(1, len(listed))
+        self.assertNotIn("jump_password", listed[0])
+        self.assertNotIn("node_password", listed[0])
 
         with self._open(
             "/api/environments/" + created["id"] + "/delete",
@@ -120,3 +137,24 @@ class EnvironmentApiTests(unittest.TestCase):
                 cookie=cookie,
             )
         self.assertEqual(400, failed.exception.code)
+
+    def test_create_requires_passwords_and_never_echoes_them(self) -> None:
+        cookie = self._login()
+        with self.assertRaises(HTTPError) as failed:
+            self._open(
+                "/api/environments",
+                data=json.dumps(
+                    {
+                        "name": "no-pass",
+                        "region": "cn-southwest-2",
+                        "cluster_name": "x",
+                        "workload_name": "y",
+                        "jump_host": "jump",
+                        "nodes": ["172.31.8.33"],
+                    }
+                ).encode(),
+                method="POST",
+                cookie=cookie,
+            )
+        self.assertEqual(400, failed.exception.code)
+        self.assertIn("密码", json.loads(failed.exception.read().decode())["error"])

@@ -539,6 +539,40 @@ class JobPipelineTests(unittest.TestCase):
         self.assertEqual("done", sub["deploy"])
         self.assertEqual("skipped", sub["test"])
 
+    def test_gamma_running_after_push_results(self) -> None:
+        job = make_job("pipe-gamma-live", status="running")
+        job["stage"] = "gamma"
+        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": True}
+        job["results"] = [
+            {
+                "service_id": "memory-service",
+                "ok": True,
+                "remote": "swr.cn-southwest-2.myhuaweicloud.com/public_ai/memory-service:202609101200_abc",
+            }
+        ]
+        payload = server.job_payload(job, compact=True)
+        steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
+        self.assertEqual("running", steps["gamma"]["status"])
+        self.assertEqual("done", steps["push"]["status"])
+        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
+        self.assertEqual("running", sub["deploy"])
+        self.assertEqual("pending", sub["test"])
+
+    def test_gamma_failed_after_successful_push(self) -> None:
+        job = make_job("pipe-gamma-fail", status="failed")
+        job["stage"] = "gamma"
+        job["error"] = "kubectl 升级 memory-service 失败"
+        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": False}
+        job["results"] = [{"service_id": "memory-service", "ok": True}]
+        payload = server.job_payload(job, compact=True)
+        self.assertEqual("failed", payload["status"])
+        steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
+        self.assertEqual("failed", steps["gamma"]["status"])
+        self.assertEqual("done", steps["push"]["status"])
+        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
+        self.assertEqual("failed", sub["deploy"])
+        self.assertEqual("skipped", sub["test"])
+
     def test_failed_sync_marks_first_step_failed(self) -> None:
         job = make_job("pipe-fail", status="failed")
         job["stage"] = "done"

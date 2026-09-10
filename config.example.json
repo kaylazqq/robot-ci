@@ -20,5 +20,12 @@
     "secret_key": "",
     "default_region": "cn-southwest-2",
     "project_id": ""
-  }
+  },
+  "cce_namespace": "default",
+  "cce_ssh_password": "",
+  "cce_jump_password": "",
+  "cce_node_password": "",
+  "cce_ssh_key": "",
+  "cce_secrets_file": "",
+  "cce_rollout_timeout": "180s"
 }

@@ -5,6 +5,7 @@ dist/
 config.json
 data/
 users.json
+secrets/*.env
 .workspaces/
 .local/
 *.log

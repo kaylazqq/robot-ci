@@ -1168,6 +1168,12 @@ textarea { resize: vertical; min-height: 88px; }
 .env-form-card { min-height: 0; }
 .env-form-card .label { margin-top: 10px; }
 .env-form-card .label:first-child { margin-top: 0; }
+.env-secret-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #6b7c90;
+}
 .env-node-row {
   display: flex;
   gap: 8px;

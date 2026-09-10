@@ -2196,6 +2196,8 @@ function collectEnvForm() {
     cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
     workload_name: ($("envWorkload") && $("envWorkload").value || "").trim(),
     jump_host: ($("envJump") && $("envJump").value || "").trim(),
+    jump_password: ($("envJumpPassword") && $("envJumpPassword").value) || "",
+    node_password: ($("envNodePassword") && $("envNodePassword").value) || "",
     nodes,
   };
 }
@@ -2210,6 +2212,14 @@ function envNodeRowsHtml(nodes) {
 }
 function envFormHtml(env) {
   const data = env || emptyEnvDraft();
+  const creating = !data.id;
+  const jumpPassType = data.has_jump_password ? "password" : "text";
+  const nodePassType = data.has_node_password ? "password" : "text";
+  const jumpPassPh = data.has_jump_password ? "已保存，留空不修改" : "跳板机 SSH 密码";
+  const nodePassPh = data.has_node_password ? "已保存，留空不修改" : "CCE 节点 SSH 密码";
+  const secretHint = data.has_jump_password && data.has_node_password
+    ? "已保存的密码不会回显。要更换时重新输入，留空则保持不变。"
+    : "仅首次填写时明文可见，保存后任何人都不会再看到密码。";
   return (
     '<div class="env-form-card">' +
     '<label class="label" for="envRegion">Region</label>' +
@@ -2220,9 +2230,14 @@ function envFormHtml(env) {
     '<input id="envWorkload" class="input" value="' + esc(data.workload_name || "") + '" placeholder="CCE 集群中的微服务名称" required />' +
     '<label class="label" for="envJump">跳板机</label>' +
     '<input id="envJump" class="input" value="' + esc(data.jump_host || "") + '" placeholder="用于 SSH 到 CCE 集群" required />' +
+    '<label class="label" for="envJumpPassword">跳板机密码</label>' +
+    '<input id="envJumpPassword" class="input" type="' + jumpPassType + '" value="" placeholder="' + esc(jumpPassPh) + '" autocomplete="new-password" spellcheck="false"' + (creating ? " required" : "") + " />" +
     '<div class="label">节点列表</div>' +
     '<div id="envNodeList">' + envNodeRowsHtml(data.nodes) + "</div>" +
     '<div class="row"><button type="button" class="btn ghost" id="btnEnvAddNode">' + envIconPlus() + " 添加节点</button></div>" +
+    '<label class="label" for="envNodePassword">节点密码</label>' +
+    '<input id="envNodePassword" class="input" type="' + nodePassType + '" value="" placeholder="' + esc(nodePassPh) + '" autocomplete="new-password" spellcheck="false"' + (creating ? " required" : "") + " />" +
+    '<p class="env-secret-hint">' + secretHint + "</p>" +
     '<label class="label" for="envName">环境名称</label>' +
     '<input id="envName" class="input" value="' + esc(data.name || "") + '" required />' +
     '<div class="row env-form-actions">' +
@@ -2342,6 +2357,16 @@ function openEnvCreate() {
 async function saveEnvironment() {
   setEnvFormError("");
   const payload = collectEnvForm();
+  if (!envEditingId) {
+    if (!payload.jump_password) {
+      setEnvFormError("跳板机密码必填");
+      return;
+    }
+    if (!payload.node_password) {
+      setEnvFormError("节点密码必填");
+      return;
+    }
+  }
   const path = envEditingId ? "/api/environments/" + encodeURIComponent(envEditingId) : "/api/environments";
   await api(path, { method: "POST", body: JSON.stringify(payload) });
   closeEnvOverlay();
