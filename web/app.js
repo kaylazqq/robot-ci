@@ -2440,7 +2440,7 @@ function renderEnvironments() {
   if (!environments.length) {
     grid.innerHTML = isAllServices()
       ? '<p class="env-empty">请先选择一个微服务，再管理它的环境。</p>'
-      : '<p class="env-empty">当前微服务还没有环境。点左上角「创建环境」添加。</p>';
+      : "";
     return;
   }
   grid.innerHTML = environments.map(envCardHtml).join("");
