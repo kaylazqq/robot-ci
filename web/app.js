@@ -1,4 +1,30 @@
-const $ = (id) => document.getElementById(id);
+const RUN_POPUP_IDS = {
+  pageRun: 1,
+  previewBranch: 1,
+  previewBranchValue: 1,
+  previewBranchPicker: 1,
+  previewBranchMenu: 1,
+  btnRefreshPreviewBranches: 1,
+  previewBranchStatus: 1,
+  runJobPipeline: 1,
+  previewRunHint: 1,
+  btnRunPreviewConfirm: 1,
+  btnRunPreviewCancel: 1,
+};
+let runPopupWin = null;
+let runPopupDoc = null;
+function runPopupOpen() {
+  return !!(runPopupWin && runPopupDoc && !runPopupWin.closed);
+}
+function $(id) {
+  try {
+    if (RUN_POPUP_IDS[id] && runPopupOpen()) {
+      const el = runPopupDoc.getElementById(id);
+      if (el) return el;
+    }
+  } catch (_) {}
+  return document.getElementById(id);
+}
 const DAEMON_VERSION_KEY = "robotCiDaemonVersion";
 const DAEMON_VERSION_PATTERN = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
 const SERVICE_KEY = "robotCiService";
@@ -25,7 +51,6 @@ let environments = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
-let runWindowMode = /run\.html$/i.test(location.pathname) || /^#\/run(\/|$)/.test(location.hash || "");
 let runPreviewSelection = { deploy: false, test: false, environmentId: "" };
 let previewBranchPicker = null;
 let svcMenuPage = 1;
@@ -217,7 +242,7 @@ function endSession() {
 
 function showLogin(message) {
   if (sessionLive) endSession();
-  cancelRunPreview({ keepWindow: true });
+  cancelRunPreview();
   closeEnvConfirm(false);
   closeEnvOverlay();
   $("appShell").hidden = true;
@@ -286,7 +311,6 @@ function allServicesFallbackTab(next) {
 }
 
 function setNav(next, skipHash) {
-  if (runWindowMode) return;
   nav = next === "swr" ? "swr" : "build";
   document.querySelectorAll(".nav-item").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.nav === nav);
@@ -309,17 +333,8 @@ function applyServiceChrome() {
   });
   const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
   if (pipeBtn) pipeBtn.hidden = all;
-  if (runWindowMode) {
-    if ($("pageSwr")) $("pageSwr").hidden = true;
-    if ($("pageBuild")) $("pageBuild").hidden = true;
-    if ($("pageRun")) $("pageRun").hidden = false;
-    if ($("pipelineActions")) $("pipelineActions").hidden = true;
-    if ($("jobMetaBar")) $("jobMetaBar").hidden = true;
-    renderFavoriteServices();
-    return;
-  }
   if ($("pageBuild")) $("pageBuild").hidden = nav !== "build";
-  if ($("pageRun")) $("pageRun").hidden = true;
+  if (document.getElementById("pageRun")) document.getElementById("pageRun").hidden = true;
   if (!$("viewPipeline")) return;
   $("viewPipeline").hidden = tab !== "pipeline";
   if ($("viewHistory")) $("viewHistory").hidden = tab !== "history";
@@ -357,7 +372,6 @@ function setTab(next) {
   });
   applyServiceChrome();
   renderFavoriteServices();
-  if (tab !== "pipeline" && !runWindowMode) cancelRunPreview();
   if (tab !== "envs") {
     closeEnvConfirm(false);
     closeEnvOverlay();
@@ -379,9 +393,7 @@ function setTab(next) {
 
 function writeHash() {
   let next;
-  if (runWindowMode) {
-    next = "#/run/" + encodeURIComponent(currentServiceId || "");
-  } else if (nav !== "build") {
+  if (nav !== "build") {
     next = "#/" + nav;
   } else {
     const svc = encodeURIComponent(currentServiceId || "");
@@ -436,7 +448,7 @@ function updateActionButtons() {
   const svc = currentService();
   const live = jobIsLive(currentJob);
   const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
-  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runWindowMode;
+  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runPreviewActive;
   if ($("btnStop")) $("btnStop").disabled = !live || stopping;
   if ($("btnParams")) $("btnParams").disabled = !(svc && svc.requires_version);
 }
@@ -635,8 +647,9 @@ function isSelectablePreviewTask(stageId, taskId) {
 function previewTaskChecked(taskId) {
   return taskId === "deploy" ? !!runPreviewSelection.deploy : !!runPreviewSelection.test;
 }
-function createPreviewCheck(taskId) {
-  const box = document.createElement("button");
+function createPreviewCheck(taskId, doc) {
+  doc = doc || document;
+  const box = doc.createElement("button");
   box.type = "button";
   box.className = "pl-check" + (previewTaskChecked(taskId) ? " is-on" : "");
   box.setAttribute("aria-pressed", previewTaskChecked(taskId) ? "true" : "false");
@@ -684,7 +697,6 @@ function setPreviewBranchStatus(text, cls) {
   el.className = "branch-status" + (cls ? " " + cls : "");
 }
 function renderRunPage() {
-  applyServiceChrome();
   renderJobPipeline("runJobPipeline", previewPipelineData(), "", null, { preview: true });
 }
 function ensurePreviewBranchPicker() {
@@ -736,47 +748,130 @@ async function loadPreviewBranches(force) {
     picker.setDisabled(false);
   }
 }
-function isRunHash() {
-  const raw = (location.hash || "").replace(/^#\/?/, "");
-  return raw.split("/").filter(Boolean)[0] === "run";
+function runPopupStyleLinks() {
+  return Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map((link) => {
+    return '<link rel="stylesheet" href="' + link.href + '">';
+  }).join("");
 }
-function isRunWindowPage() {
-  return /run\.html$/i.test(location.pathname) || isRunHash();
+function runPopupMarkup() {
+  return "<!DOCTYPE html><html class=\"is-run-window\"><head><meta charset=\"UTF-8\"><title>运行</title>" +
+    runPopupStyleLinks() +
+    "</head><body class=\"is-run-window\"><div class=\"app is-run-window\"><div class=\"workspace\">" +
+    "<section class=\"page page-run\" id=\"pageRun\">" +
+    "<div class=\"run-block\"><label class=\"label\" for=\"previewBranch\">选择分支</label>" +
+    "<div class=\"run-branch-row\"><div class=\"branch-picker\" id=\"previewBranchPicker\">" +
+    "<button type=\"button\" class=\"input branch-trigger\" id=\"previewBranch\" aria-haspopup=\"listbox\" aria-expanded=\"false\">" +
+    "<span id=\"previewBranchValue\"></span>" +
+    "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M7 10l5 5 5-5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>" +
+    "</button><div class=\"branch-menu\" id=\"previewBranchMenu\" role=\"listbox\" hidden></div></div>" +
+    "<button type=\"button\" class=\"icon-btn\" id=\"btnRefreshPreviewBranches\" title=\"刷新\" aria-label=\"刷新\">" +
+    "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>" +
+    "<path d=\"M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>" +
+    "</button></div><p class=\"branch-status\" id=\"previewBranchStatus\" hidden></p></div>" +
+    "<div class=\"run-block run-block-tasks\"><label class=\"label\">选择任务</label>" +
+    "<section class=\"job-pipeline\" id=\"runJobPipeline\" aria-label=\"选择任务\"></section>" +
+    "<p class=\"hint error\" id=\"previewRunHint\" hidden></p></div>" +
+    "<div class=\"run-page-footer\">" +
+    "<button type=\"button\" class=\"btn primary\" id=\"btnRunPreviewConfirm\">确认</button>" +
+    "<button type=\"button\" class=\"btn ghost\" id=\"btnRunPreviewCancel\">取消</button>" +
+    "</div></section></div></div></body></html>";
 }
-function applyRunWindowChrome() {
-  runWindowMode = true;
-  document.documentElement.classList.add("is-run-window");
-  document.body.classList.add("is-run-window");
-  if ($("appShell")) $("appShell").classList.add("is-run-window");
-  if ($("pageSwr")) $("pageSwr").hidden = true;
-  if ($("pageBuild")) $("pageBuild").hidden = true;
-  if ($("pageRun")) $("pageRun").hidden = false;
-  document.title = "运行";
+function closeRunPopup() {
+  const win = runPopupWin;
+  runPopupWin = null;
+  runPopupDoc = null;
+  previewBranchPicker = null;
+  if (win && !win.closed) {
+    try { win.close(); } catch (_) {}
+  }
 }
-function runWindowUrl(serviceId) {
-  return location.origin + "/run.html#/run/" + encodeURIComponent(serviceId);
+function resetRunPopupState() {
+  runPreviewActive = false;
+  runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+  previewBranchPicker = null;
+  runPopupWin = null;
+  runPopupDoc = null;
 }
 function openRunWindow() {
   const svc = currentService();
   if (!svc || serviceActiveJobId) return;
+  if (runPopupOpen()) {
+    try { runPopupWin.focus(); } catch (_) {}
+    return;
+  }
   const width = Math.min(1680, Math.max(1280, (screen.availWidth || 1440) - 32));
   const height = Math.min(940, Math.max(780, (screen.availHeight || 860) - 32));
   const left = Math.max(0, Math.floor(((screen.availWidth || width) - width) / 2));
   const top = Math.max(0, Math.floor(((screen.availHeight || height) - height) / 2));
-  const features = "popup=yes,width=" + width + ",height=" + height + ",left=" + left + ",top=" + top + ",resizable=yes,scrollbars=yes";
-  const win = window.open(runWindowUrl(svc.id), "robot-ci-run-" + svc.id, features);
+  const features = [
+    "popup=yes",
+    "width=" + width,
+    "height=" + height,
+    "left=" + left,
+    "top=" + top,
+    "resizable=yes",
+    "scrollbars=yes",
+    "location=no",
+    "toolbar=no",
+    "menubar=no",
+    "status=no",
+  ].join(",");
+  const win = window.open("", "robot-ci-run-popup", features);
   if (!win) {
     alert("浏览器拦截了新窗口，请允许弹窗后重试");
     return;
   }
+  const paint = () => {
+    try {
+      win.document.open();
+      win.document.write(runPopupMarkup());
+      win.document.close();
+    } catch (_) {
+      return false;
+    }
+    return !!win.document.getElementById("pageRun");
+  };
+  const bind = () => {
+    runPopupWin = win;
+    runPopupDoc = win.document;
+    if (win.document.documentElement.dataset.runBound === "1") return;
+    win.document.documentElement.dataset.runBound = "1";
+    win.addEventListener("beforeunload", () => {
+      if (runPopupWin !== win) return;
+      resetRunPopupState();
+      updateActionButtons();
+    });
+    win.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") cancelRunPreview();
+    });
+    const confirmBtn = runPopupDoc.getElementById("btnRunPreviewConfirm");
+    const cancelBtn = runPopupDoc.getElementById("btnRunPreviewCancel");
+    const refreshBtn = runPopupDoc.getElementById("btnRefreshPreviewBranches");
+    if (confirmBtn) confirmBtn.addEventListener("click", () => confirmRunPreview());
+    if (cancelBtn) cancelBtn.addEventListener("click", () => cancelRunPreview());
+    if (refreshBtn) refreshBtn.addEventListener("click", () => loadPreviewBranches(true));
+    enterRunPage();
+  };
+  if (paint()) {
+    bind();
+  } else {
+    const url = URL.createObjectURL(new Blob([runPopupMarkup()], { type: "text/html;charset=utf-8" }));
+    const ready = () => {
+      if (!win.document.getElementById("pageRun")) return;
+      bind();
+      URL.revokeObjectURL(url);
+    };
+    try { win.location.replace(url); } catch (_) {}
+    win.addEventListener("load", ready);
+    setTimeout(ready, 80);
+  }
   try { win.focus(); } catch (_) {}
 }
 function enterRunPage() {
-  applyRunWindowChrome();
   runPreviewActive = true;
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+  previewBranchPicker = null;
   setPreviewHint("");
-  applyServiceChrome();
   renderRunPage();
   updateActionButtons();
   loadEnvironments().then(() => {
@@ -785,28 +880,19 @@ function enterRunPage() {
   loadPreviewBranches(false);
 }
 function cancelRunPreview(opts) {
-  if (runWindowMode) {
-    if (!(opts && opts.keepWindow)) window.close();
-    return;
-  }
-  if (!runPreviewActive) return;
+  if (!runPreviewActive && !runPopupOpen()) return;
   runPreviewActive = false;
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
   setPreviewHint("");
+  if (!(opts && opts.keepWindow)) closeRunPopup();
+  else {
+    previewBranchPicker = null;
+    runPopupWin = null;
+    runPopupDoc = null;
+  }
   applyServiceChrome();
   applyJob(currentJob);
   updateActionButtons();
-}
-function notifyOpenerJobStarted(jobId) {
-  try {
-    if (window.opener && !window.opener.closed) {
-      window.opener.postMessage({
-        type: "robot-ci-job-started",
-        serviceId: currentServiceId,
-        jobId: jobId,
-      }, location.origin);
-    }
-  } catch (_) {}
 }
 function confirmRunPreview() {
   const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
@@ -817,64 +903,66 @@ function confirmRunPreview() {
   const branch = (previewBranchPicker && previewBranchPicker.value) || "";
   startRun(branch);
 }
-function createStatusIcon(status, kind) {
-  const icon = document.createElement("span");
+function createStatusIcon(status, kind, doc) {
+  doc = doc || document;
+  const icon = doc.createElement("span");
   icon.className = (kind || "pl-icon") + " is-" + (status || "pending");
   icon.textContent = status === "done" ? "✓" : (status === "failed" || status === "warn") ? "✕" : status === "skipped" ? "–" : (status === "running" || status === "queued") ? "●" : "";
   return icon;
 }
-function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview) {
+function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc) {
+  doc = doc || document;
   const status = stage.status || "pending";
-  const col = document.createElement("div");
+  const col = doc.createElement("div");
   col.className = "pl-col is-" + status + (stage.id === "gamma" ? " is-gamma" : "");
   if (!preview) {
     col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
   }
-  const cap = document.createElement("div");
+  const cap = doc.createElement("div");
   cap.className = "pl-caption";
-  const title = document.createElement("div");
+  const title = doc.createElement("div");
   title.className = "pl-title";
   title.textContent = stage.label || stage.id || "";
-  const dur = document.createElement("div");
+  const dur = doc.createElement("div");
   dur.className = "pl-dur is-" + status;
   dur.textContent = PIPELINE_STATE_LABELS[status] || status;
   cap.append(title, dur);
   col.appendChild(cap);
-  const spine = document.createElement("div");
+  const spine = doc.createElement("div");
   spine.className = "pl-spine";
-  const left = document.createElement("div");
+  const left = doc.createElement("div");
   left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
-  const right = document.createElement("div");
+  const right = doc.createElement("div");
   right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
-  spine.append(left, createStatusIcon(status, "pl-stage-icon"), right);
+  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc), right);
   col.appendChild(spine);
-  const drop = document.createElement("div");
+  const drop = doc.createElement("div");
   drop.className = "pl-drop";
-  const diamond = document.createElement("div");
+  const diamond = doc.createElement("div");
   diamond.className = "pl-diamond";
-  diamond.append(document.createElement("span"), document.createElement("span"));
+  diamond.append(doc.createElement("span"), doc.createElement("span"));
   drop.appendChild(diamond);
-  const tree = document.createElement("div");
+  const tree = doc.createElement("div");
   tree.className = "pl-tree";
   if (preview && stage.id === "gamma") {
-    const envRow = document.createElement("div");
+    const envRow = doc.createElement("div");
     envRow.className = "pl-task pl-env-row";
-    envRow.appendChild(document.createElement("span"));
-    envRow.appendChild(createStatusIcon("pending", "pl-task-icon"));
-    envRow.appendChild(createGammaEnvPicker());
+    envRow.appendChild(doc.createElement("span"));
+    envRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
+    envRow.appendChild(createGammaEnvPicker(doc));
     tree.appendChild(envRow);
   }
   (stage.tasks || []).forEach((task) => {
-    const row = document.createElement("div");
+    const row = doc.createElement("div");
     row.className = "pl-task is-" + (task.status || "pending");
-    row.appendChild(document.createElement("span"));
+    row.appendChild(doc.createElement("span"));
     if (preview && isSelectablePreviewTask(stage.id, task.id)) {
       row.classList.add("is-selectable");
-      row.appendChild(createPreviewCheck(task.id));
+      row.appendChild(createPreviewCheck(task.id, doc));
     } else {
-      row.appendChild(createStatusIcon(task.status, "pl-task-icon"));
+      row.appendChild(createStatusIcon(task.status, "pl-task-icon", doc));
     }
-    const name = document.createElement("span");
+    const name = doc.createElement("span");
     name.className = "pl-task-name";
     name.textContent = task.label || task.id || "";
     row.appendChild(name);
@@ -896,28 +984,30 @@ function selectedEnvName() {
   const env = environments.find((item) => item.id === runPreviewSelection.environmentId);
   return env ? (env.name || "未命名环境") : "";
 }
-function createGammaEnvPicker() {
-  const wrap = document.createElement("div");
+function createGammaEnvPicker(doc) {
+  doc = doc || document;
+  const win = doc.defaultView || window;
+  const wrap = doc.createElement("div");
   wrap.className = "pl-env-pick";
-  const picker = document.createElement("div");
+  const picker = doc.createElement("div");
   picker.className = "pl-env-picker";
-  const trigger = document.createElement("button");
+  const trigger = doc.createElement("button");
   trigger.type = "button";
   trigger.className = "input branch-trigger pl-env-trigger";
   trigger.setAttribute("aria-haspopup", "listbox");
   trigger.setAttribute("aria-expanded", "false");
-  const label = document.createElement("span");
+  const label = doc.createElement("span");
   label.className = "pl-env-trigger-label";
   const empty = !environments.length;
   label.textContent = selectedEnvName() || (empty ? "还没有环境" : "选择环境");
   trigger.disabled = empty;
   trigger.appendChild(label);
-  const chevron = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const chevron = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
   chevron.setAttribute("viewBox", "0 0 24 24");
   chevron.setAttribute("aria-hidden", "true");
   chevron.innerHTML = '<path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>';
   trigger.appendChild(chevron);
-  const menu = document.createElement("div");
+  const menu = doc.createElement("div");
   menu.className = "branch-menu";
   menu.hidden = true;
   menu.setAttribute("role", "listbox");
@@ -933,11 +1023,11 @@ function createGammaEnvPicker() {
     menu.style.left = rect.left + "px";
     menu.style.top = (rect.bottom + 6) + "px";
     menu.style.width = width + "px";
-    menu.style.maxHeight = Math.max(120, Math.min(280, window.innerHeight - rect.bottom - 12)) + "px";
-    document.body.appendChild(menu);
+    menu.style.maxHeight = Math.max(120, Math.min(280, win.innerHeight - rect.bottom - 12)) + "px";
+    doc.body.appendChild(menu);
   };
   environments.forEach((env) => {
-    const option = document.createElement("button");
+    const option = doc.createElement("button");
     option.type = "button";
     option.className = "branch-option" + (runPreviewSelection.environmentId === env.id ? " active" : "");
     option.setAttribute("role", "option");
@@ -964,33 +1054,34 @@ function createGammaEnvPicker() {
   });
   picker.addEventListener("focusout", () => {
     setTimeout(() => {
-      if (!picker.contains(document.activeElement) && !menu.contains(document.activeElement)) close();
+      if (!picker.contains(doc.activeElement) && !menu.contains(doc.activeElement)) close();
     }, 0);
   });
   picker.append(trigger, menu);
   wrap.appendChild(picker);
   return wrap;
 }
-function createEndpoint(kind, lit) {
-  const col = document.createElement("div");
+function createEndpoint(kind, lit, doc) {
+  doc = doc || document;
+  const col = doc.createElement("div");
   col.className = "pl-end is-" + kind;
-  const cap = document.createElement("div");
+  const cap = doc.createElement("div");
   cap.className = "pl-caption";
-  const title = document.createElement("div");
+  const title = doc.createElement("div");
   title.className = "pl-title";
   title.textContent = kind === "start" ? "Start" : "End";
-  const dur = document.createElement("div");
+  const dur = doc.createElement("div");
   dur.className = "pl-dur";
   dur.innerHTML = "&nbsp;";
   cap.append(title, dur);
   col.appendChild(cap);
-  const spine = document.createElement("div");
+  const spine = doc.createElement("div");
   spine.className = "pl-spine";
-  const left = document.createElement("div");
+  const left = doc.createElement("div");
   left.className = "pl-rail left " + (kind === "start" ? "is-none" : (lit ? "is-ok" : "is-wait"));
-  const right = document.createElement("div");
+  const right = doc.createElement("div");
   right.className = "pl-rail right " + (kind === "end" ? "is-none" : (lit ? "is-ok" : "is-wait"));
-  const icon = document.createElement("span");
+  const icon = doc.createElement("span");
   icon.className = "pl-stage-icon is-end" + (lit ? " is-ok" : " is-wait");
   spine.append(left, icon, right);
   col.appendChild(spine);
@@ -1011,19 +1102,20 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   const meta = pipeline.meta || {};
   const status = jobStatus || meta.status || "";
   const stages = buildPipelineStages(pipeline, status);
-  const scroll = document.createElement("div");
+  const doc = root.ownerDocument || document;
+  const scroll = doc.createElement("div");
   scroll.className = "pl-scroll";
-  const graph = document.createElement("div");
+  const graph = doc.createElement("div");
   graph.className = "pl-graph";
   const isComplete = (stage) => Boolean(stage && stage.status === "done");
-  graph.appendChild(createEndpoint("start", !preview));
+  graph.appendChild(createEndpoint("start", !preview, doc));
   stages.forEach((stage, index) => {
     const previous = stages[index - 1];
     const incomingComplete = !preview && (index === 0 || isComplete(previous));
     const outgoingComplete = !preview && isComplete(stage);
-    graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview));
+    graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc));
   });
-  graph.appendChild(createEndpoint("end", !preview && isComplete(stages[stages.length - 1]) && status === "ok"));
+  graph.appendChild(createEndpoint("end", !preview && isComplete(stages[stages.length - 1]) && status === "ok", doc));
   scroll.appendChild(graph);
   root.appendChild(scroll);
 }
@@ -1361,7 +1453,7 @@ function activateService(id) {
     applyServiceChrome();
     return false;
   }
-  if (!runWindowMode) cancelRunPreview();
+  cancelRunPreview();
   currentServiceId = id;
   pinnedJobId = "";
   serviceActiveJobId = "";
@@ -1674,6 +1766,8 @@ function fetchServiceBranches(serviceId, force, priority) {
   return req;
 }
 function createBranchPicker(root, selectors) {
+  const doc = root.ownerDocument || document;
+  const win = doc.defaultView || window;
   const trigger = root.querySelector((selectors && selectors.trigger) || "#runBranch");
   const label = root.querySelector((selectors && selectors.label) || "#runBranchValue");
   const menu = root.querySelector((selectors && selectors.menu) || "#runBranchMenu");
@@ -1686,13 +1780,13 @@ function createBranchPicker(root, selectors) {
   const positionMenu = () => {
     const rect = trigger.getBoundingClientRect();
     const viewportGap = 12;
-    const maxHeight = Math.max(120, Math.min(360, window.innerHeight - rect.bottom - viewportGap));
+    const maxHeight = Math.max(120, Math.min(360, win.innerHeight - rect.bottom - viewportGap));
     menu.classList.add("branch-menu-portal");
     menu.style.left = rect.left + "px";
     menu.style.top = (rect.bottom + 6) + "px";
     menu.style.width = rect.width + "px";
     menu.style.maxHeight = maxHeight + "px";
-    document.body.appendChild(menu);
+    doc.body.appendChild(menu);
   };
   const setValue = (next) => {
     value = next;
@@ -1713,7 +1807,7 @@ function createBranchPicker(root, selectors) {
   });
   root.addEventListener("focusout", () => {
     setTimeout(() => {
-      if (!root.contains(document.activeElement) && !menu.contains(document.activeElement)) close();
+      if (!root.contains(doc.activeElement) && !menu.contains(doc.activeElement)) close();
     }, 0);
   });
   root.addEventListener("keydown", (event) => {
@@ -1729,7 +1823,7 @@ function createBranchPicker(root, selectors) {
       const wanted = list.includes(selectedBranch) ? selectedBranch : (list.includes(fallback) ? fallback : list[0]);
       menu.replaceChildren();
       list.forEach((name) => {
-        const option = document.createElement("button");
+        const option = doc.createElement("button");
         option.type = "button";
         option.className = "branch-option";
         option.dataset.value = name;
@@ -1891,11 +1985,7 @@ async function startRun(branch) {
       }),
     });
     closeModal();
-    if (runWindowMode) {
-      notifyOpenerJobStarted(resp.job_id);
-      window.close();
-      return;
-    }
+    closeRunPopup();
     runPreviewActive = false;
     applyServiceChrome();
     pinnedJobId = "";
@@ -2665,7 +2755,6 @@ document.addEventListener("click", (ev) => {
   if (ev.target.isConnected && !ev.target.closest("#svcPicker")) hideServiceMenu();
 });
 window.addEventListener("message", (ev) => {
-  if (runWindowMode) return;
   if (ev.origin !== location.origin) return;
   const data = ev.data;
   if (!data || data.type !== "robot-ci-job-started" || !data.jobId) return;
@@ -2678,7 +2767,7 @@ window.addEventListener("message", (ev) => {
   refreshServiceOccupancy().catch(() => {});
 });
 window.addEventListener("hashchange", async () => {
-  if (!sessionLive || runWindowMode) return;
+  if (!sessionLive) return;
   const parsed = readHash();
   if (parsed.nav === "run") return;
   if (
@@ -2729,18 +2818,6 @@ window.addEventListener("hashchange", async () => {
 
 async function bootApp(username) {
   const parsed = readHash();
-  if (parsed.nav === "run" || isRunWindowPage()) {
-    applyRunWindowChrome();
-    sessionLive = true;
-    currentUser = username;
-    if ($("loginGate")) $("loginGate").hidden = true;
-    if (parsed.service) currentServiceId = parsed.service;
-    await Promise.all([refreshHealth(), refreshServices()]);
-    enterRunPage();
-    if ($("appShell")) $("appShell").hidden = false;
-    writeHash();
-    return;
-  }
   enterApp(username);
   if (parsed.service) currentServiceId = parsed.service;
   await Promise.all([refreshHealth(), refreshServices()]);
@@ -2765,7 +2842,6 @@ async function bootApp(username) {
 }
 
 (async function boot() {
-  if (isRunWindowPage()) applyRunWindowChrome();
   try {
     const me = await api("/api/auth/me");
     if (me.user) await bootApp(me.user);
