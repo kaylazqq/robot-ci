@@ -272,13 +272,18 @@ html.is-run-window #pageSwr { display: none !important; }
   max-width: 680px;
   padding-left: 72px;
 }
-.page-swr { max-width: 820px; }
+.page-swr { max-width: none; }
 .login-cmd {
   width: 100%;
-  min-height: 220px;
+  min-height: 320px;
   font-family: var(--mono);
   font-size: 15px;
   line-height: 1.5;
+}
+.page-swr .log {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
 }
 .cce-creds { max-width: 560px; }
 
