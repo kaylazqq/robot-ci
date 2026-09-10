@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Server bootstrap for Huawei Cloud EulerOS / common Linux.
-# Run on server after files are in /opt/swr-push-helper
+# First-time bootstrap for Huawei Cloud EulerOS / common Linux.
+# Run after files are in /opt/swr-push-helper.
+# Later upgrades must stay in this directory: scripts/update-server.sh
+# or scripts/apply-release.sh. Do not mv the app dir aside and unpack a new tree.
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/swr-push-helper}"
@@ -87,6 +89,10 @@ mkdir -p "$ARCHIVE_ROOT"
 chmod 755 "$ARCHIVE_ROOT" || true
 
 export APP_DIR PORT KEY ARCHIVE_ROOT
+mkdir -p "$APP_DIR/data" "$APP_DIR/logs"
+if [[ -f "$APP_DIR/config.json" ]]; then
+  echo "keeping existing config.json"
+else
 python3 <<'PY'
 import json, os
 from pathlib import Path
@@ -112,6 +118,7 @@ cfg = {
 )
 print("wrote config.json")
 PY
+fi
 chmod 600 "$APP_DIR/config.json"
 mkdir -p /home/ci
 

@@ -23,6 +23,18 @@ bash deploy-linux.sh
 4. 浏览器打开 `http://服务器IP/`
 5. 别人只需粘贴**自己的 SWR 临时登录指令**；拉私有 GitHub 代码用服务器上的 Token，无需再登 GitHub
 
+之后升级**只改代码，不换目录**：
+
+```bash
+# 推荐：原地 git 快进（不碰 data/、config.json、logs/）
+bash /opt/swr-push-helper/scripts/update-server.sh
+
+# 只能用 tar 包时：覆盖代码，保留运行时数据
+bash /opt/swr-push-helper/scripts/apply-release.sh /tmp/robot-ci.tar.gz
+```
+
+禁止 `mv /opt/swr-push-helper /opt/swr-push-helper.bak.*` 再解压新包。收藏、环境、账号会话都在 `data/robot-ci.db`，整目录搬走等于换一台空库。`git reset --hard` 只动已跟踪文件，不会删 gitignore 的 `data/`。
+
 ## 第一阶段测试
 
 工具会在拉取服务代码后执行 `test-plans.json` 中受控的 UT/DT 测试，并在任务日志和页面显示总用例、通过、失败和错误数及失败用例摘要。第一阶段测试不阻断镜像构建或 SWR 推送；数据库、Redis、Temporal 等外部依赖测试不在测试计划中执行。
