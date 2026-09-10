@@ -1079,13 +1079,17 @@ textarea { resize: vertical; min-height: 88px; }
 .env-toolbar {
   display: flex;
   align-items: center;
+  gap: 16px;
   margin: 12px 0 16px;
 }
+.env-scope-hint { margin: 0; }
 .env-create-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
+.env-create-btn[hidden] { display: none !important; }
+.env-form-card .env-meta-row { margin-bottom: 8px; }
 .env-create-btn svg { width: 16px; height: 16px; display: block; }
 .env-grid {
   display: grid;

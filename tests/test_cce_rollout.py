@@ -224,6 +224,7 @@ class GammaAfterBuildTests(unittest.TestCase):
         env = {
             "id": "env1",
             "name": "联调",
+            "service_id": "semantic-schedule",
             "cluster_name": "AgentPlatform",
             "workload_name": "semantic-schedule",
             "jump_host": "root@122.9.139.49",
@@ -274,6 +275,29 @@ class GammaAfterBuildTests(unittest.TestCase):
         self.assertEqual("node-from-env", hop_kwargs.get("node_password"))
         with server._jobs_lock:
             self.assertEqual("gamma", server._jobs["gamma-run"]["stage"])
+
+    def test_rejects_environment_owned_by_other_service(self) -> None:
+        job = _job("gamma-wrong-env", service_id="memory-service")
+        job["optional_steps"] = {
+            "gamma_deploy": True,
+            "gamma_test": False,
+            "environment_id": "env1",
+        }
+        self.assertIsNone(server.register_job_if_idle(job))
+        env = {
+            "id": "env1",
+            "name": "schedule-gamma",
+            "service_id": "semantic-schedule",
+            "workload_name": "semantic-schedule",
+        }
+        with patch.object(server, "get_environment", return_value=env):
+            ok, err = server.maybe_run_gamma_after_build(
+                "gamma-wrong-env",
+                [{"service_id": "memory-service", "ok": True, "remote": "swr.example/img:tag1"}],
+            )
+        self.assertFalse(ok)
+        self.assertIn("semantic-schedule", err)
+        self.assertIn("不符", err)
 
     def test_run_push_job_marks_gamma_failure(self) -> None:
         job = _job("gamma-hook", service_id="memory-service")

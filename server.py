@@ -266,6 +266,7 @@ def init_store() -> None:
                 CREATE TABLE IF NOT EXISTS environments (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    service_id TEXT NOT NULL DEFAULT '',
                     region TEXT NOT NULL,
                     region_label TEXT NOT NULL,
                     cluster_name TEXT NOT NULL,
@@ -281,6 +282,7 @@ def init_store() -> None:
                 """
             )
             _ensure_environment_secret_columns(conn)
+            _ensure_environment_service_column(conn)
             conn.commit()
             try:
                 os.chmod(DB_PATH, 0o600)
@@ -363,6 +365,51 @@ def _ensure_environment_secret_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE environments ADD COLUMN node_password TEXT NOT NULL DEFAULT ''")
 
 
+def _known_service_ids() -> set[str]:
+    try:
+        payload = json.loads(SERVICES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return set()
+    if not isinstance(payload, list):
+        return set()
+    return {
+        str(item.get("id") or "").strip()
+        for item in payload
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+
+
+def _infer_environment_service_id(workload_name: str, name: str = "") -> str:
+    known = _known_service_ids()
+    workload = str(workload_name or "").strip()
+    if workload in known:
+        return workload
+    for sid, mapped in cce_rollout.SERVICE_MAP.items():
+        deploy = mapped[0] if mapped else ""
+        if deploy == workload and sid in known:
+            return sid
+    title = str(name or "").strip()
+    if title in known:
+        return title
+    return ""
+
+
+def _ensure_environment_service_column(conn: sqlite3.Connection) -> None:
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environments)")}
+    if "service_id" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
+    rows = conn.execute("SELECT id, service_id, workload_name, name FROM environments").fetchall()
+    for row in rows:
+        if str(row["service_id"] or "").strip():
+            continue
+        inferred = _infer_environment_service_id(
+            str(row["workload_name"] or ""),
+            str(row["name"] or ""),
+        )
+        if inferred:
+            conn.execute("UPDATE environments SET service_id = ? WHERE id = ?", (inferred, row["id"]))
+
+
 def _row_text(row: sqlite3.Row, key: str, default: str = "") -> str:
     keys = row.keys()
     if key not in keys:
@@ -424,6 +471,7 @@ def _environment_from_row(row: sqlite3.Row, *, include_secrets: bool = False) ->
     item = {
         "id": str(row["id"]),
         "name": str(row["name"]),
+        "service_id": _row_text(row, "service_id"),
         "region": str(row["region"]),
         "region_label": str(row["region_label"] or _env_region_label(str(row["region"]))),
         "cluster_name": str(row["cluster_name"]),
@@ -446,8 +494,10 @@ def _validate_environment_payload(
     data: dict[str, Any],
     *,
     require_passwords: bool = False,
+    require_service: bool = False,
 ) -> tuple[dict[str, Any] | None, str]:
     name = str(data.get("name") or "").strip()
+    service_id = str(data.get("service_id") or "").strip()
     region = str(data.get("region") or "").strip()
     cluster_name = str(data.get("cluster_name") or "").strip()
     workload_name = str(data.get("workload_name") or "").strip()
@@ -457,6 +507,10 @@ def _validate_environment_payload(
     nodes = _normalize_env_nodes(data.get("nodes"))
     if not name:
         return None, "环境名称必填"
+    if require_service and not service_id:
+        return None, "所属微服务必填"
+    if service_id and service_id not in _known_service_ids():
+        return None, "未知微服务"
     if region not in ENV_REGION_IDS:
         return None, "region 仅支持贵阳一"
     if not cluster_name:
@@ -471,6 +525,7 @@ def _validate_environment_payload(
         return None, "节点密码必填"
     return {
         "name": name,
+        "service_id": service_id,
         "region": region,
         "region_label": _env_region_label(region),
         "cluster_name": cluster_name,
@@ -482,14 +537,21 @@ def _validate_environment_payload(
     }, ""
 
 
-def list_environments() -> list[dict[str, Any]]:
+def list_environments(service_id: str = "") -> list[dict[str, Any]]:
+    sid = str(service_id or "").strip()
     init_store()
     with _db_lock:
         conn = _connect_db()
         try:
-            rows = conn.execute(
-                "SELECT * FROM environments ORDER BY updated_at DESC, name"
-            ).fetchall()
+            if sid:
+                rows = conn.execute(
+                    "SELECT * FROM environments WHERE service_id = ? ORDER BY updated_at DESC, name",
+                    (sid,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM environments ORDER BY updated_at DESC, name"
+                ).fetchall()
         finally:
             conn.close()
     return [_environment_from_row(row) for row in rows]
@@ -510,7 +572,7 @@ def get_environment(env_id: str, *, include_secrets: bool = False) -> dict[str, 
 
 
 def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[str, Any] | None, str]:
-    payload, err = _validate_environment_payload(data, require_passwords=True)
+    payload, err = _validate_environment_payload(data, require_passwords=True, require_service=True)
     if err or payload is None:
         return None, err
     now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -528,14 +590,15 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
             conn.execute(
                 """
                 INSERT INTO environments (
-                    id, name, region, region_label, cluster_name, workload_name,
+                    id, name, service_id, region, region_label, cluster_name, workload_name,
                     jump_host, jump_password, node_password, nodes_json,
                     created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
                     item["name"],
+                    item["service_id"],
                     item["region"],
                     item["region_label"],
                     item["cluster_name"],
@@ -564,6 +627,7 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
         return None, err
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     item = {**existing, **payload, "updated_at": now}
+    item["service_id"] = existing.get("service_id") or payload.get("service_id") or ""
     if not payload.get("jump_password"):
         item["jump_password"] = existing.get("jump_password") or ""
     if not payload.get("node_password"):
@@ -5941,6 +6005,12 @@ def maybe_run_gamma_after_build(
             if not env:
                 append_job_log(job_id, f"ERROR gamma部署失败: 环境不存在 ({env_id})")
                 return False, f"gamma部署失败: 环境不存在 ({env_id})"
+            env_sid = str(env.get("service_id") or "").strip()
+            job_sids = set(_job_service_ids(job))
+            if env_sid and env_sid not in job_sids:
+                msg = f"gamma部署失败: 环境属于 {env_sid}，与当前微服务不符"
+                append_job_log(job_id, f"ERROR {msg}")
+                return False, msg
             creds = cce_rollout.overlay_environment_passwords(
                 cce_rollout.resolve_credentials(CFG, os.environ),
                 env,
@@ -6297,7 +6367,11 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/environments":
-            self._json(200, {"environments": list_environments(), "regions": list(ENV_REGIONS)})
+            service_id = str((query.get("service_id") or [""])[0]).strip()
+            self._json(
+                200,
+                {"environments": list_environments(service_id), "regions": list(ENV_REGIONS)},
+            )
             return
 
         if path == "/api/cce/regions":

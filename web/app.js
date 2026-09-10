@@ -323,6 +323,13 @@ function applyServiceChrome() {
       ? "全量产物记录。磁盘清理后包文件会显示为已失效，记录仍保留。"
       : "当前微服务的产物记录。磁盘清理后包文件会显示为已失效，记录仍保留。";
   }
+  const createBtn = $("btnEnvCreate");
+  if (createBtn) createBtn.hidden = all;
+  if ($("envHint")) {
+    $("envHint").textContent = all
+      ? "环境属于单个微服务。请先在上方选择微服务，再查看或创建它的环境。"
+      : "当前微服务的部署环境。构建时只能选用这些环境。";
+  }
 }
 
 function jobIsLive(job) {
@@ -829,7 +836,7 @@ function createGammaEnvPicker() {
   if (!environments.length) {
     const empty = document.createElement("p");
     empty.className = "pl-env-pick-empty";
-    empty.textContent = "还没有环境，请先到环境管理创建";
+    empty.textContent = "当前微服务还没有环境，请先到环境管理创建";
     wrap.appendChild(empty);
     return wrap;
   }
@@ -1259,6 +1266,7 @@ function selectService(id) {
   if (!sessionLive) return;
   const changed = activateService(id);
   if (!changed) return;
+  closeEnvOverlay();
   if (isAllServices()) {
     stopPolling();
     applyJob(null);
@@ -1269,6 +1277,7 @@ function selectService(id) {
     writeHash();
     if (tab === "history") refreshHistory().catch(() => {});
     else if (tab === "artifacts") refreshArtifacts().catch(() => {});
+    else if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
     return;
   }
   writeHash();
@@ -1278,6 +1287,7 @@ function selectService(id) {
     stopPolling();
     if (tab === "history") refreshHistory().catch(() => {});
     else if (tab === "artifacts") refreshArtifacts().catch(() => {});
+    else if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
   }
 }
 function bindServicePicker() {
@@ -2183,7 +2193,17 @@ function envIconPlus() {
   return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 7v10M7 12h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
 }
 function emptyEnvDraft() {
-  return { name: "", region: "cn-southwest-2", cluster_name: "", workload_name: "", jump_host: "", nodes: [""] };
+  const svc = currentService();
+  const sid = svc ? svc.id : "";
+  return {
+    name: "",
+    service_id: sid,
+    region: "cn-southwest-2",
+    cluster_name: "",
+    workload_name: sid,
+    jump_host: "",
+    nodes: [""],
+  };
 }
 function collectEnvForm() {
   const nodes = Array.from(document.querySelectorAll("[data-env-node]"))
@@ -2191,6 +2211,7 @@ function collectEnvForm() {
     .filter(Boolean);
   return {
     name: ($("envName") && $("envName").value || "").trim(),
+    service_id: currentServiceId && !isAllServices() ? currentServiceId : "",
     region: ($("envRegion") && $("envRegion").value) || "cn-southwest-2",
     cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
     workload_name: ($("envWorkload") && $("envWorkload").value || "").trim(),
@@ -2219,8 +2240,10 @@ function envFormHtml(env) {
   const secretHint = data.has_jump_password && data.has_node_password
     ? "已保存的密码不会回显。要更换时重新输入，留空则保持不变。"
     : "仅首次填写时明文可见，保存后任何人都不会再看到密码。";
+  const owned = serviceTitle(services.find((item) => item.id === data.service_id) || { id: data.service_id, title: data.service_id });
   return (
     '<div class="env-form-card">' +
+    '<div class="env-meta-row"><span class="env-meta-label">所属微服务:</span><strong class="env-meta-value">' + esc(owned || "—") + "</strong></div>" +
     '<label class="label" for="envRegion">Region</label>' +
     '<select id="envRegion" class="input"><option value="cn-southwest-2">贵阳一</option></select>' +
     '<label class="label" for="envCluster">集群名称</label>' +
@@ -2255,6 +2278,7 @@ function envCardHtml(env) {
     '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除">' + envIconTrash() + "</button>" +
     "</div></div>" +
     '<div class="env-card-meta">' +
+    '<div class="env-meta-row"><span class="env-meta-label">微服务:</span><strong class="env-meta-value">' + esc(serviceTitle(services.find((item) => item.id === env.service_id) || { id: env.service_id, title: env.service_id }) || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">Region:</span><strong class="env-meta-value">' + esc(env.region_label || env.region || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">集群:</span><strong class="env-meta-value">' + esc(env.cluster_name || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">负载:</span><strong class="env-meta-value">' + esc(env.workload_name || "—") + "</strong></div>" +
@@ -2336,7 +2360,9 @@ function renderEnvironments() {
   const grid = $("envGrid");
   if (!grid) return;
   if (!environments.length) {
-    grid.innerHTML = '<p class="env-empty">还没有环境。点左上角「创建环境」添加。</p>';
+    grid.innerHTML = isAllServices()
+      ? '<p class="env-empty">请先选择一个微服务，再管理它的环境。</p>'
+      : '<p class="env-empty">当前微服务还没有环境。点左上角「创建环境」添加。</p>';
     return;
   }
   grid.innerHTML = environments.map(envCardHtml).join("");
@@ -2353,17 +2379,30 @@ function renderEnvironments() {
 }
 async function loadEnvironments() {
   setEnvError("");
-  const data = await api("/api/environments");
+  if (isAllServices() || !currentServiceId) {
+    environments = [];
+    renderEnvironments();
+    return;
+  }
+  const data = await api("/api/environments?service_id=" + encodeURIComponent(currentServiceId));
   environments = data.environments || [];
   renderEnvironments();
 }
 function openEnvCreate() {
+  if (isAllServices() || !currentService()) {
+    setEnvError("请先选择一个微服务，再创建它的环境。");
+    return;
+  }
   openEnvOverlay(emptyEnvDraft());
 }
 async function saveEnvironment() {
   setEnvFormError("");
   const payload = collectEnvForm();
   if (!envEditingId) {
+    if (!payload.service_id) {
+      setEnvFormError("请先选择一个微服务");
+      return;
+    }
     if (!payload.jump_password) {
       setEnvFormError("跳板机密码必填");
       return;
@@ -2522,6 +2561,7 @@ window.addEventListener("hashchange", async () => {
       else if (parsed.tab !== tab) setTab(parsed.tab);
       else if (tab === "history") refreshHistory().catch(() => {});
       else if (tab === "artifacts") refreshArtifacts().catch(() => {});
+      else if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
       return;
     }
     if (parsed.job) {
@@ -2537,6 +2577,7 @@ window.addEventListener("hashchange", async () => {
       refreshServiceOccupancy().catch(() => {});
       if (tab === "history") refreshHistory().catch(() => {});
       else if (tab === "artifacts") refreshArtifacts().catch(() => {});
+      else if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
     }
     return;
   }

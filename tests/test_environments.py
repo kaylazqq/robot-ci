@@ -63,6 +63,7 @@ class EnvironmentApiTests(unittest.TestCase):
 
         payload = {
             "name": "联调",
+            "service_id": "semantic-schedule",
             "region": "cn-southwest-2",
             "cluster_name": "AgentPlatform",
             "workload_name": "semantic-schedule",
@@ -79,6 +80,7 @@ class EnvironmentApiTests(unittest.TestCase):
         ) as response:
             created = json.loads(response.read().decode())["environment"]
         self.assertEqual("联调", created["name"])
+        self.assertEqual("semantic-schedule", created["service_id"])
         self.assertEqual("贵阳一", created["region_label"])
         self.assertEqual(["172.31.8.33", "172.31.22.203"], created["nodes"])
         self.assertTrue(created["has_jump_password"])
@@ -95,6 +97,7 @@ class EnvironmentApiTests(unittest.TestCase):
         ) as response:
             updated = json.loads(response.read().decode())["environment"]
         self.assertEqual("service-router", updated["workload_name"])
+        self.assertEqual("semantic-schedule", updated["service_id"])
         self.assertNotIn("jump_password", updated)
         self.assertNotIn("node_password", updated)
         stored = server.get_environment(created["id"], include_secrets=True)
@@ -104,6 +107,13 @@ class EnvironmentApiTests(unittest.TestCase):
         with self._open("/api/environments", cookie=cookie) as response:
             listed = json.loads(response.read().decode())["environments"]
         self.assertEqual(1, len(listed))
+        self.assertEqual("semantic-schedule", listed[0]["service_id"])
+        with self._open("/api/environments?service_id=semantic-schedule", cookie=cookie) as response:
+            scoped = json.loads(response.read().decode())["environments"]
+        self.assertEqual(1, len(scoped))
+        with self._open("/api/environments?service_id=memory-service", cookie=cookie) as response:
+            other = json.loads(response.read().decode())["environments"]
+        self.assertEqual([], other)
         self.assertNotIn("jump_password", listed[0])
         self.assertNotIn("node_password", listed[0])
 
@@ -146,6 +156,7 @@ class EnvironmentApiTests(unittest.TestCase):
                 data=json.dumps(
                     {
                         "name": "no-pass",
+                        "service_id": "semantic-schedule",
                         "region": "cn-southwest-2",
                         "cluster_name": "x",
                         "workload_name": "y",
@@ -158,3 +169,74 @@ class EnvironmentApiTests(unittest.TestCase):
             )
         self.assertEqual(400, failed.exception.code)
         self.assertIn("密码", json.loads(failed.exception.read().decode())["error"])
+
+    def test_create_requires_known_service(self) -> None:
+        cookie = self._login()
+        base = {
+            "name": "no-svc",
+            "region": "cn-southwest-2",
+            "cluster_name": "x",
+            "workload_name": "y",
+            "jump_host": "jump",
+            "jump_password": "j",
+            "node_password": "n",
+        }
+        with self.assertRaises(HTTPError) as missing:
+            self._open(
+                "/api/environments",
+                data=json.dumps(base).encode(),
+                method="POST",
+                cookie=cookie,
+            )
+        self.assertEqual(400, missing.exception.code)
+        self.assertIn("微服务", json.loads(missing.exception.read().decode())["error"])
+        with self.assertRaises(HTTPError) as unknown:
+            self._open(
+                "/api/environments",
+                data=json.dumps({**base, "service_id": "not-a-service"}).encode(),
+                method="POST",
+                cookie=cookie,
+            )
+        self.assertEqual(400, unknown.exception.code)
+        self.assertIn("未知", json.loads(unknown.exception.read().decode())["error"])
+
+    def test_backfills_service_id_from_workload_name(self) -> None:
+        server.init_store()
+        now = "2026-09-10 14:26:00"
+        with server._db_lock:
+            conn = server._connect_db()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO environments (
+                        id, name, service_id, region, region_label, cluster_name, workload_name,
+                        jump_host, jump_password, node_password, nodes_json,
+                        created_by, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy1",
+                        "liusong-dev-gamma",
+                        "",
+                        "cn-southwest-2",
+                        "贵阳一",
+                        "liusong-dev-gamma",
+                        "semantic-schedule",
+                        "116.63.173.182",
+                        "j",
+                        "n",
+                        "[]",
+                        "l00855954",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        server.init_store()
+        stored = server.get_environment("legacy1")
+        self.assertIsNotNone(stored)
+        self.assertEqual("semantic-schedule", stored["service_id"])
+        self.assertEqual(1, len(server.list_environments("semantic-schedule")))
+        self.assertEqual([], server.list_environments("memory-service"))
