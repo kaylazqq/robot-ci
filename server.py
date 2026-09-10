@@ -4521,6 +4521,7 @@ def build_from_source(
         "AGENTLINK_IMAGE",
         "AGENTOPS_IMAGE",
         "OPS_CONSOLE_IMAGE",
+        "LOG_AGENT_IMAGE",
         "MULTICA_SERVER_IMAGE",
         "FLEET_IMAGE",
         "LLM_GATEWAY_IMAGE",
