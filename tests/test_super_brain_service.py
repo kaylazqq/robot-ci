@@ -11,29 +11,32 @@ from cid_config import load_cid_config
 ROOT = Path(__file__).resolve().parents[1]
 
 
-class LogAgentServiceTests(unittest.TestCase):
-    def test_log_agent_is_registered_for_image_and_pytest(self) -> None:
+class SuperBrainServiceTests(unittest.TestCase):
+    def test_super_brain_is_registered_for_image_and_pytest(self) -> None:
         plans = json.loads((ROOT / "test-plans.json").read_text(encoding="utf-8"))
         catalog = json.loads((ROOT / "test-suites" / "catalog.json").read_text(encoding="utf-8"))
         services = json.loads((ROOT / "services.json").read_text(encoding="utf-8"))
 
-        item = next(service for service in services if service["id"] == "log-agent")
-        self.assertEqual("l-98761/log-agent", item["repo"])
-        self.assertEqual("https://github.com/l-98761/log-agent.git", item["github"])
+        item = next(service for service in services if service["id"] == "super-brain")
+        self.assertEqual("censong574-spec/super-brain", item["repo"])
+        self.assertEqual("https://github.com/censong574-spec/super-brain.git", item["github"])
         self.assertEqual("main", item["default_branch"])
-        self.assertEqual("log-agent", item["image"])
-        self.assertEqual("log-agent_", item["tar_prefix"])
+        self.assertEqual("super-brain", item["image"])
+        self.assertEqual("super-brain_", item["tar_prefix"])
         self.assertEqual(["python"], item["base_image_targets"])
+        self.assertFalse(any(service["id"] == "log-agent" for service in services))
 
-        self.assertEqual("log-agent-pytest", plans["services"]["log-agent"])
-        command = plans["profiles"]["log-agent-pytest"]["commands"][0]["command"]
+        self.assertEqual("super-brain-pytest", plans["services"]["super-brain"])
+        self.assertNotIn("log-agent", plans["services"])
+        command = plans["profiles"]["super-brain-pytest"]["commands"][0]["command"]
         self.assertIn("pytest -q tests", command)
-        self.assertIn("log-agent", catalog["services"])
-        roots = catalog["services"]["log-agent"]["roots"]
+        self.assertIn("super-brain", catalog["services"])
+        self.assertNotIn("log-agent", catalog["services"])
+        roots = catalog["services"]["super-brain"]["roots"]
         self.assertIn("tests", roots)
 
     def test_cid_build_uses_package_script(self) -> None:
-        svc = {"id": "log-agent", "image": "log-agent"}
+        svc = {"id": "super-brain", "image": "super-brain"}
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / ".cid").mkdir()
@@ -41,13 +44,13 @@ class LogAgentServiceTests(unittest.TestCase):
                 """
 version: 1
 service:
-  id: log-agent
-  name: log-agent
+  id: super-brain
+  name: super-brain
   language: python
-  image: log-agent
+  image: super-brain
 scripts:
   - id: ut
-    name: log-agent pytest UT
+    name: super-brain pytest UT
     type: test
     test_type: ut
     enabled: true
@@ -75,7 +78,7 @@ artifacts:
             )
             (repo / "build" / "package").mkdir(parents=True)
             (repo / "build" / "package" / "build.sh").write_text("#!/bin/bash\n", encoding="utf-8")
-            cid = load_cid_config(repo, "log-agent")
+            cid = load_cid_config(repo, "super-brain")
             self.assertIsNotNone(cid)
             with patch.object(server, "repo_dir", return_value=repo), patch.object(
                 server, "host_path", side_effect=lambda path: str(path)
@@ -90,8 +93,9 @@ artifacts:
             self.assertTrue(ok, detail)
             command = run_stream.call_args.args[1][-1]
             self.assertIn("bash build/package/build.sh", command)
-            self.assertIn("LOG_AGENT_IMAGE=", command)
-            self.assertIn("local/log-agent:202609101800_abc1234", command)
+            self.assertIn("SUPER_BRAIN_IMAGE=", command)
+            self.assertNotIn("LOG_AGENT_IMAGE=", command)
+            self.assertIn("local/super-brain:202609101800_abc1234", command)
 
 
 if __name__ == "__main__":
