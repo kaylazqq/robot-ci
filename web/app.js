@@ -1,30 +1,4 @@
-const RUN_POPUP_IDS = {
-  pageRun: 1,
-  previewBranch: 1,
-  previewBranchValue: 1,
-  previewBranchPicker: 1,
-  previewBranchMenu: 1,
-  btnRefreshPreviewBranches: 1,
-  previewBranchStatus: 1,
-  runJobPipeline: 1,
-  previewRunHint: 1,
-  btnRunPreviewConfirm: 1,
-  btnRunPreviewCancel: 1,
-};
-let runPopupWin = null;
-let runPopupDoc = null;
-function runPopupOpen() {
-  return !!(runPopupWin && runPopupDoc && !runPopupWin.closed);
-}
-function $(id) {
-  try {
-    if (RUN_POPUP_IDS[id] && runPopupOpen()) {
-      const el = runPopupDoc.getElementById(id);
-      if (el) return el;
-    }
-  } catch (_) {}
-  return document.getElementById(id);
-}
+const $ = (id) => document.getElementById(id);
 const DAEMON_VERSION_KEY = "robotCiDaemonVersion";
 const DAEMON_VERSION_PATTERN = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
 const SERVICE_KEY = "robotCiService";
@@ -334,7 +308,6 @@ function applyServiceChrome() {
   const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
   if (pipeBtn) pipeBtn.hidden = all;
   if ($("pageBuild")) $("pageBuild").hidden = nav !== "build";
-  if (document.getElementById("pageRun")) document.getElementById("pageRun").hidden = true;
   if (!$("viewPipeline")) return;
   $("viewPipeline").hidden = tab !== "pipeline";
   if ($("viewHistory")) $("viewHistory").hidden = tab !== "history";
@@ -748,124 +721,25 @@ async function loadPreviewBranches(force) {
     picker.setDisabled(false);
   }
 }
-function runPopupStyleLinks() {
-  return Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map((link) => {
-    return '<link rel="stylesheet" href="' + link.href + '">';
-  }).join("");
-}
-function runPopupMarkup() {
-  return "<!DOCTYPE html><html class=\"is-run-window\"><head><meta charset=\"UTF-8\"><title>运行</title>" +
-    runPopupStyleLinks() +
-    "</head><body class=\"is-run-window\"><div class=\"app is-run-window\"><div class=\"workspace\">" +
-    "<section class=\"page page-run\" id=\"pageRun\">" +
-    "<div class=\"run-block\"><label class=\"label\" for=\"previewBranch\">选择分支</label>" +
-    "<div class=\"run-branch-row\"><div class=\"branch-picker\" id=\"previewBranchPicker\">" +
-    "<button type=\"button\" class=\"input branch-trigger\" id=\"previewBranch\" aria-haspopup=\"listbox\" aria-expanded=\"false\">" +
-    "<span id=\"previewBranchValue\"></span>" +
-    "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M7 10l5 5 5-5\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>" +
-    "</button><div class=\"branch-menu\" id=\"previewBranchMenu\" role=\"listbox\" hidden></div></div>" +
-    "<button type=\"button\" class=\"icon-btn\" id=\"btnRefreshPreviewBranches\" title=\"刷新\" aria-label=\"刷新\">" +
-    "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\"/>" +
-    "<path d=\"M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/></svg>" +
-    "</button></div><p class=\"branch-status\" id=\"previewBranchStatus\" hidden></p></div>" +
-    "<div class=\"run-block run-block-tasks\"><label class=\"label\">选择任务</label>" +
-    "<section class=\"job-pipeline\" id=\"runJobPipeline\" aria-label=\"选择任务\"></section>" +
-    "<p class=\"hint error\" id=\"previewRunHint\" hidden></p></div>" +
-    "<div class=\"run-page-footer\">" +
-    "<button type=\"button\" class=\"btn primary\" id=\"btnRunPreviewConfirm\">确认</button>" +
-    "<button type=\"button\" class=\"btn ghost\" id=\"btnRunPreviewCancel\">取消</button>" +
-    "</div></section></div></div></body></html>";
+function runLayerOpen() {
+  const layer = $("runLayer");
+  return !!(layer && !layer.hidden);
 }
 function closeRunPopup() {
-  const win = runPopupWin;
-  runPopupWin = null;
-  runPopupDoc = null;
   previewBranchPicker = null;
-  if (win && !win.closed) {
-    try { win.close(); } catch (_) {}
-  }
-}
-function resetRunPopupState() {
-  runPreviewActive = false;
-  runPreviewSelection = { deploy: false, test: false, environmentId: "" };
-  previewBranchPicker = null;
-  runPopupWin = null;
-  runPopupDoc = null;
+  const layer = $("runLayer");
+  if (layer) layer.hidden = true;
+  document.body.classList.remove("run-open");
 }
 function openRunWindow() {
   const svc = currentService();
   if (!svc || serviceActiveJobId) return;
-  if (runPopupOpen()) {
-    try { runPopupWin.focus(); } catch (_) {}
-    return;
-  }
-  const width = Math.min(1680, Math.max(1280, (screen.availWidth || 1440) - 32));
-  const height = Math.min(940, Math.max(780, (screen.availHeight || 860) - 32));
-  const left = Math.max(0, Math.floor(((screen.availWidth || width) - width) / 2));
-  const top = Math.max(0, Math.floor(((screen.availHeight || height) - height) / 2));
-  const features = [
-    "popup=yes",
-    "width=" + width,
-    "height=" + height,
-    "left=" + left,
-    "top=" + top,
-    "resizable=yes",
-    "scrollbars=yes",
-    "location=no",
-    "toolbar=no",
-    "menubar=no",
-    "status=no",
-  ].join(",");
-  const win = window.open("", "robot-ci-run-popup", features);
-  if (!win) {
-    alert("浏览器拦截了新窗口，请允许弹窗后重试");
-    return;
-  }
-  const paint = () => {
-    try {
-      win.document.open();
-      win.document.write(runPopupMarkup());
-      win.document.close();
-    } catch (_) {
-      return false;
-    }
-    return !!win.document.getElementById("pageRun");
-  };
-  const bind = () => {
-    runPopupWin = win;
-    runPopupDoc = win.document;
-    if (win.document.documentElement.dataset.runBound === "1") return;
-    win.document.documentElement.dataset.runBound = "1";
-    win.addEventListener("beforeunload", () => {
-      if (runPopupWin !== win) return;
-      resetRunPopupState();
-      updateActionButtons();
-    });
-    win.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") cancelRunPreview();
-    });
-    const confirmBtn = runPopupDoc.getElementById("btnRunPreviewConfirm");
-    const cancelBtn = runPopupDoc.getElementById("btnRunPreviewCancel");
-    const refreshBtn = runPopupDoc.getElementById("btnRefreshPreviewBranches");
-    if (confirmBtn) confirmBtn.addEventListener("click", () => confirmRunPreview());
-    if (cancelBtn) cancelBtn.addEventListener("click", () => cancelRunPreview());
-    if (refreshBtn) refreshBtn.addEventListener("click", () => loadPreviewBranches(true));
-    enterRunPage();
-  };
-  if (paint()) {
-    bind();
-  } else {
-    const url = URL.createObjectURL(new Blob([runPopupMarkup()], { type: "text/html;charset=utf-8" }));
-    const ready = () => {
-      if (!win.document.getElementById("pageRun")) return;
-      bind();
-      URL.revokeObjectURL(url);
-    };
-    try { win.location.replace(url); } catch (_) {}
-    win.addEventListener("load", ready);
-    setTimeout(ready, 80);
-  }
-  try { win.focus(); } catch (_) {}
+  const layer = $("runLayer");
+  if (!layer) return;
+  if (runLayerOpen()) return;
+  layer.hidden = false;
+  document.body.classList.add("run-open");
+  enterRunPage();
 }
 function enterRunPage() {
   runPreviewActive = true;
@@ -879,17 +753,12 @@ function enterRunPage() {
   }).catch((e) => setPreviewHint(e.message || "加载环境失败"));
   loadPreviewBranches(false);
 }
-function cancelRunPreview(opts) {
-  if (!runPreviewActive && !runPopupOpen()) return;
+function cancelRunPreview() {
+  if (!runPreviewActive && !runLayerOpen()) return;
   runPreviewActive = false;
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
   setPreviewHint("");
-  if (!(opts && opts.keepWindow)) closeRunPopup();
-  else {
-    previewBranchPicker = null;
-    runPopupWin = null;
-    runPopupDoc = null;
-  }
+  closeRunPopup();
   applyServiceChrome();
   applyJob(currentJob);
   updateActionButtons();

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>集成开发平台</title>
-  <link rel="stylesheet" href="/styles.css?v=202609129" />
+  <link rel="stylesheet" href="/styles.css?v=202609130" />
 </head>
 <body>
   <div id="loginGate" class="login-gate" hidden>
@@ -224,6 +224,36 @@
     </div>
   </div>
 
+  <div id="runLayer" class="run-layer" hidden>
+    <section class="page page-run" id="pageRun">
+      <div class="run-block">
+        <label class="label" for="previewBranch">选择分支</label>
+        <div class="run-branch-row">
+          <div class="branch-picker" id="previewBranchPicker">
+            <button type="button" class="input branch-trigger" id="previewBranch" aria-haspopup="listbox" aria-expanded="false">
+              <span id="previewBranchValue"></span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="branch-menu" id="previewBranchMenu" role="listbox" hidden></div>
+          </div>
+          <button type="button" class="icon-btn" id="btnRefreshPreviewBranches" title="刷新" aria-label="刷新">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <p class="branch-status" id="previewBranchStatus" hidden></p>
+      </div>
+      <div class="run-block run-block-tasks">
+        <label class="label">选择任务</label>
+        <section class="job-pipeline" id="runJobPipeline" aria-label="选择任务"></section>
+        <p class="hint error" id="previewRunHint" hidden></p>
+      </div>
+      <div class="run-page-footer">
+        <button type="button" class="btn primary" id="btnRunPreviewConfirm">确认</button>
+        <button type="button" class="btn ghost" id="btnRunPreviewCancel">取消</button>
+      </div>
+    </section>
+  </div>
+
   <div class="env-overlay" id="envOverlay" hidden>
     <div class="env-overlay-backdrop" data-env-close></div>
     <section class="env-overlay-page" role="dialog" aria-modal="true" aria-labelledby="envOverlayTitle">
@@ -261,6 +291,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=202609129"></script>
+  <script src="/app.js?v=202609130"></script>
 </body>
 </html>
