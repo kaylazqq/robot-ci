@@ -306,21 +306,25 @@ html.is-run-window #pageSwr { display: none !important; }
   background: var(--surface-alt);
 }
 .toolbar-3 strong { color: var(--text); font-weight: 600; }
-.svc-picker {
+.svc-picker,
+.tpl-picker {
   position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 280px;
 }
 .svc-select-label {
+  width: 3.2em;
+  flex: none;
   color: var(--muted);
   font-size: 14px;
   white-space: nowrap;
 }
-.svc-trigger {
+.svc-trigger,
+.tpl-trigger {
+  width: 220px;
   min-width: 220px;
-  max-width: 360px;
+  max-width: 220px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -332,11 +336,18 @@ html.is-run-window #pageSwr { display: none !important; }
   cursor: pointer;
   color: var(--text);
 }
+.svc-trigger > span,
+.tpl-trigger > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .svc-trigger svg { width: 16px; height: 16px; color: var(--muted); flex: none; }
 .svc-trigger[aria-expanded="true"] { border-color: var(--blue); }
 .svc-menu {
   position: absolute;
-  left: 52px;
+  left: calc(3.2em + 8px);
   top: calc(100% + 10px);
   width: 320px;
   background: var(--surface);
@@ -457,23 +468,11 @@ html.is-run-window #pageSwr { display: none !important; }
 }
 #pageBuild #viewPipeline { padding: 18px 0 24px; }
 #pageBuild .pipeline-blank { margin: 0 20px; }
-.tpl-picker {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-right: 8px;
-}
-.tpl-trigger {
-  min-width: 200px;
-  max-width: 280px;
-  padding: 6px 10px;
-}
 .tpl-menu {
   position: absolute;
-  left: 46px;
+  left: calc(3.2em + 8px);
   top: calc(100% + 8px);
-  width: 260px;
+  width: 220px;
   max-height: 280px;
   overflow: auto;
   background: var(--surface);
