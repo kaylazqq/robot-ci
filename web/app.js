@@ -320,11 +320,6 @@ function applyServiceChrome() {
       ? "全量构建记录。点「查看」打开该次流水线。"
       : "当前微服务的构建记录。点「查看」打开该次流水线。";
   }
-  if ($("artifactsHint")) {
-    $("artifactsHint").textContent = all
-      ? "全量产物记录。磁盘清理后包文件会显示为已失效，记录仍保留。"
-      : "当前微服务的产物记录。磁盘清理后包文件会显示为已失效，记录仍保留。";
-  }
   const createBtn = $("btnEnvCreate");
   if (createBtn) createBtn.hidden = all;
   renderFavoriteServices();

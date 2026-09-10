@@ -473,6 +473,7 @@ html.is-run-window #pageSwr { display: none !important; }
   gap: 12px;
   margin-bottom: 10px;
 }
+.list-head-actions { justify-content: flex-end; }
 
 .art-table-wrap {
   overflow-x: auto;
