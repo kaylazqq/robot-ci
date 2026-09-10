@@ -1196,6 +1196,7 @@ textarea { resize: vertical; min-height: 88px; }
   place-items: center;
   padding: 24px;
 }
+.env-overlay[hidden] { display: none !important; }
 .env-overlay-backdrop {
   position: absolute;
   inset: 0;

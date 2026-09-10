@@ -147,6 +147,7 @@ function isPublicAuthPath(path) {
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     credentials: "same-origin",
+    cache: "no-store",
     headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
     ...opts,
   });
@@ -2326,6 +2327,13 @@ function openEnvOverlay(env) {
   syncEnvOverlayLock();
   if ($("envRegion")) $("envRegion").focus();
 }
+function upsertEnvironment(item) {
+  if (!item || !item.id) return;
+  const idx = environments.findIndex((env) => env.id === item.id);
+  if (idx >= 0) environments[idx] = { ...environments[idx], ...item };
+  else environments = [item, ...environments];
+}
+
 function renderEnvironments() {
   const grid = $("envGrid");
   if (!grid) return;
@@ -2368,9 +2376,15 @@ async function saveEnvironment() {
     }
   }
   const path = envEditingId ? "/api/environments/" + encodeURIComponent(envEditingId) : "/api/environments";
-  await api(path, { method: "POST", body: JSON.stringify(payload) });
+  const data = await api(path, { method: "POST", body: JSON.stringify(payload) });
+  upsertEnvironment(data.environment);
   closeEnvOverlay();
-  await loadEnvironments();
+  renderEnvironments();
+  try {
+    await loadEnvironments();
+  } catch (e) {
+    setEnvError(e.message);
+  }
 }
 let envConfirmResolver = null;
 function closeEnvConfirm(ok) {
@@ -2401,7 +2415,13 @@ async function deleteEnvironment(id) {
   setEnvError("");
   await api("/api/environments/" + encodeURIComponent(id) + "/delete", { method: "POST", body: "{}" });
   if (envEditingId === id) envEditingId = "";
-  await loadEnvironments();
+  environments = environments.filter((item) => item.id !== id);
+  renderEnvironments();
+  try {
+    await loadEnvironments();
+  } catch (e) {
+    setEnvError(e.message);
+  }
 }
 
 function bind(id, fn) {
