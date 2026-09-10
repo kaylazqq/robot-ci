@@ -1088,7 +1088,6 @@ textarea { resize: vertical; min-height: 88px; }
   gap: 16px;
   margin: 12px 0 16px;
 }
-.env-scope-hint { margin: 0; }
 .env-create-btn {
   display: inline-flex;
   align-items: center;

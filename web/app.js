@@ -337,11 +337,6 @@ function applyServiceChrome() {
   }
   const createBtn = $("btnEnvCreate");
   if (createBtn) createBtn.hidden = all;
-  if ($("envHint")) {
-    $("envHint").textContent = all
-      ? "环境属于单个微服务。请先在上方选择微服务，再查看或创建它的环境。"
-      : "当前微服务的部署环境。构建时只能选用这些环境。";
-  }
   renderFavoriteServices();
 }
 
