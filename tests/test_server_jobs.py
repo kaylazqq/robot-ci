@@ -513,6 +513,31 @@ class JobPipelineTests(unittest.TestCase):
         self.assertNotIn("push", step_ids)
         statuses = {step["id"]: step["status"] for step in payload["pipeline"]["steps"]}
         self.assertEqual("running", statuses["archive"])
+        self.assertEqual("skipped", statuses.get("gamma", "skipped"))
+
+    def test_gamma_optional_steps_default_skipped(self) -> None:
+        job = make_job("pipe-gamma", status="ok")
+        job["stage"] = "done"
+        job["results"] = [{"service_id": "memory-service", "ok": True}]
+        payload = server.job_payload(job, compact=True)
+        steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
+        self.assertIn("gamma", steps)
+        self.assertEqual("skipped", steps["gamma"]["status"])
+        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
+        self.assertEqual("skipped", sub["deploy"])
+        self.assertEqual("skipped", sub["test"])
+
+    def test_gamma_optional_steps_selected_done(self) -> None:
+        job = make_job("pipe-gamma-on", status="ok")
+        job["stage"] = "done"
+        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": False}
+        job["results"] = [{"service_id": "memory-service", "ok": True}]
+        payload = server.job_payload(job, compact=True)
+        steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
+        self.assertEqual("done", steps["gamma"]["status"])
+        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
+        self.assertEqual("done", sub["deploy"])
+        self.assertEqual("skipped", sub["test"])
 
     def test_failed_sync_marks_first_step_failed(self) -> None:
         job = make_job("pipe-fail", status="failed")

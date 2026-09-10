@@ -21,8 +21,12 @@ let viewGeneration = 0;
 let sessionLive = false;
 let logCursor = 0;
 let submitting = false;
-let hwCloudCreds = null;
-let cceRegionsLoaded = false;
+let environments = [];
+let envDraftOpen = false;
+let envEditingId = "";
+let runPreviewActive = false;
+let runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+let previewBranchPicker = null;
 let svcMenuPage = 1;
 const SVC_PAGE_SIZE = 8;
 const branchCache = {};
@@ -211,6 +215,9 @@ function endSession() {
 
 function showLogin(message) {
   if (sessionLive) endSession();
+  cancelRunPreview();
+  closeEnvConfirm(false);
+  closeEnvOverlay();
   $("appShell").hidden = true;
   $("loginGate").hidden = false;
   if ($("loginError")) {
@@ -265,29 +272,46 @@ function closeUserMenu() {
   if (btn) btn.setAttribute("aria-expanded", "false");
 }
 
+function isBuildListTab(name) {
+  return name === "history" || name === "artifacts" || name === "envs";
+}
+function normalizeBuildTab(next) {
+  return isBuildListTab(next) ? next : "pipeline";
+}
+function allServicesFallbackTab(next) {
+  if (next === "artifacts" || next === "envs") return next;
+  return "history";
+}
+
 function setNav(next, skipHash) {
-  nav = next === "swr" || next === "cce" ? next : "build";
+  nav = next === "swr" ? "swr" : "build";
   document.querySelectorAll(".nav-item").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.nav === nav);
   });
   $("pageSwr").hidden = nav !== "swr";
   $("pageBuild").hidden = nav !== "build";
-  $("pageCce").hidden = nav !== "cce";
+  if (nav !== "build" || tab !== "envs") {
+    closeEnvConfirm(false);
+    closeEnvOverlay();
+  }
+  if (nav !== "build") cancelRunPreview();
   renderFavoriteServices();
-  if (nav === "cce") initCceView().catch(() => {});
   if (!skipHash) writeHash();
 }
 
 function applyServiceChrome() {
   const all = isAllServices();
+  const envTab = tab === "envs";
   document.querySelectorAll(".history-table, .artifacts-table").forEach((table) => {
     table.classList.toggle("show-service-column", all);
   });
   const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
   if (pipeBtn) pipeBtn.hidden = all;
+  if ($("svcPicker")) $("svcPicker").hidden = envTab;
   $("viewPipeline").hidden = tab !== "pipeline";
   $("viewHistory").hidden = tab !== "history";
   $("viewArtifacts").hidden = tab !== "artifacts";
+  if ($("viewEnvs")) $("viewEnvs").hidden = !envTab;
   $("pipelineActions").hidden = all || tab !== "pipeline";
   $("jobMetaBar").hidden = all || tab !== "pipeline";
   if ($("historyHint")) {
@@ -308,17 +332,24 @@ function jobIsLive(job) {
 
 function setTab(next) {
   if (!sessionLive) return;
-  if (isAllServices() && next !== "history" && next !== "artifacts") next = "history";
-  const nextTab = next === "history" || next === "artifacts" ? next : "pipeline";
+  if (isAllServices() && next !== "history" && next !== "artifacts" && next !== "envs") next = "history";
+  const nextTab = normalizeBuildTab(next);
   const changed = tab !== nextTab;
   tab = nextTab;
   document.querySelectorAll(".subtab[data-tab]").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tab === tab);
   });
   applyServiceChrome();
+  renderFavoriteServices();
+  if (tab !== "pipeline") cancelRunPreview();
+  if (tab !== "envs") {
+    closeEnvConfirm(false);
+    closeEnvOverlay();
+  }
   if (changed) {
     if (tab === "history") refreshHistory().catch(() => {});
     if (tab === "artifacts") refreshArtifacts().catch(() => {});
+    if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
     if (tab === "pipeline" && !isAllServices()) {
       if (pinnedJobId) {
         if (currentJobId !== pinnedJobId) openJob(pinnedJobId).catch(() => {});
@@ -351,11 +382,12 @@ function writeHash() {
 function readHash() {
   const raw = (location.hash || "").replace(/^#\/?/, "");
   const parts = raw.split("/").filter(Boolean);
-  if (parts[0] === "swr" || parts[0] === "cce") return { nav: parts[0], service: "", tab: "pipeline", job: "" };
+  if (parts[0] === "cce" || parts[0] === "envs") return { nav: "build", service: "", tab: "envs", job: "" };
+  if (parts[0] === "swr") return { nav: "swr", service: "", tab: "pipeline", job: "" };
   const service = decodeURIComponent(parts[1] || "");
   let nextTab = "pipeline";
   let job = "";
-  if (parts[2] === "history" || parts[2] === "artifacts") nextTab = parts[2];
+  if (parts[2] === "history" || parts[2] === "artifacts" || parts[2] === "envs") nextTab = parts[2];
   else if (parts[2] === "job" && parts[3]) job = decodeURIComponent(parts[3]);
   return { nav: "build", service, tab: nextTab, job };
 }
@@ -383,7 +415,7 @@ function updateActionButtons() {
   const svc = currentService();
   const live = jobIsLive(currentJob);
   const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
-  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId;
+  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runPreviewActive;
   $("btnStop").disabled = !live || stopping;
   $("btnParams").disabled = !(svc && svc.requires_version);
 }
@@ -431,6 +463,8 @@ const PIPELINE_TASK_LABELS = {
   push: "推送镜像",
   "push:verify": "推送确认",
   save: "归档镜像",
+  "gamma:deploy": "gamma部署",
+  "gamma:test": "gamma测试",
 };
 const HIDDEN_PIPELINE_TASKS = {
   prepare: new Set(["swr", "ps"]),
@@ -568,6 +602,156 @@ function buildPipelineStages(pipeline, jobStatus) {
   }
   return stages;
 }
+function isSelectablePreviewTask(stageId, taskId) {
+  return runPreviewActive && stageId === "gamma" && (taskId === "deploy" || taskId === "test");
+}
+function previewTaskChecked(taskId) {
+  return taskId === "deploy" ? !!runPreviewSelection.deploy : !!runPreviewSelection.test;
+}
+function createPreviewCheck(taskId) {
+  const box = document.createElement("button");
+  box.type = "button";
+  box.className = "pl-check" + (previewTaskChecked(taskId) ? " is-on" : "");
+  box.setAttribute("aria-pressed", previewTaskChecked(taskId) ? "true" : "false");
+  box.setAttribute("aria-label", taskId === "deploy" ? "选择 gamma部署" : "选择 gamma测试");
+  box.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17.5 19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  box.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    togglePreviewTask(taskId);
+  });
+  return box;
+}
+function togglePreviewTask(taskId) {
+  if (taskId === "deploy") runPreviewSelection.deploy = !runPreviewSelection.deploy;
+  if (taskId === "test") runPreviewSelection.test = !runPreviewSelection.test;
+  renderRunPreview();
+}
+function previewPipelineData() {
+  const task = (id, label) => ({ id, label, status: "pending" });
+  return {
+    prepare: [task("env", "检查环境"), task("slot", "等待并发槽位"), task("adir", "归档目录")],
+    steps: [
+      { id: "sync", label: "拉代码", status: "pending", subtasks: [task("clone", "克隆仓库"), task("sha", "记录提交")] },
+      { id: "test", label: "测试执行", status: "pending", subtasks: [task("plan", "加载build.yaml"), task("runner", "启动测试"), task("ut-cases", "执行UT"), task("dt-cases", "执行DT")] },
+      { id: "build", label: "构建镜像", status: "pending", subtasks: [task("script", "执行构建脚本"), task("docker", "Docker构建"), task("verify", "产物校验")] },
+      { id: "push", label: "推送 SWR", status: "pending", subtasks: [task("tag", "标记镜像"), task("push", "推送镜像"), task("verify", "推送确认")] },
+      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
+      { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
+    ],
+  };
+}
+function setPreviewHint(text) {
+  const el = $("previewRunHint");
+  if (!el) return;
+  el.hidden = !text;
+  el.textContent = text || "";
+}
+function renderRunPreview() {
+  const empty = $("pipelineEmpty");
+  const actions = $("pipelineRunActions");
+  if (empty) empty.hidden = true;
+  if (actions) actions.hidden = false;
+  renderJobPipeline("liveJobPipeline", previewPipelineData(), "", null);
+}
+function ensurePreviewBranchPicker() {
+  const root = $("previewBranchPicker");
+  if (!root) return null;
+  if (!previewBranchPicker) {
+    previewBranchPicker = createBranchPicker(root, {
+      trigger: "#previewBranch",
+      label: "#previewBranchValue",
+      menu: "#previewBranchMenu",
+    });
+  }
+  return previewBranchPicker;
+}
+async function loadPreviewBranches(force) {
+  const svc = currentService();
+  const picker = ensurePreviewBranchPicker();
+  const statusEl = $("previewBranchStatus");
+  const retryBtn = $("btnRefreshPreviewBranches");
+  if (!svc || !picker) return;
+  const fallbackBranch = svc.default_branch || "main";
+  const cached = branchCache[svc.id];
+  const setLoading = (loading) => {
+    if (retryBtn) retryBtn.classList.toggle("loading", loading);
+    picker.setDisabled(loading);
+    if (loading && statusEl) {
+      statusEl.textContent = "正在加载中";
+      statusEl.className = "branch-status";
+    }
+  };
+  const applyCached = (data, updated) => {
+    picker.setOptions(
+      data.branches,
+      data.selected_branch || fallbackBranch,
+      data.default_branch || fallbackBranch
+    );
+    if (!statusEl) return;
+    const n = (data.branches || []).length;
+    statusEl.textContent = updated
+      ? ("已更新" + n + "个分支")
+      : data.cached
+        ? ("已读取服务器缓存 " + n + " 个分支")
+        : "服务器暂无分支缓存，当前使用默认分支；点击刷新加载";
+    statusEl.className = "branch-status ok";
+  };
+  if (!force && cached && cached.loaded) {
+    const preferred = await preferredTemplateBranch(svc.id, cached.selected_branch || fallbackBranch);
+    applyCached({ ...cached, selected_branch: preferred }, false);
+    return;
+  }
+  setLoading(true);
+  try {
+    const data = await fetchServiceBranches(svc.id, !!force, true);
+    applyCached(data, !!force);
+  } catch (e) {
+    picker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
+    if (statusEl) {
+      statusEl.textContent = e.message || "加载分支失败";
+      statusEl.className = "branch-status error";
+    }
+    delete branchCache[svc.id];
+  } finally {
+    if (retryBtn) retryBtn.classList.remove("loading");
+    picker.setDisabled(false);
+  }
+}
+function beginRunPreview() {
+  const svc = currentService();
+  if (!svc || serviceActiveJobId) return;
+  setTab("pipeline");
+  runPreviewActive = true;
+  runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+  setPreviewHint("");
+  renderRunPreview();
+  updateActionButtons();
+  loadEnvironments().then(() => {
+    if (runPreviewActive) renderRunPreview();
+  }).catch((e) => setPreviewHint(e.message || "加载环境失败"));
+  loadPreviewBranches(false);
+}
+function cancelRunPreview() {
+  if (!runPreviewActive) {
+    if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
+    return;
+  }
+  runPreviewActive = false;
+  runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+  setPreviewHint("");
+  if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
+  applyJob(currentJob);
+  updateActionButtons();
+}
+function confirmRunPreview() {
+  const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
+  if (wantsGamma && !runPreviewSelection.environmentId) {
+    setPreviewHint("请先选择环境");
+    return;
+  }
+  const branch = (previewBranchPicker && previewBranchPicker.value) || "";
+  startRun(branch);
+}
 function createStatusIcon(status, kind) {
   const icon = document.createElement("span");
   icon.className = (kind || "pl-icon") + " is-" + (status || "pending");
@@ -577,7 +761,7 @@ function createStatusIcon(status, kind) {
 function createStageColumn(stage, incomingComplete, outgoingComplete, onStep) {
   const status = stage.status || "pending";
   const col = document.createElement("div");
-  col.className = "pl-col is-" + status;
+  col.className = "pl-col is-" + status + (stage.id === "gamma" ? " is-gamma" : "");
   col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
   const cap = document.createElement("div");
   cap.className = "pl-caption";
@@ -609,20 +793,61 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep) {
     const row = document.createElement("div");
     row.className = "pl-task is-" + (task.status || "pending");
     row.appendChild(document.createElement("span"));
-    row.appendChild(createStatusIcon(task.status, "pl-task-icon"));
+    if (isSelectablePreviewTask(stage.id, task.id)) {
+      row.classList.add("is-selectable");
+      row.appendChild(createPreviewCheck(task.id));
+    } else {
+      row.appendChild(createStatusIcon(task.status, "pl-task-icon"));
+    }
     const name = document.createElement("span");
     name.className = "pl-task-name";
     name.textContent = task.label || task.id || "";
     row.appendChild(name);
     row.addEventListener("click", (ev) => {
       ev.stopPropagation();
+      if (isSelectablePreviewTask(stage.id, task.id)) {
+        togglePreviewTask(task.id);
+        return;
+      }
       onStep && onStep(stage.id, task.id);
     });
     tree.appendChild(row);
   });
   drop.appendChild(tree);
+  if (runPreviewActive && stage.id === "gamma") {
+    drop.appendChild(createGammaEnvPicker());
+  }
   col.appendChild(drop);
   return col;
+}
+function createGammaEnvPicker() {
+  const wrap = document.createElement("div");
+  wrap.className = "pl-env-pick";
+  const label = document.createElement("div");
+  label.className = "pl-env-pick-label";
+  label.textContent = "选择环境";
+  wrap.appendChild(label);
+  if (!environments.length) {
+    const empty = document.createElement("p");
+    empty.className = "pl-env-pick-empty";
+    empty.textContent = "还没有环境，请先到环境管理创建";
+    wrap.appendChild(empty);
+    return wrap;
+  }
+  environments.forEach((env) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "pl-env-option" + (runPreviewSelection.environmentId === env.id ? " is-on" : "");
+    btn.textContent = env.name || "未命名环境";
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      runPreviewSelection.environmentId = env.id;
+      setPreviewHint("");
+      renderRunPreview();
+    });
+    wrap.appendChild(btn);
+  });
+  return wrap;
 }
 function createEndpoint(kind, lit) {
   const col = document.createElement("div");
@@ -670,11 +895,11 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep) {
   const isComplete = (stage) => Boolean(stage && stage.status === "done");
   // Start represents a job that has begun. Every following link represents
   // a hand-off and is filled only after its source stage has completed.
-  graph.appendChild(createEndpoint("start", true));
+  graph.appendChild(createEndpoint("start", !runPreviewActive));
   stages.forEach((stage, index) => {
     const previous = stages[index - 1];
-    const incomingComplete = index === 0 || isComplete(previous);
-    const outgoingComplete = isComplete(stage);
+    const incomingComplete = !runPreviewActive && (index === 0 || isComplete(previous));
+    const outgoingComplete = !runPreviewActive && isComplete(stage);
     graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep));
   });
   graph.appendChild(createEndpoint("end", isComplete(stages[stages.length - 1]) && status === "ok"));
@@ -850,7 +1075,7 @@ function renderFavoriteServices() {
   const favorites = favoriteServiceIds
     .map((id) => services.find((item) => item.id === id))
     .filter(Boolean);
-  container.hidden = nav !== "build" || !favorites.length;
+  container.hidden = nav !== "build" || tab === "envs" || !favorites.length;
   container.replaceChildren();
   favorites.forEach((item) => {
     const chip = document.createElement("button");
@@ -1044,7 +1269,7 @@ function selectService(id) {
     }
     writeHash();
     if (tab === "history") refreshHistory().catch(() => {});
-    else refreshArtifacts().catch(() => {});
+    else if (tab === "artifacts") refreshArtifacts().catch(() => {});
     return;
   }
   writeHash();
@@ -1053,7 +1278,7 @@ function selectService(id) {
   else {
     stopPolling();
     if (tab === "history") refreshHistory().catch(() => {});
-    else refreshArtifacts().catch(() => {});
+    else if (tab === "artifacts") refreshArtifacts().catch(() => {});
   }
 }
 function bindServicePicker() {
@@ -1133,6 +1358,7 @@ function stopPolling() {
 }
 
 function applyJob(job, { loading } = {}) {
+  if (runPreviewActive) return;
   if (job && !sessionLive) return;
   if (job && !isAllServices() && currentServiceId && !jobBelongsToService(job, currentServiceId)) return;
   currentJob = job;
@@ -1144,6 +1370,7 @@ function applyJob(job, { loading } = {}) {
   const hasJob = !!(job && job.id);
   if (!hasJob) {
     if (root) { root.hidden = true; root.replaceChildren(); }
+    if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
     if (empty) {
       empty.hidden = false;
       empty.textContent = loading ? "正在加载流水线…" : "当前服务无构建历史记录";
@@ -1323,10 +1550,10 @@ function fetchServiceBranches(serviceId, force, priority) {
   branchLoads[serviceId] = req;
   return req;
 }
-function createBranchPicker(root) {
-  const trigger = root.querySelector("#runBranch");
-  const label = root.querySelector("#runBranchValue");
-  const menu = root.querySelector("#runBranchMenu");
+function createBranchPicker(root, selectors) {
+  const trigger = root.querySelector((selectors && selectors.trigger) || "#runBranch");
+  const label = root.querySelector((selectors && selectors.label) || "#runBranchValue");
+  const menu = root.querySelector((selectors && selectors.menu) || "#runBranchMenu");
   let value = "";
   const close = () => {
     menu.hidden = true;
@@ -1533,9 +1760,16 @@ async function startRun(branch) {
         branch: branch || svc.default_branch || "main",
         version: rememberedDaemonVersion() || svc.last_version || "",
         login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
+        optional_steps: {
+          gamma_deploy: !!runPreviewSelection.deploy,
+          gamma_test: !!runPreviewSelection.test,
+          environment_id: runPreviewSelection.environmentId || "",
+        },
       }),
     });
     closeModal();
+    runPreviewActive = false;
+    if ($("pipelineRunActions")) $("pipelineRunActions").hidden = true;
     pinnedJobId = "";
     setTab("pipeline");
     await openJob(resp.job_id);
@@ -1928,93 +2162,221 @@ async function logoutSWR() {
   }
 }
 
-function updateHwCredStatus() {
-  const el = $("hwCredStatus");
+function setEnvError(text) {
+  const el = $("envError");
   if (!el) return;
-  el.textContent = hwCloudCreds ? "华为云凭证：已启用（仅本会话）" : "华为云凭证：未设置";
+  el.hidden = !text;
+  el.textContent = text || "";
 }
-function setCceControlsEnabled(enabled) {
-  ["btnCceRefreshClusters", "cceClusterSelect", "btnCceRefreshWorkloads"].forEach((id) => {
-    if ($(id)) $(id).disabled = !enabled;
+function setEnvFormError(text) {
+  const el = $("envFormError");
+  if (!el) return;
+  el.hidden = !text;
+  el.textContent = text || "";
+}
+function envIconPencil() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 16.8 15.6 6.2a1.4 1.4 0 0 1 2 0l1.2 1.2a1.4 1.4 0 0 1 0 2L8.2 20H5v-3.2z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>';
+}
+function envIconTrash() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 8h10M9.5 8V6.6A1.6 1.6 0 0 1 11.1 5h1.8A1.6 1.6 0 0 1 14.5 6.6V8M8.4 8.8l.6 10.2h6l.6-10.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+function envIconPlus() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 7v10M7 12h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+}
+function emptyEnvDraft() {
+  return { name: "", region: "cn-southwest-2", cluster_name: "", workload_name: "", jump_host: "", nodes: [""] };
+}
+function collectEnvForm() {
+  const nodes = Array.from(document.querySelectorAll("[data-env-node]"))
+    .map((el) => (el.value || "").trim())
+    .filter(Boolean);
+  return {
+    name: ($("envName") && $("envName").value || "").trim(),
+    region: ($("envRegion") && $("envRegion").value) || "cn-southwest-2",
+    cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
+    workload_name: ($("envWorkload") && $("envWorkload").value || "").trim(),
+    jump_host: ($("envJump") && $("envJump").value || "").trim(),
+    nodes,
+  };
+}
+function envNodeRowsHtml(nodes) {
+  const list = nodes && nodes.length ? nodes : [""];
+  return list.map((node) => (
+    '<div class="env-node-row">' +
+    '<input class="input" data-env-node type="text" value="' + esc(node) + '" placeholder="例如 172.31.8.33" />' +
+    '<button type="button" class="btn ghost danger" data-env-remove-node>删除</button>' +
+    "</div>"
+  )).join("");
+}
+function envFormHtml(env) {
+  const data = env || emptyEnvDraft();
+  return (
+    '<div class="env-form-card">' +
+    '<label class="label" for="envRegion">Region</label>' +
+    '<select id="envRegion" class="input"><option value="cn-southwest-2">贵阳一</option></select>' +
+    '<label class="label" for="envCluster">集群名称</label>' +
+    '<input id="envCluster" class="input" value="' + esc(data.cluster_name || "") + '" required />' +
+    '<label class="label" for="envWorkload">负载名称</label>' +
+    '<input id="envWorkload" class="input" value="' + esc(data.workload_name || "") + '" placeholder="CCE 集群中的微服务名称" required />' +
+    '<label class="label" for="envJump">跳板机</label>' +
+    '<input id="envJump" class="input" value="' + esc(data.jump_host || "") + '" placeholder="用于 SSH 到 CCE 集群" required />' +
+    '<div class="label">节点列表</div>' +
+    '<div id="envNodeList">' + envNodeRowsHtml(data.nodes) + "</div>" +
+    '<div class="row"><button type="button" class="btn ghost" id="btnEnvAddNode">' + envIconPlus() + " 添加节点</button></div>" +
+    '<label class="label" for="envName">环境名称</label>' +
+    '<input id="envName" class="input" value="' + esc(data.name || "") + '" required />' +
+    '<div class="row env-form-actions">' +
+    '<button type="button" class="btn primary" id="btnEnvSave">保存</button>' +
+    '<button type="button" class="btn ghost" id="btnEnvCancel">取消</button>' +
+    "</div></div>"
+  );
+}
+function envCardHtml(env) {
+  return (
+    '<article class="env-card" data-env-id="' + esc(env.id) + '">' +
+    '<div class="env-card-head">' +
+    '<div class="env-card-name">' + esc(env.name || "未命名环境") + "</div>" +
+    '<div class="env-card-actions">' +
+    '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="编辑">' + envIconPencil() + "</button>" +
+    '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除">' + envIconTrash() + "</button>" +
+    "</div></div>" +
+    '<div class="env-card-meta">' +
+    '<div class="env-meta-row"><span class="env-meta-label">Region:</span><strong class="env-meta-value">' + esc(env.region_label || env.region || "—") + "</strong></div>" +
+    '<div class="env-meta-row"><span class="env-meta-label">集群:</span><strong class="env-meta-value">' + esc(env.cluster_name || "—") + "</strong></div>" +
+    '<div class="env-meta-row"><span class="env-meta-label">负载:</span><strong class="env-meta-value">' + esc(env.workload_name || "—") + "</strong></div>" +
+    "</div></article>"
+  );
+}
+function bindEnvForm() {
+  const list = $("envNodeList");
+  if (list) {
+    list.addEventListener("click", (ev) => {
+      const add = ev.target.closest("[data-env-add-node]");
+      const remove = ev.target.closest("[data-env-remove-node]");
+      if (add) {
+        const row = document.createElement("div");
+        row.className = "env-node-row";
+        row.innerHTML = '<input class="input" data-env-node type="text" placeholder="例如 172.31.8.33" />' +
+          '<button type="button" class="btn ghost danger" data-env-remove-node>删除</button>';
+        list.appendChild(row);
+        return;
+      }
+      if (remove) {
+        const row = remove.closest(".env-node-row");
+        if (row && list.querySelectorAll(".env-node-row").length > 1) row.remove();
+      }
+    });
+  }
+  bind("btnEnvAddNode", () => {
+    const list = $("envNodeList");
+    if (!list) return;
+    const row = document.createElement("div");
+    row.className = "env-node-row";
+    row.innerHTML = '<input class="input" data-env-node type="text" placeholder="例如 172.31.8.33" />' +
+      '<button type="button" class="btn ghost danger" data-env-remove-node>删除</button>';
+    list.appendChild(row);
   });
+  bind("btnEnvSave", () => saveEnvironment().catch((e) => setEnvFormError(e.message)));
+  bind("btnEnvCancel", () => closeEnvOverlay());
 }
-function clearHwCloudCreds() {
-  hwCloudCreds = null;
-  setCceControlsEnabled(false);
-  updateHwCredStatus();
+function syncEnvOverlayLock() {
+  const formOpen = $("envOverlay") && !$("envOverlay").hidden;
+  const confirmOpen = $("envConfirm") && !$("envConfirm").hidden;
+  document.body.classList.toggle("env-overlay-open", !!(formOpen || confirmOpen));
 }
-function applyHwCloudCreds() {
-  const ak = ($("hwAccessKey").value || "").trim();
-  const sk = ($("hwSecretKey").value || "").trim();
-  if (!ak || !sk) throw new Error("请填写 Access Key 和 Secret Key");
-  hwCloudCreds = { access_key: ak, secret_key: sk, region: $("hwRegion").value, project_id: ($("hwProjectId").value || "").trim() };
-  $("hwSecretKey").value = "";
-  setCceControlsEnabled(true);
-  updateHwCredStatus();
+function closeEnvOverlay() {
+  const overlay = $("envOverlay");
+  if (!overlay) return;
+  overlay.hidden = true;
+  envDraftOpen = false;
+  envEditingId = "";
+  setEnvFormError("");
+  const body = $("envOverlayBody");
+  if (body) body.replaceChildren();
+  syncEnvOverlayLock();
 }
-function requireHwCloudCreds() {
-  if (!hwCloudCreds) throw new Error("请先启用本会话凭证");
-  return hwCloudCreds;
+function openEnvOverlay(env) {
+  const overlay = $("envOverlay");
+  const body = $("envOverlayBody");
+  const title = $("envOverlayTitle");
+  if (!overlay || !body || !title) return;
+  envDraftOpen = !env || !env.id;
+  envEditingId = env && env.id ? env.id : "";
+  title.textContent = envEditingId ? "编辑环境" : "创建环境";
+  setEnvError("");
+  setEnvFormError("");
+  body.innerHTML = envFormHtml(env || emptyEnvDraft());
+  bindEnvForm();
+  overlay.hidden = false;
+  syncEnvOverlayLock();
+  if ($("envRegion")) $("envRegion").focus();
 }
-async function hwCcePost(path, extra) {
-  const creds = requireHwCloudCreds();
-  return api(path, { method: "POST", body: JSON.stringify({ ...creds, ...(extra || {}) }) });
-}
-function formatCceError(err) { return (err && err.data && err.data.error) || err.message || String(err); }
-function setCceLog(text) { if ($("cceLog")) $("cceLog").textContent = text || ""; }
-async function initCceView() {
-  if (cceRegionsLoaded) return;
-  const data = await api("/api/cce/regions");
-  const select = $("hwRegion");
-  select.innerHTML = (data.regions || []).map((item) =>
-    '<option value="' + esc(item.id) + '">' + esc(item.label || item.name || item.id) + " (" + esc(item.id) + ")</option>"
-  ).join("");
-  cceRegionsLoaded = true;
-}
-async function refreshCceClusters() {
-  setCceLog("正在加载集群…");
-  const data = await hwCcePost("/api/cce/clusters");
-  const select = $("cceClusterSelect");
-  const clusters = data.clusters || [];
-  select.innerHTML = clusters.length
-    ? clusters.map((item) => '<option value="' + esc(item.id) + '">' + esc(item.name || item.id) + "</option>").join("")
-    : '<option value="">无集群</option>';
-  select.disabled = !clusters.length;
-  setCceLog("已加载 " + clusters.length + " 个集群。");
-}
-function renderCceWorkloads(rows) {
-  const body = $("cceWorkloadsBody");
-  if (!rows.length) {
-    body.innerHTML = '<tr><td colspan="6" class="hint">该命名空间下无 Deployment。</td></tr>';
+function renderEnvironments() {
+  const grid = $("envGrid");
+  if (!grid) return;
+  if (!environments.length) {
+    grid.innerHTML = '<p class="env-empty">还没有环境。点左上角「创建环境」添加。</p>';
     return;
   }
-  body.innerHTML = rows.map((item) => (
-    "<tr><td class=\"mono\">" + esc(item.name || "—") + "</td><td>" + esc(item.replicas ?? "—") +
-    "</td><td>" + esc(item.ready_replicas ?? "—") + "</td><td class=\"mono\">" +
-    esc(Array.isArray(item.images) ? item.images.join(", ") : "—") + "</td><td>" +
-    esc(item.strategy || "—") + '</td><td><button type="button" class="btn ghost cce-detail-btn" data-name="' +
-    esc(item.name || "") + '">详情</button></td></tr>'
-  )).join("");
-  body.querySelectorAll(".cce-detail-btn").forEach((btn) => {
-    btn.addEventListener("click", () => loadCceWorkloadDetail(btn.getAttribute("data-name") || "").catch((e) => setCceLog(formatCceError(e))));
+  grid.innerHTML = environments.map(envCardHtml).join("");
+  grid.querySelectorAll("[data-env-edit]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-env-edit") || "";
+      const env = environments.find((item) => item.id === id);
+      if (env) openEnvOverlay(env);
+    });
+  });
+  grid.querySelectorAll("[data-env-delete]").forEach((btn) => {
+    btn.addEventListener("click", () => deleteEnvironment(btn.getAttribute("data-env-delete") || "").catch((e) => setEnvError(e.message)));
   });
 }
-async function refreshCceWorkloads() {
-  const clusterId = $("cceClusterSelect").value;
-  if (!clusterId) throw new Error("请先选择集群");
-  const namespace = ($("cceNamespace").value || "default").trim() || "default";
-  setCceLog("正在加载负载…");
-  const data = await hwCcePost("/api/cce/workloads", { cluster_id: clusterId, namespace, kind: "deployments" });
-  renderCceWorkloads(data.workloads || []);
-  setCceLog("已加载 " + (data.count || 0) + " 个负载。");
+async function loadEnvironments() {
+  setEnvError("");
+  const data = await api("/api/environments");
+  environments = data.environments || [];
+  renderEnvironments();
 }
-async function loadCceWorkloadDetail(name) {
-  const clusterId = $("cceClusterSelect").value;
-  const namespace = ($("cceNamespace").value || "default").trim() || "default";
-  const data = await hwCcePost("/api/cce/workloads/detail", { cluster_id: clusterId, namespace, kind: "deployments", name });
-  const detail = $("cceWorkloadDetail");
-  detail.hidden = false;
-  detail.textContent = JSON.stringify(data, null, 2);
+function openEnvCreate() {
+  openEnvOverlay(emptyEnvDraft());
+}
+async function saveEnvironment() {
+  setEnvFormError("");
+  const payload = collectEnvForm();
+  const path = envEditingId ? "/api/environments/" + encodeURIComponent(envEditingId) : "/api/environments";
+  await api(path, { method: "POST", body: JSON.stringify(payload) });
+  closeEnvOverlay();
+  await loadEnvironments();
+}
+let envConfirmResolver = null;
+function closeEnvConfirm(ok) {
+  const overlay = $("envConfirm");
+  if (overlay) overlay.hidden = true;
+  syncEnvOverlayLock();
+  const resolve = envConfirmResolver;
+  envConfirmResolver = null;
+  if (resolve) resolve(!!ok);
+}
+function askEnvConfirm(message) {
+  return new Promise((resolve) => {
+    if (envConfirmResolver) envConfirmResolver(false);
+    envConfirmResolver = resolve;
+    const text = $("envConfirmText");
+    if (text) text.textContent = message;
+    if ($("envConfirm")) $("envConfirm").hidden = false;
+    syncEnvOverlayLock();
+    if ($("btnEnvConfirmCancel")) $("btnEnvConfirmCancel").focus();
+  });
+}
+async function deleteEnvironment(id) {
+  if (!id) return;
+  const env = environments.find((item) => item.id === id);
+  const name = (env && env.name) || id;
+  const ok = await askEnvConfirm("确定删除环境「" + name + "」？删除后无法恢复。");
+  if (!ok) return;
+  setEnvError("");
+  await api("/api/environments/" + encodeURIComponent(id) + "/delete", { method: "POST", body: "{}" });
+  if (envEditingId === id) envEditingId = "";
+  await loadEnvironments();
 }
 
 function bind(id, fn) {
@@ -2045,7 +2407,10 @@ document.querySelectorAll(".subtab[data-tab]").forEach((btn) => {
 });
 bindServicePicker();
 bindEyeButtons(document);
-bind("btnRun", () => openRunDialog());
+bind("btnRun", () => beginRunPreview());
+bind("btnRunPreviewConfirm", () => confirmRunPreview());
+bind("btnRunPreviewCancel", () => cancelRunPreview());
+bind("btnRefreshPreviewBranches", () => loadPreviewBranches(true));
 bind("btnStop", () => openStopDialog());
 bind("btnParams", () => openParamsDialog());
 bind("btnRefreshPipeline", () => refreshPipeline().catch(() => {}));
@@ -2072,15 +2437,20 @@ bind("btnAuthLogout", async () => {
     await api("/api/auth/logout", { method: "POST", body: "{}" });
   } catch (_) {}
 });
-bind("btnHwApplyCreds", () => {
-  try { applyHwCloudCreds(); } catch (e) {
-    $("hwCredStatus").textContent = e.message;
-    $("hwCredStatus").style.color = "var(--danger)";
-  }
+bind("btnEnvCreate", () => openEnvCreate());
+document.querySelectorAll("[data-env-close]").forEach((el) => el.addEventListener("click", closeEnvOverlay));
+bind("btnEnvConfirmOk", () => closeEnvConfirm(true));
+document.querySelectorAll("[data-env-confirm-cancel]").forEach((el) => {
+  el.addEventListener("click", () => closeEnvConfirm(false));
 });
-bind("btnHwClearCreds", () => clearHwCloudCreds());
-bind("btnCceRefreshClusters", () => refreshCceClusters().catch((e) => setCceLog(formatCceError(e))));
-bind("btnCceRefreshWorkloads", () => refreshCceWorkloads().catch((e) => setCceLog(formatCceError(e))));
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape") return;
+  if ($("envConfirm") && !$("envConfirm").hidden) {
+    closeEnvConfirm(false);
+    return;
+  }
+  if ($("envOverlay") && !$("envOverlay").hidden) closeEnvOverlay();
+});
 document.querySelectorAll("[data-close-modal]").forEach((el) => el.addEventListener("click", closeModal));
 $("modalRoot").addEventListener("click", (ev) => {
   if (ev.target && ev.target.getAttribute("data-close-modal") != null) closeModal();
@@ -2105,10 +2475,10 @@ window.addEventListener("hashchange", async () => {
     if (isAllServices()) {
       stopPolling();
       applyJob(null);
-      if (tab === "pipeline" || parsed.tab === "pipeline") setTab(parsed.tab === "artifacts" ? "artifacts" : "history");
+      if (tab === "pipeline" || parsed.tab === "pipeline") setTab(allServicesFallbackTab(parsed.tab));
       else if (parsed.tab !== tab) setTab(parsed.tab);
       else if (tab === "history") refreshHistory().catch(() => {});
-      else refreshArtifacts().catch(() => {});
+      else if (tab === "artifacts") refreshArtifacts().catch(() => {});
       return;
     }
     if (parsed.job) {
@@ -2123,7 +2493,7 @@ window.addEventListener("hashchange", async () => {
       stopPolling();
       refreshServiceOccupancy().catch(() => {});
       if (tab === "history") refreshHistory().catch(() => {});
-      else refreshArtifacts().catch(() => {});
+      else if (tab === "artifacts") refreshArtifacts().catch(() => {});
     }
     return;
   }
@@ -2145,7 +2515,7 @@ async function bootApp(username) {
   if (nav === "build") {
     applyServiceChrome();
     if (isAllServices()) {
-      setTab(parsed.tab === "artifacts" ? "artifacts" : "history");
+      setTab(allServicesFallbackTab(parsed.tab));
     } else if (parsed.job) {
       pinnedJobId = parsed.job;
       setTab("pipeline");

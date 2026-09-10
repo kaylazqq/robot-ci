@@ -81,6 +81,8 @@ DEFAULT_USERNAMES = (
 DEFAULT_USERS = tuple((name, name) for name in DEFAULT_USERNAMES)
 AUTH_PUBLIC_GET = {"/api/auth/me", "/api/health"}
 AUTH_PUBLIC_POST = {"/api/auth/login"}
+ENV_REGIONS = ({"id": "cn-southwest-2", "label": "贵阳一"},)
+ENV_REGION_IDS = {item["id"] for item in ENV_REGIONS}
 _sessions: dict[str, dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 _db_lock = threading.Lock()
@@ -260,6 +262,19 @@ def init_store() -> None:
                     username TEXT NOT NULL,
                     expires REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS environments (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    region_label TEXT NOT NULL,
+                    cluster_name TEXT NOT NULL,
+                    workload_name TEXT NOT NULL,
+                    jump_host TEXT NOT NULL,
+                    nodes_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             conn.commit()
@@ -332,6 +347,202 @@ def _save_users(users: list[dict[str, str]]) -> None:
                 ],
             )
             conn.commit()
+        finally:
+            conn.close()
+
+
+def _env_region_label(region_id: str) -> str:
+    for item in ENV_REGIONS:
+        if item["id"] == region_id:
+            return item["label"]
+    return region_id
+
+
+def _normalize_env_nodes(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        parts = [part.strip() for part in re.split(r"[\n,;]+", raw)]
+        return [part for part in parts if part]
+    if isinstance(raw, list):
+        nodes: list[str] = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text:
+                nodes.append(text)
+        return nodes
+    return []
+
+
+def _environment_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        nodes = json.loads(row["nodes_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        nodes = []
+    if not isinstance(nodes, list):
+        nodes = []
+    return {
+        "id": str(row["id"]),
+        "name": str(row["name"]),
+        "region": str(row["region"]),
+        "region_label": str(row["region_label"] or _env_region_label(str(row["region"]))),
+        "cluster_name": str(row["cluster_name"]),
+        "workload_name": str(row["workload_name"]),
+        "jump_host": str(row["jump_host"]),
+        "nodes": [str(item) for item in nodes if str(item).strip()],
+        "created_by": str(row["created_by"] or ""),
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
+def _validate_environment_payload(data: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    name = str(data.get("name") or "").strip()
+    region = str(data.get("region") or "").strip()
+    cluster_name = str(data.get("cluster_name") or "").strip()
+    workload_name = str(data.get("workload_name") or "").strip()
+    jump_host = str(data.get("jump_host") or "").strip()
+    nodes = _normalize_env_nodes(data.get("nodes"))
+    if not name:
+        return None, "环境名称必填"
+    if region not in ENV_REGION_IDS:
+        return None, "region 仅支持贵阳一"
+    if not cluster_name:
+        return None, "集群名称必填"
+    if not workload_name:
+        return None, "负载名称必填"
+    if not jump_host:
+        return None, "跳板机必填"
+    return {
+        "name": name,
+        "region": region,
+        "region_label": _env_region_label(region),
+        "cluster_name": cluster_name,
+        "workload_name": workload_name,
+        "jump_host": jump_host,
+        "nodes": nodes,
+    }, ""
+
+
+def list_environments() -> list[dict[str, Any]]:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM environments ORDER BY updated_at DESC, name"
+            ).fetchall()
+        finally:
+            conn.close()
+    return [_environment_from_row(row) for row in rows]
+
+
+def get_environment(env_id: str) -> dict[str, Any] | None:
+    eid = str(env_id or "").strip()
+    if not eid:
+        return None
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute("SELECT * FROM environments WHERE id = ?", (eid,)).fetchone()
+        finally:
+            conn.close()
+    return _environment_from_row(row) if row else None
+
+
+def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[str, Any] | None, str]:
+    payload, err = _validate_environment_payload(data)
+    if err or payload is None:
+        return None, err
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    item = {
+        "id": uuid.uuid4().hex[:12],
+        **payload,
+        "created_by": str(username or "").strip(),
+        "created_at": now,
+        "updated_at": now,
+    }
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO environments (
+                    id, name, region, region_label, cluster_name, workload_name,
+                    jump_host, nodes_json, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["id"],
+                    item["name"],
+                    item["region"],
+                    item["region_label"],
+                    item["cluster_name"],
+                    item["workload_name"],
+                    item["jump_host"],
+                    json.dumps(item["nodes"], ensure_ascii=False),
+                    item["created_by"],
+                    item["created_at"],
+                    item["updated_at"],
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return item, ""
+
+
+def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    existing = get_environment(env_id)
+    if existing is None:
+        return None, "环境不存在"
+    payload, err = _validate_environment_payload(data)
+    if err or payload is None:
+        return None, err
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    item = {**existing, **payload, "updated_at": now}
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """
+                UPDATE environments SET
+                    name = ?, region = ?, region_label = ?, cluster_name = ?,
+                    workload_name = ?, jump_host = ?, nodes_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    item["name"],
+                    item["region"],
+                    item["region_label"],
+                    item["cluster_name"],
+                    item["workload_name"],
+                    item["jump_host"],
+                    json.dumps(item["nodes"], ensure_ascii=False),
+                    item["updated_at"],
+                    item["id"],
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return item, ""
+
+
+def delete_environment(env_id: str) -> bool:
+    eid = str(env_id or "").strip()
+    if not eid:
+        return False
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            cur = conn.execute("DELETE FROM environments WHERE id = ?", (eid,))
+            conn.commit()
+            return cur.rowcount > 0
         finally:
             conn.close()
 
@@ -653,6 +864,7 @@ JOB_PUBLIC_FIELDS = (
     "test_runs",
     "test_kinds",
     "cancel_requested",
+    "optional_steps",
 )
 
 JOB_COMPACT_FIELDS = (
@@ -681,6 +893,7 @@ JOB_COMPACT_FIELDS = (
     "cancel_requested",
     "slot_held",
     "queue_position",
+    "optional_steps",
 )
 
 
@@ -697,6 +910,7 @@ PIPELINE_STEP_DEFS: tuple[tuple[str, str, str], ...] = (
     ("test", "测试执行", "test"),
     ("build", "构建镜像", "build"),
     ("push", "推送 SWR", "push"),
+    ("gamma", "gamma集成测试", "gamma"),
     ("archive", "本地归档", "archive"),
 )
 
@@ -740,6 +954,10 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
         ("push", "推送镜像"),
         ("verify", "推送确认"),
     ),
+    "gamma": (
+        ("deploy", "gamma部署"),
+        ("test", "gamma测试"),
+    ),
     "archive": (
         ("save", "归档镜像"),
     ),
@@ -752,6 +970,7 @@ STAGE_TO_PIPELINE_STEP = {
     "testing": "test",
     "building": "build",
     "pushing": "push",
+    "gamma": "gamma",
     "archiving": "archive",
 }
 _TERMINAL_PIPELINE_STAGES = {"interrupted", "stopping", "done", ""}
@@ -781,6 +1000,39 @@ def _effective_pipeline_stage(job: dict[str, Any]) -> str:
     if raw in _TERMINAL_PIPELINE_STAGES:
         return _infer_pipeline_stage(job) if raw in ("interrupted", "stopping", "") else raw
     return raw
+
+
+def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {"gamma_deploy": False, "gamma_test": False, "environment_id": ""}
+    return {
+        "gamma_deploy": bool(raw.get("gamma_deploy")),
+        "gamma_test": bool(raw.get("gamma_test")),
+        "environment_id": str(raw.get("environment_id") or "").strip(),
+    }
+
+
+def _gamma_selected(job: dict[str, Any] | None, task_id: str) -> bool:
+    opts = _normalize_optional_steps((job or {}).get("optional_steps"))
+    if task_id == "deploy":
+        return bool(opts.get("gamma_deploy"))
+    if task_id == "test":
+        return bool(opts.get("gamma_test"))
+    return False
+
+
+def _apply_gamma_override(statuses: dict[str, str], job: dict[str, Any] | None, *, live: bool) -> None:
+    if "gamma" not in statuses:
+        return
+    selected = _gamma_selected(job, "deploy") or _gamma_selected(job, "test")
+    if not selected:
+        statuses["gamma"] = "skipped"
+        return
+    if live:
+        if statuses.get("push") not in ("done", "skipped"):
+            statuses["gamma"] = "pending"
+        elif statuses.get("gamma") == "done":
+            statuses["gamma"] = "pending"
 
 
 def _service_skip_push(svc: dict[str, Any] | None) -> bool:
@@ -986,6 +1238,17 @@ def _subtask_rows(
         {"id": sub_id, "label": label, "status": statuses[idx] if idx < len(statuses) else "pending"}
         for idx, (sub_id, label) in enumerate(defs)
     ]
+    if step_id == "gamma":
+        for row in rows:
+            if not _gamma_selected(job, row["id"]):
+                row["status"] = "skipped"
+            elif status == "done":
+                row["status"] = "done"
+            elif status == "skipped":
+                row["status"] = "skipped"
+            elif status == "running":
+                row["status"] = "pending" if row["id"] == "test" else "running"
+        return rows
     if step_id != "test":
         return rows
     run = ((job or {}).get("test_runs") or [{}])
@@ -1416,6 +1679,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             statuses = {step_id: "pending" for step_id, _, _ in step_defs}
             svc_status = "pending"
 
+        _apply_gamma_override(statuses, job, live=is_running and svc_status == "running")
         result_row = results_by_id.get(service_id)
         services_out.append(
             {
@@ -5822,6 +6086,10 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
 
+        if path == "/api/environments":
+            self._json(200, {"environments": list_environments(), "regions": list(ENV_REGIONS)})
+            return
+
         if path == "/api/cce/regions":
             regions = [{"id": rid, **meta} for rid, meta in huawei_cce.REGIONS.items()]
             self._json(200, {"regions": regions})
@@ -6213,6 +6481,34 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(200, {"ok": True, "github_token_configured": bool(CFG.get("github_token"))})
             return
 
+        if path == "/api/environments":
+            item, err = create_environment(data, username=user)
+            if err or item is None:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "environment": item})
+            return
+
+        m_env_del = re.fullmatch(r"/api/environments/([^/]+)/delete", path)
+        if m_env_del:
+            if delete_environment(m_env_del.group(1)):
+                self._json(200, {"ok": True})
+                return
+            self._json(404, {"ok": False, "error": "环境不存在"})
+            return
+
+        m_env = re.fullmatch(r"/api/environments/([^/]+)", path)
+        if m_env:
+            item, err = update_environment(m_env.group(1), data)
+            if err == "环境不存在":
+                self._json(404, {"ok": False, "error": err})
+                return
+            if err or item is None:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "environment": item})
+            return
+
         if path == "/api/cce/projects":
             try:
                 creds = resolve_huawei_credentials(data)
@@ -6401,6 +6697,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "ui_log": [],
                 "step_logs": {},
                 "_ui_test_running": False,
+                "optional_steps": _normalize_optional_steps(data.get("optional_steps")),
                 "cancel_requested": False,
                 "slot_held": False,
                 "queue_position": 0,

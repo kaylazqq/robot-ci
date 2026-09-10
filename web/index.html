@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>集成开发平台</title>
-  <link rel="stylesheet" href="/styles.css?v=202609082" />
+  <link rel="stylesheet" href="/styles.css?v=202609107" />
 </head>
 <body>
   <div id="loginGate" class="login-gate" hidden>
@@ -48,10 +48,6 @@
       <button type="button" class="nav-item active" data-nav="build" id="navBuild">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="18" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="18" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M8.2 12h5.3M15.8 7.6 13.5 12l2.3 4.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
         <span>微服务构建</span>
-      </button>
-      <button type="button" class="nav-item" data-nav="cce" id="navCce">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="4" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="4" y="13" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/><rect x="13" y="13" width="7" height="7" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
-        <span>环境管理</span>
       </button>
     </aside>
 
@@ -107,6 +103,7 @@
             <button type="button" class="subtab active" data-tab="pipeline">流水线详情</button>
             <button type="button" class="subtab" data-tab="history">构建历史</button>
             <button type="button" class="subtab" data-tab="artifacts">产物管理</button>
+            <button type="button" class="subtab" data-tab="envs">环境管理</button>
           </nav>
         </div>
         <div class="toolbar toolbar-2" id="pipelineActions">
@@ -138,6 +135,29 @@
 
         <div class="view-pane" id="viewPipeline">
           <section class="job-pipeline" id="liveJobPipeline" aria-label="构建流水线" hidden></section>
+          <div class="pl-run-actions" id="pipelineRunActions" hidden>
+            <div class="pl-run-actions-main">
+              <label class="label" for="previewBranch">分支</label>
+              <div class="run-branch-row">
+                <div class="branch-picker" id="previewBranchPicker">
+                  <button type="button" class="input branch-trigger" id="previewBranch" aria-haspopup="listbox" aria-expanded="false">
+                    <span id="previewBranchValue"></span>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  <div class="branch-menu" id="previewBranchMenu" role="listbox" hidden></div>
+                </div>
+                <button type="button" class="icon-btn" id="btnRefreshPreviewBranches" title="刷新" aria-label="刷新">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </div>
+              <p class="branch-status" id="previewBranchStatus"></p>
+              <p class="hint error" id="previewRunHint" hidden></p>
+            </div>
+            <div class="pl-run-actions-btns">
+              <button type="button" class="btn ghost" id="btnRunPreviewCancel">取消</button>
+              <button type="button" class="btn primary" id="btnRunPreviewConfirm">确认</button>
+            </div>
+          </div>
           <p class="pipeline-blank" id="pipelineEmpty">当前服务无构建历史记录</p>
         </div>
         <div class="view-pane" id="viewHistory" hidden>
@@ -212,60 +232,44 @@
           </div>
           <div class="test-pager" id="artifactsPager" hidden></div>
         </div>
-      </section>
-
-      <section class="page page-narrow" id="pageCce" hidden>
-        <h2>环境管理</h2>
-        <p class="hint">AK/SK 来自华为云控制台 → 我的凭证 → 访问密钥，不是左侧 SWR docker login 的临时密码。</p>
-        <p class="hint">启用后 SK 会从输入框清除（仍保留在页面内存）。刷新或关闭标签页后失效，不会写入服务器。</p>
-        <div class="cce-creds">
-          <label class="label" for="hwAccessKey">Access Key</label>
-          <input id="hwAccessKey" class="input" type="password" autocomplete="off" placeholder="AK" />
-          <label class="label" for="hwSecretKey">Secret Key</label>
-          <input id="hwSecretKey" class="input" type="password" autocomplete="off" placeholder="SK" />
-          <label class="label" for="hwRegion">Region</label>
-          <select id="hwRegion" class="input"></select>
-          <label class="label" for="hwProjectId">Project ID（可选）</label>
-          <input id="hwProjectId" class="input" type="text" autocomplete="off" placeholder="留空则按 Region 自动解析" />
-          <div class="row">
-            <button type="button" class="btn primary" id="btnHwApplyCreds">启用本会话凭证</button>
-            <button type="button" class="btn ghost" id="btnHwClearCreds">清除</button>
+        <div class="view-pane page-envs" id="viewEnvs" hidden>
+          <div class="env-toolbar">
+            <button type="button" class="btn primary env-create-btn" id="btnEnvCreate">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+              创建环境
+            </button>
           </div>
-          <p class="hint" id="hwCredStatus">华为云凭证：未设置</p>
+          <p class="hint error" id="envError" hidden></p>
+          <div class="env-grid" id="envGrid"></div>
         </div>
-        <div class="cce-toolbar row">
-          <button type="button" class="btn ghost" id="btnCceRefreshClusters" disabled>刷新集群</button>
-          <label class="hint cce-inline-label">集群
-            <select id="cceClusterSelect" class="input" disabled>
-              <option value="">— 先刷新集群 —</option>
-            </select>
-          </label>
-          <label class="hint cce-inline-label">命名空间
-            <input id="cceNamespace" class="input" type="text" value="default" />
-          </label>
-          <button type="button" class="btn ghost" id="btnCceRefreshWorkloads" disabled>刷新负载</button>
-        </div>
-        <pre class="log mini" id="cceLog"></pre>
-        <div class="art-table-wrap">
-          <table class="art-table" id="cceWorkloadsTable">
-            <thead>
-              <tr>
-                <th>名称</th>
-                <th>副本</th>
-                <th>就绪</th>
-                <th>镜像</th>
-                <th>策略</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="cceWorkloadsBody">
-              <tr><td colspan="6" class="hint">设置凭证并选择集群后刷新负载。</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <pre class="log mini cce-detail" id="cceWorkloadDetail" hidden></pre>
       </section>
     </div>
+  </div>
+
+  <div class="env-overlay" id="envOverlay" hidden>
+    <div class="env-overlay-backdrop" data-env-close></div>
+    <section class="env-overlay-page" role="dialog" aria-modal="true" aria-labelledby="envOverlayTitle">
+      <div class="env-overlay-head">
+        <h2 id="envOverlayTitle">创建环境</h2>
+        <button type="button" class="env-icon-btn" data-env-close title="关闭" aria-label="关闭">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <p class="hint error" id="envFormError" hidden></p>
+      <div id="envOverlayBody"></div>
+    </section>
+  </div>
+
+  <div class="env-overlay" id="envConfirm" hidden>
+    <div class="env-overlay-backdrop" data-env-confirm-cancel></div>
+    <section class="env-confirm-page" role="dialog" aria-modal="true" aria-labelledby="envConfirmTitle">
+      <h2 id="envConfirmTitle">删除环境</h2>
+      <p id="envConfirmText">确定删除这个环境？</p>
+      <div class="row env-confirm-actions">
+        <button type="button" class="btn danger env-confirm-ok" id="btnEnvConfirmOk">删除</button>
+        <button type="button" class="btn ghost" id="btnEnvConfirmCancel" data-env-confirm-cancel>取消</button>
+      </div>
+    </section>
   </div>
 
   <div class="modal-root" id="modalRoot" hidden>
@@ -279,6 +283,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=202609077"></script>
+  <script src="/app.js?v=202609107"></script>
 </body>
 </html>
