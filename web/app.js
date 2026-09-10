@@ -302,17 +302,15 @@ function setNav(next, skipHash) {
 
 function applyServiceChrome() {
   const all = isAllServices();
-  const envTab = tab === "envs";
   document.querySelectorAll(".history-table, .artifacts-table").forEach((table) => {
     table.classList.toggle("show-service-column", all);
   });
   const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
   if (pipeBtn) pipeBtn.hidden = all;
-  if ($("svcPicker")) $("svcPicker").hidden = envTab;
   $("viewPipeline").hidden = tab !== "pipeline";
   $("viewHistory").hidden = tab !== "history";
   $("viewArtifacts").hidden = tab !== "artifacts";
-  if ($("viewEnvs")) $("viewEnvs").hidden = !envTab;
+  if ($("viewEnvs")) $("viewEnvs").hidden = tab !== "envs";
   $("pipelineActions").hidden = all || tab !== "pipeline";
   $("jobMetaBar").hidden = all || tab !== "pipeline";
   if ($("historyHint")) {
@@ -1076,7 +1074,7 @@ function renderFavoriteServices() {
   const favorites = favoriteServiceIds
     .map((id) => services.find((item) => item.id === id))
     .filter(Boolean);
-  container.hidden = nav !== "build" || tab === "envs" || !favorites.length;
+  container.hidden = nav !== "build" || !favorites.length;
   container.replaceChildren();
   favorites.forEach((item) => {
     const chip = document.createElement("button");
