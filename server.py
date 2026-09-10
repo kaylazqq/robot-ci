@@ -283,6 +283,7 @@ def init_store() -> None:
             )
             _ensure_environment_secret_columns(conn)
             _ensure_environment_service_column(conn)
+            _ensure_pipeline_templates_table(conn)
             conn.commit()
             try:
                 os.chmod(DB_PATH, 0o600)
@@ -741,6 +742,284 @@ def resolve_template_branch(
     if fallback in names:
         return fallback
     return names[0] if names else fallback
+
+
+BUILTIN_PIPELINE_TEMPLATES = (
+    {"kind": "personal", "name": "个人构建流水线", "gamma_deploy": 0, "gamma_test": 0},
+    {"kind": "release", "name": "生产发布", "gamma_deploy": 1, "gamma_test": 1},
+)
+
+
+def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_templates (
+            id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            service_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            branch TEXT NOT NULL DEFAULT '',
+            gamma_deploy INTEGER NOT NULL DEFAULT 0,
+            gamma_test INTEGER NOT NULL DEFAULT 0,
+            environment_id TEXT NOT NULL DEFAULT '',
+            builtin INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pipeline_templates_user_svc "
+        "ON pipeline_templates (username, service_id)"
+    )
+
+
+def _pipeline_template_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "username": str(row["username"] or ""),
+        "service_id": str(row["service_id"] or ""),
+        "name": str(row["name"] or ""),
+        "kind": str(row["kind"] or "custom"),
+        "branch": str(row["branch"] or "").strip(),
+        "gamma_deploy": bool(row["gamma_deploy"]),
+        "gamma_test": bool(row["gamma_test"]),
+        "environment_id": str(row["environment_id"] or "").strip(),
+        "builtin": bool(row["builtin"]),
+        "created_at": str(row["created_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
+def _now_stamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT INTO pipeline_templates (
+            id, username, service_id, name, kind, branch,
+            gamma_deploy, gamma_test, environment_id, builtin, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item["id"],
+            item["username"],
+            item["service_id"],
+            item["name"],
+            item["kind"],
+            item["branch"],
+            1 if item["gamma_deploy"] else 0,
+            1 if item["gamma_test"] else 0,
+            item["environment_id"],
+            1 if item["builtin"] else 0,
+            item["created_at"],
+            item["updated_at"],
+        ),
+    )
+
+
+def ensure_default_pipeline_templates(username: str, service_id: str) -> None:
+    user = str(username or "").strip()
+    sid = str(service_id or "").strip()
+    if not user or not sid:
+        return
+    init_store()
+    now = _now_stamp()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            _ensure_pipeline_templates_table(conn)
+            conn.execute(
+                """
+                UPDATE pipeline_templates
+                SET name = '生产发布', updated_at = ?
+                WHERE username = ? AND service_id = ? AND kind = 'release'
+                  AND builtin = 1 AND name = '生成发布'
+                """,
+                (now, user, sid),
+            )
+            for spec in BUILTIN_PIPELINE_TEMPLATES:
+                row = conn.execute(
+                    """
+                    SELECT id FROM pipeline_templates
+                    WHERE username = ? AND service_id = ? AND kind = ? AND builtin = 1
+                    """,
+                    (user, sid, spec["kind"]),
+                ).fetchone()
+                if row:
+                    continue
+                _insert_pipeline_template(
+                    conn,
+                    {
+                        "id": uuid.uuid4().hex[:12],
+                        "username": user,
+                        "service_id": sid,
+                        "name": spec["name"],
+                        "kind": spec["kind"],
+                        "branch": "",
+                        "gamma_deploy": spec["gamma_deploy"],
+                        "gamma_test": spec["gamma_test"],
+                        "environment_id": "",
+                        "builtin": True,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_pipeline_templates(username: str, service_id: str) -> list[dict[str, Any]]:
+    user = str(username or "").strip()
+    sid = str(service_id or "").strip()
+    if not user or not sid:
+        return []
+    ensure_default_pipeline_templates(user, sid)
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM pipeline_templates
+                WHERE username = ? AND service_id = ?
+                ORDER BY builtin DESC,
+                    CASE kind WHEN 'personal' THEN 0 WHEN 'release' THEN 1 ELSE 2 END,
+                    updated_at DESC
+                """,
+                (user, sid),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [_pipeline_template_from_row(row) for row in rows]
+
+
+def get_pipeline_template(username: str, template_id: str) -> dict[str, Any] | None:
+    user = str(username or "").strip()
+    tid = str(template_id or "").strip()
+    if not user or not tid:
+        return None
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            _ensure_pipeline_templates_table(conn)
+            row = conn.execute(
+                "SELECT * FROM pipeline_templates WHERE id = ? AND username = ?",
+                (tid, user),
+            ).fetchone()
+        finally:
+            conn.close()
+    return _pipeline_template_from_row(row) if row else None
+
+
+def _normalize_template_fields(data: dict[str, Any], *, require_name: bool = False) -> tuple[dict[str, Any] | None, str]:
+    name = str((data or {}).get("name") or "").strip()
+    if require_name and not name:
+        return None, "模板名称不能为空"
+    if name and len(name) > 60:
+        return None, "模板名称过长"
+    branch = str((data or {}).get("branch") or "").strip()
+    if branch and not re.match(r"^[\w./\-]+$", branch):
+        return None, "分支无效"
+    return {
+        "name": name,
+        "branch": branch,
+        "gamma_deploy": bool((data or {}).get("gamma_deploy")),
+        "gamma_test": bool((data or {}).get("gamma_test")),
+        "environment_id": str((data or {}).get("environment_id") or "").strip(),
+    }, ""
+
+
+def update_pipeline_template(username: str, template_id: str, data: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    item = get_pipeline_template(username, template_id)
+    if item is None:
+        return None, "模板不存在"
+    fields, err = _normalize_template_fields(data, require_name=True)
+    if err or fields is None:
+        return None, err
+    now = _now_stamp()
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """
+                UPDATE pipeline_templates SET
+                    name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?,
+                    environment_id = ?, updated_at = ?
+                WHERE id = ? AND username = ?
+                """,
+                (
+                    fields["name"],
+                    fields["branch"],
+                    1 if fields["gamma_deploy"] else 0,
+                    1 if fields["gamma_test"] else 0,
+                    fields["environment_id"],
+                    now,
+                    item["id"],
+                    username,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    if fields["branch"]:
+        save_run_template(username, item["service_id"], fields["branch"])
+    return get_pipeline_template(username, item["id"]), ""
+
+
+def delete_pipeline_template(username: str, template_id: str) -> str:
+    item = get_pipeline_template(username, template_id)
+    if item is None:
+        return "模板不存在"
+    if item["builtin"]:
+        return "默认流水线不能删除"
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                "DELETE FROM pipeline_templates WHERE id = ? AND username = ?",
+                (item["id"], username),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return ""
+
+
+def copy_pipeline_template(
+    username: str, template_id: str, name: str = ""
+) -> tuple[dict[str, Any] | None, str]:
+    item = get_pipeline_template(username, template_id)
+    if item is None:
+        return None, "模板不存在"
+    raw_name = str(name or "").strip()
+    if raw_name and len(raw_name) > 60:
+        return None, "模板名称过长"
+    now = _now_stamp()
+    copied = {
+        **item,
+        "id": uuid.uuid4().hex[:12],
+        "name": raw_name or ((item["name"] or "流水线") + "_copy")[:60],
+        "kind": "custom",
+        "builtin": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            _insert_pipeline_template(conn, copied)
+            conn.commit()
+        finally:
+            conn.close()
+    return copied, ""
 
 
 def get_service_favorites(username: str) -> list[str]:
@@ -6551,6 +6830,24 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(200, {"service_id": service_id, "branch": preferred or None})
             return
 
+        if path == "/api/pipeline-templates":
+            service_id = str((query.get("service_id") or [""])[0]).strip()
+            if not service_id:
+                self._json(400, {"error": "缺少微服务"})
+                return
+            catalog = {str(item.get("id")) for item in load_services()}
+            if service_id not in catalog:
+                self._json(404, {"error": "未知微服务"})
+                return
+            self._json(
+                200,
+                {
+                    "service_id": service_id,
+                    "templates": list_pipeline_templates(user or "", service_id),
+                },
+            )
+            return
+
         if path == "/api/jobs":
             def _query_int(name: str, default: int) -> int:
                 try:
@@ -6749,6 +7046,39 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": err})
                 return
             self._json(200, {"ok": True, "service_id": service_id, "branch": branch})
+            return
+
+        m_tpl_copy = re.fullmatch(r"/api/pipeline-templates/([^/]+)/copy", path)
+        if m_tpl_copy:
+            item, err = copy_pipeline_template(
+                user, m_tpl_copy.group(1), str(data.get("name") or "")
+            )
+            if err or item is None:
+                self._json(404 if err == "模板不存在" else 400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "template": item})
+            return
+
+        m_tpl_del = re.fullmatch(r"/api/pipeline-templates/([^/]+)/delete", path)
+        if m_tpl_del:
+            err = delete_pipeline_template(user, m_tpl_del.group(1))
+            if err:
+                code = 404 if err == "模板不存在" else 400
+                self._json(code, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True})
+            return
+
+        m_tpl = re.fullmatch(r"/api/pipeline-templates/([^/]+)", path)
+        if m_tpl:
+            item, err = update_pipeline_template(user, m_tpl.group(1), data)
+            if err == "模板不存在":
+                self._json(404, {"ok": False, "error": err})
+                return
+            if err or item is None:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "template": item})
             return
 
         if path == "/api/login":

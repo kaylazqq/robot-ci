@@ -26,6 +26,11 @@ let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
 let runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+let pipelineTemplates = [];
+let selectedTemplateId = "";
+let runLayerMode = "run";
+let runLayerTemplateId = "";
+let cloneSourceId = "";
 let previewBranchPicker = null;
 let svcMenuPage = 1;
 const SVC_PAGE_SIZE = 8;
@@ -217,6 +222,7 @@ function endSession() {
 function showLogin(message) {
   if (sessionLive) endSession();
   cancelRunPreview();
+  closeCloneWindow();
   closeEnvConfirm(false);
   closeEnvOverlay();
   $("appShell").hidden = true;
@@ -294,7 +300,10 @@ function setNav(next, skipHash) {
     closeEnvConfirm(false);
     closeEnvOverlay();
   }
-  if (nav !== "build") cancelRunPreview();
+  if (nav !== "build") {
+    cancelRunPreview();
+    closeCloneWindow();
+  }
   applyServiceChrome();
   renderFavoriteServices();
   if (!skipHash) writeHash();
@@ -344,6 +353,7 @@ function setTab(next) {
     if (tab === "artifacts") refreshArtifacts().catch(() => {});
     if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
     if (tab === "pipeline" && !isAllServices()) {
+      loadPipelineTemplates().catch(() => {});
       if (pinnedJobId) {
         if (currentJobId !== pinnedJobId) openJob(pinnedJobId).catch(() => {});
       } else {
@@ -411,7 +421,16 @@ function updateActionButtons() {
   const svc = currentService();
   const live = jobIsLive(currentJob);
   const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
-  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runPreviewActive;
+  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runPreviewActive || cloneLayerOpen();
+  const tpl = selectedPipelineTemplate();
+  const tplBusy = !svc || runPreviewActive || cloneLayerOpen();
+  if ($("tplTrigger")) $("tplTrigger").disabled = tplBusy;
+  if ($("btnTplEdit")) $("btnTplEdit").disabled = tplBusy || !tpl;
+  if ($("btnTplCopy")) $("btnTplCopy").disabled = tplBusy || !tpl;
+  if ($("btnTplDelete")) {
+    $("btnTplDelete").disabled = tplBusy || !tpl || !!(tpl && tpl.builtin);
+    $("btnTplDelete").hidden = !!(tpl && tpl.builtin) || !tpl;
+  }
   if ($("btnStop")) $("btnStop").disabled = !live || stopping;
   if ($("btnParams")) $("btnParams").disabled = !(svc && svc.requires_version);
 }
@@ -695,12 +714,15 @@ async function loadPreviewBranches(force) {
   };
   if (!force && cached && cached.loaded) {
     const preferred = await preferredTemplateBranch(svc.id, cached.selected_branch || fallbackBranch);
-    applyCached({ ...cached, selected_branch: preferred });
+    const tpl = findPipelineTemplate(runLayerTemplateId);
+    applyCached({ ...cached, selected_branch: (tpl && tpl.branch) || preferred });
     return;
   }
   setLoading(true);
   try {
     const data = await fetchServiceBranches(svc.id, !!force, true);
+    const tpl = findPipelineTemplate(runLayerTemplateId);
+    if (tpl && tpl.branch) data.selected_branch = tpl.branch;
     applyCached(data);
   } catch (e) {
     picker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
@@ -721,31 +743,88 @@ function closeRunPopup() {
   if (layer) layer.hidden = true;
   document.body.classList.remove("run-open");
 }
-function openRunWindow() {
+function findPipelineTemplate(id) {
+  return pipelineTemplates.find((item) => item.id === id) || null;
+}
+function selectedPipelineTemplate() {
+  return findPipelineTemplate(selectedTemplateId);
+}
+function defaultPersonalTemplate() {
+  return pipelineTemplates.find((item) => item.kind === "personal" && item.builtin) || pipelineTemplates[0] || null;
+}
+function applyTemplateDefaults(tpl) {
+  runPreviewSelection = {
+    deploy: !!(tpl && tpl.gamma_deploy),
+    test: !!(tpl && tpl.gamma_test),
+    environmentId: (tpl && tpl.environment_id) || "",
+  };
+}
+function syncRunLayerChrome() {
+  const tpl = findPipelineTemplate(runLayerTemplateId);
+  const caption = $("runTplCaption");
+  if (caption) {
+    caption.hidden = !tpl || runLayerMode === "edit";
+    caption.textContent = tpl ? ("流水线：" + tpl.name) : "";
+  }
+  const nameBlock = $("runTemplateNameBlock");
+  const nameInput = $("runTemplateName");
+  if (nameBlock) nameBlock.hidden = runLayerMode !== "edit";
+  if (nameInput) nameInput.value = tpl ? (tpl.name || "") : "";
+  const confirm = $("btnRunPreviewConfirm");
+  if (confirm) confirm.textContent = runLayerMode === "edit" ? "保存" : "确认";
+}
+function openRunWindow(templateId) {
   const svc = currentService();
   if (!svc || serviceActiveJobId) return;
   const layer = $("runLayer");
   if (!layer) return;
-  if (runLayerOpen()) return;
+  if (runLayerOpen() || cloneLayerOpen()) return;
+  hideTplMenu();
+  const tpl = findPipelineTemplate(templateId) || selectedPipelineTemplate() || defaultPersonalTemplate();
+  runLayerMode = "run";
+  runLayerTemplateId = tpl ? tpl.id : "";
+  if (tpl) selectedTemplateId = tpl.id;
+  renderPipelineTemplates();
   layer.hidden = false;
   document.body.classList.add("run-open");
-  enterRunPage();
+  enterRunPage(tpl);
 }
-function enterRunPage() {
+function openEditTemplate(templateId) {
+  const svc = currentService();
+  const tpl = findPipelineTemplate(templateId);
+  const layer = $("runLayer");
+  if (!svc || !tpl || !layer || runLayerOpen()) return;
+  hideTplMenu();
+  runLayerMode = "edit";
+  runLayerTemplateId = tpl.id;
+  selectedTemplateId = tpl.id;
+  renderPipelineTemplates();
+  layer.hidden = false;
+  document.body.classList.add("run-open");
+  enterRunPage(tpl);
+}
+function enterRunPage(tpl) {
   runPreviewActive = true;
-  runPreviewSelection = { deploy: false, test: false, environmentId: "" };
+  applyTemplateDefaults(tpl);
   previewBranchPicker = null;
   setPreviewHint("");
+  syncRunLayerChrome();
   renderRunPage();
   updateActionButtons();
   loadEnvironments().then(() => {
-    if (runPreviewActive) renderRunPage();
+    if (!runPreviewActive) return;
+    if (tpl && tpl.environment_id && !environments.some((item) => item.id === tpl.environment_id)) {
+      runPreviewSelection.environmentId = "";
+    }
+    renderRunPage();
   }).catch((e) => setPreviewHint(e.message || "加载环境失败"));
   loadPreviewBranches(false);
 }
 function cancelRunPreview() {
   if (!runPreviewActive && !runLayerOpen()) return;
   runPreviewActive = false;
+  runLayerMode = "run";
+  runLayerTemplateId = "";
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
   setPreviewHint("");
   closeRunPopup();
@@ -754,6 +833,10 @@ function cancelRunPreview() {
   updateActionButtons();
 }
 function confirmRunPreview() {
+  if (runLayerMode === "edit") {
+    saveEditedTemplate().catch((e) => setPreviewHint(e.message || "保存失败"));
+    return;
+  }
   const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
   if (wantsGamma && !runPreviewSelection.environmentId) {
     setPreviewHint("请先选择环境");
@@ -761,6 +844,153 @@ function confirmRunPreview() {
   }
   const branch = (previewBranchPicker && previewBranchPicker.value) || "";
   startRun(branch);
+}
+async function saveEditedTemplate() {
+  if (!runLayerTemplateId) return;
+  const name = (($("runTemplateName") && $("runTemplateName").value) || "").trim();
+  if (!name) {
+    setPreviewHint("请填写流水线名称");
+    return;
+  }
+  const branch = (previewBranchPicker && previewBranchPicker.value) || "";
+  const data = await api("/api/pipeline-templates/" + encodeURIComponent(runLayerTemplateId), {
+    method: "POST",
+    body: JSON.stringify({
+      name,
+      branch,
+      gamma_deploy: !!runPreviewSelection.deploy,
+      gamma_test: !!runPreviewSelection.test,
+      environment_id: runPreviewSelection.environmentId || "",
+    }),
+  });
+  if (data.template) {
+    const idx = pipelineTemplates.findIndex((item) => item.id === data.template.id);
+    if (idx >= 0) pipelineTemplates[idx] = data.template;
+    else pipelineTemplates.push(data.template);
+  }
+  cancelRunPreview();
+  await loadPipelineTemplates();
+}
+function hideTplMenu() {
+  const menu = $("tplMenu");
+  const trigger = $("tplTrigger");
+  if (menu) menu.hidden = true;
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+}
+function renderPipelineTemplates() {
+  const label = $("tplTriggerLabel");
+  const menu = $("tplMenu");
+  const tpl = selectedPipelineTemplate() || defaultPersonalTemplate();
+  if (label) label.textContent = tpl ? (tpl.name || "未命名流水线") : "选择流水线";
+  if (menu) {
+    menu.innerHTML = pipelineTemplates.map((item) => (
+      '<button type="button" role="option" data-tpl-id="' + esc(item.id) + '"' +
+      (item.id === selectedTemplateId ? ' class="active"' : "") + ">" +
+      esc(item.name || "未命名流水线") +
+      "</button>"
+    )).join("");
+    menu.querySelectorAll("[data-tpl-id]").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const id = btn.getAttribute("data-tpl-id") || "";
+        if (id) selectedTemplateId = id;
+        hideTplMenu();
+        renderPipelineTemplates();
+      });
+    });
+  }
+  updateActionButtons();
+}
+async function loadPipelineTemplates() {
+  if (isAllServices() || !currentServiceId) {
+    pipelineTemplates = [];
+    selectedTemplateId = "";
+    renderPipelineTemplates();
+    return;
+  }
+  const [tplData, envData] = await Promise.all([
+    api("/api/pipeline-templates?service_id=" + encodeURIComponent(currentServiceId)),
+    api("/api/environments?service_id=" + encodeURIComponent(currentServiceId)),
+  ]);
+  pipelineTemplates = tplData.templates || [];
+  environments = envData.environments || [];
+  if (tab === "envs") renderEnvironments();
+  if (!selectedTemplateId || !pipelineTemplates.some((item) => item.id === selectedTemplateId)) {
+    const personal = defaultPersonalTemplate();
+    selectedTemplateId = personal ? personal.id : "";
+  }
+  renderPipelineTemplates();
+}
+function cloneLayerOpen() {
+  const layer = $("cloneLayer");
+  return !!(layer && !layer.hidden);
+}
+function setCloneHint(text) {
+  const el = $("cloneHint");
+  if (!el) return;
+  el.hidden = !text;
+  el.textContent = text || "";
+}
+function openCloneWindow(templateId) {
+  const svc = currentService();
+  const tpl = findPipelineTemplate(templateId) || selectedPipelineTemplate();
+  const layer = $("cloneLayer");
+  if (!svc || !tpl || !layer || runLayerOpen() || cloneLayerOpen()) return;
+  hideTplMenu();
+  cloneSourceId = tpl.id;
+  selectedTemplateId = tpl.id;
+  renderPipelineTemplates();
+  const nameInput = $("cloneTemplateName");
+  if (nameInput) nameInput.value = (tpl.name || "流水线") + "_copy";
+  setCloneHint("");
+  layer.hidden = false;
+  document.body.classList.add("clone-open");
+  updateActionButtons();
+  if (nameInput) nameInput.focus();
+}
+function closeCloneWindow() {
+  if (!cloneLayerOpen() && !cloneSourceId) return;
+  cloneSourceId = "";
+  setCloneHint("");
+  const layer = $("cloneLayer");
+  if (layer) layer.hidden = true;
+  document.body.classList.remove("clone-open");
+  updateActionButtons();
+}
+async function confirmClone() {
+  if (!cloneSourceId) return;
+  const name = (($("cloneTemplateName") && $("cloneTemplateName").value) || "").trim();
+  if (!name) {
+    setCloneHint("请填写流水线名称");
+    return;
+  }
+  const data = await api("/api/pipeline-templates/" + encodeURIComponent(cloneSourceId) + "/copy", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+  if (data.template) selectedTemplateId = data.template.id;
+  closeCloneWindow();
+  await loadPipelineTemplates();
+}
+function confirmDeleteTemplate(id) {
+  const tpl = findPipelineTemplate(id);
+  if (!tpl || tpl.builtin) return;
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    "<p>确定删除流水线「" + esc(tpl.name) + "」？</p>" +
+    '<div class="row"><button type="button" class="btn ghost" data-close-modal>取消</button>' +
+    '<button type="button" class="btn danger" id="btnTplDeleteOk">删除</button></div>';
+  openModal("删除流水线", wrap, { narrow: true });
+  wrap.querySelector("#btnTplDeleteOk").addEventListener("click", async () => {
+    try {
+      await api("/api/pipeline-templates/" + encodeURIComponent(id) + "/delete", { method: "POST", body: "{}" });
+      closeModal();
+      if (selectedTemplateId === id) selectedTemplateId = "";
+      await loadPipelineTemplates();
+    } catch (e) {
+      alert(e.message || "删除失败");
+    }
+  });
 }
 function createStatusIcon(status, kind, doc) {
   doc = doc || document;
@@ -1185,6 +1415,7 @@ function hideServiceMenu() {
   if ($("serviceTrigger")) $("serviceTrigger").setAttribute("aria-expanded", "false");
 }
 function showServiceMenu() {
+  hideTplMenu();
   const menu = $("serviceMenu");
   const trigger = $("serviceTrigger");
   if (!menu || !trigger) return;
@@ -1314,7 +1545,10 @@ function activateService(id) {
     return false;
   }
   cancelRunPreview();
+  closeCloneWindow();
   currentServiceId = id;
+  selectedTemplateId = "";
+  pipelineTemplates = [];
   pinnedJobId = "";
   serviceActiveJobId = "";
   viewGeneration += 1;
@@ -1350,7 +1584,10 @@ function selectService(id) {
   }
   writeHash();
   refreshServiceOccupancy().catch(() => {});
-  if (tab === "pipeline") loadServiceJob();
+  if (tab === "pipeline") {
+    loadPipelineTemplates().catch(() => {});
+    loadServiceJob();
+  }
   else {
     stopPolling();
     if (tab === "history") refreshHistory().catch(() => {});
@@ -1847,6 +2084,8 @@ async function startRun(branch) {
     closeModal();
     closeRunPopup();
     runPreviewActive = false;
+    runLayerMode = "run";
+    runLayerTemplateId = "";
     applyServiceChrome();
     pinnedJobId = "";
     setTab("pipeline");
@@ -2559,6 +2798,42 @@ document.querySelectorAll(".subtab[data-tab]").forEach((btn) => {
 bindServicePicker();
 bindEyeButtons(document);
 bind("btnRun", () => openRunWindow());
+bind("btnTplEdit", () => {
+  const tpl = selectedPipelineTemplate();
+  if (tpl) openEditTemplate(tpl.id);
+});
+bind("btnTplCopy", () => {
+  const tpl = selectedPipelineTemplate();
+  if (tpl) openCloneWindow(tpl.id);
+});
+bind("btnCloneConfirm", () => confirmClone().catch((e) => setCloneHint(e.message || "克隆失败")));
+document.querySelectorAll("[data-clone-close]").forEach((el) => {
+  el.addEventListener("click", () => closeCloneWindow());
+});
+bind("btnTplDelete", () => {
+  const tpl = selectedPipelineTemplate();
+  if (tpl) confirmDeleteTemplate(tpl.id);
+});
+function bindTplPicker() {
+  const trigger = $("tplTrigger");
+  const menu = $("tplMenu");
+  if (!trigger || trigger.dataset.bound === "1") return;
+  trigger.dataset.bound = "1";
+  trigger.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (!menu) return;
+    const opening = menu.hidden;
+    if (opening) {
+      hideServiceMenu();
+      menu.hidden = false;
+    } else {
+      menu.hidden = true;
+    }
+    trigger.setAttribute("aria-expanded", String(opening));
+  });
+  if (menu) menu.addEventListener("click", (ev) => ev.stopPropagation());
+}
+bindTplPicker();
 bind("btnRunPreviewConfirm", () => confirmRunPreview());
 bind("btnRunPreviewCancel", () => cancelRunPreview());
 bind("btnRefreshPreviewBranches", () => loadPreviewBranches(true));
@@ -2604,6 +2879,10 @@ document.addEventListener("keydown", (ev) => {
     closeEnvOverlay();
     return;
   }
+  if (cloneLayerOpen()) {
+    closeCloneWindow();
+    return;
+  }
   if (runPreviewActive) cancelRunPreview();
 });
 document.querySelectorAll("[data-close-modal]").forEach((el) => el.addEventListener("click", closeModal));
@@ -2613,6 +2892,7 @@ $("modalRoot").addEventListener("click", (ev) => {
 document.addEventListener("click", (ev) => {
   if (!ev.target.closest(".user-wrap")) closeUserMenu();
   if (ev.target.isConnected && !ev.target.closest("#svcPicker")) hideServiceMenu();
+  if (ev.target.isConnected && !ev.target.closest("#tplPicker")) hideTplMenu();
 });
 window.addEventListener("message", (ev) => {
   if (ev.origin !== location.origin) return;
@@ -2653,11 +2933,15 @@ window.addEventListener("hashchange", async () => {
     if (parsed.job) {
       pinnedJobId = parsed.job;
       if (parsed.tab !== tab) setTab(parsed.tab);
+      loadPipelineTemplates().catch(() => {});
       await openJob(parsed.job);
       return;
     }
     if (parsed.tab !== tab) setTab(parsed.tab);
-    if (tab === "pipeline") await loadServiceJob();
+    if (tab === "pipeline") {
+      loadPipelineTemplates().catch(() => {});
+      await loadServiceJob();
+    }
     else {
       stopPolling();
       refreshServiceOccupancy().catch(() => {});
@@ -2689,12 +2973,15 @@ async function bootApp(username) {
     } else if (parsed.job) {
       pinnedJobId = parsed.job;
       setTab("pipeline");
+      loadPipelineTemplates().catch(() => {});
       await openJob(parsed.job);
       refreshServiceOccupancy().catch(() => {});
     } else {
       setTab(parsed.tab);
-      if (tab === "pipeline") await loadServiceJob();
-      else refreshServiceOccupancy().catch(() => {});
+      if (tab === "pipeline") {
+        loadPipelineTemplates().catch(() => {});
+        await loadServiceJob();
+      } else refreshServiceOccupancy().catch(() => {});
     }
   } else {
     writeHash();
