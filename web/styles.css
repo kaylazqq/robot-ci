@@ -160,11 +160,16 @@ textarea { resize: vertical; min-height: 88px; }
   grid-template-columns: 221px 1fr;
   min-height: 100vh;
 }
-.app.is-run-window {
+.app.is-run-window,
+html.is-run-window .app {
   grid-template-columns: 1fr;
 }
 .app.is-run-window .nav,
-.app.is-run-window .topbar { display: none; }
+.app.is-run-window .topbar,
+html.is-run-window .nav,
+html.is-run-window .topbar { display: none !important; }
+html.is-run-window #pageBuild,
+html.is-run-window #pageSwr { display: none !important; }
 .nav {
   background: var(--sidebar);
   border-right: 1px solid var(--line);

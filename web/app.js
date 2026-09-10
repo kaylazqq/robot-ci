@@ -25,7 +25,7 @@ let environments = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
-let runWindowMode = false;
+let runWindowMode = /run\.html$/i.test(location.pathname) || /^#\/run(\/|$)/.test(location.hash || "");
 let runPreviewSelection = { deploy: false, test: false, environmentId: "" };
 let previewBranchPicker = null;
 let svcMenuPage = 1;
@@ -236,10 +236,10 @@ function showLogin(message) {
 function enterApp(username) {
   sessionLive = true;
   currentUser = username;
-  $("loginGate").hidden = true;
-  $("appShell").hidden = false;
-  $("userNameLabel").textContent = username;
-  $("userAvatar").textContent = String(username).slice(0, 1).toUpperCase();
+  if ($("loginGate")) $("loginGate").hidden = true;
+  if ($("appShell")) $("appShell").hidden = false;
+  if ($("userNameLabel")) $("userNameLabel").textContent = username;
+  if ($("userAvatar")) $("userAvatar").textContent = String(username).slice(0, 1).toUpperCase();
 }
 
 function bindEyeButtons(root) {
@@ -286,11 +286,12 @@ function allServicesFallbackTab(next) {
 }
 
 function setNav(next, skipHash) {
+  if (runWindowMode) return;
   nav = next === "swr" ? "swr" : "build";
   document.querySelectorAll(".nav-item").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.nav === nav);
   });
-  $("pageSwr").hidden = nav !== "swr";
+  if ($("pageSwr")) $("pageSwr").hidden = nav !== "swr";
   if (nav !== "build" || tab !== "envs") {
     closeEnvConfirm(false);
     closeEnvOverlay();
@@ -319,12 +320,13 @@ function applyServiceChrome() {
   }
   if ($("pageBuild")) $("pageBuild").hidden = nav !== "build";
   if ($("pageRun")) $("pageRun").hidden = true;
+  if (!$("viewPipeline")) return;
   $("viewPipeline").hidden = tab !== "pipeline";
-  $("viewHistory").hidden = tab !== "history";
-  $("viewArtifacts").hidden = tab !== "artifacts";
+  if ($("viewHistory")) $("viewHistory").hidden = tab !== "history";
+  if ($("viewArtifacts")) $("viewArtifacts").hidden = tab !== "artifacts";
   if ($("viewEnvs")) $("viewEnvs").hidden = tab !== "envs";
-  $("pipelineActions").hidden = all || tab !== "pipeline";
-  $("jobMetaBar").hidden = all || tab !== "pipeline";
+  if ($("pipelineActions")) $("pipelineActions").hidden = all || tab !== "pipeline";
+  if ($("jobMetaBar")) $("jobMetaBar").hidden = all || tab !== "pipeline";
   if ($("historyHint")) {
     $("historyHint").textContent = all
       ? "全量构建记录。点「查看」打开该次流水线。"
@@ -435,11 +437,12 @@ function updateActionButtons() {
   const live = jobIsLive(currentJob);
   const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
   if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runWindowMode;
-  $("btnStop").disabled = !live || stopping;
-  $("btnParams").disabled = !(svc && svc.requires_version);
+  if ($("btnStop")) $("btnStop").disabled = !live || stopping;
+  if ($("btnParams")) $("btnParams").disabled = !(svc && svc.requires_version);
 }
 
 function renderJobMeta(job) {
+  if (!$("metaBranch")) return;
   const live = jobIsLive(job);
   $("metaBranch").textContent = (job && job.branch) || "—";
   $("metaCommit").textContent = shortSha(job && job.commit_sha);
@@ -733,8 +736,25 @@ async function loadPreviewBranches(force) {
     picker.setDisabled(false);
   }
 }
+function isRunHash() {
+  const raw = (location.hash || "").replace(/^#\/?/, "");
+  return raw.split("/").filter(Boolean)[0] === "run";
+}
+function isRunWindowPage() {
+  return /run\.html$/i.test(location.pathname) || isRunHash();
+}
+function applyRunWindowChrome() {
+  runWindowMode = true;
+  document.documentElement.classList.add("is-run-window");
+  document.body.classList.add("is-run-window");
+  if ($("appShell")) $("appShell").classList.add("is-run-window");
+  if ($("pageSwr")) $("pageSwr").hidden = true;
+  if ($("pageBuild")) $("pageBuild").hidden = true;
+  if ($("pageRun")) $("pageRun").hidden = false;
+  document.title = "运行";
+}
 function runWindowUrl(serviceId) {
-  return location.origin + location.pathname + "#/run/" + encodeURIComponent(serviceId);
+  return location.origin + "/run.html#/run/" + encodeURIComponent(serviceId);
 }
 function openRunWindow() {
   const svc = currentService();
@@ -752,12 +772,9 @@ function openRunWindow() {
   try { win.focus(); } catch (_) {}
 }
 function enterRunPage() {
-  runWindowMode = true;
+  applyRunWindowChrome();
   runPreviewActive = true;
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
-  document.documentElement.classList.add("is-run-window");
-  if ($("appShell")) $("appShell").classList.add("is-run-window");
-  document.title = "运行";
   setPreviewHint("");
   applyServiceChrome();
   renderRunPage();
@@ -2711,15 +2728,22 @@ window.addEventListener("hashchange", async () => {
 });
 
 async function bootApp(username) {
-  enterApp(username);
   const parsed = readHash();
-  if (parsed.service) currentServiceId = parsed.service;
-  await Promise.all([refreshHealth(), refreshServices()]);
-  if (parsed.nav === "run") {
+  if (parsed.nav === "run" || isRunWindowPage()) {
+    applyRunWindowChrome();
+    sessionLive = true;
+    currentUser = username;
+    if ($("loginGate")) $("loginGate").hidden = true;
+    if (parsed.service) currentServiceId = parsed.service;
+    await Promise.all([refreshHealth(), refreshServices()]);
     enterRunPage();
+    if ($("appShell")) $("appShell").hidden = false;
     writeHash();
     return;
   }
+  enterApp(username);
+  if (parsed.service) currentServiceId = parsed.service;
+  await Promise.all([refreshHealth(), refreshServices()]);
   setNav(parsed.nav, true);
   if (nav === "build") {
     applyServiceChrome();
@@ -2741,6 +2765,7 @@ async function bootApp(username) {
 }
 
 (async function boot() {
+  if (isRunWindowPage()) applyRunWindowChrome();
   try {
     const me = await api("/api/auth/me");
     if (me.user) await bootApp(me.user);
