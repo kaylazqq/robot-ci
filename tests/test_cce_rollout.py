@@ -217,7 +217,7 @@ class GammaAfterBuildTests(unittest.TestCase):
         job = _job("gamma-run", service_id="semantic-schedule")
         job["optional_steps"] = {
             "gamma_deploy": True,
-            "gamma_test": True,
+            "gamma_test": False,
             "environment_id": "env1",
         }
         self.assertIsNone(server.register_job_if_idle(job))

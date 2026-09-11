@@ -1379,3 +1379,9 @@ body.clone-open { overflow: hidden; }
   border-color: #e3a8ae;
 }
 body.env-overlay-open { overflow: hidden; }
+.gamma-suite-options { display: grid; gap: 8px; padding: 10px 0 10px 8px; margin-left: 50%; width: 150px; font-size: 12px; }
+.gamma-suite-options label { display: flex; align-items: center; gap: 6px; }
+.gamma-result-link { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--border); }
+.gamma-result-link a { color: var(--primary, #008899); text-decoration: underline; overflow-wrap: anywhere; }
+.log a { color: #83d9ff; text-decoration: underline; text-underline-offset: 3px; }
+.log a:hover, .log a:focus-visible { color: #fff; }
