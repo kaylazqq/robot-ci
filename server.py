@@ -252,6 +252,11 @@ def init_store() -> None:
                     branches_json TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS service_branch_caches (
+                    service_id TEXT PRIMARY KEY,
+                    branches_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
@@ -4764,24 +4769,30 @@ def summarize_command_failure(lines: list[str], fallback: str) -> str:
     return (cleaned[-1][-500:] if cleaned else fallback)
 
 
-def _cache_branches(repo: str, names: list[str]) -> list[str]:
+def _cache_branches(service_id: str, names: list[str]) -> list[str]:
+    """Persist a branch list for exactly one microservice.
+
+    The repository name is deliberately not used as the cache identity: distinct
+    services may share a repository but still require independent branch choices.
+    """
+    cache_key = str(service_id or "").strip()
     unique = sorted({name.strip() for name in names if name and name.strip()})
-    if unique:
+    if cache_key and unique:
         updated_at = time.time()
         with _branch_cache_lock:
-            _branch_cache[repo] = (updated_at, unique)
+            _branch_cache[cache_key] = (updated_at, unique)
         init_store()
         with _db_lock:
             conn = _connect_db()
             try:
                 conn.execute(
                     """
-                    INSERT INTO branch_caches (repo, branches_json, updated_at) VALUES (?, ?, ?)
-                    ON CONFLICT(repo) DO UPDATE SET
+                    INSERT INTO service_branch_caches (service_id, branches_json, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(service_id) DO UPDATE SET
                       branches_json = excluded.branches_json,
                       updated_at = excluded.updated_at
                     """,
-                    (repo, json.dumps(unique, ensure_ascii=False), updated_at),
+                    (cache_key, json.dumps(unique, ensure_ascii=False), updated_at),
                 )
                 conn.commit()
             finally:
@@ -4789,20 +4800,22 @@ def _cache_branches(repo: str, names: list[str]) -> list[str]:
     return unique
 
 
-def cached_branches(repo: str) -> list[str]:
+def cached_branches(service_id: str) -> list[str]:
+    """Read only this microservice's persisted branch cache; never fetch remote."""
+    cache_key = str(service_id or "").strip()
     with _branch_cache_lock:
-        cached = _branch_cache.get(repo)
+        cached = _branch_cache.get(cache_key)
     if cached:
         return list(cached[1])
-    if not repo:
+    if not cache_key:
         return []
     init_store()
     with _db_lock:
         conn = _connect_db()
         try:
             row = conn.execute(
-                "SELECT branches_json, updated_at FROM branch_caches WHERE repo = ?",
-                (repo,),
+                "SELECT branches_json, updated_at FROM service_branch_caches WHERE service_id = ?",
+                (cache_key,),
             ).fetchone()
         finally:
             conn.close()
@@ -4817,16 +4830,21 @@ def cached_branches(repo: str) -> list[str]:
     unique = sorted({str(name).strip() for name in names if str(name).strip()})
     if unique:
         with _branch_cache_lock:
-            _branch_cache[repo] = (float(row["updated_at"] or time.time()), unique)
+            _branch_cache[cache_key] = (float(row["updated_at"] or time.time()), unique)
     return unique
 
 
-def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] | str]:
+def list_branches_api(
+    repo: str, force: bool = False, *, cache_key: str = ""
+) -> tuple[bool, list[str] | str]:
     if not repo:
         return False, "missing repo"
+    # Supplying a key is mandatory for application callers. Retain the repo
+    # fallback only for the standalone helper and its legacy unit tests.
+    cache_id = str(cache_key or repo).strip()
 
     if not force:
-        cached = cached_branches(repo)
+        cached = cached_branches(cache_id)
         if cached:
             return True, cached
 
@@ -4845,7 +4863,7 @@ def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] |
                 parts = line.split()
                 if len(parts) >= 2 and parts[1].startswith("refs/heads/"):
                     names.append(parts[1][len("refs/heads/") :])
-            names = _cache_branches(repo, names)
+            names = _cache_branches(cache_id, names)
             if names:
                 return True, names
             ssh_err = "git ls-remote returned no branch refs"
@@ -4873,7 +4891,7 @@ def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] |
                 names.extend(str(branch.get("name") or "") for branch in data if isinstance(branch, dict))
                 if len(data) < 100:
                     break
-            names = _cache_branches(repo, names)
+            names = _cache_branches(cache_id, names)
             if names:
                 return True, names
             return False, f"SSH: {ssh_err}; GitHub API returned no branches"
@@ -6776,11 +6794,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(404, {"error": "unknown service"})
                 return
             repo = repo_full_name(svc)
+            service_id = str(svc.get("id") or "")
             force_refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
             default = svc.get("default_branch") or "main"
             if force_refresh:
-                cached_before_refresh = cached_branches(repo)
-                ok, result = list_branches_api(repo, force=True)
+                cached_before_refresh = cached_branches(service_id)
+                ok, result = list_branches_api(repo, force=True, cache_key=service_id)
                 from_cache = False
                 refresh_error = ""
                 if not ok and cached_before_refresh:
@@ -6789,7 +6808,7 @@ class Handler(SimpleHTTPRequestHandler):
                     from_cache = True
                     refresh_error = "远程刷新失败，已保留服务器缓存"
             else:
-                result = cached_branches(repo)
+                result = cached_branches(service_id)
                 ok = True
                 from_cache = bool(result)
                 refresh_error = ""
@@ -6814,6 +6833,7 @@ class Handler(SimpleHTTPRequestHandler):
                 200,
                 {
                     "branches": branches,
+                    "service_id": service_id,
                     "default_branch": default,
                     "selected_branch": selected,
                     "cached": from_cache,
@@ -7243,6 +7263,26 @@ class Handler(SimpleHTTPRequestHandler):
                 svc = catalog.get(item["service_id"])
                 if not svc:
                     self._json(400, {"error": f"unknown service: {item['service_id']}"})
+                    return
+                default_branch = str(svc.get("default_branch") or "main")
+                cached = cached_branches(item["service_id"])
+                if cached and item["branch"] not in cached:
+                    self._json(
+                        400,
+                        {
+                            "error": "所选分支不在当前微服务的缓存中，请刷新分支后重试",
+                            "error_code": "branch_not_cached",
+                        },
+                    )
+                    return
+                if not cached and item["branch"] != default_branch:
+                    self._json(
+                        400,
+                        {
+                            "error": "服务器暂无该微服务的分支缓存，仅可使用默认分支；请刷新分支后重试",
+                            "error_code": "branch_cache_missing",
+                        },
+                    )
                     return
                 if svc.get("requires_version") and not DAEMON_VERSION_RE.fullmatch(item.get("version") or ""):
                     self._json(

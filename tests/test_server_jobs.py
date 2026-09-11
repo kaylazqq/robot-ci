@@ -831,6 +831,14 @@ class BranchLookupTests(unittest.TestCase):
         self.assertEqual(first, refreshed)
         self.assertEqual(2, run_cmd.call_count)
 
+    def test_service_branch_caches_are_isolated_for_shared_repositories(self) -> None:
+        server._cache_branches("service-a", ["main", "feature/a"])
+        server._cache_branches("service-b", ["main", "feature/b"])
+        with server._branch_cache_lock:
+            server._branch_cache.clear()
+        self.assertEqual(["feature/a", "main"], server.cached_branches("service-a"))
+        self.assertEqual(["feature/b", "main"], server.cached_branches("service-b"))
+
     @patch.object(server, "gh_token", return_value="token")
     @patch.object(server, "urlopen")
     def test_github_api_fetches_more_than_one_page(self, urlopen, _token) -> None:
@@ -1296,6 +1304,21 @@ class JobEndpointTests(unittest.TestCase):
         self.assertTrue(services["multica-fleet"]["archive_only"])
         self.assertEqual("censong574-spec/multica-fleet", services["multica-fleet"]["repo"])
 
+    @patch.object(server, "cached_branches", return_value=["main", "feature/a"])
+    def test_push_rejects_branch_not_in_selected_service_cache(self, cached) -> None:
+        with self.assertRaises(HTTPError) as raised:
+            self._open(
+                "/api/push",
+                data=json.dumps(
+                    {"service_id": "memory-service", "branch": "feature/b"}
+                ).encode(),
+                method="POST",
+            )
+        self.assertEqual(400, raised.exception.code)
+        payload = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual("branch_not_cached", payload["error_code"])
+        cached.assert_called_once_with("memory-service")
+
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
     def test_branch_lookup_uses_default_until_user_refreshes(self, lookup) -> None:
         with patch.object(server, "cached_branches", return_value=[]):
@@ -1311,7 +1334,7 @@ class JobEndpointTests(unittest.TestCase):
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual("branch lookup failed", payload["error"])
         self.assertEqual("SSH timeout", payload["detail"])
-        lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=True, cache_key="memory-service")
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
     def test_branch_retry_forces_backend_refresh(self, lookup) -> None:
@@ -1319,7 +1342,7 @@ class JobEndpointTests(unittest.TestCase):
             payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(["main", "feature/latest"], payload["branches"])
         self.assertEqual("main", payload["selected_branch"])
-        lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=True, cache_key="memory-service")
 
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
     @patch.object(server, "cached_branches", return_value=["main", "feature/cached"])
@@ -1329,8 +1352,8 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual(["main", "feature/cached"], payload["branches"])
         self.assertTrue(payload["cached"])
         self.assertIn("远程刷新失败", payload["refresh_error"])
-        cached.assert_called_once_with("rollingfruit/CellMem")
-        lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
+        cached.assert_called_once_with("memory-service")
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=True, cache_key="memory-service")
 
 
 class DiskPruneAndArtifactTests(unittest.TestCase):

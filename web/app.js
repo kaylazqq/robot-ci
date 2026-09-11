@@ -33,9 +33,9 @@ let runLayerTemplateId = "";
 let cloneSourceId = "";
 let previewBranchPicker = null;
 let previewBranchLoadGeneration = 0;
+let previewBranchServiceId = "";
 let svcMenuPage = 1;
 const SVC_PAGE_SIZE = 8;
-const branchCache = {};
 const branchLoads = {};
 const BRANCH_LOAD_LIMIT = 3;
 const branchLoadQueue = [];
@@ -707,7 +707,6 @@ async function loadPreviewBranches(force) {
     currentServiceId === svc.id
   );
   const fallbackBranch = svc.default_branch || "main";
-  const cached = branchCache[svc.id];
   const setLoading = (loading) => {
     if (!isCurrentLoad()) return;
     if (retryBtn) retryBtn.classList.toggle("loading", loading);
@@ -734,15 +733,12 @@ async function loadPreviewBranches(force) {
       setPreviewBranchStatus("服务器暂无分支缓存，当前使用默认分支；点击刷新加载");
     }
   };
-  if (!force && cached && cached.loaded) {
-    const tpl = findPipelineTemplate(runLayerTemplateId);
-    if (!isCurrentLoad()) return;
-    applyCached({ ...cached, selected_branch: (tpl && tpl.branch) || cached.selected_branch || fallbackBranch });
-    return;
-  }
   setLoading(true);
   try {
     const data = await fetchServiceBranches(svc.id, !!force, true);
+    if (data.service_id && data.service_id !== svc.id) {
+      throw new Error("分支缓存服务不匹配，请重新打开运行页");
+    }
     const tpl = findPipelineTemplate(runLayerTemplateId);
     if (tpl && tpl.branch) data.selected_branch = tpl.branch;
     applyCached(data);
@@ -750,7 +746,6 @@ async function loadPreviewBranches(force) {
     if (!isCurrentLoad()) return;
     picker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
     setPreviewBranchStatus(e.message || "加载分支失败", "error");
-    delete branchCache[svc.id];
   } finally {
     if (!isCurrentLoad()) return;
     if (retryBtn) retryBtn.classList.remove("loading");
@@ -833,6 +828,7 @@ function enterRunPage(tpl) {
   applyTemplateDefaults(tpl);
   previewBranchPicker = null;
   const svc = currentService();
+  previewBranchServiceId = (svc && svc.id) || "";
   const fallbackBranch = (svc && svc.default_branch) || "main";
   const picker = ensurePreviewBranchPicker();
   if (picker) {
@@ -862,6 +858,7 @@ function cancelRunPreview() {
   previewBranchLoadGeneration += 1;
   if (!runPreviewActive && !runLayerOpen()) return;
   runPreviewActive = false;
+  previewBranchServiceId = "";
   runLayerMode = "run";
   runLayerTemplateId = "";
   runPreviewSelection = { deploy: false, test: false, environmentId: "" };
@@ -882,6 +879,10 @@ function confirmRunPreview() {
     return;
   }
   const branch = (previewBranchPicker && previewBranchPicker.value) || "";
+  if (!branch || previewBranchServiceId !== currentServiceId) {
+    setPreviewHint("微服务已切换，请重新打开运行页后选择分支");
+    return;
+  }
   startRun(branch);
 }
 async function saveEditedTemplate() {
@@ -1875,11 +1876,8 @@ function queueBranchLoad(task, priority) {
 }
 function fetchServiceBranches(serviceId, force, priority) {
   if (!sessionLive) return Promise.reject(new Error("请先登录"));
-  if (!force && branchCache[serviceId] && branchCache[serviceId].loaded) {
-    return Promise.resolve(branchCache[serviceId]);
-  }
   if (!force && branchLoads[serviceId]) return branchLoads[serviceId];
-  const req = queueBranchLoad(() => {
+  const request = queueBranchLoad(() => {
     if (!sessionLive) return Promise.reject(new Error("请先登录"));
     const path = "/api/services/" + encodeURIComponent(serviceId) + "/branches" + (force ? "?refresh=1" : "");
     if (typeof AbortController === "undefined") return api(path);
@@ -1893,25 +1891,20 @@ function fetchServiceBranches(serviceId, force, priority) {
       if (timedOut) throw new Error("刷新分支超时，请稍后重试");
       throw error;
     }).finally(() => clearTimeout(timer));
-  }, !!priority).then((data) => {
-    if (!sessionLive) return data;
-    const cached = {
-      loaded: true,
-      branches: data.branches || [],
-      selected_branch: data.selected_branch || "",
-      default_branch: data.default_branch || "",
-      cached: data.cached === true || force,
-      refresh_error: data.refresh_error || "",
-    };
-    branchCache[serviceId] = cached;
-    delete branchLoads[serviceId];
-    return cached;
-  }).catch((err) => {
-    delete branchLoads[serviceId];
-    throw err;
+  }, !!priority).then((data) => ({
+    service_id: data.service_id || serviceId,
+    branches: data.branches || [],
+    selected_branch: data.selected_branch || "",
+    default_branch: data.default_branch || "",
+    cached: data.cached === true,
+    refresh_error: data.refresh_error || "",
+  }));
+  if (force) return request;
+  const shared = request.finally(() => {
+    if (branchLoads[serviceId] === shared) delete branchLoads[serviceId];
   });
-  branchLoads[serviceId] = req;
-  return req;
+  branchLoads[serviceId] = shared;
+  return shared;
 }
 function createBranchPicker(root, selectors) {
   const doc = root.ownerDocument || document;
@@ -2022,16 +2015,8 @@ async function openRunDialog() {
   const statusEl = wrap.querySelector("#runBranchStatus");
   const retryBtn = wrap.querySelector("#btnRefreshBranches");
   const fallbackBranch = svc.default_branch || "main";
-  const cached = branchCache[svc.id];
-  const alreadyLoaded = !!(cached && cached.loaded);
-  const selected = (cached && cached.selected_branch) || fallbackBranch;
-  branchPicker.setOptions(cached && cached.branches, selected, (cached && cached.default_branch) || fallbackBranch);
+  branchPicker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
   openModal("运行流水线", wrap, { narrow: true });
-  if (!alreadyLoaded) {
-    statusEl.textContent = "正在加载中";
-    retryBtn.classList.add("loading");
-    branchPicker.setDisabled(true);
-  }
   const setLoading = (loading) => {
     retryBtn.classList.toggle("loading", loading);
     branchPicker.setDisabled(loading);
@@ -2055,10 +2040,6 @@ async function openRunDialog() {
     statusEl.className = "branch-status ok";
   };
   const loadBranches = async (force) => {
-    if (!force && branchCache[svc.id] && branchCache[svc.id].loaded) {
-      applyCached(branchCache[svc.id], false);
-      return;
-    }
     setLoading(true);
     try {
       const data = await fetchServiceBranches(svc.id, force, true);
@@ -2067,7 +2048,6 @@ async function openRunDialog() {
       branchPicker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
       statusEl.textContent = e.message || "加载分支失败";
       statusEl.className = "branch-status error";
-      delete branchCache[svc.id];
     } finally {
       retryBtn.classList.remove("loading");
       branchPicker.setDisabled(false);
@@ -2083,6 +2063,11 @@ async function openRunDialog() {
 async function startRun(branch) {
   const svc = currentService();
   if (!svc || submitting) return;
+  const selectedBranch = String(branch || "").trim();
+  if (!selectedBranch) {
+    alert("请选择分支后再运行");
+    return;
+  }
   if (svc.requires_version && !DAEMON_VERSION_PATTERN.test(rememberedDaemonVersion() || svc.last_version || "")) {
     closeModal();
     openParamsDialog("运行前请先配置 Daemon version");
@@ -2094,7 +2079,7 @@ async function startRun(branch) {
       method: "POST",
       body: JSON.stringify({
         service_id: svc.id,
-        branch: branch || svc.default_branch || "main",
+        branch: selectedBranch,
         version: rememberedDaemonVersion() || svc.last_version || "",
         login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
         optional_steps: {
