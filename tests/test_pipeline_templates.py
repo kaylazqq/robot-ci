@@ -97,10 +97,6 @@ class PipelineTemplateApiTests(unittest.TestCase):
         self.assertEqual("我的日常构建", updated["template"]["name"])
         self.assertEqual("develop", updated["template"]["branch"])
 
-        with self._open("/api/run-templates?service_id=memory-service", cookie=cookie) as response:
-            last_branch = json.loads(response.read().decode("utf-8"))
-        self.assertEqual("develop", last_branch["branch"])
-
         with self._open(
             "/api/pipeline-templates/" + release["id"] + "/copy",
             data=json.dumps({"name": "生产发布 克隆"}).encode(),

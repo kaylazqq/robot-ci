@@ -241,13 +241,6 @@ def init_store() -> None:
                     salt TEXT NOT NULL,
                     password_hash TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS run_templates (
-                    username TEXT NOT NULL,
-                    service_id TEXT NOT NULL,
-                    branch TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (username, service_id)
-                );
                 CREATE TABLE IF NOT EXISTS service_favorites (
                     username TEXT NOT NULL,
                     service_id TEXT NOT NULL,
@@ -684,70 +677,6 @@ def delete_environment(env_id: str) -> bool:
             conn.close()
 
 
-def get_run_template(username: str, service_id: str) -> str:
-    user = str(username or "").strip()
-    sid = str(service_id or "").strip()
-    if not user or not sid:
-        return ""
-    init_store()
-    with _db_lock:
-        conn = _connect_db()
-        try:
-            row = conn.execute(
-                "SELECT branch FROM run_templates WHERE username = ? AND service_id = ?",
-                (user, sid),
-            ).fetchone()
-        finally:
-            conn.close()
-    return str(row["branch"] or "").strip() if row else ""
-
-
-def save_run_template(username: str, service_id: str, branch: str) -> str:
-    user = str(username or "").strip()
-    sid = str(service_id or "").strip()
-    value = str(branch or "").strip()
-    if not user:
-        return "未登录"
-    if not sid:
-        return "缺少微服务"
-    if not value or not re.match(r"^[\w./\-]+$", value):
-        return "分支无效"
-    init_store()
-    with _db_lock:
-        conn = _connect_db()
-        try:
-            conn.execute(
-                """
-                INSERT INTO run_templates (username, service_id, branch, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(username, service_id) DO UPDATE SET
-                    branch = excluded.branch,
-                    updated_at = excluded.updated_at
-                """,
-                (user, sid, value, time.strftime("%Y-%m-%d %H:%M:%S")),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    return ""
-
-
-def resolve_template_branch(
-    username: str,
-    service_id: str,
-    branches: list[str],
-    default: str = "main",
-) -> str:
-    names = [str(item).strip() for item in (branches or []) if str(item).strip()]
-    fallback = str(default or "main").strip() or "main"
-    preferred = get_run_template(username, service_id)
-    if preferred and preferred in names:
-        return preferred
-    if fallback in names:
-        return fallback
-    return names[0] if names else fallback
-
-
 BUILTIN_PIPELINE_TEMPLATES = (
     {"kind": "personal", "name": "个人构建流水线", "gamma_deploy": 0, "gamma_test": 0},
     {"kind": "release", "name": "生产发布", "gamma_deploy": 1, "gamma_test": 1},
@@ -971,8 +900,6 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
             conn.commit()
         finally:
             conn.close()
-    if fields["branch"]:
-        save_run_template(username, item["service_id"], fields["branch"])
     return get_pipeline_template(username, item["id"]), ""
 
 
@@ -6870,28 +6797,17 @@ class Handler(SimpleHTTPRequestHandler):
             if default in branches:
                 branches.remove(default)
                 branches.insert(0, default)
-            preferred = get_run_template(user or "", str(svc.get("id") or ""))
-            selected = resolve_template_branch(user or "", str(svc.get("id") or ""), branches, default)
+            selected = default if default in branches else (branches[0] if branches else default)
             self._json(
                 200,
                 {
                     "branches": branches,
                     "default_branch": default,
-                    "preferred_branch": preferred or None,
                     "selected_branch": selected,
                     "cached": from_cache,
                     "refresh_error": refresh_error or None,
                 },
             )
-            return
-
-        if path == "/api/run-templates":
-            service_id = str((query.get("service_id") or [""])[0]).strip()
-            if not service_id:
-                self._json(400, {"error": "缺少微服务"})
-                return
-            preferred = get_run_template(user or "", service_id)
-            self._json(200, {"service_id": service_id, "branch": preferred or None})
             return
 
         if path == "/api/pipeline-templates":
@@ -7096,20 +7012,6 @@ class Handler(SimpleHTTPRequestHandler):
                     "service_ids": service_ids,
                 },
             )
-            return
-
-        if path == "/api/run-templates":
-            service_id = str(data.get("service_id") or "").strip()
-            branch = str(data.get("branch") or "").strip()
-            catalog = {str(item.get("id")): item for item in load_services()}
-            if service_id not in catalog:
-                self._json(404, {"ok": False, "error": "未知微服务"})
-                return
-            err = save_run_template(user, service_id, branch)
-            if err:
-                self._json(400, {"ok": False, "error": err})
-                return
-            self._json(200, {"ok": True, "service_id": service_id, "branch": branch})
             return
 
         m_tpl_copy = re.fullmatch(r"/api/pipeline-templates/([^/]+)/copy", path)
