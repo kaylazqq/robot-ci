@@ -1090,6 +1090,8 @@ def destroy_session(token: str) -> None:
 
 def session_cookie_name() -> str:
     """Cookies are host-scoped, not port-scoped. Isolate :18889 from :80."""
+    if os.environ.get('ROBOT_CI_PUBLIC_ORIGIN'):
+        return SESSION_COOKIE
     try:
         port = int(CFG.get("port") or 80)
     except (TypeError, ValueError, NameError):
@@ -1212,6 +1214,7 @@ JOB_PUBLIC_FIELDS = (
     "test_kinds",
     "cancel_requested",
     "optional_steps",
+    "gamma_e2e",
 )
 
 JOB_COMPACT_FIELDS = (
@@ -1241,6 +1244,7 @@ JOB_COMPACT_FIELDS = (
     "slot_held",
     "queue_position",
     "optional_steps",
+    "gamma_e2e",
 )
 
 
@@ -1352,10 +1356,13 @@ def _effective_pipeline_stage(job: dict[str, Any]) -> str:
 def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {"gamma_deploy": False, "gamma_test": False, "environment_id": ""}
+    from gamma_e2e import options
+    extra = options(raw) if raw.get('environment_id') == 'ci-e2e' else {}
     return {
         "gamma_deploy": bool(raw.get("gamma_deploy")),
         "gamma_test": bool(raw.get("gamma_test")),
         "environment_id": str(raw.get("environment_id") or "").strip(),
+        **extra,
     }
 
 
@@ -2962,6 +2969,7 @@ def persist_job_meta(job_id: str) -> None:
             "slot_held",
             "queue_position",
             "optional_steps",
+            "gamma_e2e",
         )
         meta = {k: job.get(k) for k in keys}
         # Keep running-job JSON small so history listing stays cheap.
@@ -3029,6 +3037,8 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "step_logs": meta.get("step_logs") or {},
         "cancel_requested": bool(meta.get("cancel_requested")),
         "stage_before_stop": meta.get("stage_before_stop"),
+        "optional_steps": meta.get("optional_steps") or {},
+        "gamma_e2e": meta.get("gamma_e2e"),
         "log": log_lines,
     }
 
@@ -6236,6 +6246,12 @@ def push_one_service(
             return result
         append_job_log(job_id, f"WARN: local archive failed (ignored): {arc_path}")
 
+    if _normalize_optional_steps(_job_copy(job_id).get('optional_steps')).get('environment_id') == 'ci-e2e':
+        image_code, image_output = docker_cmd('image', 'inspect', '--format', '{{.Id}}', local_ref, timeout=30)
+        if image_code != 0 or not re.fullmatch(r'sha256:[0-9a-f]{64}', image_output.strip()) or not arc_path:
+            result['error'] = 'Gamma E2E requires an exact image ID and image archive'
+            return result
+        result['image_id'] = image_output.strip()
     remove_business_images(job_id, remote, local_ref)
     result["ok"] = True
     result["remote"] = remote
@@ -6291,6 +6307,20 @@ def maybe_run_gamma_after_build(
     set_job(job_id, stage="gamma")
     env = None
     env_id = str(opts.get("environment_id") or "").strip()
+    if env_id == 'ci-e2e':
+        if not opts.get('gamma_test'):
+            return False, 'CI 隔离 E2E 必须选择 gamma测试；不执行 CCE 部署'
+        from gamma_e2e import run as run_e2e
+        # Compilation is complete. E2E owns its own single slot and lease.
+        release_build_slot(job_id)
+        with log_substep('test'):
+            try:
+                return run_e2e(job_id,results,opts,lambda line:append_job_log(job_id,line),
+                    lambda state:set_job(job_id,gamma_e2e=state),lambda:job_cancel_requested(job_id))
+            except Exception as exc:
+                message='Gamma E2E 接入失败: '+str(exc)
+                append_job_log(job_id,message)
+                return False,message
     if env_id:
         env = get_environment(env_id, include_secrets=True)
 
@@ -6336,7 +6366,8 @@ def maybe_run_gamma_after_build(
 
     if opts.get("gamma_test"):
         with log_substep("test"):
-            append_job_log(job_id, "gamma测试尚未接入，已跳过")
+            append_job_log(job_id, "当前环境未接入 gamma测试；请选择 CI 隔离 E2E")
+            return False, "当前环境未接入 gamma测试，未执行测试"
     return True, ""
 
 
@@ -6644,6 +6675,14 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        if path == '/api/auth/pipeline':
+            if self.client_address[0] not in {'127.0.0.1', '::1'}:
+                self._json(404, {})
+                return
+            user = self._current_user()
+            self._json(200 if user else 401, {'user': user or None},
+                       extra_headers={'X-Pipeline-User': user or '', 'Cache-Control': 'no-store'})
+            return
         user = self._require_api_user(path, "GET")
         if user is None:
             return
@@ -7296,6 +7335,18 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                     return
             client_id = _normalize_client_id(data.get("client_id"))
+            try:
+                optional_steps = _normalize_optional_steps(data.get('optional_steps'))
+                if optional_steps.get('environment_id') == 'ci-e2e':
+                    if not optional_steps.get('gamma_test'):
+                        raise ValueError('CI E2E requires gamma test selection')
+                    baseline = json.loads(Path(os.environ.get('GAMMA_E2E_BASELINE_FILE','/etc/pr-e2e/artifact-baseline.json')).read_text())
+                    supported = {entry['repo'] for entry in baseline.values()}
+                    if any(catalog[item['service_id']].get('repo') not in supported for item in items):
+                        raise ValueError('Selected service has no CI E2E baseline mapping')
+            except (ValueError, TypeError, OSError, KeyError) as exc:
+                self._json(400, {'error':'Gamma configuration invalid: '+str(exc)})
+                return
             docker = docker_ready_for_push()
             if not docker["ok"]:
                 self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
@@ -7335,7 +7386,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "ui_log": [],
                 "step_logs": {},
                 "_ui_test_running": False,
-                "optional_steps": _normalize_optional_steps(data.get("optional_steps")),
+                "optional_steps": optional_steps,
                 "cancel_requested": False,
                 "slot_held": False,
                 "queue_position": 0,
@@ -7377,6 +7428,8 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     host, port = CFG["host"], CFG["port"]
+    host = os.environ.get('ROBOT_CI_BIND', host)
+    port = int(os.environ.get('ROBOT_CI_PORT', port))
     allow_remote = str(CFG.get("allow_remote") or os.environ.get("SWR_ALLOW_REMOTE") or "").lower() in (
         "1",
         "true",

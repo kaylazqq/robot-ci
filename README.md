@@ -213,3 +213,22 @@ kubectl create secret generic gmagent-runtime \
 ```
 
 不要把 Secret 明文、SWR 临时登录密码、GitHub PAT 或模型 API Key 提交到 robot-ci、GM Agent 仓库、构建日志和镜像归档。
+
+## CI 隔离 Gamma E2E
+
+运行流水线时选择「CI 隔离 E2E」，勾选 gamma 测试及 E01/E02/E03（默认全部），可选择是否执行基线对照。此目标不调用 CCE 部署；原有 CCE 环境部署仍是独立选项。
+
+构建成功后捕获镜像 ID、交接已归档 TAR，并校验镜像配置摘要和 TAR 哈希。Pipeline Hub 使用现有单队列、独立 Docker 执行基线与候选；构建槽位在等待 E2E 前释放。测试失败会使 Gamma 节点失败，构建及 SWR 产物仍保留。构建详情和步骤日志中的报告 URL 可直接点击，重启后历史记录保留链接。
+
+服务端依赖现有 Pipeline Hub：控制 API 位于回环 `8792`，报告位于 `8080`；公网不开放内部提交接口。部署前配置：
+
+- `/etc/pr-e2e/artifact-baseline.json`：完整基线的服务名、仓库、40 位源码 SHA、确切镜像 ID；只允许已有映射的服务。
+- `/etc/pr-e2e/secrets/worker-token`：内部控制凭据，仅服务端读取。
+- `/var/lib/pr-e2e/artifact-inbox/<build-id>`：独立镜像交接目录，运行用户 `pr-e2e` 可读。
+- `GAMMA_E2E_BASELINE_FILE`、`GAMMA_E2E_TOKEN_FILE`、`GAMMA_E2E_ARCHIVE_ROOT` 可覆盖对应路径，默认归档根为 `/usr/share/nginx/html/images`。
+
+同一构建 ID 重复提交复用记录，输入不同则拒绝。停止构建等待不会取消已入队的 Hub 任务；控制服务中断时保留链接且不判通过。镜像 inbox 暂需按已结束且已归档任务人工清理，不能做全局 Docker 清理。
+
+该模式验证构建产物及选定链路，不表示某个 PR 可独立合入；代码检视、GitHub 回写和 NewLink 通知默认不参与。Multica Server 与测试 Daemon 应来自同一提交，推荐直接提取 Server 镜像内的 Daemon，并记录二进制哈希。
+
+链接渲染仅识别 HTTP/HTTPS，通过 DOM 文本节点创建，不执行日志中的 HTML；新窗口使用 `noopener noreferrer`。测试入口：`python -m unittest discover -s tests -p test_gamma_bridge.py`；安装 Playwright 后可运行 `node tests/test_log_links.cjs`（使用本机 Chrome）。

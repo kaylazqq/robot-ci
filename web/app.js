@@ -75,20 +75,51 @@ function bindLogFollow(el, state) {
     state.follow = isLogNearBottom(el);
   });
 }
+function pipelineUrl(value) {
+  return String(value || '').replace(/^http:\/\/119\.8\.233\.58:8080\/(?=(?:runs|batches|artifacts)\/)/, 'http://119.8.233.58/pipeline/');
+}
+function renderLogText(el, text) {
+  const value = String(text == null ? "" : text);
+  if (el.textContent === value) return;
+  const fragment = document.createDocumentFragment();
+  const urls = /https?:\/\/[^\s<>"'`\u3000\u201c\u201d\u2018\u2019]+/gi;
+  let offset = 0;
+  for (const match of value.matchAll(urls)) {
+    let href = match[0].replace(/[.,;:!?，。；：！？、）】》]+$/u, "");
+    // Keep balanced parentheses in URLs, but leave prose delimiters outside.
+    while (href.endsWith(")") && (href.match(/\)/g) || []).length > (href.match(/\(/g) || []).length) href = href.slice(0, -1);
+    try {
+      const parsed = new URL(href);
+      if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) continue;
+    } catch (_) { continue; }
+    fragment.append(document.createTextNode(value.slice(offset, match.index)));
+    const link = document.createElement("a");
+    link.href = pipelineUrl(href);
+    link.textContent = href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.referrerPolicy = "no-referrer";
+    fragment.append(link);
+    offset = match.index + href.length;
+  }
+  fragment.append(document.createTextNode(value.slice(offset)));
+  el.replaceChildren(fragment);
+}
+
 function paintLog(el, text, state) {
   if (!el) return;
   if (state && !state.follow) {
     state.pendingText = text;
     state.flush = () => {
       if (state.follow && state.pendingText != null) {
-        el.textContent = state.pendingText;
+        renderLogText(el, state.pendingText);
         el.scrollTop = el.scrollHeight;
         state.pendingText = null;
       }
     };
     return;
   }
-  el.textContent = text;
+  renderLogText(el, text);
   el.scrollTop = el.scrollHeight;
 }
 
@@ -637,6 +668,10 @@ function createPreviewCheck(taskId, doc) {
   box.className = "pl-check" + (previewTaskChecked(taskId) ? " is-on" : "");
   box.setAttribute("aria-pressed", previewTaskChecked(taskId) ? "true" : "false");
   box.setAttribute("aria-label", taskId === "deploy" ? "gamma部署" : "gamma测试");
+  if (taskId === 'deploy' && runPreviewSelection.environmentId === 'ci-e2e') {
+    box.disabled = true;
+    box.title = 'CI 隔离环境由 E2E Worker 准备，不部署 CCE';
+  }
   box.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17.5 19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   box.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -645,6 +680,7 @@ function createPreviewCheck(taskId, doc) {
   return box;
 }
 function togglePreviewTask(taskId) {
+  if (taskId === 'deploy' && runPreviewSelection.environmentId === 'ci-e2e') return;
   if (taskId === "deploy") runPreviewSelection.deploy = !runPreviewSelection.deploy;
   if (taskId === "test") runPreviewSelection.test = !runPreviewSelection.test;
   if (!runPreviewSelection.deploy && !runPreviewSelection.test) {
@@ -874,6 +910,9 @@ function confirmRunPreview() {
     return;
   }
   const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
+  if (runPreviewSelection.environmentId === 'ci-e2e' && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
+    setPreviewHint('请至少选择一个 E2E 用例'); return;
+  }
   if (wantsGamma && !runPreviewSelection.environmentId) {
     setPreviewHint("请先选择环境");
     return;
@@ -1106,11 +1145,28 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     });
     tree.appendChild(row);
   });
+  if (preview && stage.id === 'gamma' && runPreviewSelection.environmentId === 'ci-e2e') {
+    const group = doc.createElement('div'); group.className = 'gamma-suite-options';
+    for (const [id, title] of [['E01','创建机器人'],['E02','私聊与追问'],['E03','群聊 @']]) {
+      const label = doc.createElement('label'), box = doc.createElement('input');
+      box.type='checkbox'; box.value=id; box.checked=(runPreviewSelection.suites || ['E01','E02','E03']).includes(id);
+      box.addEventListener('change', () => {
+        const values=new Set(runPreviewSelection.suites || ['E01','E02','E03']);
+        box.checked ? values.add(id) : values.delete(id); runPreviewSelection.suites=[...values];
+      });
+      label.append(box, doc.createTextNode(id+' '+title)); group.append(label);
+    }
+    const label=doc.createElement('label'), box=doc.createElement('input');
+    box.type='checkbox'; box.checked=runPreviewSelection.baseline !== false;
+    box.addEventListener('change', () => {runPreviewSelection.baseline=box.checked;});
+    label.append(box,doc.createTextNode('基线对照'));group.append(label);tree.append(group);
+  }
   drop.appendChild(tree);
   col.appendChild(drop);
   return col;
 }
 function selectedEnvName() {
+  if (runPreviewSelection.environmentId === 'ci-e2e') return 'CI 隔离 E2E';
   const env = environments.find((item) => item.id === runPreviewSelection.environmentId);
   return env ? (env.name || "未命名环境") : "";
 }
@@ -1128,7 +1184,8 @@ function createGammaEnvPicker(doc) {
   trigger.setAttribute("aria-expanded", "false");
   const label = doc.createElement("span");
   label.className = "pl-env-trigger-label";
-  const empty = !environments.length;
+  const choices=[{id:'ci-e2e',name:'CI 隔离 E2E · 不修改 CCE'},...environments];
+  const empty = !choices.length;
   label.textContent = selectedEnvName() || (empty ? "还没有环境" : "选择环境");
   trigger.disabled = empty;
   trigger.appendChild(label);
@@ -1156,7 +1213,7 @@ function createGammaEnvPicker(doc) {
     menu.style.maxHeight = Math.max(120, Math.min(280, win.innerHeight - rect.bottom - 12)) + "px";
     doc.body.appendChild(menu);
   };
-  environments.forEach((env) => {
+  choices.forEach((env) => {
     const option = doc.createElement("button");
     option.type = "button";
     option.className = "branch-option" + (runPreviewSelection.environmentId === env.id ? " active" : "");
@@ -1165,11 +1222,13 @@ function createGammaEnvPicker(doc) {
     option.addEventListener("click", (ev) => {
       ev.stopPropagation();
       runPreviewSelection.environmentId = env.id;
+      if (env.id === 'ci-e2e') runPreviewSelection.deploy = false;
       label.textContent = env.name || "未命名环境";
       menu.querySelectorAll(".branch-option").forEach((item) => item.classList.toggle("active", item === option));
       setPreviewHint("");
       close();
       trigger.focus();
+      renderRunPage();
     });
     menu.appendChild(option);
   });
@@ -1733,6 +1792,19 @@ function applyJob(job, { loading } = {}) {
   renderJobPipeline("liveJobPipeline", job.pipeline, job.status, (stageId, taskId) => {
     openStepModal(stageId, taskId);
   });
+  if (job.gamma_e2e) {
+    const row=document.createElement('div'); row.className='gamma-result-link';
+    const state=document.createElement('span');
+    const gammaStatus=job.gamma_e2e.conclusion === 'failure' ? '未通过' : job.gamma_e2e.conclusion === 'success' ? '通过' : ({queued:'排队中',running:'执行中',interrupted:'已中断',blocked:'环境阻塞',detached:'已脱离构建等待'}[job.gamma_e2e.state] || job.gamma_e2e.state || '等待');
+    state.textContent='构建产物已生成 · Gamma '+gammaStatus+(job.gamma_e2e.stage ? ' · '+job.gamma_e2e.stage : '');
+    row.append(state);
+    const url=pipelineUrl(job.gamma_e2e.url);
+    if (url.startsWith('http://119.8.233.58/pipeline/batches/gamma-')) {
+      const link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noreferrer';
+      link.textContent='查看 Gamma E2E 流程与报告';row.append(link);
+    }
+    $('liveJobPipeline').append(row);
+  }
 }
 
 async function openJob(jobId, { fromHistory } = {}) {
@@ -2086,6 +2158,8 @@ async function startRun(branch) {
           gamma_deploy: !!runPreviewSelection.deploy,
           gamma_test: !!runPreviewSelection.test,
           environment_id: runPreviewSelection.environmentId || "",
+          gamma_suites: runPreviewSelection.suites || ['E01','E02','E03'],
+          gamma_baseline: runPreviewSelection.baseline !== false,
         },
       }),
     });
@@ -2786,6 +2860,15 @@ function bind(id, fn) {
   if (el) el.addEventListener("click", fn);
 }
 
+function returnToPipeline() {
+  const target = new URLSearchParams(location.search).get('return_to');
+  if (target && /^\/(pipeline|submit)(\/|$)/.test(target) && !target.includes('\\')) {
+    const url = new URL(target, location.origin);
+    if (url.origin === location.origin) { location.replace(url.href); return true; }
+  }
+  return false;
+}
+
 $("loginForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   $("loginError").hidden = true;
@@ -2794,7 +2877,7 @@ $("loginForm").addEventListener("submit", async (ev) => {
       method: "POST",
       body: JSON.stringify({ username: $("authUser").value.trim(), password: $("authPass").value }),
     });
-    await bootApp(data.username);
+    if (!returnToPipeline()) await bootApp(data.username);
   } catch (e) {
     $("loginError").hidden = false;
     $("loginError").textContent = e.message || "登录失败";
@@ -3003,7 +3086,7 @@ async function bootApp(username) {
 (async function boot() {
   try {
     const me = await api("/api/auth/me");
-    if (me.user) await bootApp(me.user);
+    if (me.user) { if (!returnToPipeline()) await bootApp(me.user); }
     else showLogin();
   } catch (_) {
     showLogin();
