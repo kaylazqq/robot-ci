@@ -68,6 +68,23 @@ class CidConfigTests(unittest.TestCase):
                 with self.assertRaises(CidConfigError):
                     load_cid_config(self.write(VALID + "\n" + forbidden), "demo")
 
+    def test_enabled_dt_without_report_uses_command_result_table(self) -> None:
+        enabled_dt = VALID.replace(
+            """    enabled: false
+    reason: No DT yet.
+""",
+            """    enabled: true
+    command: bash scripts/ci/dt.sh
+""",
+        )
+        config = load_cid_config(self.write(enabled_dt), "demo")
+        plan = build_test_plan(config)
+        commands = plan["profiles"]["cid-demo"]["commands"]
+        dt = next(command for command in commands if command["test_type"] == "dt")
+        self.assertEqual("bash scripts/ci/dt.sh", dt["command"])
+        self.assertNotIn("parser", dt)
+        self.assertNotIn("report", dt)
+
     def test_rejects_service_id_mismatch(self) -> None:
         with self.assertRaisesRegex(CidConfigError, "service.id mismatch"):
             load_cid_config(self.write(VALID), "another-service")

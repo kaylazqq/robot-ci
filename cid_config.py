@@ -74,8 +74,12 @@ def load_cid_config(repo_dir: Path, expected_service_id: str = "") -> dict[str, 
             if step.get("test_type") not in {"ut", "dt"}:
                 raise CidConfigError(f"scripts[{index}].test_type must be ut or dt")
             report = step.get("report")
+            if report is None and step.get("test_type") == "dt":
+                # DT is rendered from the command result table. It does not
+                # upload or depend on a repository-generated report artifact.
+                continue
             if not isinstance(report, dict):
-                raise CidConfigError(f"scripts[{index}].report is required")
+                raise CidConfigError(f"scripts[{index}].report is required for UT")
             if report.get("format") not in {"junit", "go-json", "case-json", "unittest"}:
                 raise CidConfigError(f"scripts[{index}].report.format is unsupported")
             if not str(report.get("path") or "").strip():
@@ -143,17 +147,17 @@ def build_test_plan(config: dict[str, Any]) -> dict[str, Any]:
     for step in config.get("scripts") or []:
         if step.get("type") != "test" or step.get("enabled") is not True:
             continue
-        report = step["report"]
-        commands.append(
-            {
-                "name": str(step.get("name") or step["id"]),
-                "command": str(step["command"]),
-                "parser": str(report["format"]),
-                "report": _report_relative_path(str(report["path"]), str(step["id"])),
-                "timeout_sec": int(step.get("timeout_sec") or 1200),
-                "test_type": str(step.get("test_type") or ""),
-            }
-        )
+        command = {
+            "name": str(step.get("name") or step["id"]),
+            "command": str(step["command"]),
+            "timeout_sec": int(step.get("timeout_sec") or 1200),
+            "test_type": str(step.get("test_type") or ""),
+        }
+        report = step.get("report")
+        if isinstance(report, dict):
+            command["parser"] = str(report["format"])
+            command["report"] = _report_relative_path(str(report["path"]), str(step["id"]))
+        commands.append(command)
     if not commands:
         return {"version": 1, "services": {}, "profiles": {}}
     profile = f"cid-{service_id}"

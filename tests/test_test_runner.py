@@ -9,6 +9,16 @@ import test_runner
 
 
 class TestResultParsing(unittest.TestCase):
+    def test_parse_shell_keeps_dt_command_result_as_table_case(self) -> None:
+        total, passed, failed, failures, cases = test_runner.parse_shell(
+            "deployment contract DT", 0, "deployment contract passed\n", 42
+        )
+        self.assertEqual((total, passed, failed), (1, 1, 0))
+        self.assertEqual(failures, [])
+        self.assertEqual(cases[0]["name"], "deployment contract DT")
+        self.assertEqual(cases[0]["status"], "passed")
+        self.assertEqual(cases[0]["duration_ms"], 42)
+
     def test_go_parser_keeps_leaf_cases_and_resolves_source_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
