@@ -32,6 +32,7 @@ let runLayerMode = "run";
 let runLayerTemplateId = "";
 let cloneSourceId = "";
 let previewBranchPicker = null;
+let previewBranchLoadGeneration = 0;
 let svcMenuPage = 1;
 const SVC_PAGE_SIZE = 8;
 const branchCache = {};
@@ -698,15 +699,24 @@ async function loadPreviewBranches(force) {
   const picker = ensurePreviewBranchPicker();
   const retryBtn = $("btnRefreshPreviewBranches");
   if (!svc || !picker) return;
+  const loadGeneration = ++previewBranchLoadGeneration;
+  const isCurrentLoad = () => (
+    runPreviewActive &&
+    runLayerOpen() &&
+    loadGeneration === previewBranchLoadGeneration &&
+    currentServiceId === svc.id
+  );
   const fallbackBranch = svc.default_branch || "main";
   const cached = branchCache[svc.id];
   const setLoading = (loading) => {
+    if (!isCurrentLoad()) return;
     if (retryBtn) retryBtn.classList.toggle("loading", loading);
     if (retryBtn) retryBtn.disabled = loading;
     picker.setDisabled(loading);
     if (loading) setPreviewBranchStatus(force ? "正在从远程更新分支…" : "正在读取服务器缓存…");
   };
   const applyCached = (data) => {
+    if (!isCurrentLoad()) return;
     picker.setOptions(
       data.branches,
       data.selected_branch || fallbackBranch,
@@ -726,6 +736,7 @@ async function loadPreviewBranches(force) {
   if (!force && cached && cached.loaded) {
     const preferred = await preferredTemplateBranch(svc.id, cached.selected_branch || fallbackBranch);
     const tpl = findPipelineTemplate(runLayerTemplateId);
+    if (!isCurrentLoad()) return;
     applyCached({ ...cached, selected_branch: (tpl && tpl.branch) || preferred });
     return;
   }
@@ -736,10 +747,12 @@ async function loadPreviewBranches(force) {
     if (tpl && tpl.branch) data.selected_branch = tpl.branch;
     applyCached(data);
   } catch (e) {
+    if (!isCurrentLoad()) return;
     picker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
     setPreviewBranchStatus(e.message || "加载分支失败", "error");
     delete branchCache[svc.id];
   } finally {
+    if (!isCurrentLoad()) return;
     if (retryBtn) retryBtn.classList.remove("loading");
     if (retryBtn) retryBtn.disabled = false;
     picker.setDisabled(false);
@@ -833,6 +846,7 @@ function enterRunPage(tpl) {
   loadPreviewBranches(false);
 }
 function cancelRunPreview() {
+  previewBranchLoadGeneration += 1;
   if (!runPreviewActive && !runLayerOpen()) return;
   runPreviewActive = false;
   runLayerMode = "run";
@@ -1855,7 +1869,7 @@ function fetchServiceBranches(serviceId, force, priority) {
   const req = queueBranchLoad(() => {
     if (!sessionLive) return Promise.reject(new Error("请先登录"));
     const path = "/api/services/" + encodeURIComponent(serviceId) + "/branches" + (force ? "?refresh=1" : "");
-    if (!force || typeof AbortController === "undefined") return api(path);
+    if (typeof AbortController === "undefined") return api(path);
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
