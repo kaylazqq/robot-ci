@@ -2285,7 +2285,7 @@ function orderedTestCases(cases) {
     .sort((left, right) => testCasePriority(left.item.status) - testCasePriority(right.item.status) || left.index - right.index)
     .map((entry) => entry.item);
 }
-function openTestFailureDetail(item, heading, onViewLog) {
+function openTestFailureDetail(item, heading, onBack) {
   const wrap = document.createElement("div");
   wrap.className = "test-failure-detail";
   const name = document.createElement("strong");
@@ -2297,23 +2297,20 @@ function openTestFailureDetail(item, heading, onViewLog) {
   meta.textContent = (item.status === "error" ? "错误" : "失败") + location + command;
   const detail = document.createElement("pre");
   detail.className = "log test-failure-log";
-  detail.textContent = item.detail || "该用例未提供独立失败摘要，请查看测试日志。";
+  detail.textContent = item.detail || "该用例未提供独立失败摘要。";
   wrap.append(name, meta, detail);
-  if (typeof onViewLog === "function") {
+  if (typeof onBack === "function") {
     const actions = document.createElement("div");
     actions.className = "row";
-    const viewLog = document.createElement("button");
-    viewLog.type = "button";
-    viewLog.className = "btn ghost";
-    viewLog.textContent = "查看测试日志";
-    viewLog.addEventListener("click", () => {
-      closeModal();
-      onViewLog();
-    });
-    actions.appendChild(viewLog);
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "btn ghost";
+    back.textContent = "返回测试结果";
+    back.addEventListener("click", onBack);
+    actions.appendChild(back);
     wrap.appendChild(actions);
   }
-  openModal((heading || "测试") + "失败详情", wrap, { wide: true });
+  openModal((heading || "测试") + "失败详情", wrap);
 }
 function filterRun(run, kind) {
   if (!run || !kind) return run;
@@ -2383,7 +2380,7 @@ function renderTestRun(root, run, heading, onViewLog) {
       detailButton.type = "button";
       detailButton.className = "test-status bad test-failure-button";
       detailButton.textContent = label;
-      detailButton.title = "查看失败摘要和测试日志";
+      detailButton.title = "查看失败摘要";
       detailButton.addEventListener("click", () => openTestFailureDetail(item, heading, onViewLog));
       status.appendChild(detailButton);
     } else {
@@ -2558,13 +2555,14 @@ async function openStepModal(stageId, taskId) {
       if (caseSel && caseSel.view === "results") {
         logEl.hidden = true;
         tableWrap.hidden = false;
-        const showCaseLog = () => {
-          selectedTask = caseSel.taskId + ":log";
+        const showCaseResults = () => {
+          selectedTask = caseSel.taskId + ":results";
+          openModal("步骤详情", wrap, { wide: true });
           paintList();
           loadStep();
         };
-        if (caseSel.taskId === "ut-cases") renderTestRun(tableWrap, filterRun(run, "ut"), "UT 测试结果", showCaseLog);
-        else renderTestRun(tableWrap, filterRun(run, "dt"), "DT 测试结果", showCaseLog);
+        if (caseSel.taskId === "ut-cases") renderTestRun(tableWrap, filterRun(run, "ut"), "UT 测试结果", showCaseResults);
+        else renderTestRun(tableWrap, filterRun(run, "dt"), "DT 测试结果", showCaseResults);
         return;
       }
       tableWrap.hidden = true;

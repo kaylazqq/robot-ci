@@ -15,7 +15,6 @@ const assert = require('node:assert/strict');
     await page.addScriptTag({content: `
       const testTableState = new Map();
       function formatDuration(value) { return String(value) + 'ms'; }
-      function closeModal() { window.closedFailureModal = true; }
       function openModal(title, content) {
         window.failureModal = {title, text: content.textContent};
         document.body.append(content);
@@ -23,7 +22,7 @@ const assert = require('node:assert/strict');
       ${source.slice(start, end)}
     `});
     const result = await page.evaluate(() => {
-      let openedLog = false;
+      let returnedToResults = false;
       renderTestRun(document.querySelector('#root'), {
         status: 'failed',
         summary: {total: 5, passed: 2, failed: 1, errors: 1},
@@ -34,19 +33,18 @@ const assert = require('node:assert/strict');
           {name: 'error', status: 'error', duration_ms: 1, detail: 'connection refused'},
           {name: 'pass second', status: 'passed', duration_ms: 1},
         ],
-      }, 'UT 测试结果', () => { openedLog = true; });
+      }, 'UT 测试结果', () => { returnedToResults = true; });
       const rows = [...document.querySelectorAll('.test-table tbody tr')].map((row) => row.children[0].textContent);
       const failureButton = [...document.querySelectorAll('.test-failure-button')].find((button) => button.textContent === '失败');
       failureButton.click();
       const modalText = window.failureModal.text;
       [...document.querySelectorAll('.test-failure-detail .btn')][0].click();
-      return {rows, modalText, openedLog, closed: window.closedFailureModal};
+      return {rows, modalText, returnedToResults};
     });
     assert.deepEqual(result.rows, ['failure', 'error', 'pass first', 'skip', 'pass second']);
     assert.match(result.modalText, /assertion did not match/);
-    assert.equal(result.openedLog, true);
-    assert.equal(result.closed, true);
-    console.log('PASS: failures first, clickable failure detail, and log navigation');
+    assert.equal(result.returnedToResults, true);
+    console.log('PASS: failures first, clickable failure detail, and return to results');
   } finally {
     await browser.close();
   }
