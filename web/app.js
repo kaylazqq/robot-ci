@@ -793,8 +793,28 @@ function runLayerOpen() {
   const layer = $("runLayer");
   return !!(layer && !layer.hidden);
 }
+function resetPreviewBranchMenuDom() {
+  const root = $("previewBranchPicker");
+  const menu = $("previewBranchMenu");
+  if (!menu) return;
+  menu.hidden = true;
+  menu.classList.remove("branch-menu-portal");
+  menu.style.left = "";
+  menu.style.top = "";
+  menu.style.width = "";
+  menu.style.maxHeight = "";
+  const trigger = $("previewBranch");
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  if (root && menu.parentElement !== root) root.appendChild(menu);
+}
 function closeRunPopup() {
-  previewBranchPicker = null;
+  // Keep the singleton picker; rebinding createBranchPicker on every enter
+  // stacks click handlers and makes open/close alternate.
+  if (previewBranchPicker && typeof previewBranchPicker.close === "function") {
+    previewBranchPicker.close();
+  } else {
+    resetPreviewBranchMenuDom();
+  }
   const layer = $("runLayer");
   if (layer) layer.hidden = true;
   document.body.classList.remove("run-open");
@@ -862,7 +882,7 @@ function openEditTemplate(templateId) {
 function enterRunPage(tpl) {
   runPreviewActive = true;
   applyTemplateDefaults(tpl);
-  previewBranchPicker = null;
+  resetPreviewBranchMenuDom();
   const svc = currentService();
   previewBranchServiceId = (svc && svc.id) || "";
   const fallbackBranch = (svc && svc.default_branch) || "main";
@@ -2035,6 +2055,7 @@ function createBranchPicker(root, selectors) {
     }
   });
   return {
+    close,
     setOptions(branches, selectedBranch, fallback) {
       const list = branches && branches.length ? branches : [selectedBranch || fallback || "main"];
       const wanted = list.includes(selectedBranch) ? selectedBranch : (list.includes(fallback) ? fallback : list[0]);
