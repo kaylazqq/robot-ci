@@ -526,7 +526,7 @@ function commandTestKind(command) {
     return commandTestKind({ name: command });
   }
   const typed = String((command && command.test_type) || "").toLowerCase();
-  if (typed === "ut" || typed === "dt") return typed;
+  if (typed === "ut" || typed === "dt" || typed === "gamma") return typed;
   const name = String((command && (command.name || command.command)) || "");
   const hasUt = /\bUT\b/i.test(name);
   const hasDt = /\bDT\b/i.test(name);
@@ -2472,16 +2472,18 @@ function appendStepHeading(list, label, status, className) {
   row.append(dot, text);
   list.appendChild(row);
 }
-function isCaseTaskId(id) {
-  return id === "ut-cases" || id === "dt-cases";
+function isCaseTaskId(id, stageId) {
+  return id === "ut-cases" || id === "dt-cases" || (stageId === "gamma" && id === "test");
 }
 function parseCaseSelection(selected) {
-  const match = String(selected || "").match(/^(ut-cases|dt-cases):(results|log)$/);
+  const match = String(selected || "").match(/^(ut-cases|dt-cases|gamma-test):(results|log)$/);
   if (!match) return null;
   return { taskId: match[1], view: match[2] };
 }
 function normalizeStepSelection(taskId, stage) {
-  if (isCaseTaskId(taskId)) return taskId + ":results";
+  if (isCaseTaskId(taskId, stage && stage.id)) {
+    return (stage && stage.id === "gamma" ? "gamma-test" : taskId) + ":results";
+  }
   return taskId || (stage.tasks && stage.tasks[0] && stage.tasks[0].id) || stage.id;
 }
 
@@ -2518,15 +2520,16 @@ async function openStepModal(stageId, taskId) {
       loadStep();
     });
     (stage.tasks || []).forEach((task) => {
-      if (isCaseTaskId(task.id)) {
+      const caseTaskId = stage.id === "gamma" && task.id === "test" ? "gamma-test" : task.id;
+      if (isCaseTaskId(task.id, stage.id)) {
         appendStepHeading(list, task.label || task.id, task.status, "sub");
-        appendStepButton(list, "测试结果", "", "sub nested", selectedTask === task.id + ":results", () => {
-          selectedTask = task.id + ":results";
+        appendStepButton(list, "测试结果", "", "sub nested", selectedTask === caseTaskId + ":results", () => {
+          selectedTask = caseTaskId + ":results";
           paintList();
           loadStep();
         });
-        appendStepButton(list, "日志详情", "", "sub nested", selectedTask === task.id + ":log", () => {
-          selectedTask = task.id + ":log";
+        appendStepButton(list, "日志详情", "", "sub nested", selectedTask === caseTaskId + ":log", () => {
+          selectedTask = caseTaskId + ":log";
           paintList();
           loadStep();
         });
@@ -2543,14 +2546,16 @@ async function openStepModal(stageId, taskId) {
   const loadStep = async () => {
     const caseSel = parseCaseSelection(selectedTask);
     const selected = caseSel
-      ? (stage.tasks || []).find((task) => task.id === caseSel.taskId)
+      ? (stage.tasks || []).find((task) => task.id === (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId))
       : (stage.tasks || []).find((task) => task.id === selectedTask);
     const logStep = (selected && selected.logStep) || stage.logStep || stage.id;
-    const sub = caseSel ? caseSel.taskId : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
+    const sub = caseSel ? (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId) : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
     try {
       const job = await api("/api/jobs/" + currentJobId + "?step=" + encodeURIComponent(logStep) + (sub ? "&sub=" + encodeURIComponent(sub) : "") + "&view=ui");
       const lines = Array.isArray(job.log) ? job.log : [];
-      const run = (job.test_runs && job.test_runs[0]) || currentTestRun(currentJob);
+      const run = caseSel && caseSel.taskId === "gamma-test"
+        ? ((job.gamma_runs && job.gamma_runs[0]) || (currentJob.gamma_runs && currentJob.gamma_runs[0]))
+        : ((job.test_runs && job.test_runs[0]) || currentTestRun(currentJob));
       tableWrap.replaceChildren();
       if (caseSel && caseSel.view === "results") {
         logEl.hidden = true;
@@ -2562,7 +2567,8 @@ async function openStepModal(stageId, taskId) {
           loadStep();
         };
         if (caseSel.taskId === "ut-cases") renderTestRun(tableWrap, filterRun(run, "ut"), "UT 测试结果", showCaseResults);
-        else renderTestRun(tableWrap, filterRun(run, "dt"), "DT 测试结果", showCaseResults);
+        else if (caseSel.taskId === "dt-cases") renderTestRun(tableWrap, filterRun(run, "dt"), "DT 测试结果", showCaseResults);
+        else renderTestRun(tableWrap, filterRun(run, "gamma"), "Gamma 测试结果", showCaseResults);
         return;
       }
       tableWrap.hidden = true;
@@ -2675,6 +2681,7 @@ function emptyEnvDraft() {
     region: "cn-southwest-2",
     cluster_name: "",
     workload_name: sid,
+    test_base_url: "",
     jump_host: "",
     nodes: [""],
   };
@@ -2689,6 +2696,7 @@ function collectEnvForm() {
     region: ($("envRegion") && $("envRegion").value) || "cn-southwest-2",
     cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
     workload_name: ($("envWorkload") && $("envWorkload").value || "").trim(),
+    test_base_url: ($("envTestBaseUrl") && $("envTestBaseUrl").value || "").trim(),
     jump_host: ($("envJump") && $("envJump").value || "").trim(),
     jump_password: ($("envJumpPassword") && $("envJumpPassword").value) || "",
     node_password: ($("envNodePassword") && $("envNodePassword").value) || "",
@@ -2724,6 +2732,9 @@ function envFormHtml(env) {
     '<input id="envCluster" class="input" value="' + esc(data.cluster_name || "") + '" required />' +
     '<label class="label" for="envWorkload">负载名称</label>' +
     '<input id="envWorkload" class="input" value="' + esc(data.workload_name || "") + '" placeholder="CCE 集群中的微服务名称" required />' +
+    '<label class="label" for="envTestBaseUrl">Gamma 测试地址</label>' +
+    '<input id="envTestBaseUrl" class="input" type="url" value="' + esc(data.test_base_url || "") + '" placeholder="例如 http://agent-governance-gw:8684" />' +
+    '<p class="env-secret-hint">gamma 用例通过 GAMMA_BASE_URL 使用此地址；不保存访问凭据。</p>' +
     '<label class="label" for="envJump">跳板机</label>' +
     '<input id="envJump" class="input" value="' + esc(data.jump_host || "") + '" placeholder="用于 SSH 到 CCE 集群" required />' +
     '<label class="label" for="envJumpPassword">跳板机密码</label>' +
@@ -2756,6 +2767,7 @@ function envCardHtml(env) {
     '<div class="env-meta-row"><span class="env-meta-label">Region:</span><strong class="env-meta-value">' + esc(env.region_label || env.region || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">集群:</span><strong class="env-meta-value">' + esc(env.cluster_name || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">负载:</span><strong class="env-meta-value">' + esc(env.workload_name || "—") + "</strong></div>" +
+    '<div class="env-meta-row"><span class="env-meta-label">Gamma 地址:</span><strong class="env-meta-value">' + esc(env.test_base_url || "未配置") + "</strong></div>" +
     "</div></article>"
   );
 }

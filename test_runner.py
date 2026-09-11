@@ -260,7 +260,9 @@ def parse_case_json(
     return len(cases), sum(item["status"] == "passed" for item in cases), sum(item["status"] == "failed" for item in cases), failure_cases(cases), cases
 
 
-def build_test_environment(repo_dir: Path, report_dir: Path) -> dict[str, str]:
+def build_test_environment(
+    repo_dir: Path, report_dir: Path, extra_env: dict[str, str] | None = None
+) -> dict[str, str]:
     env = os.environ.copy()
     home = env.get("HOME") or env.get("USERPROFILE")
     if not home:
@@ -303,14 +305,21 @@ def build_test_environment(repo_dir: Path, report_dir: Path) -> dict[str, str]:
             "TEST_RUNNER_ROOT": str(Path(__file__).resolve().parent),
         }
     )
+    if extra_env:
+        env.update({str(key): str(value) for key, value in extra_env.items()})
     return env
 
 
-def run_command(command: dict[str, Any], repo_dir: Path, report_dir: Path) -> tuple[int, str, int]:
+def run_command(
+    command: dict[str, Any],
+    repo_dir: Path,
+    report_dir: Path,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str, int]:
     report_path = Path(str(command.get("report") or "report.out"))
     command_report_dir = report_dir / report_path.parent
     command_report_dir.mkdir(parents=True, exist_ok=True)
-    env = build_test_environment(repo_dir, command_report_dir)
+    env = build_test_environment(repo_dir, command_report_dir, extra_env)
     started = time.monotonic()
     print(f"$ {command['command']}", flush=True)
     try:
@@ -347,7 +356,23 @@ def main() -> int:
     parser.add_argument("--service", required=True)
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--report-dir", required=True, type=Path)
+    parser.add_argument(
+        "--extra-env-json",
+        default="{}",
+        help="JSON object of server-provided, non-secret environment values",
+    )
     args = parser.parse_args()
+
+    try:
+        extra_env_raw = json.loads(args.extra_env_json)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid --extra-env-json: {exc}") from exc
+    if not isinstance(extra_env_raw, dict) or any(
+        not isinstance(key, str) or not isinstance(value, (str, int, float, bool))
+        for key, value in extra_env_raw.items()
+    ):
+        raise SystemExit("--extra-env-json must be an object with scalar values")
+    extra_env = {key: str(value) for key, value in extra_env_raw.items()}
 
     plans_data = json.loads(args.plans.read_text(encoding="utf-8"))
     catalog_path = args.plans.parent / "test-suites" / "catalog.json"
@@ -384,10 +409,10 @@ def main() -> int:
         name = command.get("name") or command.get("command") or "test command"
         test_type = str(command.get("test_type") or "").strip().lower()
         marker = "@@TEST_STEP@@ " + name
-        if test_type in {"ut", "dt"}:
+        if test_type in {"ut", "dt", "gamma"}:
             marker += " @@TEST_TYPE@@ " + test_type
         print(marker, flush=True)
-        code, output, elapsed = run_command(command, args.repo, args.report_dir)
+        code, output, elapsed = run_command(command, args.repo, args.report_dir, extra_env)
         parser_name = command.get("parser") or "shell"
         if parser_name == "go-json":
             total, passed, failed, failures, cases = parse_go_json(args.report_dir / command["report"], name, output, args.repo)

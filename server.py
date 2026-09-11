@@ -270,6 +270,7 @@ def init_store() -> None:
                     region_label TEXT NOT NULL,
                     cluster_name TEXT NOT NULL,
                     workload_name TEXT NOT NULL,
+                    test_base_url TEXT NOT NULL DEFAULT '',
                     jump_host TEXT NOT NULL,
                     jump_password TEXT NOT NULL DEFAULT '',
                     node_password TEXT NOT NULL DEFAULT '',
@@ -363,6 +364,8 @@ def _ensure_environment_secret_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE environments ADD COLUMN jump_password TEXT NOT NULL DEFAULT ''")
     if "node_password" not in cols:
         conn.execute("ALTER TABLE environments ADD COLUMN node_password TEXT NOT NULL DEFAULT ''")
+    if "test_base_url" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN test_base_url TEXT NOT NULL DEFAULT ''")
 
 
 def _known_service_ids() -> set[str]:
@@ -479,6 +482,7 @@ def _environment_from_row(row: sqlite3.Row, *, include_secrets: bool = False) ->
         "region_label": str(row["region_label"] or _env_region_label(str(row["region"]))),
         "cluster_name": str(row["cluster_name"]),
         "workload_name": str(row["workload_name"]),
+        "test_base_url": _row_text(row, "test_base_url"),
         "jump_host": str(row["jump_host"]),
         "nodes": [str(item) for item in nodes if str(item).strip()],
         "has_jump_password": bool(jump_password),
@@ -504,6 +508,7 @@ def _validate_environment_payload(
     region = str(data.get("region") or "").strip()
     cluster_name = str(data.get("cluster_name") or "").strip()
     workload_name = str(data.get("workload_name") or "").strip()
+    test_base_url = str(data.get("test_base_url") or "").strip().rstrip("/")
     jump_host = str(data.get("jump_host") or "").strip()
     jump_password = _secret_text(data.get("jump_password"))
     node_password = _secret_text(data.get("node_password"))
@@ -522,6 +527,17 @@ def _validate_environment_payload(
         return None, "负载名称必填"
     if not jump_host:
         return None, "跳板机必填"
+    if test_base_url:
+        parsed = urlparse(test_base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None, "Gamma 测试地址必须是无凭据的 http/https 地址"
     if require_passwords and not jump_password:
         return None, "跳板机密码必填"
     if require_passwords and not node_password:
@@ -533,6 +549,7 @@ def _validate_environment_payload(
         "region_label": _env_region_label(region),
         "cluster_name": cluster_name,
         "workload_name": workload_name,
+        "test_base_url": test_base_url,
         "jump_host": jump_host,
         "jump_password": jump_password,
         "node_password": node_password,
@@ -593,10 +610,10 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
             conn.execute(
                 """
                 INSERT INTO environments (
-                    id, name, service_id, region, region_label, cluster_name, workload_name,
+                    id, name, service_id, region, region_label, cluster_name, workload_name, test_base_url,
                     jump_host, jump_password, node_password, nodes_json,
                     created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
@@ -606,6 +623,7 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
                     item["region_label"],
                     item["cluster_name"],
                     item["workload_name"],
+                    item["test_base_url"],
                     item["jump_host"],
                     item["jump_password"],
                     item["node_password"],
@@ -643,7 +661,7 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                 """
                 UPDATE environments SET
                     name = ?, region = ?, region_label = ?, cluster_name = ?,
-                    workload_name = ?, jump_host = ?, jump_password = ?,
+                    workload_name = ?, test_base_url = ?, jump_host = ?, jump_password = ?,
                     node_password = ?, nodes_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -653,6 +671,7 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                     item["region_label"],
                     item["cluster_name"],
                     item["workload_name"],
+                    item["test_base_url"],
                     item["jump_host"],
                     item["jump_password"],
                     item["node_password"],
@@ -1212,6 +1231,8 @@ JOB_PUBLIC_FIELDS = (
     "test_report",
     "test_runs",
     "test_kinds",
+    "gamma_runs",
+    "gamma_deployed",
     "cancel_requested",
     "optional_steps",
     "gamma_e2e",
@@ -1240,6 +1261,8 @@ JOB_COMPACT_FIELDS = (
     "test_summary",
     "test_report",
     "test_kinds",
+    "gamma_runs",
+    "gamma_deployed",
     "cancel_requested",
     "slot_held",
     "queue_position",
@@ -1597,7 +1620,11 @@ def _subtask_rows(
     elif step_id == "build":
         fail_index = _build_fail_index(defs, job, result)
     elif step_id == "gamma":
-        fail_index = 0 if _gamma_selected(job, "deploy") else 1
+        fail_index = (
+            [item[0] for item in defs].index("test")
+            if _gamma_selected(job, "test") and any(item[0] == "test" for item in defs)
+            else 0
+        )
     else:
         fail_index = len(defs) - 1
     statuses = _spread_status_to_subtasks(status, len(defs), fail_index=fail_index)
@@ -1615,9 +1642,14 @@ def _subtask_rows(
                 row["status"] = "skipped"
             elif status == "running":
                 if row["id"] == "deploy":
-                    row["status"] = "running"
+                    row["status"] = "done" if (job or {}).get("gamma_deployed") else "running"
                 else:
-                    row["status"] = "pending" if _gamma_selected(job, "deploy") else "running"
+                    runs = (job or {}).get("gamma_runs") or []
+                    if runs:
+                        run_status = str((runs[-1] or {}).get("status") or "")
+                        row["status"] = "done" if run_status == "passed" else "failed"
+                    else:
+                        row["status"] = "pending" if _gamma_selected(job, "deploy") and not (job or {}).get("gamma_deployed") else "running"
         return rows
     if step_id != "test":
         return rows
@@ -1668,6 +1700,11 @@ def _step_detail(step_id: str, status: str, result: dict[str, Any] | None, job: 
             return Path(archive).name
         return "docker save → nginx"
     if step_id == "gamma":
+        runs = job.get("gamma_runs") or []
+        if runs:
+            summary = (runs[-1] or {}).get("summary") or {}
+            if isinstance(summary, dict) and summary.get("total"):
+                return f"{summary.get('passed', 0)}/{summary.get('total')} 通过 · {runs[-1].get('status') or '—'}"
         remote = str((result or {}).get("remote") or job.get("remote") or "")
         if remote and remote != "archive-only":
             return remote.split("/")[-1]
@@ -2436,6 +2473,7 @@ def snapshot_job_for_payload(
     snap["_ui_test_running"] = job.get("_ui_test_running")
     snap["results"] = list(job.get("results") or [])
     snap["test_runs"] = list(job.get("test_runs") or [])
+    snap["gamma_runs"] = list(job.get("gamma_runs") or [])
     if not compact:
         snap["test_cases"] = list(job.get("test_cases") or [])
         snap["test_failures"] = list(job.get("test_failures") or [])
@@ -2484,10 +2522,11 @@ def job_payload(
     payload["log_cursor"] = len(selected_log)
     payload["step"] = step_id or None
     payload["sub"] = sub_id or None
-    revision = len(job.get("test_runs") or [])
+    revision = len(job.get("test_runs") or []) + len(job.get("gamma_runs") or [])
     payload["test_revision"] = revision
     if compact and test_revision != revision:
         payload["test_runs"] = deepcopy(job.get("test_runs") or [])
+        payload["gamma_runs"] = deepcopy(job.get("gamma_runs") or [])
     payload["pipeline"] = build_job_pipeline(job)
     return payload
 
@@ -2964,6 +3003,8 @@ def persist_job_meta(job_id: str) -> None:
             "test_report",
             "test_runs",
             "test_kinds",
+            "gamma_runs",
+            "gamma_deployed",
             "cancel_requested",
             "stage_before_stop",
             "slot_held",
@@ -3034,6 +3075,8 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "test_report": meta.get("test_report"),
         "test_runs": meta.get("test_runs") or [],
         "test_kinds": meta.get("test_kinds") or [],
+        "gamma_runs": meta.get("gamma_runs") or [],
+        "gamma_deployed": bool(meta.get("gamma_deployed")),
         "step_logs": meta.get("step_logs") or {},
         "cancel_requested": bool(meta.get("cancel_requested")),
         "stage_before_stop": meta.get("stage_before_stop"),
@@ -3524,6 +3567,109 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
     return result
 
 
+def gamma_test_environment(environment: dict[str, Any]) -> dict[str, str]:
+    """Return only non-secret, stable metadata exposed to a gamma test command."""
+    return {
+        "GAMMA_BASE_URL": str(environment.get("test_base_url") or "").rstrip("/"),
+        "GAMMA_ENVIRONMENT_ID": str(environment.get("id") or ""),
+        "GAMMA_ENVIRONMENT_NAME": str(environment.get("name") or ""),
+        "GAMMA_REGION": str(environment.get("region") or ""),
+        "GAMMA_CLUSTER_NAME": str(environment.get("cluster_name") or ""),
+        "GAMMA_WORKLOAD_NAME": str(environment.get("workload_name") or ""),
+    }
+
+
+def run_gamma_tests(
+    job_id: str,
+    service_id: str,
+    repo_dir: Path,
+    commit_sha: str,
+    environment: dict[str, Any],
+) -> dict[str, Any]:
+    """Execute repository-owned gamma cases after a successful rollout."""
+    report_dir = test_report_dir(job_id, service_id) / "gamma"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = report_dir / "summary.json"
+    try:
+        cid = load_cid_config(repo_dir, service_id)
+    except CidConfigError as exc:
+        cid = None
+        cid_error = str(exc)
+    else:
+        cid_error = ""
+    if cid_error:
+        result: dict[str, Any] = {
+            "status": "error", "total": 0, "passed": 0, "failed": 0,
+            "errors": 1, "duration_ms": 0,
+            "failures": [{"name": "CID configuration", "detail": cid_error}],
+        }
+    elif cid is None:
+        result = {
+            "status": "not_configured", "total": 0, "passed": 0, "failed": 0,
+            "errors": 1, "duration_ms": 0,
+            "failures": [{"name": "gamma测试", "detail": "未找到 .cid/build.yaml 中的 gamma 测试契约"}],
+        }
+    else:
+        plan = build_test_plan(cid, test_types={"gamma"})
+        profile = next(iter((plan.get("profiles") or {}).values()), {})
+        if not profile.get("commands"):
+            result = {
+                "status": "not_configured", "total": 0, "passed": 0, "failed": 0,
+                "errors": 1, "duration_ms": 0,
+                "failures": [{"name": "gamma测试", "detail": "服务未在 .cid/build.yaml 声明启用的 gamma 用例"}],
+            }
+        elif not str(environment.get("test_base_url") or "").strip():
+            result = {
+                "status": "error", "total": 0, "passed": 0, "failed": 0,
+                "errors": 1, "duration_ms": 0,
+                "failures": [{"name": "gamma测试", "detail": "环境未配置 Gamma 测试地址"}],
+            }
+        else:
+            plans_path = report_dir / "cid-gamma-plan.json"
+            plans_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            env_json = json.dumps(gamma_test_environment(environment), ensure_ascii=False)
+            append_job_log(job_id, "Loaded gamma test stages from .cid/build.yaml")
+            append_job_log(job_id, f"gamma测试开始 service={service_id} sha={commit_sha}")
+            command = " ".join((
+                "python3.11", shlex.quote(host_path(TEST_RUNNER_PATH)),
+                "--plans", shlex.quote(host_path(plans_path)),
+                "--service", shlex.quote(service_id),
+                "--repo", shlex.quote(host_path(repo_dir)),
+                "--report-dir", shlex.quote(host_path(report_dir)),
+                "--extra-env-json", shlex.quote(env_json),
+            ))
+            exit_code = run_stream(
+                job_id, bash_lc(command), timeout=int(CFG.get("gamma_test_timeout_sec") or 3600)
+            )
+            try:
+                result = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                result = {
+                    "status": "timeout" if exit_code == 124 else "error",
+                    "total": 0, "passed": 0, "failed": 0, "errors": 1, "duration_ms": 0,
+                    "failures": [{"name": "gamma测试", "detail": "gamma 测试摘要未生成"}],
+                }
+    result["commit_sha"] = commit_sha
+    result["report_dir"] = str(report_dir)
+    safe_service_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", service_id).strip("._") or "service"
+    try:
+        (LOG_DIR / f"job-{job_id}-{safe_service_id}-gamma.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+    append_job_log(
+        job_id,
+        "GAMMA TEST summary "
+        f"status={result.get('status')} total={result.get('total', 0)} "
+        f"passed={result.get('passed', 0)} failed={result.get('failed', 0)} "
+        f"errors={result.get('errors', 0)} duration_ms={result.get('duration_ms', 0)}",
+    )
+    for item in (result.get("failures") or [])[:20]:
+        append_job_log(job_id, f"GAMMA TEST FAIL {item.get('name')}: {item.get('detail')}")
+    return result
+
+
 def tests_block_build(result: dict[str, Any]) -> bool:
     """Whether the configured framework policy rejects this test result."""
     return (
@@ -3987,6 +4133,18 @@ def record_test_run(job_id: str, test_run: dict[str, Any]) -> None:
                 "test_report": test_run.get("test_report"),
             }
         )
+    persist_job_meta(job_id)
+
+
+def record_gamma_run(job_id: str, gamma_run: dict[str, Any]) -> None:
+    """Persist gamma evidence independently from pre-build UT/DT evidence."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        runs = list(job.get("gamma_runs") or [])
+        runs.append(gamma_run)
+        job["gamma_runs"] = runs
     persist_job_meta(job_id)
 
 
@@ -6324,6 +6482,16 @@ def maybe_run_gamma_after_build(
     if env_id:
         env = get_environment(env_id, include_secrets=True)
 
+    if opts.get("gamma_test"):
+        if not env_id:
+            return False, "gamma测试失败: 未选择环境"
+        if not env:
+            return False, f"gamma测试失败: 环境不存在 ({env_id})"
+        env_sid = str(env.get("service_id") or "").strip()
+        job_sids = set(_job_service_ids(job))
+        if env_sid and env_sid not in job_sids:
+            return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
+
     if opts.get("gamma_deploy"):
         with log_substep("deploy"):
             if not env_id:
@@ -6363,11 +6531,45 @@ def maybe_run_gamma_after_build(
                 append_job_log(job_id, f"ERROR {err}")
                 return False, err
             append_job_log(job_id, "gamma部署成功")
+            set_job(job_id, gamma_deployed=True)
 
     if opts.get("gamma_test"):
         with log_substep("test"):
-            append_job_log(job_id, "当前环境未接入 gamma测试；请选择 CI 隔离 E2E")
-            return False, "当前环境未接入 gamma测试，未执行测试"
+            catalog = {item["id"]: item for item in load_services()}
+            for result in results:
+                service_id = str(result.get("service_id") or "").strip()
+                svc = catalog.get(service_id)
+                if not svc:
+                    return False, f"gamma测试失败: 未知微服务 ({service_id or '?'})"
+                gamma_result = run_gamma_tests(
+                    job_id,
+                    service_id,
+                    repo_dir(svc, job_id),
+                    str(result.get("commit_sha") or ""),
+                    env or {},
+                )
+                summary = {
+                    key: gamma_result.get(key, 0)
+                    for key in ("total", "passed", "failed", "errors", "skipped", "duration_ms")
+                }
+                safe_service_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", service_id).strip("._") or "service"
+                gamma_run = {
+                    "service_id": service_id,
+                    "title": svc.get("title") or service_id,
+                    "branch": str(result.get("branch") or ""),
+                    "commit_sha": gamma_result.get("commit_sha"),
+                    "status": gamma_result.get("status"),
+                    "summary": summary,
+                    "commands": gamma_result.get("commands") or [],
+                    "failures": gamma_result.get("failures") or [],
+                    "test_cases": gamma_result.get("test_cases") or [],
+                    "test_report": str(LOG_DIR / f"job-{job_id}-{safe_service_id}-gamma.json"),
+                    "environment_id": env_id,
+                    "environment_name": (env or {}).get("name") or env_id,
+                }
+                record_gamma_run(job_id, gamma_run)
+                if gamma_result.get("status") != "passed":
+                    return False, f"gamma测试未通过: {service_id} ({gamma_result.get('status')})"
     return True, ""
 
 
@@ -7382,6 +7584,8 @@ class Handler(SimpleHTTPRequestHandler):
                 "progress": None,
                 "current": None,
                 "test_runs": [],
+                "gamma_runs": [],
+                "gamma_deployed": False,
                 "log": [],
                 "ui_log": [],
                 "step_logs": {},

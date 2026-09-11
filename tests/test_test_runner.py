@@ -112,6 +112,17 @@ class TestResultParsing(unittest.TestCase):
             self.assertEqual(env["TMPDIR"], str(tmp_root))
             self.assertEqual(env["GOTMPDIR"], str(tmp_root))
 
+    def test_build_test_environment_accepts_server_gamma_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = test_runner.build_test_environment(
+                root,
+                root / "reports",
+                {"GAMMA_BASE_URL": "http://service:8684", "GAMMA_ENVIRONMENT_NAME": "gamma"},
+            )
+        self.assertEqual("http://service:8684", env["GAMMA_BASE_URL"])
+        self.assertEqual("gamma", env["GAMMA_ENVIRONMENT_NAME"])
+
 
 if __name__ == "__main__":
     unittest.main()

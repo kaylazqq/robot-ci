@@ -83,6 +83,7 @@ class EnvironmentApiTests(unittest.TestCase):
         self.assertEqual("semantic-schedule", created["service_id"])
         self.assertEqual("贵阳一", created["region_label"])
         self.assertEqual(["172.31.8.33", "172.31.22.203"], created["nodes"])
+        self.assertEqual("", created["test_base_url"])
         self.assertTrue(created["has_jump_password"])
         self.assertTrue(created["has_node_password"])
         self.assertNotIn("jump_password", created)
@@ -128,6 +129,22 @@ class EnvironmentApiTests(unittest.TestCase):
         with self._open("/api/environments", cookie=cookie) as response:
             after = json.loads(response.read().decode())
         self.assertEqual([], after["environments"])
+
+    def test_gamma_test_base_url_is_validated_and_persisted(self) -> None:
+        cookie = self._login()
+        payload = {
+            "name": "gamma", "service_id": "semantic-schedule", "region": "cn-southwest-2",
+            "cluster_name": "cluster", "workload_name": "semantic-schedule", "jump_host": "jump",
+            "jump_password": "jump-secret", "node_password": "node-secret", "nodes": [],
+            "test_base_url": "http://semantic-schedule:8766/",
+        }
+        with self._open("/api/environments", data=json.dumps(payload).encode(), method="POST", cookie=cookie) as response:
+            created = json.loads(response.read().decode())["environment"]
+        self.assertEqual("http://semantic-schedule:8766", created["test_base_url"])
+        payload["test_base_url"] = "https://user:password@example.invalid"
+        with self.assertRaises(HTTPError) as failed:
+            self._open("/api/environments", data=json.dumps(payload).encode(), method="POST", cookie=cookie)
+        self.assertEqual(400, failed.exception.code)
 
     def test_create_rejects_unknown_region(self) -> None:
         cookie = self._login()

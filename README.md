@@ -114,6 +114,12 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报告格式、artifact 交付配置和禁止字段。主机安装包按 `artifacts.package.pattern` 从仓库工作区发现；YAML 无效时，当前服务明确失败，不会静默伪装为旧流程。
 
+## CCE Gamma 测试
+
+真实 Gamma 环境的流程为「构建并推送镜像 → CCE rollout 替换该负载镜像并等待就绪 → 执行服务仓 Gamma 用例」。服务在 `.cid/build.yaml` 增加 `type: test`、`test_type: gamma` 的步骤，并像 UT/DT 一样提供 `junit`、`go-json`、`case-json` 或 `unittest` 报告路径。Gamma 用例不会在构建前执行，只有用户在流水线勾选「gamma测试」且 rollout 成功后才运行；未声明用例或未生成报告会让 Gamma 阶段失败，不能误报通过。
+
+环境管理中为每个 CCE 环境配置「Gamma 测试地址」（无用户名、密码的 `http(s)` 基址）。平台仅注入 `GAMMA_BASE_URL`、环境 ID/名称、Region、集群和负载等非敏感变量；跳板机和节点凭据绝不传给服务仓测试命令。Gamma 节点的「测试结果 / 日志详情」使用与 UT/DT 相同的分页用例表、失败摘要和日志视图。
+
 ## 安全提醒
 
 - 不要把账号密码发到聊天或写进仓库

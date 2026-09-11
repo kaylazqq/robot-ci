@@ -71,8 +71,8 @@ def load_cid_config(repo_dir: Path, expected_service_id: str = "") -> dict[str, 
         if enabled and not str(step.get("command") or "").strip():
             raise CidConfigError(f"scripts[{index}].command is required when enabled")
         if step_type == "test" and enabled:
-            if step.get("test_type") not in {"ut", "dt"}:
-                raise CidConfigError(f"scripts[{index}].test_type must be ut or dt")
+            if step.get("test_type") not in {"ut", "dt", "gamma"}:
+                raise CidConfigError(f"scripts[{index}].test_type must be ut, dt or gamma")
             report = step.get("report")
             if not isinstance(report, dict):
                 raise CidConfigError(f"scripts[{index}].report is required")
@@ -137,11 +137,23 @@ def _report_relative_path(configured: str, step_id: str) -> str:
     return PurePosixPath(step_id, path.name).as_posix()
 
 
-def build_test_plan(config: dict[str, Any]) -> dict[str, Any]:
+def build_test_plan(
+    config: dict[str, Any], *, test_types: set[str] | None = None
+) -> dict[str, Any]:
+    """Build a runner plan from one CID contract.
+
+    Unit/deployment tests run before building by default.  Gamma tests are a
+    separate post-rollout gate and callers must opt into them explicitly.
+    """
+    selected_types = test_types or {"ut", "dt"}
     service_id = str(config["service"]["id"])
     commands: list[dict[str, Any]] = []
     for step in config.get("scripts") or []:
-        if step.get("type") != "test" or step.get("enabled") is not True:
+        if (
+            step.get("type") != "test"
+            or step.get("enabled") is not True
+            or step.get("test_type") not in selected_types
+        ):
             continue
         report = step["report"]
         commands.append(

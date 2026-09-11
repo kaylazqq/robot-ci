@@ -62,6 +62,26 @@ class CidConfigTests(unittest.TestCase):
         self.assertEqual("ut", command["test_type"])
         self.assertEqual(1, len(plan["profiles"]["cid-demo"]["commands"]))
 
+    def test_gamma_stages_are_opt_in(self) -> None:
+        gamma = """
+  - id: gamma
+    name: Demo Gamma
+    type: test
+    test_type: gamma
+    enabled: true
+    command: bash scripts/ci/gamma.sh
+    report:
+      format: case-json
+      path: .cid/output/reports/gamma/cases.json
+"""
+        config = load_cid_config(self.write(VALID.replace("  - id: build", gamma + "  - id: build")), "demo")
+        default_plan = build_test_plan(config)
+        gamma_plan = build_test_plan(config, test_types={"gamma"})
+        self.assertEqual(["ut"], [item["test_type"] for item in default_plan["profiles"]["cid-demo"]["commands"]])
+        command = gamma_plan["profiles"]["cid-demo"]["commands"][0]
+        self.assertEqual("gamma", command["test_type"])
+        self.assertEqual("gamma/cases.json", command["report"])
+
     def test_rejects_framework_owned_keys_anywhere(self) -> None:
         for forbidden in ("dependencies: {}", "machine: {}", "continue_on_error: true"):
             with self.subTest(forbidden=forbidden):

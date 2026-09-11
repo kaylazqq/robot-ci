@@ -1897,6 +1897,51 @@ class BusinessImageAndTmpTests(unittest.TestCase):
             self.assertTrue(root.is_dir())
 
 
+class GammaTestRunnerTests(unittest.TestCase):
+    def test_runs_only_gamma_contract_and_excludes_environment_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = server.Path(temporary)
+            (root / ".cid").mkdir()
+            (root / ".cid" / "build.yaml").write_text(
+                """version: 1
+service: {id: demo, image: demo}
+scripts:
+  - {id: gamma, type: test, test_type: gamma, enabled: true, command: bash gamma.sh, report: {format: case-json, path: .cid/output/reports/gamma/cases.json}}
+  - {id: build, type: build, enabled: true, command: bash build.sh}
+artifacts: {image: {enabled: true, delivery: swr}}
+""",
+                encoding="utf-8",
+            )
+            report_dir = root / "reports"
+            gamma_report_dir = report_dir / "gamma"
+            environment = {
+                "id": "gamma-a", "name": "Gamma A", "region": "cn-southwest-2",
+                "cluster_name": "cluster", "workload_name": "demo",
+                "test_base_url": "http://demo:8684", "jump_password": "never-pass-this",
+                "node_password": "never-pass-this-either",
+            }
+
+            def fake_stream(_job_id, _command, **_kwargs):
+                gamma_report_dir.mkdir(parents=True, exist_ok=True)
+                (gamma_report_dir / "summary.json").write_text(
+                    json.dumps({"status": "passed", "total": 1, "passed": 1, "failed": 0,
+                                "errors": 0, "skipped": 0, "duration_ms": 4, "commands": [],
+                                "failures": [], "test_cases": []}),
+                    encoding="utf-8",
+                )
+                return 0
+
+            with patch.object(server, "test_report_dir", return_value=report_dir):
+                with patch.object(server, "run_stream", side_effect=fake_stream) as run_stream:
+                    with patch.object(server, "append_job_log"):
+                        with patch.object(server, "host_path", side_effect=lambda path: str(path)):
+                            result = server.run_gamma_tests("gamma-job", "demo", root, "a" * 40, environment)
+            self.assertEqual("passed", result["status"])
+            command = " ".join(run_stream.call_args.args[1])
+            self.assertIn("GAMMA_BASE_URL", command)
+            self.assertNotIn("never-pass-this", command)
+
+
 class DockerReadyForPushTests(unittest.TestCase):
     def setUp(self) -> None:
         self.saved_cache = server._docker_cache
