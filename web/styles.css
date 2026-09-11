@@ -771,7 +771,7 @@ html.is-run-window #pageSwr { display: none !important; }
 .test-status.bad { color: var(--danger); font-weight: 600; }
 .test-failure-button { padding: 0; border: 0; background: transparent; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; font: inherit; }
 .test-failure-button:hover { color: #b42318; }
-.test-failure-detail { display: grid; gap: 10px; padding: 4px 12px; }
+.test-failure-detail { display: grid; gap: 10px; padding: 4px 0; }
 .test-failure-detail .hint { margin: 0; }
 .test-failure-log { max-height: 50vh; overflow: auto; white-space: pre-wrap; }
 .test-pager { display: flex; justify-content: flex-end; gap: 8px; align-items: center; margin-top: 10px; color: var(--muted); flex-wrap: wrap; }
