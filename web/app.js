@@ -1984,11 +1984,15 @@ function createBranchPicker(root, selectors) {
   const trigger = root.querySelector((selectors && selectors.trigger) || "#runBranch");
   const label = root.querySelector((selectors && selectors.label) || "#runBranchValue");
   const menu = root.querySelector((selectors && selectors.menu) || "#runBranchMenu");
+  if (!trigger || !label || !menu) return null;
   let value = "";
   const close = () => {
     menu.hidden = true;
     trigger.setAttribute("aria-expanded", "false");
-    menu.remove();
+    // The list is temporarily portalled to <body> when opened so it is not
+    // clipped by a dialog. Put the same node back after closing; removing it
+    // breaks the next service's picker and leaves stale branch text visible.
+    if (menu.parentElement !== root) root.appendChild(menu);
   };
   const positionMenu = () => {
     const rect = trigger.getBoundingClientRect();
