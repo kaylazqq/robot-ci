@@ -1321,6 +1321,17 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual("main", payload["selected_branch"])
         lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
 
+    @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
+    @patch.object(server, "cached_branches", return_value=["main", "feature/cached"])
+    def test_branch_refresh_falls_back_to_persisted_cache(self, cached, lookup) -> None:
+        with self._open("/api/services/memory-service/branches?refresh=1") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(["main", "feature/cached"], payload["branches"])
+        self.assertTrue(payload["cached"])
+        self.assertIn("远程刷新失败", payload["refresh_error"])
+        cached.assert_called_once_with("rollingfruit/CellMem")
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
+
 
 class DiskPruneAndArtifactTests(unittest.TestCase):
     def setUp(self) -> None:

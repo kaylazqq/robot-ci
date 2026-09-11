@@ -128,6 +128,7 @@ ARTIFACTS_DEFAULT_PAGE_SIZE = 10
 HISTORY_DEFAULT_PAGE_SIZE = 10
 HISTORY_MAX_ENTRIES = 500
 HISTORY_TRIM_TO = 250
+BRANCH_REFRESH_TIMEOUT_SEC = 20
 DISK_USAGE_PRUNE_RATIO = 0.80
 BUILDKIT_CACHE_MAX_AGE = "168h"
 BUILDKIT_CACHE_KEEP_STORAGE = "50GB"
@@ -397,6 +398,9 @@ def _infer_environment_service_id(workload_name: str, name: str = "") -> str:
 
 def _ensure_environment_service_column(conn: sqlite3.Connection) -> None:
     cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environments)")}
+    if "workload_name" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN workload_name TEXT NOT NULL DEFAULT ''")
+        cols.add("workload_name")
     if "service_id" not in cols:
         conn.execute("ALTER TABLE environments ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
     rows = conn.execute("SELECT id, service_id, workload_name, name FROM environments").fetchall()
@@ -4887,10 +4891,15 @@ def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] |
         if cached:
             return True, cached
 
+    deadline = time.monotonic() + BRANCH_REFRESH_TIMEOUT_SEC
+
+    def remaining_timeout(limit: float) -> float:
+        return max(1.0, min(limit, deadline - time.monotonic()))
+
     # 1) SSH ls-remote (preferred on shared server)
     if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
         ssh_url = f"git@github.com:{repo}.git"
-        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=30, env=git_env())
+        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=remaining_timeout(12), env=git_env())
         if code == 0:
             names = []
             for line in out.splitlines():
@@ -4912,11 +4921,13 @@ def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] |
         try:
             names: list[str] = []
             for page in range(1, 11):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"刷新分支超时（{BRANCH_REFRESH_TIMEOUT_SEC} 秒）")
                 url = f"https://api.github.com/repos/{repo}/branches?per_page=100&page={page}"
                 req = Request(url)
                 req.add_header("Accept", "application/vnd.github+json")
                 req.add_header("Authorization", f"Bearer {token}")
-                with urlopen(req, timeout=30) as resp:
+                with urlopen(req, timeout=remaining_timeout(8)) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 if not isinstance(data, list):
                     raise ValueError("GitHub branches response is not a list")
@@ -6829,12 +6840,20 @@ class Handler(SimpleHTTPRequestHandler):
             force_refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
             default = svc.get("default_branch") or "main"
             if force_refresh:
+                cached_before_refresh = cached_branches(repo)
                 ok, result = list_branches_api(repo, force=True)
                 from_cache = False
+                refresh_error = ""
+                if not ok and cached_before_refresh:
+                    result = cached_before_refresh
+                    ok = True
+                    from_cache = True
+                    refresh_error = "远程刷新失败，已保留服务器缓存"
             else:
                 result = cached_branches(repo)
                 ok = True
                 from_cache = bool(result)
+                refresh_error = ""
                 if not result:
                     result = [default]
             if not ok:
@@ -6861,6 +6880,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "preferred_branch": preferred or None,
                     "selected_branch": selected,
                     "cached": from_cache,
+                    "refresh_error": refresh_error or None,
                 },
             )
             return

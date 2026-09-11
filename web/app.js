@@ -702,7 +702,9 @@ async function loadPreviewBranches(force) {
   const cached = branchCache[svc.id];
   const setLoading = (loading) => {
     if (retryBtn) retryBtn.classList.toggle("loading", loading);
+    if (retryBtn) retryBtn.disabled = loading;
     picker.setDisabled(loading);
+    if (loading) setPreviewBranchStatus(force ? "正在从远程更新分支…" : "正在读取服务器缓存…");
   };
   const applyCached = (data) => {
     picker.setOptions(
@@ -710,7 +712,16 @@ async function loadPreviewBranches(force) {
       data.selected_branch || fallbackBranch,
       data.default_branch || fallbackBranch
     );
-    setPreviewBranchStatus("");
+    const count = (data.branches || []).length;
+    if (data.refresh_error) {
+      setPreviewBranchStatus("远程刷新失败，已使用服务器缓存（" + count + " 个分支）", "error");
+    } else if (force) {
+      setPreviewBranchStatus("已更新 " + count + " 个分支", "ok");
+    } else if (data.cached) {
+      setPreviewBranchStatus("已读取服务器缓存（" + count + " 个分支）", "ok");
+    } else {
+      setPreviewBranchStatus("服务器暂无分支缓存，当前使用默认分支；点击刷新加载");
+    }
   };
   if (!force && cached && cached.loaded) {
     const preferred = await preferredTemplateBranch(svc.id, cached.selected_branch || fallbackBranch);
@@ -730,6 +741,7 @@ async function loadPreviewBranches(force) {
     delete branchCache[svc.id];
   } finally {
     if (retryBtn) retryBtn.classList.remove("loading");
+    if (retryBtn) retryBtn.disabled = false;
     picker.setDisabled(false);
   }
 }
@@ -1842,7 +1854,18 @@ function fetchServiceBranches(serviceId, force, priority) {
   if (!force && branchLoads[serviceId]) return branchLoads[serviceId];
   const req = queueBranchLoad(() => {
     if (!sessionLive) return Promise.reject(new Error("请先登录"));
-    return api("/api/services/" + encodeURIComponent(serviceId) + "/branches" + (force ? "?refresh=1" : ""));
+    const path = "/api/services/" + encodeURIComponent(serviceId) + "/branches" + (force ? "?refresh=1" : "");
+    if (!force || typeof AbortController === "undefined") return api(path);
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 30000);
+    return api(path, { signal: controller.signal }).catch((error) => {
+      if (timedOut) throw new Error("刷新分支超时，请稍后重试");
+      throw error;
+    }).finally(() => clearTimeout(timer));
   }, !!priority).then((data) => {
     if (!sessionLive) return data;
     const cached = {
@@ -1851,6 +1874,7 @@ function fetchServiceBranches(serviceId, force, priority) {
       selected_branch: data.selected_branch || data.preferred_branch || "",
       default_branch: data.default_branch || "",
       cached: data.cached === true || force,
+      refresh_error: data.refresh_error || "",
     };
     branchCache[serviceId] = cached;
     delete branchLoads[serviceId];
