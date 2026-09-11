@@ -58,6 +58,23 @@ class AuthApiTests(unittest.TestCase):
             cookie = (response.headers.get("Set-Cookie") or "").split(";", 1)[0]
         return cookie
 
+    def test_pipeline_auth_uses_session_and_logout(self) -> None:
+        with self.assertRaises(HTTPError) as denied:
+            self._open('/api/auth/pipeline')
+        self.assertEqual(401, denied.exception.code)
+        cookie = self._login()
+        with self._open('/api/auth/pipeline', cookie=cookie) as response:
+            self.assertEqual(server.DEFAULT_USERNAME, json.load(response)['user'])
+        with self._open('/api/auth/logout', data=b'{}', method='POST', cookie=cookie):
+            pass
+        with self.assertRaises(HTTPError) as expired:
+            self._open('/api/auth/pipeline', cookie=cookie)
+        self.assertEqual(401, expired.exception.code)
+
+    def test_public_cookie_is_independent_of_backend_port(self) -> None:
+        with patch.dict(server.os.environ, {'ROBOT_CI_PUBLIC_ORIGIN':'http://119.8.233.58'}), patch.dict(server.CFG, {'port':18082}):
+            self.assertEqual(server.SESSION_COOKIE, server.session_cookie_name())
+
     def test_login_me_password_and_protected_api(self) -> None:
         with self.assertRaises(HTTPError) as denied:
             self._open("/api/services")
