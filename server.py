@@ -3081,8 +3081,20 @@ def load_config() -> dict[str, Any]:
         except OSError:
             cfg["workspace_root"] = str((ROOT / "workspaces").resolve())
     Path(cfg["workspace_root"]).mkdir(parents=True, exist_ok=True)
-    cfg["host"] = cfg.get("host") or "127.0.0.1"
-    cfg["port"] = int(cfg.get("port") or 80)
+    # A same-site deployment keeps nginx on :80 and binds the helper privately.
+    # Service-manager overrides must take precedence over config.json so routine
+    # code deployments cannot accidentally compete with nginx for the public port.
+    bind_host = (
+        os.environ.get("ROBOT_CI_BIND")
+        or os.environ.get("ROBOT_CI_HOST")
+        or ""
+    ).strip()
+    bind_port = (os.environ.get("ROBOT_CI_PORT") or "").strip()
+    cfg["host"] = bind_host or cfg.get("host") or "127.0.0.1"
+    try:
+        cfg["port"] = int(bind_port or cfg.get("port") or 80)
+    except ValueError:
+        cfg["port"] = int(cfg.get("port") or 80)
     cfg["allow_remote"] = bool(cfg.get("allow_remote")) or str(
         os.environ.get("SWR_ALLOW_REMOTE") or ""
     ).lower() in ("1", "true", "yes")
