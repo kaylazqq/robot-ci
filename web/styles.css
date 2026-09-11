@@ -769,6 +769,11 @@ html.is-run-window #pageSwr { display: none !important; }
 .test-table th, .test-table td { padding: 6px 8px; border-top: 1px solid var(--line); text-align: left; }
 .test-status.ok { color: var(--green); font-weight: 600; }
 .test-status.bad { color: var(--danger); font-weight: 600; }
+.test-failure-button { padding: 0; border: 0; background: transparent; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; font: inherit; }
+.test-failure-button:hover { color: #b42318; }
+.test-failure-detail { display: grid; gap: 10px; }
+.test-failure-detail .hint { margin: 0; }
+.test-failure-log { max-height: 50vh; overflow: auto; white-space: pre-wrap; }
 .test-pager { display: flex; justify-content: flex-end; gap: 8px; align-items: center; margin-top: 10px; color: var(--muted); flex-wrap: wrap; }
 .test-page-size { display: inline-flex; align-items: center; gap: 4px; }
 .test-page-size .input { width: auto; min-width: 64px; padding: 4px 8px; }

@@ -2276,6 +2276,45 @@ function shortCaseName(name) {
   const parts = value.split(".");
   return parts.length > 2 ? parts.slice(-2).join(".") : value;
 }
+function testCasePriority(status) {
+  if (status === "passed" || status === "skipped") return 1;
+  return 0;
+}
+function orderedTestCases(cases) {
+  return (cases || []).map((item, index) => ({ item, index }))
+    .sort((left, right) => testCasePriority(left.item.status) - testCasePriority(right.item.status) || left.index - right.index)
+    .map((entry) => entry.item);
+}
+function openTestFailureDetail(item, heading, onViewLog) {
+  const wrap = document.createElement("div");
+  wrap.className = "test-failure-detail";
+  const name = document.createElement("strong");
+  name.textContent = shortCaseName(item.name);
+  const meta = document.createElement("p");
+  meta.className = "hint";
+  const location = item.file ? " · " + item.file : "";
+  const command = item.command ? " · " + item.command : "";
+  meta.textContent = (item.status === "error" ? "错误" : "失败") + location + command;
+  const detail = document.createElement("pre");
+  detail.className = "log test-failure-log";
+  detail.textContent = item.detail || "该用例未提供独立失败摘要，请查看测试日志。";
+  wrap.append(name, meta, detail);
+  if (typeof onViewLog === "function") {
+    const actions = document.createElement("div");
+    actions.className = "row";
+    const viewLog = document.createElement("button");
+    viewLog.type = "button";
+    viewLog.className = "btn ghost";
+    viewLog.textContent = "查看测试日志";
+    viewLog.addEventListener("click", () => {
+      closeModal();
+      onViewLog();
+    });
+    actions.appendChild(viewLog);
+    wrap.appendChild(actions);
+  }
+  openModal((heading || "测试") + "失败详情", wrap, { wide: true });
+}
 function filterRun(run, kind) {
   if (!run || !kind) return run;
   const cases = casesForKind(run, kind);
@@ -2293,7 +2332,7 @@ function filterRun(run, kind) {
     summary: { total: cases.length, passed, failed, errors, skipped },
   };
 }
-function renderTestRun(root, run, heading) {
+function renderTestRun(root, run, heading, onViewLog) {
   if (!run) {
     root.textContent = "暂无测试结果。";
     return;
@@ -2312,7 +2351,7 @@ function renderTestRun(root, run, heading) {
     " · 失败 " + (summary.failed || 0) + " · 错误 " + (summary.errors || 0);
   head.append(title, overview);
   root.appendChild(head);
-  const cases = Array.isArray(run.test_cases) ? run.test_cases : [];
+  const cases = orderedTestCases(Array.isArray(run.test_cases) ? run.test_cases : []);
   if (!cases.length) {
     const empty = document.createElement("p");
     empty.className = "hint";
@@ -2336,8 +2375,21 @@ function renderTestRun(root, run, heading) {
     name.textContent = shortCaseName(item.name);
     const status = document.createElement("td");
     const passed = item.status === "passed";
-    status.textContent = passed ? "通过" : item.status === "skipped" ? "跳过" : "失败";
-    status.className = "test-status " + (passed ? "ok" : item.status === "skipped" ? "" : "bad");
+    const skipped = item.status === "skipped";
+    const abnormal = !passed && !skipped;
+    const label = passed ? "通过" : skipped ? "跳过" : item.status === "error" ? "错误" : "失败";
+    if (abnormal) {
+      const detailButton = document.createElement("button");
+      detailButton.type = "button";
+      detailButton.className = "test-status bad test-failure-button";
+      detailButton.textContent = label;
+      detailButton.title = "查看失败摘要和测试日志";
+      detailButton.addEventListener("click", () => openTestFailureDetail(item, heading, onViewLog));
+      status.appendChild(detailButton);
+    } else {
+      status.textContent = label;
+      status.className = "test-status " + (passed ? "ok" : "");
+    }
     const dur = document.createElement("td");
     dur.textContent = item.duration_ms == null ? "—" : formatDuration(item.duration_ms);
     row.append(name, status, dur);
@@ -2364,7 +2416,7 @@ function renderTestRun(root, run, heading) {
     state.page = 1;
     testTableState.set(key, state);
     root.replaceChildren();
-    renderTestRun(root, run, heading);
+    renderTestRun(root, run, heading, onViewLog);
   });
   sizeWrap.append(size, " 条");
   const prev = document.createElement("button");
@@ -2376,7 +2428,7 @@ function renderTestRun(root, run, heading) {
     state.page -= 1;
     testTableState.set(key, state);
     root.replaceChildren();
-    renderTestRun(root, run, heading);
+    renderTestRun(root, run, heading, onViewLog);
   });
   const next = document.createElement("button");
   next.type = "button";
@@ -2387,7 +2439,7 @@ function renderTestRun(root, run, heading) {
     state.page += 1;
     testTableState.set(key, state);
     root.replaceChildren();
-    renderTestRun(root, run, heading);
+    renderTestRun(root, run, heading, onViewLog);
   });
   const pos = document.createElement("span");
   pos.textContent = "第 " + state.page + " / " + pageCount + " 页（" + cases.length + " 条）";
@@ -2506,8 +2558,13 @@ async function openStepModal(stageId, taskId) {
       if (caseSel && caseSel.view === "results") {
         logEl.hidden = true;
         tableWrap.hidden = false;
-        if (caseSel.taskId === "ut-cases") renderTestRun(tableWrap, filterRun(run, "ut"), "UT 测试结果");
-        else renderTestRun(tableWrap, filterRun(run, "dt"), "DT 测试结果");
+        const showCaseLog = () => {
+          selectedTask = caseSel.taskId + ":log";
+          paintList();
+          loadStep();
+        };
+        if (caseSel.taskId === "ut-cases") renderTestRun(tableWrap, filterRun(run, "ut"), "UT 测试结果", showCaseLog);
+        else renderTestRun(tableWrap, filterRun(run, "dt"), "DT 测试结果", showCaseLog);
         return;
       }
       tableWrap.hidden = true;
