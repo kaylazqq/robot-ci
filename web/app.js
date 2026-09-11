@@ -32,6 +32,7 @@ let runLayerMode = "run";
 let runLayerTemplateId = "";
 let cloneSourceId = "";
 let previewBranchPicker = null;
+let previewBranchLoadGeneration = 0;
 let svcMenuPage = 1;
 const SVC_PAGE_SIZE = 8;
 const branchCache = {};
@@ -734,24 +735,45 @@ async function loadPreviewBranches(force) {
   const picker = ensurePreviewBranchPicker();
   const retryBtn = $("btnRefreshPreviewBranches");
   if (!svc || !picker) return;
+  const loadGeneration = ++previewBranchLoadGeneration;
+  const isCurrentLoad = () => (
+    runPreviewActive &&
+    runLayerOpen() &&
+    loadGeneration === previewBranchLoadGeneration &&
+    currentServiceId === svc.id
+  );
   const fallbackBranch = svc.default_branch || "main";
   const cached = branchCache[svc.id];
   const setLoading = (loading) => {
+    if (!isCurrentLoad()) return;
     if (retryBtn) retryBtn.classList.toggle("loading", loading);
-    picker.setDisabled(loading);
+    if (retryBtn) retryBtn.disabled = loading;
+    // 默认分支始终可用；读取缓存不能让用户的运行入口失去响应。
+    picker.setDisabled(false);
+    if (loading) setPreviewBranchStatus(force ? "正在从远程更新分支…" : "正在读取服务器缓存…");
   };
   const applyCached = (data) => {
+    if (!isCurrentLoad()) return;
     picker.setOptions(
       data.branches,
       data.selected_branch || fallbackBranch,
       data.default_branch || fallbackBranch
     );
-    setPreviewBranchStatus("");
+    const count = (data.branches || []).length;
+    if (data.refresh_error) {
+      setPreviewBranchStatus("远程刷新失败，已使用服务器缓存（" + count + " 个分支）", "error");
+    } else if (force) {
+      setPreviewBranchStatus("已更新 " + count + " 个分支", "ok");
+    } else if (data.cached) {
+      setPreviewBranchStatus("已读取服务器缓存（" + count + " 个分支）", "ok");
+    } else {
+      setPreviewBranchStatus("服务器暂无分支缓存，当前使用默认分支；点击刷新加载");
+    }
   };
   if (!force && cached && cached.loaded) {
-    const preferred = await preferredTemplateBranch(svc.id, cached.selected_branch || fallbackBranch);
     const tpl = findPipelineTemplate(runLayerTemplateId);
-    applyCached({ ...cached, selected_branch: (tpl && tpl.branch) || preferred });
+    if (!isCurrentLoad()) return;
+    applyCached({ ...cached, selected_branch: (tpl && tpl.branch) || cached.selected_branch || fallbackBranch });
     return;
   }
   setLoading(true);
@@ -761,11 +783,14 @@ async function loadPreviewBranches(force) {
     if (tpl && tpl.branch) data.selected_branch = tpl.branch;
     applyCached(data);
   } catch (e) {
+    if (!isCurrentLoad()) return;
     picker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
     setPreviewBranchStatus(e.message || "加载分支失败", "error");
     delete branchCache[svc.id];
   } finally {
+    if (!isCurrentLoad()) return;
     if (retryBtn) retryBtn.classList.remove("loading");
+    if (retryBtn) retryBtn.disabled = false;
     picker.setDisabled(false);
   }
 }
@@ -843,6 +868,19 @@ function enterRunPage(tpl) {
   runPreviewActive = true;
   applyTemplateDefaults(tpl);
   previewBranchPicker = null;
+  const svc = currentService();
+  const fallbackBranch = (svc && svc.default_branch) || "main";
+  const picker = ensurePreviewBranchPicker();
+  if (picker) {
+    picker.setOptions([fallbackBranch], fallbackBranch, fallbackBranch);
+    picker.setDisabled(false);
+  }
+  const retryBtn = $("btnRefreshPreviewBranches");
+  if (retryBtn) {
+    retryBtn.classList.remove("loading");
+    retryBtn.disabled = false;
+  }
+  setPreviewBranchStatus("");
   setPreviewHint("");
   syncRunLayerChrome();
   renderRunPage();
@@ -857,6 +895,7 @@ function enterRunPage(tpl) {
   loadPreviewBranches(false);
 }
 function cancelRunPreview() {
+  previewBranchLoadGeneration += 1;
   if (!runPreviewActive && !runLayerOpen()) return;
   runPreviewActive = false;
   runLayerMode = "run";
@@ -1914,15 +1953,27 @@ function fetchServiceBranches(serviceId, force, priority) {
   if (!force && branchLoads[serviceId]) return branchLoads[serviceId];
   const req = queueBranchLoad(() => {
     if (!sessionLive) return Promise.reject(new Error("请先登录"));
-    return api("/api/services/" + encodeURIComponent(serviceId) + "/branches" + (force ? "?refresh=1" : ""));
+    const path = "/api/services/" + encodeURIComponent(serviceId) + "/branches" + (force ? "?refresh=1" : "");
+    if (typeof AbortController === "undefined") return api(path);
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 30000);
+    return api(path, { signal: controller.signal }).catch((error) => {
+      if (timedOut) throw new Error("刷新分支超时，请稍后重试");
+      throw error;
+    }).finally(() => clearTimeout(timer));
   }, !!priority).then((data) => {
     if (!sessionLive) return data;
     const cached = {
       loaded: true,
       branches: data.branches || [],
-      selected_branch: data.selected_branch || data.preferred_branch || "",
+      selected_branch: data.selected_branch || "",
       default_branch: data.default_branch || "",
       cached: data.cached === true || force,
+      refresh_error: data.refresh_error || "",
     };
     branchCache[serviceId] = cached;
     delete branchLoads[serviceId];
@@ -2015,17 +2066,6 @@ function createBranchPicker(root, selectors) {
   };
 }
 
-async function preferredTemplateBranch(serviceId, fallback) {
-  try {
-    const tmpl = await api("/api/run-templates?service_id=" + encodeURIComponent(serviceId));
-    if (tmpl && tmpl.branch) {
-      if (branchCache[serviceId]) branchCache[serviceId].selected_branch = tmpl.branch;
-      return tmpl.branch;
-    }
-  } catch (_) {}
-  return fallback;
-}
-
 async function openRunDialog() {
   const svc = currentService();
   if (!svc) return;
@@ -2046,21 +2086,17 @@ async function openRunDialog() {
     '<button type="button" class="icon-btn" id="btnRefreshBranches" title="刷新" aria-label="刷新">' +
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
     '</button>' +
-    '<button type="button" class="btn ghost" id="btnSaveTemplate">保存为模板</button>' +
     '</div>' +
     '<p class="branch-status" id="runBranchStatus"></p>' +
-    '<p class="hint run-template-hint" id="runTemplateHint"></p>' +
     '<div class="row"><button type="button" class="btn ghost" data-close-modal>取消</button>' +
     '<button type="button" class="btn primary" id="btnRunConfirm">确定</button></div>';
   const branchPicker = createBranchPicker(wrap.querySelector("#runBranchPicker"));
   const statusEl = wrap.querySelector("#runBranchStatus");
   const retryBtn = wrap.querySelector("#btnRefreshBranches");
-  const hint = wrap.querySelector("#runTemplateHint");
   const fallbackBranch = svc.default_branch || "main";
   const cached = branchCache[svc.id];
   const alreadyLoaded = !!(cached && cached.loaded);
-  let selected = (cached && cached.selected_branch) || fallbackBranch;
-  if (alreadyLoaded) selected = await preferredTemplateBranch(svc.id, selected);
+  const selected = (cached && cached.selected_branch) || fallbackBranch;
   branchPicker.setOptions(cached && cached.branches, selected, (cached && cached.default_branch) || fallbackBranch);
   openModal("运行流水线", wrap, { narrow: true });
   if (!alreadyLoaded) {
@@ -2092,8 +2128,7 @@ async function openRunDialog() {
   };
   const loadBranches = async (force) => {
     if (!force && branchCache[svc.id] && branchCache[svc.id].loaded) {
-      const preferred = await preferredTemplateBranch(svc.id, branchCache[svc.id].selected_branch || fallbackBranch);
-      applyCached({ ...branchCache[svc.id], selected_branch: preferred }, false);
+      applyCached(branchCache[svc.id], false);
       return;
     }
     setLoading(true);
@@ -2112,18 +2147,6 @@ async function openRunDialog() {
   };
   wrap.querySelector("#btnRefreshBranches").addEventListener("click", () => {
     loadBranches(true);
-  });
-  wrap.querySelector("#btnSaveTemplate").addEventListener("click", async () => {
-    try {
-      await api("/api/run-templates", {
-        method: "POST",
-        body: JSON.stringify({ service_id: svc.id, branch: branchPicker.value }),
-      });
-      if (branchCache[svc.id]) branchCache[svc.id].selected_branch = branchPicker.value;
-      hint.textContent = "已保存 " + svc.title + " @ " + branchPicker.value;
-    } catch (e) {
-      hint.textContent = e.message || "保存模板失败";
-    }
   });
   loadBranches(false);
   wrap.querySelector("#btnRunConfirm").addEventListener("click", () => startRun(branchPicker.value));
@@ -2479,7 +2502,11 @@ async function openStepModal(stageId, taskId) {
       }
       tableWrap.hidden = true;
       logEl.hidden = false;
-      paintLog(logEl, lines.length ? lines.join("\n") : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。"), follow);
+      const failedSelection = selected || stage;
+      const emptyLog = failedSelection && failedSelection.status === "failed" && job.error
+        ? "失败原因：\n" + job.error
+        : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。");
+      paintLog(logEl, lines.length ? lines.join("\n") : emptyLog, follow);
     } catch (e) {
       tableWrap.hidden = true;
       logEl.hidden = false;

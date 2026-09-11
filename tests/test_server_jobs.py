@@ -387,6 +387,28 @@ class JobPayloadTests(unittest.TestCase):
         verify = server.job_payload(job, step="build", sub="verify")
         self.assertEqual(["[11:32:00] build finished"], verify["log"])
 
+    def test_partial_legacy_docker_sublog_includes_buildkit_failure(self) -> None:
+        job = make_job("sub-log-buildkit")
+        failure = (
+            "[09:45:30] ERROR: failed to solve: local/ai-python-build:3.11.15-v1: "
+            "failed to resolve source metadata for docker.io/local/ai-python-build:3.11.15-v1: "
+            "pull access denied: insufficient_scope"
+        )
+        job["step_logs"] = {
+            "build": [
+                "[09:45:29] #1 [internal] load build definition from Dockerfile",
+                failure,
+                "[09:45:30] ERROR build exit=1",
+            ],
+            "build:docker": ["[09:45:29] #1 [internal] load build definition from Dockerfile"],
+            "build:verify": ["[09:45:30] ERROR build exit=1"],
+        }
+
+        docker = server.job_payload(job, step="build", sub="docker")
+        self.assertIn(failure, docker["log"])
+        verify = server.job_payload(job, step="build", sub="verify")
+        self.assertNotIn("[09:45:30] ERROR build exit=1", verify["log"])
+
     def test_test_step_markers_route_to_ut_or_dt_sublogs(self) -> None:
         self.assertEqual("ut-cases", server._infer_test_log_substep("@@TEST_STEP@@ Temporal shell UT @@TEST_TYPE@@ ut"))
         self.assertEqual("dt-cases", server._infer_test_log_substep("@@TEST_STEP@@ Service Router DT @@TEST_TYPE@@ dt"))
@@ -627,6 +649,31 @@ class JobPipelineTests(unittest.TestCase):
         sub = {item["id"]: item["status"] for item in sync["subtasks"]}
         self.assertEqual("done", sub["clone"])
         self.assertEqual("done", sub["sha"])
+
+    def test_buildkit_base_image_pull_denial_marks_build_not_push(self) -> None:
+        job = make_job("pipe-buildkit-pull", status="failed", service_id="agentlink")
+        job["stage"] = "done"
+        job["commit_sha"] = "25e8855662c833938f96696dc720db5aefc80c71"
+        job["test_status"] = "passed"
+        job["error"] = (
+            "ERROR: failed to solve: local/ai-python-build:3.11.15-v1: "
+            "failed to resolve source metadata for docker.io/local/ai-python-build:3.11.15-v1: "
+            "pull access denied: insufficient_scope"
+        )
+        job["results"] = [{
+            "service_id": "agentlink",
+            "ok": False,
+            "error": job["error"],
+            "commit_sha": job["commit_sha"],
+            "test_status": "passed",
+        }]
+
+        statuses = {
+            step["id"]: step["status"]
+            for step in server.job_payload(job, compact=True)["pipeline"]["steps"]
+        }
+        self.assertEqual("failed", statuses["build"])
+        self.assertEqual("skipped", statuses["push"])
 
     def test_failed_job_without_results_marks_active_step(self) -> None:
         job = make_job("pipe-interrupt", status="failed")
@@ -1272,6 +1319,17 @@ class JobEndpointTests(unittest.TestCase):
             payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(["main", "feature/latest"], payload["branches"])
         self.assertEqual("main", payload["selected_branch"])
+        lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
+
+    @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
+    @patch.object(server, "cached_branches", return_value=["main", "feature/cached"])
+    def test_branch_refresh_falls_back_to_persisted_cache(self, cached, lookup) -> None:
+        with self._open("/api/services/memory-service/branches?refresh=1") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(["main", "feature/cached"], payload["branches"])
+        self.assertTrue(payload["cached"])
+        self.assertIn("远程刷新失败", payload["refresh_error"])
+        cached.assert_called_once_with("rollingfruit/CellMem")
         lookup.assert_called_once_with("rollingfruit/CellMem", force=True)
 
 

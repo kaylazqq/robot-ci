@@ -165,33 +165,6 @@ class AuthApiTests(unittest.TestCase):
         token = cookie.split("=", 1)[-1]
         self.assertEqual("l30042018", server.session_username(token))
 
-    def test_run_template_is_saved_per_user_and_service(self) -> None:
-        cookie = self._login()
-        with self._open(
-            "/api/run-templates",
-            data=json.dumps({"service_id": "memory-service", "branch": "develop"}).encode(),
-            method="POST",
-            cookie=cookie,
-        ) as response:
-            saved = json.loads(response.read().decode("utf-8"))
-        self.assertTrue(saved["ok"])
-        self.assertEqual("develop", saved["branch"])
-
-        with self._open("/api/run-templates?service_id=memory-service", cookie=cookie) as response:
-            loaded = json.loads(response.read().decode("utf-8"))
-        self.assertEqual("develop", loaded["branch"])
-
-        with self._open(
-            "/api/run-templates",
-            data=json.dumps({"service_id": "memory-service", "branch": "release"}).encode(),
-            method="POST",
-            cookie=cookie,
-        ) as response:
-            json.loads(response.read().decode("utf-8"))
-        with self._open("/api/run-templates?service_id=memory-service", cookie=cookie) as response:
-            overwritten = json.loads(response.read().decode("utf-8"))
-        self.assertEqual("release", overwritten["branch"])
-
     def test_service_favorites_are_saved_in_user_selected_order(self) -> None:
         cookie = self._login()
         first, second = (item["id"] for item in server.load_services()[:2])
@@ -219,28 +192,18 @@ class AuthApiTests(unittest.TestCase):
         self.assertFalse(removed["favorited"])
         self.assertEqual([second], removed["service_ids"])
 
+    def test_legacy_run_template_endpoint_is_not_available(self) -> None:
+        cookie = self._login()
+        with self.assertRaises(HTTPError) as missing:
+            self._open("/api/run-templates?service_id=memory-service", cookie=cookie)
+        self.assertEqual(404, missing.exception.code)
+
     def test_branch_cache_survives_memory_reset(self) -> None:
         repo = "example/service"
         server._cache_branches(repo, ["release", "main"])
         with server._branch_cache_lock:
             server._branch_cache.clear()
         self.assertEqual(["main", "release"], server.cached_branches(repo))
-
-    def test_missing_template_branch_falls_back_to_default(self) -> None:
-        self.assertEqual(
-            "main",
-            server.resolve_template_branch("l30042018", "memory-service", ["main", "develop"], "main"),
-        )
-        server.save_run_template("l30042018", "memory-service", "gone")
-        self.assertEqual(
-            "main",
-            server.resolve_template_branch("l30042018", "memory-service", ["main", "develop"], "main"),
-        )
-        server.save_run_template("l30042018", "memory-service", "develop")
-        self.assertEqual(
-            "develop",
-            server.resolve_template_branch("l30042018", "memory-service", ["main", "develop"], "main"),
-        )
 
     def test_legacy_users_json_is_imported_into_sqlite(self) -> None:
         self.users_patch.stop()

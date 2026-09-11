@@ -128,6 +128,7 @@ ARTIFACTS_DEFAULT_PAGE_SIZE = 10
 HISTORY_DEFAULT_PAGE_SIZE = 10
 HISTORY_MAX_ENTRIES = 500
 HISTORY_TRIM_TO = 250
+BRANCH_REFRESH_TIMEOUT_SEC = 20
 DISK_USAGE_PRUNE_RATIO = 0.80
 BUILDKIT_CACHE_MAX_AGE = "168h"
 BUILDKIT_CACHE_KEEP_STORAGE = "50GB"
@@ -239,13 +240,6 @@ def init_store() -> None:
                     username TEXT PRIMARY KEY,
                     salt TEXT NOT NULL,
                     password_hash TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS run_templates (
-                    username TEXT NOT NULL,
-                    service_id TEXT NOT NULL,
-                    branch TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (username, service_id)
                 );
                 CREATE TABLE IF NOT EXISTS service_favorites (
                     username TEXT NOT NULL,
@@ -397,6 +391,9 @@ def _infer_environment_service_id(workload_name: str, name: str = "") -> str:
 
 def _ensure_environment_service_column(conn: sqlite3.Connection) -> None:
     cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environments)")}
+    if "workload_name" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN workload_name TEXT NOT NULL DEFAULT ''")
+        cols.add("workload_name")
     if "service_id" not in cols:
         conn.execute("ALTER TABLE environments ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
     rows = conn.execute("SELECT id, service_id, workload_name, name FROM environments").fetchall()
@@ -680,70 +677,6 @@ def delete_environment(env_id: str) -> bool:
             conn.close()
 
 
-def get_run_template(username: str, service_id: str) -> str:
-    user = str(username or "").strip()
-    sid = str(service_id or "").strip()
-    if not user or not sid:
-        return ""
-    init_store()
-    with _db_lock:
-        conn = _connect_db()
-        try:
-            row = conn.execute(
-                "SELECT branch FROM run_templates WHERE username = ? AND service_id = ?",
-                (user, sid),
-            ).fetchone()
-        finally:
-            conn.close()
-    return str(row["branch"] or "").strip() if row else ""
-
-
-def save_run_template(username: str, service_id: str, branch: str) -> str:
-    user = str(username or "").strip()
-    sid = str(service_id or "").strip()
-    value = str(branch or "").strip()
-    if not user:
-        return "未登录"
-    if not sid:
-        return "缺少微服务"
-    if not value or not re.match(r"^[\w./\-]+$", value):
-        return "分支无效"
-    init_store()
-    with _db_lock:
-        conn = _connect_db()
-        try:
-            conn.execute(
-                """
-                INSERT INTO run_templates (username, service_id, branch, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(username, service_id) DO UPDATE SET
-                    branch = excluded.branch,
-                    updated_at = excluded.updated_at
-                """,
-                (user, sid, value, time.strftime("%Y-%m-%d %H:%M:%S")),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-    return ""
-
-
-def resolve_template_branch(
-    username: str,
-    service_id: str,
-    branches: list[str],
-    default: str = "main",
-) -> str:
-    names = [str(item).strip() for item in (branches or []) if str(item).strip()]
-    fallback = str(default or "main").strip() or "main"
-    preferred = get_run_template(username, service_id)
-    if preferred and preferred in names:
-        return preferred
-    if fallback in names:
-        return fallback
-    return names[0] if names else fallback
-
-
 BUILTIN_PIPELINE_TEMPLATES = (
     {"kind": "personal", "name": "个人构建流水线", "gamma_deploy": 0, "gamma_test": 0},
     {"kind": "release", "name": "生产发布", "gamma_deploy": 1, "gamma_test": 1},
@@ -967,8 +900,6 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
             conn.commit()
         finally:
             conn.close()
-    if fields["branch"]:
-        save_run_template(username, item["service_id"], fields["branch"])
     return get_pipeline_template(username, item["id"]), ""
 
 
@@ -1890,7 +1821,22 @@ def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
         return "sync"
     if any(token in err for token in ("archive", "host package", "tar.gz", "bundle", "fleet")):
         return "archive"
-    if "push" in step_ids and any(token in err for token in ("push", "swr", "docker login", "denied")):
+    # BuildKit pull/auth failures happen while resolving a Dockerfile base image,
+    # before an application image exists to push. Do not let the generic word
+    # "denied" paint those failures as an SWR push error.
+    if any(
+        token in err
+        for token in (
+            "failed to solve",
+            "resolve source metadata",
+            "load metadata for",
+            "dockerfile",
+            "buildkit",
+            "buildx",
+        )
+    ):
+        return "build"
+    if "push" in step_ids and any(token in err for token in ("push", "swr", "docker login")):
         return "push"
     if any(token in err for token in ("build", "docker", "npm", "compile", "make", "solve")):
         return "build"
@@ -3145,8 +3091,20 @@ def load_config() -> dict[str, Any]:
         except OSError:
             cfg["workspace_root"] = str((ROOT / "workspaces").resolve())
     Path(cfg["workspace_root"]).mkdir(parents=True, exist_ok=True)
-    cfg["host"] = cfg.get("host") or "127.0.0.1"
-    cfg["port"] = int(cfg.get("port") or 80)
+    # A same-site deployment keeps nginx on :80 and binds the helper privately.
+    # Service-manager overrides must take precedence over config.json so routine
+    # code deployments cannot accidentally compete with nginx for the public port.
+    bind_host = (
+        os.environ.get("ROBOT_CI_BIND")
+        or os.environ.get("ROBOT_CI_HOST")
+        or ""
+    ).strip()
+    bind_port = (os.environ.get("ROBOT_CI_PORT") or "").strip()
+    cfg["host"] = bind_host or cfg.get("host") or "127.0.0.1"
+    try:
+        cfg["port"] = int(bind_port or cfg.get("port") or 80)
+    except ValueError:
+        cfg["port"] = int(cfg.get("port") or 80)
     cfg["allow_remote"] = bool(cfg.get("allow_remote")) or str(
         os.environ.get("SWR_ALLOW_REMOTE") or ""
     ).lower() in ("1", "true", "yes")
@@ -3388,9 +3346,20 @@ def ensure_protected_image_holds() -> None:
         if not is_protected_base_image(ref):
             continue
         name = _protected_image_hold_name(ref)
-        code, _ = docker_cmd("inspect", "-f", "{{.Id}}", name, timeout=30)
-        if code == 0:
+        image_code, image_id = docker_cmd("image", "inspect", "-f", "{{.Id}}", ref, timeout=30)
+        hold_code, hold_image_id = docker_cmd("inspect", "-f", "{{.Image}}", name, timeout=30)
+        if (
+            image_code == 0
+            and hold_code == 0
+            and image_id.strip()
+            and image_id.strip() == hold_image_id.strip()
+        ):
             continue
+        if hold_code == 0:
+            # The tag may have been rebuilt since this hold was created. A stale
+            # hold protects the old image ID and lets `docker image prune -af`
+            # delete the newly tagged base image.
+            docker_cmd("rm", "-f", name, timeout=30)
         docker_cmd("create", "--name", name, ref, "true", timeout=60)
 
 
@@ -3856,18 +3825,25 @@ def _infer_pipeline_log_substep(step_id: str, line: str) -> str:
             return "sha"
         return "clone"
     if step_id == "build":
-        if any(token in lowered for token in ("build finished", "error build", "产物校验")):
+        if any(token in lowered for token in ("build finished", "产物校验")):
             return "verify"
         if any(
             token in lowered
             for token in (
                 "dockerfile",
                 "docker build",
+                "failed to solve",
+                "resolve source metadata",
+                "load metadata for",
+                "pull access denied",
+                "insufficient_scope",
+                "repository does not exist",
+                "docker.io/",
                 "sending build context",
                 "successfully tagged",
                 "docker 多阶段",
             )
-        ):
+        ) or re.match(r"^#\d+(?:\s|$)", text):
             return "docker"
         return "script"
     if step_id == "push":
@@ -3910,7 +3886,18 @@ def _selected_step_logs(logs: dict[str, Any], step_id: str, sub_id: str) -> list
     seen: set[str] = set()
     for key in _substep_alias_keys(step_id, want):
         for line in logs.get(key) or []:
+            if step_id == "build" and _infer_pipeline_log_substep(step_id, line) != want:
+                continue
             if line in seen:
+                continue
+            seen.add(line)
+            selected.append(line)
+    # Older persisted jobs may contain only the first few explicit BuildKit
+    # lines under build:docker. Re-infer the parent build log as well so the
+    # decisive failure is visible when those historical nodes are opened.
+    if selected and step_id == "build":
+        for line in parent:
+            if line in seen or _infer_pipeline_log_substep(step_id, line) != want:
                 continue
             seen.add(line)
             selected.append(line)
@@ -4853,10 +4840,15 @@ def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] |
         if cached:
             return True, cached
 
+    deadline = time.monotonic() + BRANCH_REFRESH_TIMEOUT_SEC
+
+    def remaining_timeout(limit: float) -> float:
+        return max(1.0, min(limit, deadline - time.monotonic()))
+
     # 1) SSH ls-remote (preferred on shared server)
     if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
         ssh_url = f"git@github.com:{repo}.git"
-        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=30, env=git_env())
+        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=remaining_timeout(12), env=git_env())
         if code == 0:
             names = []
             for line in out.splitlines():
@@ -4878,11 +4870,13 @@ def list_branches_api(repo: str, force: bool = False) -> tuple[bool, list[str] |
         try:
             names: list[str] = []
             for page in range(1, 11):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"刷新分支超时（{BRANCH_REFRESH_TIMEOUT_SEC} 秒）")
                 url = f"https://api.github.com/repos/{repo}/branches?per_page=100&page={page}"
                 req = Request(url)
                 req.add_header("Accept", "application/vnd.github+json")
                 req.add_header("Authorization", f"Bearer {token}")
-                with urlopen(req, timeout=30) as resp:
+                with urlopen(req, timeout=remaining_timeout(8)) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 if not isinstance(data, list):
                     raise ValueError("GitHub branches response is not a list")
@@ -6824,12 +6818,20 @@ class Handler(SimpleHTTPRequestHandler):
             force_refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
             default = svc.get("default_branch") or "main"
             if force_refresh:
+                cached_before_refresh = cached_branches(repo)
                 ok, result = list_branches_api(repo, force=True)
                 from_cache = False
+                refresh_error = ""
+                if not ok and cached_before_refresh:
+                    result = cached_before_refresh
+                    ok = True
+                    from_cache = True
+                    refresh_error = "远程刷新失败，已保留服务器缓存"
             else:
                 result = cached_branches(repo)
                 ok = True
                 from_cache = bool(result)
+                refresh_error = ""
                 if not result:
                     result = [default]
             if not ok:
@@ -6846,27 +6848,17 @@ class Handler(SimpleHTTPRequestHandler):
             if default in branches:
                 branches.remove(default)
                 branches.insert(0, default)
-            preferred = get_run_template(user or "", str(svc.get("id") or ""))
-            selected = resolve_template_branch(user or "", str(svc.get("id") or ""), branches, default)
+            selected = default if default in branches else (branches[0] if branches else default)
             self._json(
                 200,
                 {
                     "branches": branches,
                     "default_branch": default,
-                    "preferred_branch": preferred or None,
                     "selected_branch": selected,
                     "cached": from_cache,
+                    "refresh_error": refresh_error or None,
                 },
             )
-            return
-
-        if path == "/api/run-templates":
-            service_id = str((query.get("service_id") or [""])[0]).strip()
-            if not service_id:
-                self._json(400, {"error": "缺少微服务"})
-                return
-            preferred = get_run_template(user or "", service_id)
-            self._json(200, {"service_id": service_id, "branch": preferred or None})
             return
 
         if path == "/api/pipeline-templates":
@@ -7071,20 +7063,6 @@ class Handler(SimpleHTTPRequestHandler):
                     "service_ids": service_ids,
                 },
             )
-            return
-
-        if path == "/api/run-templates":
-            service_id = str(data.get("service_id") or "").strip()
-            branch = str(data.get("branch") or "").strip()
-            catalog = {str(item.get("id")): item for item in load_services()}
-            if service_id not in catalog:
-                self._json(404, {"ok": False, "error": "未知微服务"})
-                return
-            err = save_run_template(user, service_id, branch)
-            if err:
-                self._json(400, {"ok": False, "error": err})
-                return
-            self._json(200, {"ok": True, "service_id": service_id, "branch": branch})
             return
 
         m_tpl_copy = re.fullmatch(r"/api/pipeline-templates/([^/]+)/copy", path)
