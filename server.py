@@ -1154,6 +1154,8 @@ def destroy_session(token: str) -> None:
 
 def session_cookie_name() -> str:
     """Cookies are host-scoped, not port-scoped. Isolate :18889 from :80."""
+    if os.environ.get('ROBOT_CI_PUBLIC_ORIGIN'):
+        return SESSION_COOKIE
     try:
         port = int(CFG.get("port") or 80)
     except (TypeError, ValueError, NameError):
@@ -6661,6 +6663,14 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        if path == '/api/auth/pipeline':
+            if self.client_address[0] not in {'127.0.0.1', '::1'}:
+                self._json(404, {})
+                return
+            user = self._current_user()
+            self._json(200 if user else 401, {'user': user or None},
+                       extra_headers={'X-Pipeline-User': user or '', 'Cache-Control': 'no-store'})
+            return
         user = self._require_api_user(path, "GET")
         if user is None:
             return
@@ -7400,6 +7410,8 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     host, port = CFG["host"], CFG["port"]
+    host = os.environ.get('ROBOT_CI_BIND', host)
+    port = int(os.environ.get('ROBOT_CI_PORT', port))
     allow_remote = str(CFG.get("allow_remote") or os.environ.get("SWR_ALLOW_REMOTE") or "").lower() in (
         "1",
         "true",

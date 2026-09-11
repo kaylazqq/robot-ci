@@ -74,6 +74,9 @@ function bindLogFollow(el, state) {
     state.follow = isLogNearBottom(el);
   });
 }
+function pipelineUrl(value) {
+  return String(value || '').replace(/^http:\/\/119\.8\.233\.58:8080\/(?=(?:runs|batches|artifacts)\/)/, 'http://119.8.233.58/pipeline/');
+}
 function renderLogText(el, text) {
   const value = String(text == null ? "" : text);
   if (el.textContent === value) return;
@@ -90,7 +93,7 @@ function renderLogText(el, text) {
     } catch (_) { continue; }
     fragment.append(document.createTextNode(value.slice(offset, match.index)));
     const link = document.createElement("a");
-    link.href = href;
+    link.href = pipelineUrl(href);
     link.textContent = href;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
@@ -1755,8 +1758,8 @@ function applyJob(job, { loading } = {}) {
     const gammaStatus=job.gamma_e2e.conclusion === 'failure' ? '未通过' : job.gamma_e2e.conclusion === 'success' ? '通过' : ({queued:'排队中',running:'执行中',interrupted:'已中断',blocked:'环境阻塞',detached:'已脱离构建等待'}[job.gamma_e2e.state] || job.gamma_e2e.state || '等待');
     state.textContent='构建产物已生成 · Gamma '+gammaStatus+(job.gamma_e2e.stage ? ' · '+job.gamma_e2e.stage : '');
     row.append(state);
-    const url=job.gamma_e2e.url || '';
-    if (url.startsWith('http://119.8.233.58:8080/batches/gamma-')) {
+    const url=pipelineUrl(job.gamma_e2e.url);
+    if (url.startsWith('http://119.8.233.58/pipeline/batches/gamma-')) {
       const link=document.createElement('a');link.href=url;link.target='_blank';link.rel='noreferrer';
       link.textContent='查看 Gamma E2E 流程与报告';row.append(link);
     }
@@ -2845,6 +2848,15 @@ function bind(id, fn) {
   if (el) el.addEventListener("click", fn);
 }
 
+function returnToPipeline() {
+  const target = new URLSearchParams(location.search).get('return_to');
+  if (target && /^\/(pipeline|submit)(\/|$)/.test(target) && !target.includes('\\')) {
+    const url = new URL(target, location.origin);
+    if (url.origin === location.origin) { location.replace(url.href); return true; }
+  }
+  return false;
+}
+
 $("loginForm").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   $("loginError").hidden = true;
@@ -2853,7 +2865,7 @@ $("loginForm").addEventListener("submit", async (ev) => {
       method: "POST",
       body: JSON.stringify({ username: $("authUser").value.trim(), password: $("authPass").value }),
     });
-    await bootApp(data.username);
+    if (!returnToPipeline()) await bootApp(data.username);
   } catch (e) {
     $("loginError").hidden = false;
     $("loginError").textContent = e.message || "登录失败";
@@ -3062,7 +3074,7 @@ async function bootApp(username) {
 (async function boot() {
   try {
     const me = await api("/api/auth/me");
-    if (me.user) await bootApp(me.user);
+    if (me.user) { if (!returnToPipeline()) await bootApp(me.user); }
     else showLogin();
   } catch (_) {
     showLogin();

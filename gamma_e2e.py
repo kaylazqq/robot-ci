@@ -85,7 +85,7 @@ def run(job_id, results, opts, log, progress, cancelled):
     manifest=prepare(job_id,results,opts,log)
     receipt=request('/internal/artifact-batches',manifest)
     run_id=receipt['id']
-    url='http://119.8.233.58:8080'+receipt['web_path']
+    url=os.environ.get('GAMMA_E2E_PUBLIC_BASE','http://119.8.233.58/pipeline').rstrip('/')+receipt['web_path']
     log('Gamma Pipeline: '+url)
     progress({'id':run_id,'url':url,'state':'queued','build_status':'success'})
     deadline=time.monotonic()+6*3600
