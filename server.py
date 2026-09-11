@@ -1883,7 +1883,22 @@ def _failed_pipeline_step(result: dict[str, Any], step_ids: list[str]) -> str:
         return "sync"
     if any(token in err for token in ("archive", "host package", "tar.gz", "bundle", "fleet")):
         return "archive"
-    if "push" in step_ids and any(token in err for token in ("push", "swr", "docker login", "denied")):
+    # BuildKit pull/auth failures happen while resolving a Dockerfile base image,
+    # before an application image exists to push. Do not let the generic word
+    # "denied" paint those failures as an SWR push error.
+    if any(
+        token in err
+        for token in (
+            "failed to solve",
+            "resolve source metadata",
+            "load metadata for",
+            "dockerfile",
+            "buildkit",
+            "buildx",
+        )
+    ):
+        return "build"
+    if "push" in step_ids and any(token in err for token in ("push", "swr", "docker login")):
         return "push"
     if any(token in err for token in ("build", "docker", "npm", "compile", "make", "solve")):
         return "build"
@@ -3378,9 +3393,20 @@ def ensure_protected_image_holds() -> None:
         if not is_protected_base_image(ref):
             continue
         name = _protected_image_hold_name(ref)
-        code, _ = docker_cmd("inspect", "-f", "{{.Id}}", name, timeout=30)
-        if code == 0:
+        image_code, image_id = docker_cmd("image", "inspect", "-f", "{{.Id}}", ref, timeout=30)
+        hold_code, hold_image_id = docker_cmd("inspect", "-f", "{{.Image}}", name, timeout=30)
+        if (
+            image_code == 0
+            and hold_code == 0
+            and image_id.strip()
+            and image_id.strip() == hold_image_id.strip()
+        ):
             continue
+        if hold_code == 0:
+            # The tag may have been rebuilt since this hold was created. A stale
+            # hold protects the old image ID and lets `docker image prune -af`
+            # delete the newly tagged base image.
+            docker_cmd("rm", "-f", name, timeout=30)
         docker_cmd("create", "--name", name, ref, "true", timeout=60)
 
 
@@ -3846,18 +3872,25 @@ def _infer_pipeline_log_substep(step_id: str, line: str) -> str:
             return "sha"
         return "clone"
     if step_id == "build":
-        if any(token in lowered for token in ("build finished", "error build", "产物校验")):
+        if any(token in lowered for token in ("build finished", "产物校验")):
             return "verify"
         if any(
             token in lowered
             for token in (
                 "dockerfile",
                 "docker build",
+                "failed to solve",
+                "resolve source metadata",
+                "load metadata for",
+                "pull access denied",
+                "insufficient_scope",
+                "repository does not exist",
+                "docker.io/",
                 "sending build context",
                 "successfully tagged",
                 "docker 多阶段",
             )
-        ):
+        ) or re.match(r"^#\d+(?:\s|$)", text):
             return "docker"
         return "script"
     if step_id == "push":
@@ -3900,7 +3933,18 @@ def _selected_step_logs(logs: dict[str, Any], step_id: str, sub_id: str) -> list
     seen: set[str] = set()
     for key in _substep_alias_keys(step_id, want):
         for line in logs.get(key) or []:
+            if step_id == "build" and _infer_pipeline_log_substep(step_id, line) != want:
+                continue
             if line in seen:
+                continue
+            seen.add(line)
+            selected.append(line)
+    # Older persisted jobs may contain only the first few explicit BuildKit
+    # lines under build:docker. Re-infer the parent build log as well so the
+    # decisive failure is visible when those historical nodes are opened.
+    if selected and step_id == "build":
+        for line in parent:
+            if line in seen or _infer_pipeline_log_substep(step_id, line) != want:
                 continue
             seen.add(line)
             selected.append(line)

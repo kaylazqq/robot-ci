@@ -2405,7 +2405,11 @@ async function openStepModal(stageId, taskId) {
       }
       tableWrap.hidden = true;
       logEl.hidden = false;
-      paintLog(logEl, lines.length ? lines.join("\n") : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。"), follow);
+      const failedSelection = selected || stage;
+      const emptyLog = failedSelection && failedSelection.status === "failed" && job.error
+        ? "失败原因：\n" + job.error
+        : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。");
+      paintLog(logEl, lines.length ? lines.join("\n") : emptyLog, follow);
     } catch (e) {
       tableWrap.hidden = true;
       logEl.hidden = false;
