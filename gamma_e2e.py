@@ -12,13 +12,13 @@ import time
 from urllib.request import Request, urlopen, build_opener, ProxyHandler
 
 TARGET = 'ci-e2e'
-SUITES = ('E01', 'E02', 'E03')
+SUITES = ('E01', 'E02', 'E03', 'E04', 'E05', 'E06')
 
 
 def options(raw):
-    selected=raw.get('gamma_suites',list(SUITES))
+    selected=raw.get('gamma_suites',['E01','E02','E03'])
     if not isinstance(selected,list) or not selected or len(set(selected))!=len(selected) or any(s not in SUITES for s in selected):
-        raise ValueError('Gamma E2E requires a nonempty E01/E02/E03 set')
+        raise ValueError('Gamma E2E requires a nonempty E01-E06 set')
     return {'gamma_suites':selected,'gamma_baseline':bool(raw.get('gamma_baseline',True))}
 
 

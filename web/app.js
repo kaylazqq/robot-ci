@@ -930,7 +930,7 @@ function confirmRunPreview() {
     return;
   }
   const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
-  if (runPreviewSelection.environmentId === 'ci-e2e' && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
+  if (runPreviewSelection.test && (runPreviewSelection.environmentId === 'ci-e2e' || runPreviewSelection.mode === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
     setPreviewHint('请至少选择一个 E2E 用例'); return;
   }
   if (wantsGamma && !runPreviewSelection.environmentId) {
@@ -1165,9 +1165,23 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     });
     tree.appendChild(row);
   });
-  if (preview && stage.id === 'gamma' && runPreviewSelection.environmentId === 'ci-e2e') {
+  if (preview && stage.id === 'gamma' && runPreviewSelection.test) {
+    if (runPreviewSelection.environmentId !== 'ci-e2e') {
+      const mode = doc.createElement('select');
+      mode.className = 'input'; mode.setAttribute('aria-label', 'Gamma 测试方式');
+      for (const [value, text] of [['repository','仓库 Gamma 用例'], ['browser-e2e','浏览器 E2E · E01–E06']]) {
+        const option = doc.createElement('option'); option.value = value; option.textContent = text;
+        mode.appendChild(option);
+      }
+      mode.value = runPreviewSelection.mode || 'repository';
+      mode.addEventListener('change', () => { runPreviewSelection.mode = mode.value; renderRunPage(); });
+      tree.appendChild(mode);
+    }
+  }
+  if (preview && stage.id === 'gamma' && runPreviewSelection.test &&
+      (runPreviewSelection.environmentId === 'ci-e2e' || runPreviewSelection.mode === 'browser-e2e')) {
     const group = doc.createElement('div'); group.className = 'gamma-suite-options';
-    for (const [id, title] of [['E01','创建机器人'],['E02','私聊与追问'],['E03','群聊 @']]) {
+    for (const [id, title] of [['E01','创建机器人'],['E02','私聊与追问'],['E03','群聊 @'],['E04','停止与取消'],['E05','失败与恢复'],['E06','重复事件与幂等']]) {
       const label = doc.createElement('label'), box = doc.createElement('input');
       box.type='checkbox'; box.value=id; box.checked=(runPreviewSelection.suites || ['E01','E02','E03']).includes(id);
       box.addEventListener('change', () => {
@@ -1179,7 +1193,9 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     const label=doc.createElement('label'), box=doc.createElement('input');
     box.type='checkbox'; box.checked=runPreviewSelection.baseline !== false;
     box.addEventListener('change', () => {runPreviewSelection.baseline=box.checked;});
-    label.append(box,doc.createTextNode('基线对照'));group.append(label);tree.append(group);
+    label.append(box,doc.createTextNode('基线对照'));
+    if (runPreviewSelection.environmentId === 'ci-e2e') group.append(label);
+    tree.append(group);
   }
   drop.appendChild(tree);
   col.appendChild(drop);
@@ -2184,6 +2200,7 @@ async function startRun(branch) {
           gamma_test: !!runPreviewSelection.test,
           environment_id: runPreviewSelection.environmentId || "",
           gamma_suites: runPreviewSelection.suites || ['E01','E02','E03'],
+          gamma_mode: runPreviewSelection.mode || 'repository',
           gamma_baseline: runPreviewSelection.baseline !== false,
         },
       }),
