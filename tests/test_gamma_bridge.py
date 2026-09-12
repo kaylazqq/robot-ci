@@ -10,6 +10,22 @@ import gamma_e2e
 
 
 class GammaBridgeTests(unittest.TestCase):
+    def test_deploy_only_never_falls_back_when_gamma_driver_missing(self):
+        import gamma_real
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
+        tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
+                     ('_normalize_optional_steps', 'maybe_run_gamma_after_build')]
+        scope = {'Any': object, '_job_copy': lambda _: {'optional_steps': {
+            'environment_id': 'dedicated', 'gamma_deploy': True, 'gamma_test': False}},
+            'job_cancel_requested': lambda _: False, 'set_job': Mock(),
+            'get_environment': Mock(return_value={'name': 'dev-gamma'}), 'cce_rollout': Mock()}
+        exec(compile(tree, 'server.py', 'exec'), scope)
+        with patch.object(gamma_real, 'owns_environment', return_value=True), patch.object(gamma_real, 'available', return_value=False):
+            ok, message = scope['maybe_run_gamma_after_build']('job', [])
+        self.assertFalse(ok)
+        self.assertIn('未部署镜像', message)
+        scope['cce_rollout'].deploy_job_results.assert_not_called()
+
     def test_repository_gamma_remains_default(self):
         import re
         import gamma_real

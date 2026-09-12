@@ -17,7 +17,7 @@ class GammaPreflightTests(unittest.TestCase):
         function.body = [node, ast.Return(value=ast.Constant('accepted'))]
         module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
         handler = Mock()
-        scope = {'data': {'optional_steps': options}, '_normalize_optional_steps': lambda v: v, 'self': handler,
+        scope = {'CFG': {}, 'data': {'optional_steps': options}, '_normalize_optional_steps': lambda v: v, 'self': handler,
                  'items': [{'service_id': 'agent-governance-gw'}]}
         exec(compile(module, 'gamma-preflight', 'exec'), scope)
         with patch.object(gamma_real, 'available', return_value=ready), patch.object(gamma_real, 'validate_selection'):

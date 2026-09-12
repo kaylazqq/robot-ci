@@ -6,6 +6,8 @@ import re
 import subprocess
 import tarfile
 import sqlite3
+import time
+import os
 from contextlib import closing
 
 ROOT = Path('/var/lib/pr-e2e/build-inbox')
@@ -29,12 +31,16 @@ def environment_config(environment):
     return dict(selected)
 
 
-def available(environment):
+def owns_environment(environment):
     try:
         environment_config(environment)
-        return DRIVER.is_file()
+        return True
     except (ValueError, OSError, sqlite3.Error, TypeError):
         return False
+
+
+def available(environment):
+    return owns_environment(environment) and DRIVER.is_file()
 
 
 def validate_selection(environment, service_ids):
@@ -77,11 +83,16 @@ def prepare(job_id, results, opts):
     if result.returncode or json.loads(result.stdout).get('config', {}).get('digest') != image_id:
         raise ValueError('SWR manifest does not match the archived build image')
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    pinned_archive = ROOT / (job_id + '.tar')
+    if not pinned_archive.exists():
+        os.link(archive, pinned_archive)
     manifest = ROOT / (job_id + '.json')
     body = {'build_id': job_id, 'environment_id': opts['environment_id'], 'result': row,
             'pinned_image': pinned, 'image_id': image_id, 'deploy': bool(opts.get('gamma_deploy'))}
     from gamma_e2e import options
-    body['suite_ids'] = options(opts)['gamma_suites']
+    body['suite_ids'] = options(opts)['gamma_suites'] if opts.get('gamma_test') else []
+    if manifest.exists() and json.loads(manifest.read_text()) != body:
+        raise ValueError('Immutable build handoff already exists with different inputs')
     manifest.write_text(json.dumps(body))
     manifest.chmod(0o600)
     return manifest
@@ -91,33 +102,33 @@ def run(job_id, results, opts, log, progress, cancelled):
     if not available(opts.get('environment_id')):
         return False, 'Real Gamma environment is not configured'
     manifest = prepare(job_id, results, opts)
-    command = ['systemd-run', '--quiet', '--wait', '--pipe', '--collect',
-               '--unit=robot-gamma-' + job_id, '--slice=pr-e2e.slice',
-               '/usr/local/bin/python3.11', str(DRIVER), '--environment-id', opts['environment_id'],
-               '--build-manifest', str(manifest), '--suites', *json.loads(manifest.read_text())['suite_ids']]
-    record = None
+    from gamma_e2e import request
+    frozen = json.loads(manifest.read_text())
+    submitted = request('/internal/gamma', {'submission_id': 'robot-' + job_id,
+        'environment_id': opts['environment_id'], 'mode': 'test' if opts.get('gamma_test') else 'deploy',
+        'suite_ids': frozen['suite_ids'], 'build_manifest': str(manifest),
+        'build_manifest_sha256': hashlib.sha256(manifest.read_bytes()).hexdigest(), 'requested_by': 'robot-ci:' + job_id})
+    run_id = submitted['id']
+    record = {'id': run_id, 'url': 'http://119.8.233.58/pipeline/runs/' + run_id, 'state': 'queued'}
+    log('Gamma Pipeline: ' + record['url'])
+    progress(record)
     stop_requested = False
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as process:
-        for line in process.stdout:
-            if cancelled() and not stop_requested:
-                stop_requested = True
-                log('Gamma stop requested; waiting for the isolated driver to finish safely')
-            line = line.strip()
-            if line.startswith('PIPELINE_URL='):
-                url = line.split('=', 1)[1]
-                record = {'id': url.rsplit('/', 1)[-1], 'url': url, 'state': 'running'}
-                progress(record)
-                log('Gamma Pipeline: ' + url)
-            else:
-                log(line)
-                if record and line.startswith('Gamma stage: '):
-                    snapshot = json.loads((Path('/var/lib/pr-e2e-share/runs') / record['id'] / 'run.json').read_text())
-                    progress({**record, 'stage': line.split(': ', 1)[1], 'stages': snapshot.get('stages', [])})
-        code = process.wait()
-    if not record:
-        return False, 'Gamma driver did not create a report'
-    result = json.loads((Path('/var/lib/pr-e2e-share/runs') / record['id'] / 'run.json').read_text())
-    ok = code == 0 and result.get('conclusion') == 'success' and not result.get('stale') and not stop_requested
+    last = None
+    while True:
+        if cancelled() and not stop_requested:
+            stop_requested = True
+            log('构建停止请求已记录；Gamma 环境任务保留，等待安全完成或恢复检查')
+        result = request('/api/runs/' + run_id)
+        state = (result.get('status'), result.get('summary'), result.get('queue_position'))
+        if state != last:
+            log('Gamma ' + json.dumps(state, ensure_ascii=False))
+            progress({**record, 'state': state[0], 'summary': state[1], 'queue_position': state[2],
+                      'stages': result.get('stages', [])})
+            last = state
+        if result.get('status') in ('completed', 'interrupted', 'blocked'):
+            break
+        time.sleep(5)
+    ok = result.get('conclusion') == 'success' and result.get('cleanup', {}).get('status') == 'passed' and not result.get('stale') and not stop_requested
     progress({**record, 'state': 'completed', 'conclusion': result.get('conclusion'), 'summary': result.get('summary'),
               'stages': result.get('stages', []), 'rollback': result.get('rollback')})
     return ok, '' if ok else ('Cancelled after safe driver completion' if stop_requested else result.get('summary', 'Gamma failed')) + ': ' + record['url']
