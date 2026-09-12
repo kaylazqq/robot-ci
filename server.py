@@ -3027,6 +3027,7 @@ def persist_job_meta(job_id: str) -> None:
             "queue_position",
             "optional_steps",
             "gamma_e2e",
+            "frozen_inputs",
         )
         meta = {k: job.get(k) for k in keys}
         # Keep running-job JSON small so history listing stays cheap.
@@ -3098,6 +3099,7 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "stage_before_stop": meta.get("stage_before_stop"),
         "optional_steps": meta.get("optional_steps") or {},
         "gamma_e2e": meta.get("gamma_e2e"),
+        "frozen_inputs": meta.get("frozen_inputs") or {},
         "log": log_lines,
     }
 
@@ -4292,6 +4294,8 @@ def repo_dir(svc: dict[str, Any], job_id: str | None = None) -> Path:
     root = Path(CFG["workspace_root"])
     name = clone_dir_name(svc)
     suffix = job_workspace_suffix(job_id)
+    if CFG.get('freeze_build_inputs') and suffix:
+        return root / 'frozen-inputs' / suffix / name
     return root / (f"{name}--{suffix}" if suffix else name)
 
 
@@ -5148,6 +5152,18 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     # Always wipe this job's checkout (including build outputs) then fresh clone.
     wipe_workspace_dir(job_id, dest, label=f"workspace {svc.get('id') or dest.name}")
 
+    frozen = (_job_copy(job_id) or {}).get('frozen_inputs', {})
+    if CFG.get('freeze_build_inputs'):
+        from frozen_builds import checkout
+        ok, detail = checkout(job_id, dest, clone_url, frozen.get(svc['id']), run_stream, run_cmd, git_args, genv)
+        if not ok:
+            return ok, detail
+        run_cmd(git_args('-C', str(dest), 'remote', 'set-url', 'origin', public), timeout=30, env=genv)
+        ok, error = validate_cloned_repo_contract(dest, svc)
+        if ok and svc.get('id') == 'multica-fleet':
+            restore_fleet_runtime_cache(job_id, dest)
+        return (True, str(dest)) if ok else (False, error)
+
     append_job_log(job_id, "git clone…")
     code = run_stream(
         job_id,
@@ -5210,6 +5226,9 @@ def validate_cloned_repo_contract(dest: Path, svc: dict[str, Any]) -> tuple[bool
 
 def public_service_dir() -> Path:
     """Sibling of per-service clone dirs: <workspace_root>/public-service."""
+    job_id = current_job_id()
+    if CFG.get('freeze_build_inputs') and job_id:
+        return Path(CFG['workspace_root']) / 'frozen-inputs' / job_id / 'public-service'
     return Path(CFG["workspace_root"]) / "public-service"
 
 
@@ -5231,6 +5250,13 @@ def ensure_public_service(job_id: str) -> tuple[bool, str]:
         clone_url = clone_url_for(url)
         genv = git_env()
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if CFG.get('freeze_build_inputs'):
+            from frozen_builds import checkout
+            sha = (_job_copy(job_id) or {}).get('frozen_inputs', {}).get('public-service')
+            if dest.exists():
+                code, actual = run_cmd(git_args('-C', str(dest), 'rev-parse', 'HEAD'), env=genv, timeout=30)
+                return (True, str(dest)) if not code and actual.strip() == sha else (False, 'Frozen shared dependency changed')
+            return checkout(job_id, dest, clone_url, sha, run_stream, run_cmd, git_args, genv)
         rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
         now = time.time()
         append_job_log(job_id, f"ensure shared public-service → {dest} @ {branch}")
@@ -6509,7 +6535,11 @@ def maybe_run_gamma_after_build(
             return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
 
     # Fail before changing a shared cluster when its browser driver is absent.
-    if opts.get("gamma_test") and opts.get("gamma_mode") == "browser-e2e":
+    from gamma_real import owns_environment
+    gamma_owned = owns_environment(env_id) if env_id else False
+    if gamma_owned and opts.get('gamma_test') and opts.get('gamma_mode') != 'browser-e2e':
+        return False, 'dev-gamma 是专用 E2E 环境，请选择浏览器 E2E 模式'
+    if (opts.get("gamma_test") and opts.get("gamma_mode") == "browser-e2e") or (gamma_owned and opts.get('gamma_deploy')):
         from gamma_real import available, run as run_real_gamma
         if not available(env_id):
             return False, '该环境尚未配置真实 Gamma 驱动；未部署镜像'
@@ -7568,7 +7598,19 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                     return
             client_id = _normalize_client_id(data.get("client_id"))
+            frozen_inputs = {}
             try:
+                if CFG.get('freeze_build_inputs'):
+                    from frozen_builds import resolve as freeze_ref
+                    for item in items:
+                        svc = catalog[item['service_id']]
+                        url = svc.get('github') or ('https://github.com/' + svc['repo'] + '.git')
+                        frozen_inputs[item['service_id']] = freeze_ref(clone_url_for(url,
+                            public_https=bool(svc.get('public_https')), prefer_token_https=bool(svc.get('prefer_token_https'))),
+                            item['branch'], run_cmd, git_args, git_env())
+                    if any(not catalog[item['service_id']].get('skip_public_service') for item in items):
+                        frozen_inputs['public-service'] = freeze_ref(clone_url_for(CFG.get('public_service_github') or 'https://github.com/rollingfruit/public-service.git'),
+                            CFG.get('public_service_branch') or 'main', run_cmd, git_args, git_env())
                 optional_steps = _normalize_optional_steps(data.get('optional_steps'))
                 if optional_steps.get('gamma_test') and optional_steps.get('gamma_mode') == 'browser-e2e' and optional_steps.get('environment_id') != 'ci-e2e':
                     from gamma_real import available
@@ -7596,6 +7638,7 @@ class Handler(SimpleHTTPRequestHandler):
             service_ids = [it["service_id"] for it in items]
             branches = ",".join(it["branch"] for it in items)
             new_job = {
+                'frozen_inputs': frozen_inputs,
                 "id": job_id,
                 "client_id": client_id,
                 "operator": user,
