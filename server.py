@@ -1380,7 +1380,12 @@ def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {"gamma_deploy": False, "gamma_test": False, "environment_id": ""}
     from gamma_e2e import options
-    extra = options(raw) if raw.get('environment_id') == 'ci-e2e' else {}
+    mode = raw.get('gamma_mode', 'repository')
+    if mode not in ('repository', 'browser-e2e'):
+        raise ValueError('Unknown Gamma test mode')
+    extra = options(raw) if (raw.get('gamma_test') and mode == 'browser-e2e') or raw.get('environment_id') == 'ci-e2e' else {}
+    if 'gamma_mode' in raw:
+        extra['gamma_mode'] = mode
     return {
         "gamma_deploy": bool(raw.get("gamma_deploy")),
         "gamma_test": bool(raw.get("gamma_test")),
@@ -1633,6 +1638,7 @@ def _subtask_rows(
         for idx, (sub_id, label) in enumerate(defs)
     ]
     if step_id == "gamma":
+        evidence_stages = ((job or {}).get('gamma_e2e') or {}).get('stages') or []
         for row in rows:
             if not _gamma_selected(job, row["id"]):
                 row["status"] = "skipped"
@@ -1650,6 +1656,16 @@ def _subtask_rows(
                         row["status"] = "done" if run_status == "passed" else "failed"
                     else:
                         row["status"] = "pending" if _gamma_selected(job, "deploy") and not (job or {}).get("gamma_deployed") else "running"
+            related = [s for s in evidence_stages if s.get('id') == 'deploy'] if row['id'] == 'deploy' else [s for s in evidence_stages if s.get('id') in ('E01', 'E02', 'E03', 'E04', 'E05', 'E06')]
+            if related:
+                if any(s.get('conclusion') in ('failure', 'error') for s in related):
+                    row['status'] = 'failed'
+                elif all(s.get('conclusion') == 'success' for s in related):
+                    row['status'] = 'done'
+                elif any(s.get('status') == 'running' for s in related):
+                    row['status'] = 'running'
+                else:
+                    row['status'] = 'pending'
         return rows
     if step_id != "test":
         return rows
@@ -6492,6 +6508,21 @@ def maybe_run_gamma_after_build(
         if env_sid and env_sid not in job_sids:
             return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
 
+    # Fail before changing a shared cluster when its browser driver is absent.
+    if opts.get("gamma_test") and opts.get("gamma_mode") == "browser-e2e":
+        from gamma_real import available, run as run_real_gamma
+        if not available(env_id):
+            return False, '该环境尚未配置真实 Gamma 驱动；未部署镜像'
+        release_build_slot(job_id)
+        with log_substep('test'):
+            try:
+                return run_real_gamma(job_id, results, opts, lambda line: append_job_log(job_id, line),
+                    lambda state: set_job(job_id, gamma_e2e=state), lambda: job_cancel_requested(job_id))
+            except Exception as exc:
+                message = 'Gamma 接入失败: ' + str(exc)
+                append_job_log(job_id, message)
+                return False, message
+
     if opts.get("gamma_deploy"):
         with log_substep("deploy"):
             if not env_id:
@@ -7539,6 +7570,12 @@ class Handler(SimpleHTTPRequestHandler):
             client_id = _normalize_client_id(data.get("client_id"))
             try:
                 optional_steps = _normalize_optional_steps(data.get('optional_steps'))
+                if optional_steps.get('gamma_test') and optional_steps.get('gamma_mode') == 'browser-e2e' and optional_steps.get('environment_id') != 'ci-e2e':
+                    from gamma_real import available
+                    if not available(optional_steps.get('environment_id')):
+                        raise ValueError('该环境尚未配置真实 Gamma 驱动；未创建构建任务')
+                    from gamma_real import validate_selection
+                    validate_selection(optional_steps.get('environment_id'), [item['service_id'] for item in items])
                 if optional_steps.get('environment_id') == 'ci-e2e':
                     if not optional_steps.get('gamma_test'):
                         raise ValueError('CI E2E requires gamma test selection')
