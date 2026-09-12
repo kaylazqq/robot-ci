@@ -222,11 +222,15 @@ kubectl create secret generic gmagent-runtime \
 
 ## dev-gamma 集成验证与 CI 诊断
 
+Gamma 测试提供两种明确模式：默认“仓库 Gamma 用例”保留 `.cid/build.yaml` 的部署后测试；选择“浏览器 E2E · E01–E06”才调用下面的真实环境驱动。接口通过 `optional_steps.gamma_mode` 指定 `repository` 或 `browser-e2e`，缺省为 `repository`；只有浏览器模式和 CI 隔离 E2E 校验 `gamma_suites`。未安装浏览器驱动不影响仓库 Gamma 测试或仅出包/部署。
+
 正式集成目标为环境管理中已有的 `dev-gamma`：CI 机按原构建契约构建并推送 SWR，经原 `cce_rollout` 跳板与节点配置部署到真实 CCE 工作负载，再由 CI 浏览器驱动执行 E01/E02/E03。不要在跳板机编译，不另建同名 Compose 环境代替真实集群。
 
 dev-gamma 按原环境管理的每模块配置接入，不再限定治理服务的环境 ID。`gamma_real.py` 以原 dev-gamma 连接记录核对集群（跳板与节点），校验所选环境属于本次构建模块，复用原服务目录的镜像名及 `cce_rollout` 工作负载/容器映射。每次更新一个模块镜像并验证完整服务链路，未配置 dev-gamma 环境的模块须先在原环境管理中配置，不能靠相同显示名称授权其他集群。
 
-同时勾选 gamma 部署和 gamma 测试后，校验归档镜像配置 ID 与 SWR 不可变摘要，部署并等待就绪，再运行用户选择的用例。E01 创建、E02 私聊与追问、E03 群聊、E04 停止、E05 失败与恢复、E06 幂等均可选择；默认前三项，空集合或未知用例拒绝提交。只勾选部分用例不代表六项全部通过。E05 只停止并恢复本次专用 Daemon。`CI 隔离 E2E` 仍是不同的执行环境；真实 dev-gamma 不执行基线对照。
+浏览器模式下同时勾选 gamma 部署和 gamma 测试后，校验归档镜像配置 ID 与 SWR 不可变摘要，部署并等待就绪，再运行用户选择的用例。E01 创建、E02 私聊与追问、E03 群聊、E04 停止、E05 失败与恢复、E06 幂等均可选择；默认前三项，空集合或未知用例拒绝提交。只勾选部分用例不代表六项全部通过。E05 注入并恢复本次专用 Daemon 进程崩溃，不覆盖优雅停机；E06 是浏览器消息与原生 Job 幂等接口的混合测试。`CI 隔离 E2E` 仍是不同的执行环境；真实 dev-gamma 不执行基线对照。
+
+后续完整验收：`/pipeline/runs/gamma-check-20260911-205917-64cccb` 中 E01–E06 同一次运行全部通过，75 份产物哈希校验通过。该记录来自固定 CCE 构建镜像的手动交接，不是本次 rebase 后重新点击构建的验收。Multica OpenCode 最终输出修复在独立源码分支中，本 PR 只包含 Robot CI 接入；部署还需要 Pipeline Hub 的 Gamma 驱动、readiness 模块及配套用例，不是单独更新本仓即可安装完整 E2E 环境。
 
 所有模块共用 dev-gamma 环境互斥锁。Multica 更新后才提取并校验新的 Daemon，避免 Server/Daemon 版本错配；用例内部接口使用本次转发地址，不再把 CI 本机 18080 当成 dev-gamma。集群快照包含所有 Deployment，发生外部更新会标记过期。2026-09-11 已只读核对 16 个现有模块的工作负载/容器映射，这不表示 16 个模块都已经分别部署并跑过 E2E。
 

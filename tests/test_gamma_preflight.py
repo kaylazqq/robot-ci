@@ -24,13 +24,13 @@ class GammaPreflightTests(unittest.TestCase):
             return scope['check'](), handler
 
     def test_configured_gamma_is_allowed(self):
-        result, handler = self.check({'gamma_test': True, 'environment_id': 'a5932430eb2f'}, ready=True)
+        result, handler = self.check({'gamma_test': True, 'gamma_mode': 'browser-e2e', 'environment_id': 'a5932430eb2f'}, ready=True)
         self.assertEqual(result, 'accepted')
         handler._json.assert_not_called()
 
     def test_real_environment_test_fails_before_job_creation(self):
         for environment in ('', 'a5932430eb2f', 'another-environment'):
-            result, handler = self.check({'gamma_test': True, 'environment_id': environment})
+            result, handler = self.check({'gamma_test': True, 'gamma_mode': 'browser-e2e', 'environment_id': environment})
             self.assertIsNone(result)
             self.assertEqual(handler._json.call_args.args[0], 400)
             self.assertIn('未创建构建任务', handler._json.call_args.args[1]['error'])
@@ -38,6 +38,12 @@ class GammaPreflightTests(unittest.TestCase):
     def test_build_only_and_existing_deploy_only_are_unchanged(self):
         for options in ({}, {'gamma_test': False, 'gamma_deploy': True, 'environment_id': 'gamma'}):
             result, handler = self.check(options)
+            self.assertEqual(result, 'accepted')
+            handler._json.assert_not_called()
+
+    def test_repository_tests_do_not_require_browser_driver(self):
+        for mode in ({}, {'gamma_mode': 'repository'}):
+            result, handler = self.check({'gamma_test': True, 'environment_id': 'gamma', **mode})
             self.assertEqual(result, 'accepted')
             handler._json.assert_not_called()
 

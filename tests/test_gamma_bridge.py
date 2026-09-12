@@ -10,13 +10,36 @@ import gamma_e2e
 
 
 class GammaBridgeTests(unittest.TestCase):
+    def test_repository_gamma_remains_default(self):
+        import re
+        import gamma_real
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
+        tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
+                     ('_normalize_optional_steps', 'maybe_run_gamma_after_build')]
+        scope = {'Any': object, 're': re, 'LOG_DIR': Path('/unused'),
+                 '_job_copy': lambda _: {'optional_steps': {'environment_id': 'repo-env', 'gamma_test': True}},
+                 '_job_service_ids': lambda _: ['service'], 'job_cancel_requested': lambda _: False,
+                 'set_job': Mock(),
+                 'get_environment': Mock(return_value={'name': 'repo-env', 'service_id': 'service'}),
+                 'log_substep': lambda _: nullcontext(), 'load_services': lambda: [{'id': 'service'}],
+                 'repo_dir': lambda *_: Path('/unused'), 'record_gamma_run': Mock(),
+                 'run_gamma_tests': Mock(return_value={'status': 'passed', 'total': 1, 'passed': 1})}
+        exec(compile(tree, 'server.py', 'exec'), scope)
+        with patch.object(gamma_real, 'run') as browser:
+            self.assertEqual(scope['maybe_run_gamma_after_build']('test', [{'service_id': 'service', 'ok': True}]), (True, ''))
+            scope['run_gamma_tests'].assert_called_once()
+            scope['record_gamma_run'].assert_called_once()
+            browser.assert_not_called()
+        with self.assertRaises(ValueError):
+            scope['_normalize_optional_steps']({'gamma_test': True, 'gamma_mode': 'unknown'})
+
     def test_real_environment_normalization_preserves_selected_suites(self):
         tree = ast.parse((Path(__file__).resolve().parents[1]/'server.py').read_text(encoding='utf-8'))
         tree.body = [n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name == '_normalize_optional_steps']
         scope = {'Any':object}
         exec(compile(tree,'server.py','exec'),scope)
         for suites in (['E04'], ['E01','E02','E03','E04','E05','E06']):
-            result = scope['_normalize_optional_steps']({'environment_id':'multica-dev-gamma','gamma_test':True,'gamma_suites':suites})
+            result = scope['_normalize_optional_steps']({'environment_id':'multica-dev-gamma','gamma_test':True,'gamma_mode':'browser-e2e','gamma_suites':suites})
             self.assertEqual(result['gamma_suites'], suites)
 
     def test_configured_gamma_calls_real_driver_and_propagates_failure(self):
@@ -25,7 +48,8 @@ class GammaBridgeTests(unittest.TestCase):
         tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
                      ('_normalize_optional_steps', 'maybe_run_gamma_after_build')]
         env = {'Any': object, '_job_copy': lambda _: {'optional_steps': {
-            'environment_id': 'a5932430eb2f', 'gamma_test': True, 'gamma_deploy': True}},
+            'environment_id': 'a5932430eb2f', 'gamma_test': True, 'gamma_deploy': True, 'gamma_mode': 'browser-e2e'}},
+            '_job_service_ids': lambda _: ['agent-governance-gw'],
             'job_cancel_requested': lambda _: False, 'set_job': Mock(), 'release_build_slot': Mock(),
             'get_environment': Mock(return_value={'name': 'dev-gamma'}),
             'append_job_log': Mock(), 'log_substep': lambda _: nullcontext(), 'cce_rollout': Mock()}
@@ -42,7 +66,8 @@ class GammaBridgeTests(unittest.TestCase):
                      ('_normalize_optional_steps', 'maybe_run_gamma_after_build')]
         deploy = Mock()
         env = {'Any': object, '_job_copy': lambda _: {'optional_steps': {
-            'environment_id': 'real-gamma', 'gamma_test': True, 'gamma_deploy': True}},
+            'environment_id': 'real-gamma', 'gamma_test': True, 'gamma_deploy': True, 'gamma_mode': 'browser-e2e'}},
+            '_job_service_ids': lambda _: ['agent-governance-gw'],
             'job_cancel_requested': lambda _: False, 'set_job': Mock(),
             'get_environment': Mock(return_value={'name': 'dev-gamma'}),
             'append_job_log': Mock(), 'cce_rollout': Mock(deploy_job_results=deploy)}
