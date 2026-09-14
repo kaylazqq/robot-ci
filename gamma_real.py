@@ -117,7 +117,9 @@ def run(job_id, results, opts, log, progress, cancelled):
     while True:
         if cancelled() and not stop_requested:
             stop_requested = True
-            log('构建停止请求已记录；Gamma 环境任务保留，等待安全完成或恢复检查')
+            log('构建已停止；不再等待 Gamma Pipeline')
+            progress({**record, 'state': 'interrupted', 'summary': 'CI 构建已停止'})
+            return False, 'CI build stopped'
         result = request('/api/runs/' + run_id)
         state = (result.get('status'), result.get('summary'), result.get('queue_position'))
         if state != last:

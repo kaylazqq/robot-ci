@@ -676,8 +676,14 @@ function createPreviewCheck(taskId, doc) {
   return box;
 }
 function togglePreviewTask(taskId) {
-  if (taskId === "deploy") runPreviewSelection.deploy = !runPreviewSelection.deploy;
-  if (taskId === "test") runPreviewSelection.test = !runPreviewSelection.test;
+  if (taskId === "deploy") {
+    runPreviewSelection.deploy = !runPreviewSelection.deploy;
+    if (!runPreviewSelection.deploy) runPreviewSelection.test = false;
+  }
+  if (taskId === "test") {
+    runPreviewSelection.test = !runPreviewSelection.test;
+    if (runPreviewSelection.test) runPreviewSelection.deploy = true;
+  }
   if (!runPreviewSelection.deploy && !runPreviewSelection.test) {
     runPreviewSelection.environmentId = "";
   }
@@ -824,9 +830,10 @@ function defaultPersonalTemplate() {
   return pipelineTemplates.find((item) => item.kind === "personal" && item.builtin) || pipelineTemplates[0] || null;
 }
 function applyTemplateDefaults(tpl) {
+  const test = !!(tpl && tpl.gamma_test);
   runPreviewSelection = {
-    deploy: !!(tpl && tpl.gamma_deploy),
-    test: !!(tpl && tpl.gamma_test),
+    deploy: !!(tpl && tpl.gamma_deploy) || test,
+    test,
     environmentId: (tpl && tpl.environment_id) || "",
     deploymentMode: "parallel",
   };
@@ -1867,7 +1874,7 @@ function applyJob(job, { loading } = {}) {
     const state=document.createElement('span');
     const gammaStatus=job.gamma_e2e.conclusion === 'failure' ? '未通过' : job.gamma_e2e.conclusion === 'success' ? '通过' : ({queued:'排队中',running:'执行中',interrupted:'已中断',blocked:'环境阻塞',detached:'已脱离构建等待'}[job.gamma_e2e.state] || job.gamma_e2e.state || '等待');
     state.textContent = job.cancel_requested
-      ? '已请求停止，正在终止 Gamma 任务'
+      ? (jobIsLive(job) ? '已请求停止，正在终止 Gamma 任务' : '构建已停止 · 已退出 Gamma 等待')
       : '构建产物已生成 · Gamma ' + gammaStatus + (job.gamma_e2e.stage ? ' · ' + job.gamma_e2e.stage : '');
     row.append(state);
     const url=pipelineUrl(job.gamma_e2e.url);

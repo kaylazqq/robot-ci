@@ -2,14 +2,41 @@ import ast
 from contextlib import nullcontext
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock,patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import gamma_e2e
+import gamma_real
 
 
 class GammaBridgeTests(unittest.TestCase):
+    def test_test_selection_always_enables_deployment(self):
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
+        tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_normalize_optional_steps']
+        scope = {'Any': object}
+        exec(compile(tree, 'server.py', 'exec'), scope)
+        normalized = scope['_normalize_optional_steps']({'gamma_deploy': False, 'gamma_test': True})
+        self.assertTrue(normalized['gamma_deploy'])
+        self.assertTrue(normalized['gamma_test'])
+
+    def test_real_gamma_stop_returns_without_waiting_for_pipeline(self):
+        progress = Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / 'manifest.json'
+            manifest.write_text('{"suite_ids": []}', encoding='utf-8')
+            with patch.object(gamma_real, 'available', return_value=True), \
+                 patch.object(gamma_real, 'prepare', return_value=manifest), \
+                 patch.object(gamma_e2e, 'request', return_value={'id': 'run-1'}):
+                ok, error = gamma_real.run(
+                    'job', [], {'environment_id': 'env'}, lambda _line: None,
+                    progress, lambda: True,
+                )
+        self.assertFalse(ok)
+        self.assertEqual('CI build stopped', error)
+        self.assertEqual('interrupted', progress.call_args.args[0]['state'])
+
     def test_deploy_only_never_falls_back_when_gamma_driver_missing(self):
         import gamma_real
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
@@ -17,14 +44,16 @@ class GammaBridgeTests(unittest.TestCase):
                      ('_normalize_optional_steps', 'maybe_run_gamma_after_build')]
         scope = {'Any': object, '_job_copy': lambda _: {'optional_steps': {
             'environment_id': 'dedicated', 'gamma_deploy': True, 'gamma_test': False}},
-            'job_cancel_requested': lambda _: False, 'set_job': Mock(),
-            'get_environment': Mock(return_value={'name': 'dev-gamma'}), 'cce_rollout': Mock()}
+            '_job_service_ids': lambda _: ['service'], 'job_cancel_requested': lambda _: False,
+            'set_job': Mock(), 'append_job_log': Mock(), 'log_substep': lambda _: nullcontext(),
+            'CFG': {}, 'os': Mock(environ={}),
+            'get_environment': Mock(return_value={'name': 'dev-gamma', 'service_id': 'service'}),
+            'cce_rollout': Mock(deploy_job_results=Mock(return_value=(True, '')))}
         exec(compile(tree, 'server.py', 'exec'), scope)
         with patch.object(gamma_real, 'owns_environment', return_value=True), patch.object(gamma_real, 'available', return_value=False):
             ok, message = scope['maybe_run_gamma_after_build']('job', [])
-        self.assertFalse(ok)
-        self.assertIn('未部署镜像', message)
-        scope['cce_rollout'].deploy_job_results.assert_not_called()
+        self.assertTrue(ok, message)
+        scope['cce_rollout'].deploy_job_results.assert_called_once()
 
     def test_browser_e2e_is_default_and_repository_path_disabled(self):
         import re
@@ -37,6 +66,8 @@ class GammaBridgeTests(unittest.TestCase):
                  '_job_service_ids': lambda _: ['service'], 'job_cancel_requested': lambda _: False,
                  'set_job': Mock(), 'release_build_slot': Mock(),
                  'get_environment': Mock(return_value={'name': 'repo-env', 'service_id': 'service'}),
+                 'CFG': {}, 'os': Mock(environ={}),
+                 'cce_rollout': Mock(deploy_job_results=Mock(return_value=(True, ''))),
                  'log_substep': lambda _: nullcontext(), 'load_services': lambda: [{'id': 'service'}],
                  'repo_dir': lambda *_: Path('/unused'), 'record_gamma_run': Mock(),
                  'run_gamma_tests': Mock(return_value={'status': 'passed', 'total': 1, 'passed': 1}),
@@ -46,11 +77,11 @@ class GammaBridgeTests(unittest.TestCase):
         self.assertEqual('browser-e2e', normalized['gamma_mode'])
         mapped = scope['_normalize_optional_steps']({'gamma_test': True, 'gamma_mode': 'repository'})
         self.assertEqual('browser-e2e', mapped['gamma_mode'])
-        with patch.object(gamma_real, 'owns_environment', return_value=False), \
-             patch.object(gamma_real, 'available', return_value=True), \
+        with patch.object(gamma_real, 'available', return_value=True), \
              patch.object(gamma_real, 'run', return_value=(True, '')) as browser:
             self.assertEqual(scope['maybe_run_gamma_after_build']('test', [{'service_id': 'service', 'ok': True}]), (True, ''))
             browser.assert_called_once()
+            scope['cce_rollout'].deploy_job_results.assert_called_once()
             scope['run_gamma_tests'].assert_not_called()
             scope['record_gamma_run'].assert_not_called()
         with self.assertRaises(ValueError):
@@ -74,31 +105,33 @@ class GammaBridgeTests(unittest.TestCase):
             'environment_id': 'a5932430eb2f', 'gamma_test': True, 'gamma_deploy': True, 'gamma_mode': 'browser-e2e'}},
             '_job_service_ids': lambda _: ['agent-governance-gw'],
             'job_cancel_requested': lambda _: False, 'set_job': Mock(), 'release_build_slot': Mock(),
-            'get_environment': Mock(return_value={'name': 'dev-gamma'}),
-            'append_job_log': Mock(), 'log_substep': lambda _: nullcontext(), 'cce_rollout': Mock()}
+            'get_environment': Mock(return_value={'name': 'dev-gamma'}), 'CFG': {}, 'os': Mock(environ={}),
+            'append_job_log': Mock(), 'log_substep': lambda _: nullcontext(),
+            'cce_rollout': Mock(deploy_job_results=Mock(return_value=(True, '')))}
         exec(compile(tree, 'server.py', 'exec'), env)
         with patch.object(gamma_real, 'available', return_value=True), patch.object(gamma_real, 'run', return_value=(False, 'E02 failed')) as run:
             self.assertEqual(env['maybe_run_gamma_after_build']('test', [{'ok': True}]), (False, 'E02 failed'))
             run.assert_called_once()
-            env['cce_rollout'].deploy_job_results.assert_not_called()
+            env['cce_rollout'].deploy_job_results.assert_called_once()
             env['release_build_slot'].assert_called_once_with('test')
 
     def test_unconfigured_cce_test_blocks_before_deployment(self):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text())
+        tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
         tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
                      ('_normalize_optional_steps', 'maybe_run_gamma_after_build')]
         deploy = Mock()
         env = {'Any': object, '_job_copy': lambda _: {'optional_steps': {
             'environment_id': 'real-gamma', 'gamma_test': True, 'gamma_deploy': True, 'gamma_mode': 'browser-e2e'}},
             '_job_service_ids': lambda _: ['agent-governance-gw'],
-            'job_cancel_requested': lambda _: False, 'set_job': Mock(),
-            'get_environment': Mock(return_value={'name': 'dev-gamma'}),
-            'append_job_log': Mock(), 'cce_rollout': Mock(deploy_job_results=deploy)}
+            'job_cancel_requested': lambda _: False, 'set_job': Mock(), 'release_build_slot': Mock(),
+            'get_environment': Mock(return_value={'name': 'dev-gamma'}), 'CFG': {}, 'os': Mock(environ={}),
+            'append_job_log': Mock(), 'log_substep': lambda _: nullcontext(),
+            'cce_rollout': Mock(deploy_job_results=Mock(return_value=(True, '')))}
         exec(compile(tree, 'server.py', 'exec'), env)
         ok, error = env['maybe_run_gamma_after_build']('test', [])
         self.assertFalse(ok)
-        self.assertIn('未部署镜像', error)
-        deploy.assert_not_called()
+        self.assertIn('未执行 Gamma 测试', error)
+        env['cce_rollout'].deploy_job_results.assert_called_once()
 
     def test_options(self):
         self.assertEqual(gamma_e2e.options({})['gamma_suites'],['E01','E02','E03'])
@@ -108,7 +141,7 @@ class GammaBridgeTests(unittest.TestCase):
 
     def test_ci_target_never_calls_cce(self):
         # Load the orchestration functions without starting the server or touching its DB.
-        tree=ast.parse((Path(__file__).resolve().parents[1]/'server.py').read_text())
+        tree=ast.parse((Path(__file__).resolve().parents[1]/'server.py').read_text(encoding='utf-8'))
         tree.body=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ('_normalize_optional_steps','maybe_run_gamma_after_build')]
         env={'Any':object,'_job_copy':lambda _: {'optional_steps':{'environment_id':'ci-e2e','gamma_test':True}},
              'job_cancel_requested':lambda _:False,'set_job':Mock(),'release_build_slot':Mock(),

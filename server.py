@@ -1574,9 +1574,12 @@ def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
     deployment_mode = str(raw.get("deployment_mode") or "parallel").strip().lower()
     if deployment_mode not in {"parallel", "inplace"}:
         raise ValueError("Unknown deployment mode")
+    gamma_test = bool(raw.get("gamma_test"))
     return {
-        "gamma_deploy": bool(raw.get("gamma_deploy")),
-        "gamma_test": bool(raw.get("gamma_test")),
+        # Gamma tests run against the freshly deployed image.  Enforce the
+        # dependency at the API boundary as well as in the UI.
+        "gamma_deploy": bool(raw.get("gamma_deploy")) or gamma_test,
+        "gamma_test": gamma_test,
         "environment_id": str(raw.get("environment_id") or "").strip(),
         "deployment_mode": deployment_mode,
         **extra,
@@ -6761,35 +6764,6 @@ def maybe_run_gamma_after_build(
         if env_sid and env_sid not in job_sids:
             return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
 
-    parallel_release = bool(opts.get("gamma_deploy")) and opts.get("deployment_mode") == "parallel"
-    # A deployment-only parallel release has no dependency on Gamma at all.
-    # Only inspect the Gamma driver for test requests or the legacy path.
-    gamma_owned = False
-    if opts.get("gamma_test") or not parallel_release:
-        from gamma_real import owns_environment
-        gamma_owned = owns_environment(env_id) if env_id else False
-    if gamma_owned and opts.get('gamma_test') and opts.get('gamma_mode') != 'browser-e2e':
-        return False, 'dev-gamma 是专用 E2E 环境，请选择浏览器 E2E 模式'
-    # A parallel release creates its candidate Deployment through cce_rollout.
-    # Do not route its deployment through gamma_real: that path submits the
-    # external Gamma platform and performs the legacy in-place deployment.
-    if not parallel_release and (
-        (opts.get("gamma_test") and opts.get("gamma_mode") == "browser-e2e")
-        or (gamma_owned and opts.get('gamma_deploy'))
-    ):
-        from gamma_real import available, run as run_real_gamma
-        if not available(env_id):
-            return False, '该环境尚未配置真实 Gamma 驱动；未部署镜像'
-        release_build_slot(job_id)
-        with log_substep('test'):
-            try:
-                return run_real_gamma(job_id, results, opts, lambda line: append_job_log(job_id, line),
-                    lambda state: set_job(job_id, gamma_e2e=state), lambda: job_cancel_requested(job_id))
-            except Exception as exc:
-                message = 'Gamma 接入失败: ' + str(exc)
-                append_job_log(job_id, message)
-                return False, message
-
     if opts.get("gamma_deploy"):
         with log_substep("deploy"):
             if not env_id:
@@ -6849,33 +6823,27 @@ def maybe_run_gamma_after_build(
             set_job(job_id, gamma_deployed=True, gamma_rollouts=created_rollouts)
 
     if opts.get("gamma_test"):
-        if parallel_release:
-            # The CCE candidate is ready.  Gamma is test-only here: explicitly
-            # clear gamma_deploy so the external platform cannot replace the
-            # source workload a second time.
-            from gamma_real import available, run as run_real_gamma
-            if not available(env_id):
-                return False, "该环境尚未配置真实 Gamma 驱动；新负载已创建，未执行 Gamma 测试"
-            test_opts = {**opts, "gamma_deploy": False}
-            release_build_slot(job_id)
-            with log_substep("test"):
-                try:
-                    return run_real_gamma(
-                        job_id,
-                        results,
-                        test_opts,
-                        lambda line: append_job_log(job_id, line),
-                        lambda state: set_job(job_id, gamma_e2e=state),
-                        lambda: job_cancel_requested(job_id),
-                    )
-                except Exception as exc:
-                    message = "Gamma 测试接入失败: " + str(exc)
-                    append_job_log(job_id, message)
-                    return False, message
-        # Repository-mode CID gamma from 58df727 is disabled; browser-e2e /
-        # ci-e2e / gamma_real must own gamma测试. Falling through here means the
-        # request was not routed to a supported driver.
-        return False, "仓库 Gamma 用例已暂时停用；请使用浏览器 E2E"
+        # Deployment is always owned by CCE.  The external Pipeline is entered
+        # only for the dependent test step and must never deploy again.
+        from gamma_real import available, run as run_real_gamma
+        if not available(env_id):
+            return False, "该环境尚未配置真实 Gamma 驱动；部署已完成，未执行 Gamma 测试"
+        test_opts = {**opts, "gamma_deploy": False}
+        release_build_slot(job_id)
+        with log_substep("test"):
+            try:
+                return run_real_gamma(
+                    job_id,
+                    results,
+                    test_opts,
+                    lambda line: append_job_log(job_id, line),
+                    lambda state: set_job(job_id, gamma_e2e=state),
+                    lambda: job_cancel_requested(job_id),
+                )
+            except Exception as exc:
+                message = "Gamma 测试接入失败: " + str(exc)
+                append_job_log(job_id, message)
+                return False, message
     return True, ""
 
 
@@ -7008,6 +6976,8 @@ def run_push_job(
         archive_summary = str(archive_dir) if archive_dir else (archives[0] if archives else "")
         if fail_n == 0:
             gamma_ok, gamma_err = maybe_run_gamma_after_build(job_id, results)
+            if job_cancel_requested(job_id):
+                raise JobStopped()
             if not gamma_ok:
                 set_job(
                     job_id,
