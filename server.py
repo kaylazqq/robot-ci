@@ -1380,12 +1380,15 @@ def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {"gamma_deploy": False, "gamma_test": False, "environment_id": ""}
     from gamma_e2e import options
-    mode = raw.get('gamma_mode', 'repository')
-    if mode not in ('repository', 'browser-e2e'):
-        raise ValueError('Unknown Gamma test mode')
-    extra = options(raw) if (raw.get('gamma_test') and mode == 'browser-e2e') or raw.get('environment_id') == 'ci-e2e' else {}
-    if 'gamma_mode' in raw:
-        extra['gamma_mode'] = mode
+    # Repository CID gamma (58df727) is temporarily disabled; keep the same
+    # production path as :80 — browser E2E via gamma_real / ci-e2e.
+    mode = str(raw.get("gamma_mode") or "browser-e2e").strip() or "browser-e2e"
+    if mode == "repository":
+        mode = "browser-e2e"
+    if mode not in ("browser-e2e",):
+        raise ValueError("Unknown Gamma test mode")
+    extra = options(raw) if (raw.get("gamma_test") and mode == "browser-e2e") or raw.get("environment_id") == "ci-e2e" else {}
+    extra["gamma_mode"] = mode
     return {
         "gamma_deploy": bool(raw.get("gamma_deploy")),
         "gamma_test": bool(raw.get("gamma_test")),
@@ -6595,42 +6598,12 @@ def maybe_run_gamma_after_build(
             set_job(job_id, gamma_deployed=True)
 
     if opts.get("gamma_test"):
-        with log_substep("test"):
-            catalog = {item["id"]: item for item in load_services()}
-            for result in results:
-                service_id = str(result.get("service_id") or "").strip()
-                svc = catalog.get(service_id)
-                if not svc:
-                    return False, f"gamma测试失败: 未知微服务 ({service_id or '?'})"
-                gamma_result = run_gamma_tests(
-                    job_id,
-                    service_id,
-                    repo_dir(svc, job_id),
-                    str(result.get("commit_sha") or ""),
-                    env or {},
-                )
-                summary = {
-                    key: gamma_result.get(key, 0)
-                    for key in ("total", "passed", "failed", "errors", "skipped", "duration_ms")
-                }
-                safe_service_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", service_id).strip("._") or "service"
-                gamma_run = {
-                    "service_id": service_id,
-                    "title": svc.get("title") or service_id,
-                    "branch": str(result.get("branch") or ""),
-                    "commit_sha": gamma_result.get("commit_sha"),
-                    "status": gamma_result.get("status"),
-                    "summary": summary,
-                    "commands": gamma_result.get("commands") or [],
-                    "failures": gamma_result.get("failures") or [],
-                    "test_cases": gamma_result.get("test_cases") or [],
-                    "test_report": str(LOG_DIR / f"job-{job_id}-{safe_service_id}-gamma.json"),
-                    "environment_id": env_id,
-                    "environment_name": (env or {}).get("name") or env_id,
-                }
-                record_gamma_run(job_id, gamma_run)
-                if gamma_result.get("status") != "passed":
-                    return False, f"gamma测试未通过: {service_id} ({gamma_result.get('status')})"
+        # Repository-mode CID gamma from 58df727 is disabled; browser-e2e /
+        # ci-e2e / gamma_real must own gamma测试. Falling through here means the
+        # request was not routed to a supported driver.
+        return False, (
+            "仓库 Gamma 用例已暂时停用；请使用浏览器 E2E（与现网 :80 相同）或 CI 隔离 E2E"
+        )
     return True, ""
 
 

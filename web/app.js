@@ -930,7 +930,7 @@ function confirmRunPreview() {
     return;
   }
   const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
-  if (runPreviewSelection.test && (runPreviewSelection.environmentId === 'ci-e2e' || runPreviewSelection.mode === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
+  if (runPreviewSelection.test && (runPreviewSelection.environmentId === 'ci-e2e' || (runPreviewSelection.mode || 'browser-e2e') === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
     setPreviewHint('请至少选择一个 E2E 用例'); return;
   }
   if (wantsGamma && !runPreviewSelection.environmentId) {
@@ -1166,17 +1166,8 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     tree.appendChild(row);
   });
   if (preview && stage.id === 'gamma' && runPreviewSelection.test) {
-    if (runPreviewSelection.environmentId !== 'ci-e2e') {
-      const mode = doc.createElement('select');
-      mode.className = 'input'; mode.setAttribute('aria-label', 'Gamma 测试方式');
-      for (const [value, text] of [['repository','仓库 Gamma 用例'], ['browser-e2e','浏览器 E2E · E01–E06']]) {
-        const option = doc.createElement('option'); option.value = value; option.textContent = text;
-        mode.appendChild(option);
-      }
-      mode.value = runPreviewSelection.mode || 'repository';
-      mode.addEventListener('change', () => { runPreviewSelection.mode = mode.value; renderRunPage(); });
-      tree.appendChild(mode);
-    }
+    // Repository CID gamma is temporarily disabled; keep production :80 browser E2E only.
+    runPreviewSelection.mode = 'browser-e2e';
   }
   if (preview && stage.id === 'gamma' && runPreviewSelection.test &&
       (runPreviewSelection.environmentId === 'ci-e2e' || runPreviewSelection.mode === 'browser-e2e')) {
@@ -2200,7 +2191,7 @@ async function startRun(branch) {
           gamma_test: !!runPreviewSelection.test,
           environment_id: runPreviewSelection.environmentId || "",
           gamma_suites: runPreviewSelection.suites || ['E01','E02','E03'],
-          gamma_mode: runPreviewSelection.mode || 'repository',
+          gamma_mode: runPreviewSelection.mode || 'browser-e2e',
           gamma_baseline: runPreviewSelection.baseline !== false,
         },
       }),

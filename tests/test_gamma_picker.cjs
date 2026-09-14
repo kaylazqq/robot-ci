@@ -22,20 +22,18 @@ const os = require('node:os');
         function renderRunPage(){document.querySelector('main').replaceChildren(createStageColumn({id:'gamma',label:'gamma集成测试',tasks:[]},false,false,null,true));}
         renderRunPage();
       `});
-      await expect(page.locator('.gamma-suite-options input[type=checkbox]')).toHaveCount(0);
-      await page.getByLabel('Gamma 测试方式').selectOption('browser-e2e');
+      // Repository mode selector is removed; browser E2E suites are always shown.
+      await expect(page.getByLabel('Gamma 测试方式')).toHaveCount(0);
       await expect(page.locator('.gamma-suite-options input[type=checkbox]')).toHaveCount(6);
       for(const id of ['E04','E05','E06']) await page.locator('input[value='+id+']').check();
       const selected=await page.evaluate(()=>runPreviewSelection.suites);
       if(selected.join(',')!=='E01,E02,E03,E04,E05,E06') throw Error('Suite selection was lost');
       await expect(page.getByText('基线对照',{exact:true})).toHaveCount(0);
       if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1)) throw Error('Horizontal overflow');
+      const mode=await page.evaluate(()=>runPreviewSelection.mode);
+      if(mode!=='browser-e2e') throw Error('Expected browser-e2e mode, got '+mode);
       await page.screenshot({path:path.join(output,`picker-${width}.png`),fullPage:true});
-      await page.getByLabel('Gamma 测试方式').selectOption('repository');
-      await expect(page.locator('.gamma-suite-options')).toHaveCount(0);
-      await page.getByLabel('Gamma 测试方式').selectOption('browser-e2e');
-      await expect(page.locator('.gamma-suite-options input:checked')).toHaveCount(6);
-      console.log(JSON.stringify({width,selected,environment:'multica dev-gamma',passed:true}));
+      console.log(JSON.stringify({width,selected,environment:'multica dev-gamma',mode,passed:true}));
       await page.close();
     }
   } finally {await browser.close();}

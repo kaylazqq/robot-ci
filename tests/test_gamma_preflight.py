@@ -9,6 +9,7 @@ import gamma_real
 
 class GammaPreflightTests(unittest.TestCase):
     def check(self, options, ready=False):
+        import server
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.Try) and
                     any(isinstance(s, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'optional_steps'
@@ -17,7 +18,8 @@ class GammaPreflightTests(unittest.TestCase):
         function.body = [node, ast.Return(value=ast.Constant('accepted'))]
         module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
         handler = Mock()
-        scope = {'CFG': {}, 'data': {'optional_steps': options}, '_normalize_optional_steps': lambda v: v, 'self': handler,
+        scope = {'CFG': {}, 'data': {'optional_steps': options},
+                 '_normalize_optional_steps': server._normalize_optional_steps, 'self': handler,
                  'items': [{'service_id': 'agent-governance-gw'}]}
         exec(compile(module, 'gamma-preflight', 'exec'), scope)
         with patch.object(gamma_real, 'available', return_value=ready), patch.object(gamma_real, 'validate_selection'):
@@ -41,12 +43,13 @@ class GammaPreflightTests(unittest.TestCase):
             self.assertEqual(result, 'accepted')
             handler._json.assert_not_called()
 
-    def test_repository_tests_do_not_require_browser_driver(self):
-        for mode in ({}, {'gamma_mode': 'repository'}):
-            result, handler = self.check({'gamma_test': True, 'environment_id': 'gamma', **mode})
-            self.assertEqual(result, 'accepted')
-            handler._json.assert_not_called()
-
+    def test_gamma_tests_require_browser_driver(self):
+        result, handler = self.check({'gamma_test': True, 'environment_id': 'gamma'})
+        self.assertIsNone(result)
+        self.assertEqual(handler._json.call_args.args[0], 400)
+        mapped, handler2 = self.check({'gamma_test': True, 'gamma_mode': 'repository', 'environment_id': 'gamma'})
+        self.assertIsNone(mapped)
+        self.assertEqual(handler2._json.call_args.args[0], 400)
 
 if __name__ == '__main__':
     unittest.main()

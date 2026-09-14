@@ -26,7 +26,7 @@ class GammaBridgeTests(unittest.TestCase):
         self.assertIn('未部署镜像', message)
         scope['cce_rollout'].deploy_job_results.assert_not_called()
 
-    def test_repository_gamma_remains_default(self):
+    def test_browser_e2e_is_default_and_repository_path_disabled(self):
         import re
         import gamma_real
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
@@ -35,17 +35,24 @@ class GammaBridgeTests(unittest.TestCase):
         scope = {'Any': object, 're': re, 'LOG_DIR': Path('/unused'),
                  '_job_copy': lambda _: {'optional_steps': {'environment_id': 'repo-env', 'gamma_test': True}},
                  '_job_service_ids': lambda _: ['service'], 'job_cancel_requested': lambda _: False,
-                 'set_job': Mock(),
+                 'set_job': Mock(), 'release_build_slot': Mock(),
                  'get_environment': Mock(return_value={'name': 'repo-env', 'service_id': 'service'}),
                  'log_substep': lambda _: nullcontext(), 'load_services': lambda: [{'id': 'service'}],
                  'repo_dir': lambda *_: Path('/unused'), 'record_gamma_run': Mock(),
-                 'run_gamma_tests': Mock(return_value={'status': 'passed', 'total': 1, 'passed': 1})}
+                 'run_gamma_tests': Mock(return_value={'status': 'passed', 'total': 1, 'passed': 1}),
+                 'append_job_log': Mock()}
         exec(compile(tree, 'server.py', 'exec'), scope)
-        with patch.object(gamma_real, 'run') as browser:
+        normalized = scope['_normalize_optional_steps']({'gamma_test': True})
+        self.assertEqual('browser-e2e', normalized['gamma_mode'])
+        mapped = scope['_normalize_optional_steps']({'gamma_test': True, 'gamma_mode': 'repository'})
+        self.assertEqual('browser-e2e', mapped['gamma_mode'])
+        with patch.object(gamma_real, 'owns_environment', return_value=False), \
+             patch.object(gamma_real, 'available', return_value=True), \
+             patch.object(gamma_real, 'run', return_value=(True, '')) as browser:
             self.assertEqual(scope['maybe_run_gamma_after_build']('test', [{'service_id': 'service', 'ok': True}]), (True, ''))
-            scope['run_gamma_tests'].assert_called_once()
-            scope['record_gamma_run'].assert_called_once()
-            browser.assert_not_called()
+            browser.assert_called_once()
+            scope['run_gamma_tests'].assert_not_called()
+            scope['record_gamma_run'].assert_not_called()
         with self.assertRaises(ValueError):
             scope['_normalize_optional_steps']({'gamma_test': True, 'gamma_mode': 'unknown'})
 

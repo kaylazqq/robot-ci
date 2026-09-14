@@ -116,9 +116,7 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 
 ## CCE Gamma 测试
 
-真实 Gamma 环境的流程为「构建并推送镜像 → CCE rollout 替换该负载镜像并等待就绪 → 执行服务仓 Gamma 用例」。服务在 `.cid/build.yaml` 增加 `type: test`、`test_type: gamma` 的步骤，并像 UT/DT 一样提供 `junit`、`go-json`、`case-json` 或 `unittest` 报告路径。Gamma 用例不会在构建前执行，只有用户在流水线勾选「gamma测试」且 rollout 成功后才运行；未声明用例或未生成报告会让 Gamma 阶段失败，不能误报通过。
-
-环境管理中为每个 CCE 环境配置「Gamma 测试地址」（无用户名、密码的 `http(s)` 基址）。平台仅注入 `GAMMA_BASE_URL`、环境 ID/名称、Region、集群和负载等非敏感变量；跳板机和节点凭据绝不传给服务仓测试命令。Gamma 节点的「测试结果 / 日志详情」使用与 UT/DT 相同的分页用例表、失败摘要和日志视图。
+真实 Gamma 环境的主路径与现网 `:80` 一致：构建并推送镜像后，经 `cce_rollout` / `gamma_real` 部署到所选 CCE 环境，再由浏览器驱动执行 E01–E06（默认 E01–E03）。`optional_steps.gamma_mode` 固定为 `browser-e2e`（历史值 `repository` 会被映射到浏览器模式）。仓库内 `.cid` 的 `test_type: gamma` 冒烟路径已暂时停用，避免与现网能力验收分叉。
 
 ## 安全提醒
 
@@ -222,7 +220,7 @@ kubectl create secret generic gmagent-runtime \
 
 ## dev-gamma 集成验证与 CI 诊断
 
-Gamma 测试提供两种明确模式：默认“仓库 Gamma 用例”保留 `.cid/build.yaml` 的部署后测试；选择“浏览器 E2E · E01–E06”才调用下面的真实环境驱动。接口通过 `optional_steps.gamma_mode` 指定 `repository` 或 `browser-e2e`，缺省为 `repository`；只有浏览器模式和 CI 隔离 E2E 校验 `gamma_suites`。未安装浏览器驱动不影响仓库 Gamma 测试或仅出包/部署。
+Gamma 测试与现网 `:80` 对齐：默认并仅使用“浏览器 E2E · E01–E06”（`optional_steps.gamma_mode=browser-e2e`）。历史 `repository` 仓库 CID 冒烟模式已暂时停用并自动映射为浏览器模式。浏览器模式和 CI 隔离 E2E 会校验 `gamma_suites`；未安装浏览器驱动时不能启动 gamma 测试。
 
 正式集成目标为环境管理中已有的 `dev-gamma`：CI 机按原构建契约构建并推送 SWR，经原 `cce_rollout` 跳板与节点配置部署到真实 CCE 工作负载，再由 CI 浏览器驱动执行 E01/E02/E03。不要在跳板机编译，不另建同名 Compose 环境代替真实集群。
 
