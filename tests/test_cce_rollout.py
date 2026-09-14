@@ -424,6 +424,21 @@ class GammaAfterBuildTests(unittest.TestCase):
         self.assertEqual("stopped", meta["status"])
         self.assertEqual("done", meta["stage"])
 
+    def test_restart_converts_old_failed_stop_request_to_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_log_dir = server.LOG_DIR
+            try:
+                server.LOG_DIR = root
+                (root / "job-abcd1234.json").write_text(json.dumps({
+                    "id": "abcd1234", "status": "failed", "stage": "gamma", "cancel_requested": True,
+                }), encoding="utf-8")
+                self.assertEqual(1, server.reap_orphaned_running_jobs())
+                meta = json.loads((root / "job-abcd1234.json").read_text(encoding="utf-8"))
+            finally:
+                server.LOG_DIR = old_log_dir
+        self.assertEqual("stopped", meta["status"])
+
     def test_disk_failed_job_with_stop_request_is_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -3355,12 +3355,17 @@ def reap_orphaned_running_jobs() -> int:
             meta = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, TypeError):
             continue
-        if not isinstance(meta, dict) or meta.get("status") != "running":
+        if not isinstance(meta, dict):
+            continue
+        was_stop_requested = bool(meta.get("cancel_requested"))
+        status = str(meta.get("status") or "")
+        if status != "running" and not (
+            was_stop_requested and status in {"queued", "stopping", "failed"}
+        ):
             continue
         prev_stage = str(meta.get("stage") or "")
         if prev_stage and prev_stage not in _TERMINAL_PIPELINE_STAGES and not meta.get("stage_before_stop"):
             meta["stage_before_stop"] = prev_stage
-        was_stop_requested = bool(meta.get("cancel_requested"))
         meta["status"] = "stopped" if was_stop_requested else "failed"
         meta["stage"] = "done" if was_stop_requested else "interrupted"
         meta["error"] = STOPPED_JOB_ERROR if was_stop_requested else INTERRUPTED_JOB_ERROR
