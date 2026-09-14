@@ -1,10 +1,12 @@
-"""SSH jump → CCE worker → kubectl set image + rollout.
+"""SSH jump → CCE worker → in-place or parallel Deployment rollout.
 
 Used by gamma deploy after a successful SWR push. Credentials come from
 config / process env / an optional secrets file — never from git.
 """
 from __future__ import annotations
 
+import base64
+import copy
 import json
 import os
 import re
@@ -480,6 +482,185 @@ def set_image_and_rollout(
     return run_remote(set_cmd, rollout_timeout_seconds(timeout) + 60)
 
 
+PARALLEL_RELEASE_LABEL = "robot-ci.io/release"
+PARALLEL_SOURCE_LABEL = "robot-ci.io/source-workload"
+
+
+def parallel_deployment_name(source: str, release_id: str) -> str:
+    """Build a deterministic DNS label no longer than a Deployment name permits."""
+    base = re.sub(r"[^a-z0-9-]+", "-", str(source or "").lower()).strip("-")
+    token = re.sub(r"[^a-z0-9]+", "", str(release_id or "").lower())[:12]
+    if not base or not token:
+        raise CceRolloutError("无法生成新版本负载名称")
+    suffix = f"-r-{token}"
+    return (base[: 63 - len(suffix)].rstrip("-") + suffix)[:63]
+
+
+def deployment_manifest_for_parallel_release(
+    source_payload: Mapping[str, Any],
+    *,
+    source_name: str,
+    release_id: str,
+    image: str,
+    container: str,
+    replicas: int = 1,
+) -> dict[str, Any]:
+    """Clone a Deployment safely, adding a selector unique to this release.
+
+    The stable Service continues to select the copied application labels.  The
+    release label is deliberately *not* added to that Service's selector.
+    """
+    if not isinstance(source_payload.get("spec"), Mapping):
+        raise CceRolloutError(f"Deployment {source_name} 返回的格式不正确")
+    if not isinstance(replicas, int) or replicas < 0 or replicas > 1000:
+        raise CceRolloutError("实例数必须是 0 到 1000 的整数")
+    validate_image_ref(image)
+    spec = copy.deepcopy(dict(source_payload["spec"]))
+    template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+    pod_spec = template.get("spec") if isinstance(template.get("spec"), dict) else {}
+    containers = pod_spec.get("containers") if isinstance(pod_spec.get("containers"), list) else []
+    if not any(isinstance(row, dict) and row.get("name") == container for row in containers):
+        raise CceRolloutError(f"容器 {container} 不在 Deployment {source_name} 中")
+    for row in containers:
+        if isinstance(row, dict) and row.get("name") == container:
+            row["image"] = image
+
+    name = parallel_deployment_name(source_name, release_id)
+    release = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(release_id)).strip("-_.")[:63]
+    if not release:
+        raise CceRolloutError("发布标识不合法")
+    labels = copy.deepcopy((source_payload.get("metadata") or {}).get("labels") or {})
+    labels[PARALLEL_RELEASE_LABEL] = release
+    labels[PARALLEL_SOURCE_LABEL] = source_name
+    pod_labels = copy.deepcopy((template.get("metadata") or {}).get("labels") or {})
+    pod_labels[PARALLEL_RELEASE_LABEL] = release
+    pod_labels[PARALLEL_SOURCE_LABEL] = source_name
+    selector = copy.deepcopy(spec.get("selector") or {})
+    match_labels = copy.deepcopy(selector.get("matchLabels") or {})
+    match_labels[PARALLEL_RELEASE_LABEL] = release
+    selector["matchLabels"] = match_labels
+    spec["selector"] = selector
+    template["metadata"] = {**copy.deepcopy(template.get("metadata") or {}), "labels": pod_labels}
+    template["spec"] = pod_spec
+    spec["template"] = template
+    spec["replicas"] = replicas
+    return {
+        "apiVersion": str(source_payload.get("apiVersion") or "apps/v1"),
+        "kind": "Deployment",
+        "metadata": {
+            "name": name,
+            "namespace": str((source_payload.get("metadata") or {}).get("namespace") or ""),
+            "labels": labels,
+            "annotations": {
+                PARALLEL_SOURCE_LABEL: source_name,
+                PARALLEL_RELEASE_LABEL: release,
+            },
+        },
+        "spec": spec,
+    }
+
+
+def deployment_summary(payload: Mapping[str, Any], *, name: str = "") -> dict[str, Any]:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+    spec = payload.get("spec") if isinstance(payload.get("spec"), Mapping) else {}
+    status = payload.get("status") if isinstance(payload.get("status"), Mapping) else {}
+    template = spec.get("template") if isinstance(spec.get("template"), Mapping) else {}
+    labels = metadata.get("labels") if isinstance(metadata.get("labels"), Mapping) else {}
+    pod_spec = template.get("spec") if isinstance(template.get("spec"), Mapping) else {}
+    containers = pod_spec.get("containers") if isinstance(pod_spec.get("containers"), list) else []
+    images = [str(row.get("image") or "") for row in containers if isinstance(row, Mapping) and str(row.get("image") or "")]
+    return {
+        "name": str(metadata.get("name") or name),
+        "exists": True,
+        "desired_replicas": int(spec.get("replicas") or 0),
+        "ready_replicas": int(status.get("readyReplicas") or 0),
+        "available_replicas": int(status.get("availableReplicas") or 0),
+        "images": images,
+        "release_id": str(labels.get(PARALLEL_RELEASE_LABEL) or ""),
+        "source_workload": str(labels.get(PARALLEL_SOURCE_LABEL) or ""),
+    }
+
+
+def get_deployment_payload(run_remote: RemoteFn, *, namespace: str, deploy: str) -> dict[str, Any] | None:
+    code, out, err = run_remote(
+        f"kubectl -n {shlex.quote(namespace)} get deploy {shlex.quote(deploy)} -o json", 60
+    )
+    if code != 0:
+        text = (err or out or "").lower()
+        if "notfound" in text or "not found" in text:
+            return None
+        detail = (err or out or "").strip() or f"exit {code}"
+        raise CceRolloutError(f"读取 Deployment {deploy} 失败: {detail}")
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise CceRolloutError(f"Deployment {deploy} 返回的不是 JSON") from exc
+    if not isinstance(payload, dict):
+        raise CceRolloutError(f"Deployment {deploy} 返回的不是对象")
+    return payload
+
+
+def create_parallel_deployment(
+    run_remote: RemoteFn,
+    *,
+    namespace: str,
+    source: str,
+    release_id: str,
+    image: str,
+    container: str,
+    replicas: int,
+    timeout: str,
+) -> dict[str, Any]:
+    payload = get_deployment_payload(run_remote, namespace=namespace, deploy=source)
+    if payload is None:
+        raise CceRolloutError(f"源 Deployment 不存在: {source}")
+    manifest = deployment_manifest_for_parallel_release(
+        payload, source_name=source, release_id=release_id,
+        image=image, container=container, replicas=replicas,
+    )
+    name = str(manifest["metadata"]["name"])
+    encoded = base64.b64encode(json.dumps(manifest, ensure_ascii=False).encode("utf-8")).decode("ascii")
+    command = (
+        f"printf %s {shlex.quote(encoded)} | base64 -d | kubectl -n {shlex.quote(namespace)} apply -f - && "
+        f"kubectl -n {shlex.quote(namespace)} rollout status deploy/{shlex.quote(name)} "
+        f"--timeout={shlex.quote(timeout)}"
+    )
+    code, out, err = run_remote(command, rollout_timeout_seconds(timeout) + 60)
+    if code != 0:
+        detail = (err or out or "").strip() or f"exit {code}"
+        raise CceRolloutError(f"创建新版本负载 {name} 失败: {detail}")
+    created = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+    if created is None:
+        raise CceRolloutError(f"新版本负载创建后未找到: {name}")
+    return deployment_summary(created, name=name)
+
+
+def scale_deployment(
+    run_remote: RemoteFn, *, namespace: str, deploy: str, replicas: int
+) -> dict[str, Any]:
+    if not isinstance(replicas, int) or replicas < 0 or replicas > 1000:
+        raise CceRolloutError("实例数必须是 0 到 1000 的整数")
+    code, out, err = run_remote(
+        f"kubectl -n {shlex.quote(namespace)} scale deploy/{shlex.quote(deploy)} --replicas={replicas}", 60
+    )
+    if code != 0:
+        detail = (err or out or "").strip() or f"exit {code}"
+        raise CceRolloutError(f"设置 {deploy} 实例数失败: {detail}")
+    payload = get_deployment_payload(run_remote, namespace=namespace, deploy=deploy)
+    if payload is None:
+        raise CceRolloutError(f"设置实例数后未找到负载: {deploy}")
+    return deployment_summary(payload)
+
+
+def delete_deployment(run_remote: RemoteFn, *, namespace: str, deploy: str) -> None:
+    code, out, err = run_remote(
+        f"kubectl -n {shlex.quote(namespace)} delete deploy/{shlex.quote(deploy)} --wait=true", 180
+    )
+    if code != 0:
+        detail = (err or out or "").strip() or f"exit {code}"
+        raise CceRolloutError(f"删除旧版本负载 {deploy} 失败: {detail}")
+
+
 def deploy_job_results(
     *,
     environment: Mapping[str, Any],
@@ -489,6 +670,9 @@ def deploy_job_results(
     rollout_timeout: str = "180s",
     hop: Callable[..., tuple[int, str, str]] | None = None,
     log: Callable[[str], None] | None = None,
+    mode: str = "inplace",
+    release_id: str = "",
+    on_parallel_created: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[bool, str]:
     write = log or (lambda _line: None)
     jump_host = str(environment.get("jump_host") or "").strip()
@@ -507,6 +691,10 @@ def deploy_job_results(
             "未配置跳板机 SSH 凭据，请在 CI 的 config.json 设置 cce_ssh_password，"
             "或设置环境变量 CCE_SSH_PASSWORD / CCE_JUMP_PASSWORD"
         )
+    if mode not in {"inplace", "parallel"}:
+        return False, "不支持的部署方式"
+    if mode == "parallel" and not release_id:
+        return False, "平滑部署缺少发布标识"
 
     candidates: list[tuple[str, str]] = []
     for row in results:
@@ -550,13 +738,36 @@ def deploy_job_results(
         )
 
     for service_id, deploy, image, preferred in planned:
-        write(f"gamma部署 {service_id} → deploy/{deploy} image={image}")
+        write(f"gamma部署 {service_id} → deploy/{deploy} image={image} mode={mode}")
         try:
             containers = inspect_containers(run_remote, namespace, deploy)
             container = pick_container(containers, image=image, preferred=preferred)
             current = next((img for name, img in containers if name == container), "")
             if current:
                 write(f"当前容器 {container}={current}")
+            if mode == "parallel":
+                write(f"创建新版本 Deployment，旧版本 {deploy} 保持不变")
+                created = create_parallel_deployment(
+                    run_remote,
+                    namespace=namespace,
+                    source=deploy,
+                    release_id=release_id,
+                    image=image,
+                    container=container,
+                    replicas=1,
+                    timeout=rollout_timeout,
+                )
+                created.update({
+                    "service_id": service_id, "source_workload": deploy,
+                    "container": container, "image": image,
+                })
+                if on_parallel_created:
+                    on_parallel_created(created)
+                write(
+                    f"新版本负载已就绪 deploy/{created['name']} "
+                    f"实例={created['desired_replicas']}"
+                )
+                continue
             write(f"kubectl set image deploy/{deploy} {container}={image}")
             code, out, err = set_image_and_rollout(
                 run_remote,

@@ -1293,6 +1293,39 @@ body.clone-open { overflow: hidden; }
   line-height: 1.45;
   color: #6b7c90;
 }
+.env-rollout-actions { margin-top: auto; }
+.env-rollouts { display: grid; gap: 12px; }
+.env-rollout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  border-top: 1px solid rgba(67, 122, 182, .35);
+  padding-top: 14px;
+}
+.env-rollout-head {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+  color: #345d88;
+}
+.env-rollout-workload {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #a8c7e8;
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(255,255,255,.48);
+  min-width: 0;
+}
+.env-rollout-workload.is-new { border-color: #68ae86; }
+.env-rollout-workload strong { color: #254f78; }
+.env-rollout-workload span, .env-rollout-workload small { overflow-wrap: anywhere; }
+.env-rollout-workload small { color: #607a94; }
+.env-rollout-scale { display: flex; gap: 6px; align-items: center; }
+.env-rollout-scale .input { width: 78px; min-width: 0; padding: 6px 7px; }
+.env-rollout-scale .btn, .env-rollout-workload > .btn { font-size: 12px; padding: 6px 8px; }
 .env-node-row {
   display: flex;
   gap: 8px;
@@ -1386,6 +1419,9 @@ body.clone-open { overflow: hidden; }
 body.env-overlay-open { overflow: hidden; }
 .gamma-suite-options { display: grid; gap: 8px; padding: 10px 0 10px 8px; margin-left: 50%; width: 150px; font-size: 12px; }
 .gamma-suite-options label { display: flex; align-items: center; gap: 6px; }
+.gamma-deploy-options { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 0 10px 8px; margin-left: 50%; font-size: 14px; }
+.gamma-deploy-options .input { width: auto; min-width: 130px; font-size: 14px; }
+.gamma-deploy-options .env-secret-hint { flex-basis: 100%; font-size: 13px; }
 .gamma-result-link { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .gamma-result-link a { color: var(--primary, #008899); text-decoration: underline; overflow-wrap: anywhere; }
 .log a { color: #83d9ff; text-decoration: underline; text-underline-offset: 3px; }

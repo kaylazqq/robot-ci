@@ -22,7 +22,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
@@ -279,6 +279,20 @@ def init_store() -> None:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS parallel_rollouts (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    environment_id TEXT NOT NULL,
+                    service_id TEXT NOT NULL,
+                    source_workload TEXT NOT NULL,
+                    candidate_workload TEXT NOT NULL,
+                    image TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    old_deleted_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_parallel_rollouts_environment
+                    ON parallel_rollouts(environment_id, created_at DESC);
                 """
             )
             _ensure_environment_secret_columns(conn)
@@ -699,6 +713,186 @@ def delete_environment(env_id: str) -> bool:
             return cur.rowcount > 0
         finally:
             conn.close()
+
+
+def create_parallel_rollout_record(
+    *, job_id: str, environment_id: str, service_id: str, source_workload: str,
+    candidate_workload: str, image: str,
+) -> dict[str, Any]:
+    """Persist a created parallel Deployment so UI actions survive job completion."""
+    item = {
+        "id": uuid.uuid4().hex[:12], "job_id": str(job_id),
+        "environment_id": str(environment_id), "service_id": str(service_id),
+        "source_workload": str(source_workload), "candidate_workload": str(candidate_workload),
+        "image": str(image), "status": "active",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"), "old_deleted_at": "",
+    }
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """INSERT INTO parallel_rollouts (
+                    id, job_id, environment_id, service_id, source_workload,
+                    candidate_workload, image, status, created_at, old_deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(item[key] for key in (
+                    "id", "job_id", "environment_id", "service_id", "source_workload",
+                    "candidate_workload", "image", "status", "created_at", "old_deleted_at",
+                )),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return item
+
+
+def list_parallel_rollouts(environment_id: str) -> list[dict[str, Any]]:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM parallel_rollouts WHERE environment_id = ? ORDER BY created_at DESC",
+                (str(environment_id),),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_parallel_rollout(rollout_id: str) -> dict[str, Any] | None:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute("SELECT * FROM parallel_rollouts WHERE id = ?", (str(rollout_id),)).fetchone()
+        finally:
+            conn.close()
+    return dict(row) if row else None
+
+
+def mark_parallel_rollout_old_deleted(rollout_id: str) -> None:
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                "UPDATE parallel_rollouts SET status = 'old_deleted', old_deleted_at = ? WHERE id = ?",
+                (now, str(rollout_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def set_environment_active_workload(env_id: str, workload_name: str) -> None:
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                "UPDATE environments SET workload_name = ?, updated_at = ? WHERE id = ?",
+                (str(workload_name), now, str(env_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _parallel_rollout_remote(record: Mapping[str, Any]) -> tuple[dict[str, Any], Any, str]:
+    env = get_environment(str(record.get("environment_id") or ""), include_secrets=True)
+    if env is None:
+        raise cce_rollout.CceRolloutError("发布环境不存在")
+    creds = cce_rollout.overlay_environment_passwords(
+        cce_rollout.resolve_credentials(CFG, os.environ), env
+    )
+    if not (
+        str(env.get("jump_host") or "").strip()
+        and [str(row) for row in (env.get("nodes") or []) if str(row).strip()]
+        and cce_rollout.has_ssh_auth(creds)
+    ):
+        raise cce_rollout.CceRolloutError("环境未配置可用的跳板机、节点或 SSH 凭据")
+    namespace = str(CFG.get("cce_namespace") or "default").strip() or "default"
+
+    def run_remote(command: str, timeout: int) -> tuple[int, str, str]:
+        return cce_rollout.exec_via_nodes(
+            command,
+            jump_host=str(env.get("jump_host") or ""),
+            nodes=[str(row) for row in (env.get("nodes") or []) if str(row).strip()],
+            creds=creds,
+            timeout=timeout,
+        )
+
+    return env, run_remote, namespace
+
+
+def parallel_rollout_live_state(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
+    record = get_parallel_rollout(rollout_id)
+    if record is None:
+        return None, "平滑发布记录不存在"
+    try:
+        _env, run_remote, namespace = _parallel_rollout_remote(record)
+        old_payload = cce_rollout.get_deployment_payload(
+            run_remote, namespace=namespace, deploy=str(record["source_workload"])
+        )
+        new_payload = cce_rollout.get_deployment_payload(
+            run_remote, namespace=namespace, deploy=str(record["candidate_workload"])
+        )
+    except cce_rollout.CceRolloutError as exc:
+        return None, str(exc)
+    old = cce_rollout.deployment_summary(old_payload) if old_payload else {
+        "name": record["source_workload"], "exists": False,
+    }
+    new = cce_rollout.deployment_summary(new_payload) if new_payload else {
+        "name": record["candidate_workload"], "exists": False,
+    }
+    return {**record, "namespace": namespace, "old": old, "new": new}, ""
+
+
+def scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tuple[dict[str, Any] | None, str]:
+    if target not in {"old", "new"}:
+        return None, "只能调整新版本或旧版本实例数"
+    try:
+        amount = int(replicas)
+    except (TypeError, ValueError):
+        return None, "实例数必须是整数"
+    record = get_parallel_rollout(rollout_id)
+    if record is None:
+        return None, "平滑发布记录不存在"
+    workload = str(record["source_workload"] if target == "old" else record["candidate_workload"])
+    try:
+        _env, run_remote, namespace = _parallel_rollout_remote(record)
+        cce_rollout.scale_deployment(run_remote, namespace=namespace, deploy=workload, replicas=amount)
+    except cce_rollout.CceRolloutError as exc:
+        return None, str(exc)
+    return parallel_rollout_live_state(rollout_id)
+
+
+def offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
+    record = get_parallel_rollout(rollout_id)
+    if record is None:
+        return None, "平滑发布记录不存在"
+    if str(record.get("status") or "") == "old_deleted":
+        return None, "旧版本已下线"
+    try:
+        _env, run_remote, namespace = _parallel_rollout_remote(record)
+        candidate = cce_rollout.get_deployment_payload(
+            run_remote, namespace=namespace, deploy=str(record["candidate_workload"])
+        )
+        if candidate is None:
+            return None, "新版本负载不存在，不能下线旧版本"
+        candidate_status = candidate.get("status") if isinstance(candidate.get("status"), Mapping) else {}
+        if int(candidate_status.get("readyReplicas") or 0) < 1:
+            return None, "新版本尚未就绪，不能下线旧版本"
+        cce_rollout.delete_deployment(run_remote, namespace=namespace, deploy=str(record["source_workload"]))
+    except cce_rollout.CceRolloutError as exc:
+        return None, str(exc)
+    mark_parallel_rollout_old_deleted(rollout_id)
+    set_environment_active_workload(str(record["environment_id"]), str(record["candidate_workload"]))
+    return parallel_rollout_live_state(rollout_id)
 
 
 BUILTIN_PIPELINE_TEMPLATES = (
@@ -1233,6 +1427,7 @@ JOB_PUBLIC_FIELDS = (
     "test_kinds",
     "gamma_runs",
     "gamma_deployed",
+    "gamma_rollouts",
     "cancel_requested",
     "optional_steps",
     "gamma_e2e",
@@ -1263,6 +1458,7 @@ JOB_COMPACT_FIELDS = (
     "test_kinds",
     "gamma_runs",
     "gamma_deployed",
+    "gamma_rollouts",
     "cancel_requested",
     "slot_held",
     "queue_position",
@@ -1378,7 +1574,7 @@ def _effective_pipeline_stage(job: dict[str, Any]) -> str:
 
 def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
-        return {"gamma_deploy": False, "gamma_test": False, "environment_id": ""}
+        return {"gamma_deploy": False, "gamma_test": False, "environment_id": "", "deployment_mode": "parallel"}
     from gamma_e2e import options
     # Repository CID gamma (58df727) is temporarily disabled; keep the same
     # production path as :80 — browser E2E via gamma_real / ci-e2e.
@@ -1389,10 +1585,14 @@ def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
         raise ValueError("Unknown Gamma test mode")
     extra = options(raw) if (raw.get("gamma_test") and mode == "browser-e2e") or raw.get("environment_id") == "ci-e2e" else {}
     extra["gamma_mode"] = mode
+    deployment_mode = str(raw.get("deployment_mode") or "parallel").strip().lower()
+    if deployment_mode not in {"parallel", "inplace"}:
+        raise ValueError("Unknown deployment mode")
     return {
         "gamma_deploy": bool(raw.get("gamma_deploy")),
         "gamma_test": bool(raw.get("gamma_test")),
         "environment_id": str(raw.get("environment_id") or "").strip(),
+        "deployment_mode": deployment_mode,
         **extra,
     }
 
@@ -1411,6 +1611,12 @@ def _apply_gamma_override(statuses: dict[str, str], job: dict[str, Any] | None, 
         return
     selected = _gamma_selected(job, "deploy") or _gamma_selected(job, "test")
     if not selected:
+        statuses["gamma"] = "skipped"
+        return
+    # A stop request is accepted synchronously while the worker may still be
+    # unwinding an external Gamma request.  Do not keep rendering that request
+    # as executing during this window.
+    if (job or {}).get("cancel_requested"):
         statuses["gamma"] = "skipped"
         return
     job_status = str((job or {}).get("status") or "")
@@ -1773,6 +1979,11 @@ def _prepare_lane_for_job(
             if job.get("slot_held"):
                 st = "done"
                 detail = f"已获得执行槽（并行上限 {limit}）"
+            elif _job_progressed_past_prepare(job):
+                # Gamma 测试会在镜像构建完成后释放构建槽。此时不能因为
+                # slot_held 已清空而把已经完成的前置步骤显示成“等待”。
+                st = "done"
+                detail = "已获得执行槽"
             elif job_status == "queued":
                 st = "queued"
                 detail = f"排队中 · 第 {pos or 1} 位，并行上限 {limit}"
@@ -2131,6 +2342,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         if (
             (_gamma_selected(job, "deploy") or _gamma_selected(job, "test"))
             and is_running
+            and not job.get("cancel_requested")
             and stage == "gamma"
         ):
             svc_status = "running"
@@ -3024,6 +3236,7 @@ def persist_job_meta(job_id: str) -> None:
             "test_kinds",
             "gamma_runs",
             "gamma_deployed",
+            "gamma_rollouts",
             "cancel_requested",
             "stage_before_stop",
             "slot_held",
@@ -3097,6 +3310,7 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "test_kinds": meta.get("test_kinds") or [],
         "gamma_runs": meta.get("gamma_runs") or [],
         "gamma_deployed": bool(meta.get("gamma_deployed")),
+        "gamma_rollouts": meta.get("gamma_rollouts") or [],
         "step_logs": meta.get("step_logs") or {},
         "cancel_requested": bool(meta.get("cancel_requested")),
         "stage_before_stop": meta.get("stage_before_stop"),
@@ -6537,12 +6751,22 @@ def maybe_run_gamma_after_build(
         if env_sid and env_sid not in job_sids:
             return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
 
-    # Fail before changing a shared cluster when its browser driver is absent.
-    from gamma_real import owns_environment
-    gamma_owned = owns_environment(env_id) if env_id else False
+    parallel_release = bool(opts.get("gamma_deploy")) and opts.get("deployment_mode") == "parallel"
+    # A deployment-only parallel release has no dependency on Gamma at all.
+    # Only inspect the Gamma driver for test requests or the legacy path.
+    gamma_owned = False
+    if opts.get("gamma_test") or not parallel_release:
+        from gamma_real import owns_environment
+        gamma_owned = owns_environment(env_id) if env_id else False
     if gamma_owned and opts.get('gamma_test') and opts.get('gamma_mode') != 'browser-e2e':
         return False, 'dev-gamma 是专用 E2E 环境，请选择浏览器 E2E 模式'
-    if (opts.get("gamma_test") and opts.get("gamma_mode") == "browser-e2e") or (gamma_owned and opts.get('gamma_deploy')):
+    # A parallel release creates its candidate Deployment through cce_rollout.
+    # Do not route its deployment through gamma_real: that path submits the
+    # external Gamma platform and performs the legacy in-place deployment.
+    if not parallel_release and (
+        (opts.get("gamma_test") and opts.get("gamma_mode") == "browser-e2e")
+        or (gamma_owned and opts.get('gamma_deploy'))
+    ):
         from gamma_real import available, run as run_real_gamma
         if not available(env_id):
             return False, '该环境尚未配置真实 Gamma 驱动；未部署镜像'
@@ -6578,8 +6802,22 @@ def maybe_run_gamma_after_build(
             timeout = str(CFG.get("cce_rollout_timeout") or "180s").strip() or "180s"
             append_job_log(
                 job_id,
-                f"gamma部署开始 env={env.get('name') or env_id} workload={env.get('workload_name')}",
+                f"gamma部署开始 env={env.get('name') or env_id} workload={env.get('workload_name')} "
+                f"mode={opts.get('deployment_mode')}",
             )
+            created_rollouts: list[dict[str, Any]] = []
+
+            def on_parallel_created(created: dict[str, Any]) -> None:
+                record = create_parallel_rollout_record(
+                    job_id=job_id,
+                    environment_id=env_id,
+                    service_id=str(created.get("service_id") or ""),
+                    source_workload=str(created.get("source_workload") or ""),
+                    candidate_workload=str(created.get("name") or ""),
+                    image=str(created.get("image") or ""),
+                )
+                created_rollouts.append({**record, "new": created})
+
             ok, err = cce_rollout.deploy_job_results(
                 environment=env,
                 results=results,
@@ -6588,6 +6826,9 @@ def maybe_run_gamma_after_build(
                 rollout_timeout=timeout,
                 hop=hop,
                 log=lambda line: append_job_log(job_id, line),
+                mode=str(opts.get("deployment_mode") or "parallel"),
+                release_id=job_id,
+                on_parallel_created=on_parallel_created,
             )
             if job_cancel_requested(job_id):
                 raise JobStopped()
@@ -6595,15 +6836,36 @@ def maybe_run_gamma_after_build(
                 append_job_log(job_id, f"ERROR {err}")
                 return False, err
             append_job_log(job_id, "gamma部署成功")
-            set_job(job_id, gamma_deployed=True)
+            set_job(job_id, gamma_deployed=True, gamma_rollouts=created_rollouts)
 
     if opts.get("gamma_test"):
+        if parallel_release:
+            # The CCE candidate is ready.  Gamma is test-only here: explicitly
+            # clear gamma_deploy so the external platform cannot replace the
+            # source workload a second time.
+            from gamma_real import available, run as run_real_gamma
+            if not available(env_id):
+                return False, "该环境尚未配置真实 Gamma 驱动；新负载已创建，未执行 Gamma 测试"
+            test_opts = {**opts, "gamma_deploy": False}
+            release_build_slot(job_id)
+            with log_substep("test"):
+                try:
+                    return run_real_gamma(
+                        job_id,
+                        results,
+                        test_opts,
+                        lambda line: append_job_log(job_id, line),
+                        lambda state: set_job(job_id, gamma_e2e=state),
+                        lambda: job_cancel_requested(job_id),
+                    )
+                except Exception as exc:
+                    message = "Gamma 测试接入失败: " + str(exc)
+                    append_job_log(job_id, message)
+                    return False, message
         # Repository-mode CID gamma from 58df727 is disabled; browser-e2e /
         # ci-e2e / gamma_real must own gamma测试. Falling through here means the
         # request was not routed to a supported driver.
-        return False, (
-            "仓库 Gamma 用例已暂时停用；请使用浏览器 E2E（与现网 :80 相同）或 CI 隔离 E2E"
-        )
+        return False, "仓库 Gamma 用例已暂时停用；请使用浏览器 E2E"
     return True, ""
 
 
@@ -6944,6 +7206,15 @@ class Handler(SimpleHTTPRequestHandler):
                 200,
                 {"environments": list_environments(service_id), "regions": list(ENV_REGIONS)},
             )
+            return
+
+        m_rollouts = re.fullmatch(r"/api/environments/([^/]+)/rollouts", path)
+        if m_rollouts:
+            rows: list[dict[str, Any]] = []
+            for record in list_parallel_rollouts(m_rollouts.group(1)):
+                state, err = parallel_rollout_live_state(str(record["id"]))
+                rows.append(state if state is not None else {**record, "error": err})
+            self._json(200, {"rollouts": rows})
             return
 
         if path == "/api/cce/regions":
@@ -7380,6 +7651,26 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": err})
                 return
             self._json(200, {"ok": True, "environment": item})
+            return
+
+        m_rollout_scale = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/scale", path)
+        if m_rollout_scale:
+            item, err = scale_parallel_rollout(
+                m_rollout_scale.group(1), str(data.get("target") or ""), data.get("replicas")
+            )
+            if err or item is None:
+                self._json(400 if err != "平滑发布记录不存在" else 404, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "rollout": item})
+            return
+
+        m_rollout_offline = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/offline-old", path)
+        if m_rollout_offline:
+            item, err = offline_parallel_rollout_old(m_rollout_offline.group(1))
+            if err or item is None:
+                self._json(400 if err != "平滑发布记录不存在" else 404, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "rollout": item})
             return
 
         m_env_del = re.fullmatch(r"/api/environments/([^/]+)/delete", path)

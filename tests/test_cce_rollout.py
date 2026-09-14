@@ -1,5 +1,7 @@
 import json
+import sys
 import tempfile
+import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -102,6 +104,32 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertEqual("env-jump", merged["jump_password"])
         self.assertEqual("env-node", merged["node_password"])
 
+    def test_parallel_manifest_keeps_service_labels_and_uses_unique_selector(self) -> None:
+        source = {
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "semantic-schedule", "namespace": "default", "labels": {"app": "schedule"}},
+            "spec": {
+                "replicas": 4,
+                "selector": {"matchLabels": {"app": "schedule"}},
+                "template": {"metadata": {"labels": {"app": "schedule"}}, "spec": {"containers": [
+                    {"name": "container-1", "image": "registry/schedule:old"},
+                    {"name": "filebeat", "image": "elastic/filebeat:8"},
+                ]}},
+            },
+        }
+        manifest = cce_rollout.deployment_manifest_for_parallel_release(
+            source, source_name="semantic-schedule", release_id="ab12cd34ef56",
+            image="registry/schedule:new", container="container-1", replicas=1,
+        )
+        self.assertEqual("semantic-schedule-r-ab12cd34ef56", manifest["metadata"]["name"])
+        labels = manifest["spec"]["template"]["metadata"]["labels"]
+        self.assertEqual("schedule", labels["app"])
+        self.assertEqual("ab12cd34ef56", labels[cce_rollout.PARALLEL_RELEASE_LABEL])
+        self.assertEqual("ab12cd34ef56", manifest["spec"]["selector"]["matchLabels"][cce_rollout.PARALLEL_RELEASE_LABEL])
+        images = {row["name"]: row["image"] for row in manifest["spec"]["template"]["spec"]["containers"]}
+        self.assertEqual("registry/schedule:new", images["container-1"])
+        self.assertEqual("elastic/filebeat:8", images["filebeat"])
+
     def test_resolve_credentials_prefers_env(self) -> None:
         creds = cce_rollout.resolve_credentials(
             {"cce_ssh_password": "from-cfg"},
@@ -161,6 +189,41 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertTrue(any("container-1=" in cmd for cmd in commands))
         self.assertFalse(any("filebeat=" in cmd for cmd in commands))
 
+    def test_deploy_job_results_parallel_creates_a_second_deployment(self) -> None:
+        commands: list[str] = []
+        source = {
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "semantic-schedule", "namespace": "default", "labels": {"app": "schedule"}},
+            "spec": {"replicas": 2, "selector": {"matchLabels": {"app": "schedule"}}, "template": {
+                "metadata": {"labels": {"app": "schedule"}},
+                "spec": {"containers": [{"name": "container-1", "image": "registry/schedule:old"}]},
+            }},
+            "status": {"readyReplicas": 2, "availableReplicas": 2},
+        }
+
+        def hop(command, **_kwargs):  # noqa: ANN001
+            commands.append(command)
+            if "get deploy" in command and "-o json" in command:
+                if "semantic-schedule-r-ab12cd34" in command:
+                    candidate = json.loads(json.dumps(source))
+                    candidate["metadata"]["name"] = "semantic-schedule-r-ab12cd34"
+                    candidate["status"] = {"readyReplicas": 1, "availableReplicas": 1}
+                    return 0, json.dumps(candidate), ""
+                return 0, json.dumps(source), ""
+            return 0, "created", ""
+
+        created: list[dict] = []
+        ok, err = cce_rollout.deploy_job_results(
+            environment={"workload_name": "semantic-schedule", "jump_host": "root@jump", "nodes": ["node"]},
+            results=[{"service_id": "semantic-schedule", "ok": True, "remote": "registry/schedule:new"}],
+            creds={"jump_password": "x", "node_password": "x"}, hop=hop,
+            mode="parallel", release_id="ab12cd34", on_parallel_created=created.append,
+        )
+        self.assertTrue(ok, err)
+        self.assertEqual("semantic-schedule-r-ab12cd34", created[0]["name"])
+        self.assertTrue(any("apply -f" in command for command in commands))
+        self.assertFalse(any("set image" in command for command in commands))
+
     def test_deploy_job_results_requires_creds(self) -> None:
         with patch.object(cce_rollout, "default_key_candidates", return_value=[]):
             ok, err = cce_rollout.deploy_job_results(
@@ -219,6 +282,7 @@ class GammaAfterBuildTests(unittest.TestCase):
             "gamma_deploy": True,
             "gamma_test": False,
             "environment_id": "env1",
+            "deployment_mode": "inplace",
         }
         self.assertIsNone(server.register_job_if_idle(job))
         env = {
@@ -275,6 +339,74 @@ class GammaAfterBuildTests(unittest.TestCase):
         self.assertEqual("node-from-env", hop_kwargs.get("node_password"))
         with server._jobs_lock:
             self.assertEqual("gamma", server._jobs["gamma-run"]["stage"])
+
+    def test_parallel_deploy_uses_cce_without_gamma_platform(self) -> None:
+        job = _job("gamma-parallel", service_id="semantic-schedule")
+        job["optional_steps"] = {
+            "gamma_deploy": True,
+            "gamma_test": False,
+            "environment_id": "env1",
+            "deployment_mode": "parallel",
+        }
+        self.assertIsNone(server.register_job_if_idle(job))
+        env = {"id": "env1", "name": "Gamma", "service_id": "semantic-schedule", "workload_name": "semantic-schedule"}
+        with patch.object(server, "get_environment", return_value=env):
+            with patch.object(cce_rollout, "resolve_credentials", return_value={}):
+                with patch.object(cce_rollout, "deploy_job_results", return_value=(True, "")) as deploy:
+                    ok, err = server.maybe_run_gamma_after_build(
+                        "gamma-parallel",
+                        [{"service_id": "semantic-schedule", "ok": True, "remote": "swr.example/img:tag1"}],
+                    )
+        self.assertTrue(ok, err)
+        deploy.assert_called_once()
+
+    def test_parallel_deploy_then_test_calls_gamma_test_only(self) -> None:
+        job = _job("gamma-parallel-test", service_id="semantic-schedule")
+        job["optional_steps"] = {
+            "gamma_deploy": True,
+            "gamma_test": True,
+            "environment_id": "env1",
+            "deployment_mode": "parallel",
+        }
+        self.assertIsNone(server.register_job_if_idle(job))
+        env = {"id": "env1", "name": "Gamma", "service_id": "semantic-schedule", "workload_name": "semantic-schedule"}
+        calls: list[dict] = []
+        fake_gamma = types.ModuleType("gamma_real")
+        fake_gamma.owns_environment = lambda _env_id: True
+        fake_gamma.available = lambda _env_id: True
+        fake_gamma.run = lambda _job_id, _results, opts, *_args: (calls.append(opts), (True, ""))[1]
+        with patch.dict(sys.modules, {"gamma_real": fake_gamma}):
+            with patch.object(server, "get_environment", return_value=env):
+                with patch.object(cce_rollout, "resolve_credentials", return_value={}):
+                    with patch.object(cce_rollout, "deploy_job_results", return_value=(True, "")):
+                        ok, err = server.maybe_run_gamma_after_build(
+                            "gamma-parallel-test",
+                            [{"service_id": "semantic-schedule", "ok": True, "remote": "swr.example/img:tag1"}],
+                        )
+        self.assertTrue(ok, err)
+        self.assertEqual(1, len(calls))
+        self.assertFalse(calls[0]["gamma_deploy"])
+
+    def test_prepare_slot_is_done_after_gamma_starts(self) -> None:
+        job = _job("gamma-progressed")
+        job.update({"stage": "gamma", "commit_sha": "b1c108f01142", "status": "running", "slot_held": False})
+        rows = server._prepare_lane_for_job(job, ["memory-service"], {"memory-service": {"id": "memory-service"}})
+        slot = next(row for row in rows if row["id"] == "slot")
+        self.assertEqual("done", slot["status"])
+
+    def test_stop_request_hides_running_gamma_stage(self) -> None:
+        job = _job("gamma-stopping")
+        job.update({
+            "stage": "gamma",
+            "status": "running",
+            "cancel_requested": True,
+            "results": [{"service_id": "memory-service", "ok": True}],
+            "optional_steps": {"gamma_deploy": True, "gamma_test": False, "environment_id": "env1"},
+        })
+        with patch.object(server, "load_services", return_value=[{"id": "memory-service", "title": "memory"}]):
+            pipeline = server.build_job_pipeline(job)
+        gamma = next(step for step in pipeline["steps"] if step["id"] == "gamma")
+        self.assertEqual("skipped", gamma["status"])
 
     def test_rejects_environment_owned_by_other_service(self) -> None:
         job = _job("gamma-wrong-env", service_id="memory-service")

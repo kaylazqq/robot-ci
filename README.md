@@ -118,6 +118,12 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 
 真实 Gamma 环境的主路径与现网 `:80` 一致：构建并推送镜像后，经 `cce_rollout` / `gamma_real` 部署到所选 CCE 环境，再由浏览器驱动执行 E01–E06（默认 E01–E03）。`optional_steps.gamma_mode` 固定为 `browser-e2e`（历史值 `repository` 会被映射到浏览器模式）。仓库内 `.cid` 的 `test_type: gamma` 冒烟路径已暂时停用，避免与现网能力验收分叉。
 
+### CCE 平滑发布
+
+在构建页面勾选「gamma部署」时，默认部署方式是「平滑发布：创建新负载」。CI 会从当前 Deployment 克隆 Pod 模板，只替换业务容器镜像，并给新 Deployment 增加唯一的 `robot-ci.io/release` selector；稳定 Service 不会被修改，因此新旧 Pod 会同时被它选中。新版本初始为 1 个实例，页面的「环境管理 → 查看新旧版本」会读取 CCE 中的真实镜像、期望实例和 Ready 实例，可分别设置两边实例数。
+
+该流程不创建候选 Service，也不执行按工作负载名模糊发现 ClusterIP Service 的仓库 Gamma 测试。需要下线时，在同一面板点击「下线旧版本（删除负载）」；系统会先确认新 Deployment 至少已有一个 Ready Pod，删除成功后将其记为环境当前工作负载，供下一次平滑发布继续克隆。仍可显式选择「原地替换」以兼容旧流程。
+
 ## 安全提醒
 
 - 不要把账号密码发到聊天或写进仓库
