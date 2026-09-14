@@ -1166,19 +1166,10 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     runPreviewSelection.mode = 'browser-e2e';
   }
   if (preview && stage.id === 'gamma' && runPreviewSelection.deploy) {
-    const group = doc.createElement('label');
+    const group = doc.createElement('div');
     group.className = 'gamma-deploy-options';
     group.append(doc.createTextNode('CCE 部署方式：'));
-    const select = doc.createElement('select');
-    select.className = 'input';
-    select.innerHTML = '<option value="parallel">平滑升级</option><option value="inplace">替换升级</option>';
-    select.value = runPreviewSelection.deploymentMode || 'parallel';
-    select.addEventListener('change', () => { runPreviewSelection.deploymentMode = select.value; renderRunPage(); });
-    group.append(select);
-    const hint = doc.createElement('span');
-    hint.className = 'env-secret-hint';
-    hint.textContent = '平滑升级先创建 1 个新版本实例；之后可在环境管理中调整新旧实例数。';
-    group.append(hint);
+    group.append(createReleaseModePicker(doc));
     tree.append(group);
   }
   if (preview && stage.id === 'gamma' && runPreviewSelection.test && runPreviewSelection.mode === 'browser-e2e') {
@@ -1285,6 +1276,49 @@ function createGammaEnvPicker(doc) {
   picker.append(trigger, menu);
   wrap.appendChild(picker);
   return wrap;
+}
+function createReleaseModePicker(doc) {
+  doc = doc || document;
+  const win = doc.defaultView || window;
+  const choices = [{ id: 'parallel', name: '平滑升级' }, { id: 'inplace', name: '替换升级' }];
+  const wrap = doc.createElement('div'); wrap.className = 'pl-env-pick release-mode-pick';
+  const picker = doc.createElement('div'); picker.className = 'pl-env-picker';
+  const trigger = doc.createElement('button'); trigger.type = 'button';
+  trigger.className = 'input branch-trigger pl-env-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox'); trigger.setAttribute('aria-expanded', 'false');
+  const label = doc.createElement('span'); label.className = 'pl-env-trigger-label';
+  label.textContent = (choices.find((item) => item.id === runPreviewSelection.deploymentMode) || choices[0]).name;
+  trigger.appendChild(label);
+  const chevron = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  chevron.setAttribute('viewBox', '0 0 24 24'); chevron.setAttribute('aria-hidden', 'true');
+  chevron.innerHTML = '<path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>';
+  trigger.appendChild(chevron);
+  const menu = doc.createElement('div'); menu.className = 'branch-menu'; menu.hidden = true; menu.setAttribute('role', 'listbox');
+  const close = () => { menu.hidden = true; trigger.setAttribute('aria-expanded', 'false'); if (menu.parentNode) menu.remove(); };
+  const positionMenu = () => {
+    const rect = trigger.getBoundingClientRect();
+    menu.classList.add('branch-menu-portal'); menu.style.left = rect.left + 'px'; menu.style.top = (rect.bottom + 6) + 'px';
+    menu.style.width = rect.width + 'px'; menu.style.maxHeight = Math.max(120, Math.min(280, win.innerHeight - rect.bottom - 12)) + 'px';
+    doc.body.appendChild(menu);
+  };
+  choices.forEach((choice) => {
+    const option = doc.createElement('button'); option.type = 'button';
+    option.className = 'branch-option' + ((runPreviewSelection.deploymentMode || 'parallel') === choice.id ? ' active' : '');
+    option.setAttribute('role', 'option'); option.textContent = choice.name;
+    option.addEventListener('click', (ev) => {
+      ev.stopPropagation(); runPreviewSelection.deploymentMode = choice.id; label.textContent = choice.name;
+      close(); trigger.focus(); renderRunPage();
+    });
+    menu.appendChild(option);
+  });
+  trigger.addEventListener('click', (ev) => {
+    ev.stopPropagation(); const opening = menu.hidden; if (opening) positionMenu(); else close();
+    menu.hidden = !opening; trigger.setAttribute('aria-expanded', String(opening));
+  });
+  picker.addEventListener('focusout', () => setTimeout(() => {
+    if (!picker.contains(doc.activeElement) && !menu.contains(doc.activeElement)) close();
+  }, 0));
+  picker.append(trigger, menu); wrap.appendChild(picker); return wrap;
 }
 function createEndpoint(kind, lit, doc) {
   doc = doc || document;
@@ -2715,7 +2749,6 @@ function emptyEnvDraft() {
     region: "cn-southwest-2",
     cluster_name: "",
     workload_name: sid,
-    test_base_url: "",
     jump_host: "",
     nodes: [""],
   };
@@ -2730,7 +2763,6 @@ function collectEnvForm() {
     region: ($("envRegion") && $("envRegion").value) || "cn-southwest-2",
     cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
     workload_name: ($("envWorkload") && $("envWorkload").value || "").trim(),
-    test_base_url: ($("envTestBaseUrl") && $("envTestBaseUrl").value || "").trim(),
     jump_host: ($("envJump") && $("envJump").value || "").trim(),
     jump_password: ($("envJumpPassword") && $("envJumpPassword").value) || "",
     node_password: ($("envNodePassword") && $("envNodePassword").value) || "",
@@ -2766,9 +2798,6 @@ function envFormHtml(env) {
     '<input id="envCluster" class="input" value="' + esc(data.cluster_name || "") + '" required />' +
     '<label class="label" for="envWorkload">负载名称</label>' +
     '<input id="envWorkload" class="input" value="' + esc(data.workload_name || "") + '" placeholder="CCE 集群中的微服务名称" required />' +
-    '<label class="label" for="envTestBaseUrl">Gamma 测试地址</label>' +
-    '<input id="envTestBaseUrl" class="input" type="url" value="' + esc(data.test_base_url || "") + '" placeholder="例如 http://agent-governance-gw:8684" />' +
-    '<p class="env-secret-hint">gamma 用例通过 GAMMA_BASE_URL 使用此地址；不保存访问凭据。</p>' +
     '<label class="label" for="envJump">跳板机</label>' +
     '<input id="envJump" class="input" value="' + esc(data.jump_host || "") + '" placeholder="用于 SSH 到 CCE 集群" required />' +
     '<label class="label" for="envJumpPassword">跳板机密码</label>' +
@@ -2801,7 +2830,6 @@ function envCardHtml(env) {
     '<div class="env-meta-row"><span class="env-meta-label">Region:</span><strong class="env-meta-value">' + esc(env.region_label || env.region || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">集群:</span><strong class="env-meta-value">' + esc(env.cluster_name || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">负载:</span><strong class="env-meta-value">' + esc(env.workload_name || "—") + "</strong></div>" +
-    '<div class="env-meta-row"><span class="env-meta-label">Gamma 地址:</span><strong class="env-meta-value">' + esc(env.test_base_url || "未配置") + "</strong></div>" +
     '</div><div class="env-rollout-actions"><button type="button" class="btn ghost" data-env-rollouts="' + esc(env.id) + '">查看新旧版本</button></div>' +
     '<div class="env-rollouts" data-env-rollout-list="' + esc(env.id) + '" hidden></div></article>'
   );
@@ -2816,7 +2844,6 @@ function rolloutWorkloadHtml(rollout, side, item) {
     '<strong>' + (old ? '旧版本负载' : '新版本负载') + '</strong><span>' + esc(item.name || '—') + '</span>' +
     '<small>镜像：' + esc(image) + '</small><small>实例：' + (exists ? replicas + '（Ready ' + Number(item.ready_replicas || 0) + '）' : '已不存在') + '</small>' +
     (exists ? '<div class="env-rollout-scale"><input class="input" type="number" min="0" max="1000" value="' + replicas + '" data-rollout-replicas="' + side + '" /><button type="button" class="btn ghost" data-rollout-scale="' + side + '">设置实例数</button></div>' : '') +
-    (old && exists && rollout.status !== 'old_deleted' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线旧版本（删除负载）</button>' : '') +
     '</div>';
 }
 
@@ -2826,7 +2853,7 @@ function renderEnvRollouts(panel, rows, error) {
   if (!rows || !rows.length) { panel.innerHTML = '<p class="env-secret-hint">暂无由 CI 创建的平滑发布负载。</p>'; return; }
   panel.innerHTML = rows.map((row) => row.error
     ? '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>'
-    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>平滑发布 ' + esc(row.created_at || '') + '</strong><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : '新旧版本并行中') + '</span></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}) + rolloutWorkloadHtml(row, 'new', row.new || {}) + '</section>'
+    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>平滑发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : '新旧版本并行中') + '</span>' + (row.old && row.old.exists && row.status !== 'old_deleted' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}) + rolloutWorkloadHtml(row, 'new', row.new || {}) + '</section>'
   ).join('');
   panel.querySelectorAll('[data-rollout-scale]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const target = btn.getAttribute('data-rollout-scale');

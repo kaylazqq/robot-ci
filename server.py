@@ -270,7 +270,6 @@ def init_store() -> None:
                     region_label TEXT NOT NULL,
                     cluster_name TEXT NOT NULL,
                     workload_name TEXT NOT NULL,
-                    test_base_url TEXT NOT NULL DEFAULT '',
                     jump_host TEXT NOT NULL,
                     jump_password TEXT NOT NULL DEFAULT '',
                     node_password TEXT NOT NULL DEFAULT '',
@@ -378,8 +377,11 @@ def _ensure_environment_secret_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE environments ADD COLUMN jump_password TEXT NOT NULL DEFAULT ''")
     if "node_password" not in cols:
         conn.execute("ALTER TABLE environments ADD COLUMN node_password TEXT NOT NULL DEFAULT ''")
-    if "test_base_url" not in cols:
-        conn.execute("ALTER TABLE environments ADD COLUMN test_base_url TEXT NOT NULL DEFAULT ''")
+    # test_base_url/GAMMA_BASE_URL belonged to the retired repository Gamma
+    # runner. Keep old SQLite schemas compatible, but erase the deprecated
+    # configuration so it is no longer stored or exposed.
+    if "test_base_url" in cols:
+        conn.execute("UPDATE environments SET test_base_url = '' WHERE test_base_url <> ''")
 
 
 def _known_service_ids() -> set[str]:
@@ -496,7 +498,6 @@ def _environment_from_row(row: sqlite3.Row, *, include_secrets: bool = False) ->
         "region_label": str(row["region_label"] or _env_region_label(str(row["region"]))),
         "cluster_name": str(row["cluster_name"]),
         "workload_name": str(row["workload_name"]),
-        "test_base_url": _row_text(row, "test_base_url"),
         "jump_host": str(row["jump_host"]),
         "nodes": [str(item) for item in nodes if str(item).strip()],
         "has_jump_password": bool(jump_password),
@@ -522,7 +523,6 @@ def _validate_environment_payload(
     region = str(data.get("region") or "").strip()
     cluster_name = str(data.get("cluster_name") or "").strip()
     workload_name = str(data.get("workload_name") or "").strip()
-    test_base_url = str(data.get("test_base_url") or "").strip().rstrip("/")
     jump_host = str(data.get("jump_host") or "").strip()
     jump_password = _secret_text(data.get("jump_password"))
     node_password = _secret_text(data.get("node_password"))
@@ -541,17 +541,6 @@ def _validate_environment_payload(
         return None, "负载名称必填"
     if not jump_host:
         return None, "跳板机必填"
-    if test_base_url:
-        parsed = urlparse(test_base_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-        ):
-            return None, "Gamma 测试地址必须是无凭据的 http/https 地址"
     if require_passwords and not jump_password:
         return None, "跳板机密码必填"
     if require_passwords and not node_password:
@@ -563,7 +552,6 @@ def _validate_environment_payload(
         "region_label": _env_region_label(region),
         "cluster_name": cluster_name,
         "workload_name": workload_name,
-        "test_base_url": test_base_url,
         "jump_host": jump_host,
         "jump_password": jump_password,
         "node_password": node_password,
@@ -624,10 +612,10 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
             conn.execute(
                 """
                 INSERT INTO environments (
-                    id, name, service_id, region, region_label, cluster_name, workload_name, test_base_url,
+                    id, name, service_id, region, region_label, cluster_name, workload_name,
                     jump_host, jump_password, node_password, nodes_json,
                     created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
@@ -637,7 +625,6 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
                     item["region_label"],
                     item["cluster_name"],
                     item["workload_name"],
-                    item["test_base_url"],
                     item["jump_host"],
                     item["jump_password"],
                     item["node_password"],
@@ -675,7 +662,7 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                 """
                 UPDATE environments SET
                     name = ?, region = ?, region_label = ?, cluster_name = ?,
-                    workload_name = ?, test_base_url = ?, jump_host = ?, jump_password = ?,
+                    workload_name = ?, jump_host = ?, jump_password = ?,
                     node_password = ?, nodes_json = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -685,7 +672,6 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                     item["region_label"],
                     item["cluster_name"],
                     item["workload_name"],
-                    item["test_base_url"],
                     item["jump_host"],
                     item["jump_password"],
                     item["node_password"],
@@ -1979,14 +1965,14 @@ def _prepare_lane_for_job(
             if job.get("slot_held"):
                 st = "done"
                 detail = f"已获得执行槽（并行上限 {limit}）"
+            elif job_status == "queued":
+                st = "queued"
+                detail = f"排队中 · 第 {pos or 1} 位，并行上限 {limit}"
             elif _job_progressed_past_prepare(job):
                 # Gamma 测试会在镜像构建完成后释放构建槽。此时不能因为
                 # slot_held 已清空而把已经完成的前置步骤显示成“等待”。
                 st = "done"
                 detail = "已获得执行槽"
-            elif job_status == "queued":
-                st = "queued"
-                detail = f"排队中 · 第 {pos or 1} 位，并行上限 {limit}"
             elif job_status == "running" and str(job.get("stage") or "") in ("starting", "queued"):
                 st = "running"
                 detail = f"申请执行槽（并行上限 {limit}）"
@@ -3836,7 +3822,6 @@ def run_tests_nonblocking(job_id: str, service_id: str, repo_dir: Path, commit_s
 def gamma_test_environment(environment: dict[str, Any]) -> dict[str, str]:
     """Return only non-secret, stable metadata exposed to a gamma test command."""
     return {
-        "GAMMA_BASE_URL": str(environment.get("test_base_url") or "").rstrip("/"),
         "GAMMA_ENVIRONMENT_ID": str(environment.get("id") or ""),
         "GAMMA_ENVIRONMENT_NAME": str(environment.get("name") or ""),
         "GAMMA_REGION": str(environment.get("region") or ""),
@@ -3883,12 +3868,6 @@ def run_gamma_tests(
                 "status": "not_configured", "total": 0, "passed": 0, "failed": 0,
                 "errors": 1, "duration_ms": 0,
                 "failures": [{"name": "gamma测试", "detail": "服务未在 .cid/build.yaml 声明启用的 gamma 用例"}],
-            }
-        elif not str(environment.get("test_base_url") or "").strip():
-            result = {
-                "status": "error", "total": 0, "passed": 0, "failed": 0,
-                "errors": 1, "duration_ms": 0,
-                "failures": [{"name": "gamma测试", "detail": "环境未配置 Gamma 测试地址"}],
             }
         else:
             plans_path = report_dir / "cid-gamma-plan.json"

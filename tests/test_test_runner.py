@@ -118,9 +118,9 @@ class TestResultParsing(unittest.TestCase):
             env = test_runner.build_test_environment(
                 root,
                 root / "reports",
-                {"GAMMA_BASE_URL": "http://service:8684", "GAMMA_ENVIRONMENT_NAME": "gamma"},
+                {"EXTRA_BASE_URL": "http://service:8684", "GAMMA_ENVIRONMENT_NAME": "gamma"},
             )
-        self.assertEqual("http://service:8684", env["GAMMA_BASE_URL"])
+        self.assertEqual("http://service:8684", env["EXTRA_BASE_URL"])
         self.assertEqual("gamma", env["GAMMA_ENVIRONMENT_NAME"])
 
 

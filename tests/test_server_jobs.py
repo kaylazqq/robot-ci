@@ -1917,7 +1917,7 @@ artifacts: {image: {enabled: true, delivery: swr}}
             environment = {
                 "id": "gamma-a", "name": "Gamma A", "region": "cn-southwest-2",
                 "cluster_name": "cluster", "workload_name": "demo",
-                "test_base_url": "http://demo:8684", "jump_password": "never-pass-this",
+                "jump_password": "never-pass-this",
                 "node_password": "never-pass-this-either",
             }
 
@@ -1938,7 +1938,7 @@ artifacts: {image: {enabled: true, delivery: swr}}
                             result = server.run_gamma_tests("gamma-job", "demo", root, "a" * 40, environment)
             self.assertEqual("passed", result["status"])
             command = " ".join(run_stream.call_args.args[1])
-            self.assertIn("GAMMA_BASE_URL", command)
+            self.assertNotIn("GAMMA_BASE_URL", command)
             self.assertNotIn("never-pass-this", command)
 
 
