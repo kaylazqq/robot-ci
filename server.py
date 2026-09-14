@@ -3275,6 +3275,26 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
             meta.update(json.loads(meta_path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             pass
+    # The stop endpoint only accepts live jobs.  If the process exits while it
+    # is unwinding, older code could persist a failed result after that accepted
+    # stop request.  Disk-only records have no worker left, so retain the user's
+    # requested terminal state instead of resurfacing them as failed/running.
+    if bool(meta.get("cancel_requested")) and str(meta.get("status") or "") in {
+        "running", "queued", "stopping", "failed"
+    }:
+        meta.update(
+            {
+                "status": "stopped",
+                "stage": "done",
+                "error": STOPPED_JOB_ERROR,
+                "finished_at": str(meta.get("finished_at") or time.strftime("%Y-%m-%d %H:%M:%S")),
+            }
+        )
+        if meta_path.is_file():
+            try:
+                meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            except OSError:
+                pass
     log_lines: list[str] = []
     if log_path.is_file():
         try:
