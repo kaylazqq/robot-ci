@@ -408,6 +408,22 @@ class GammaAfterBuildTests(unittest.TestCase):
         gamma = next(step for step in pipeline["steps"] if step["id"] == "gamma")
         self.assertEqual("skipped", gamma["status"])
 
+    def test_restart_preserves_requested_stop_as_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_log_dir = server.LOG_DIR
+            try:
+                server.LOG_DIR = root
+                (root / "job-abcd1234.json").write_text(json.dumps({
+                    "id": "abcd1234", "status": "running", "stage": "gamma", "cancel_requested": True,
+                }), encoding="utf-8")
+                self.assertEqual(1, server.reap_orphaned_running_jobs())
+                meta = json.loads((root / "job-abcd1234.json").read_text(encoding="utf-8"))
+            finally:
+                server.LOG_DIR = old_log_dir
+        self.assertEqual("stopped", meta["status"])
+        self.assertEqual("done", meta["stage"])
+
     def test_rejects_environment_owned_by_other_service(self) -> None:
         job = _job("gamma-wrong-env", service_id="memory-service")
         job["optional_steps"] = {

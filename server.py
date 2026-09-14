@@ -3340,9 +3340,12 @@ def reap_orphaned_running_jobs() -> int:
         prev_stage = str(meta.get("stage") or "")
         if prev_stage and prev_stage not in _TERMINAL_PIPELINE_STAGES and not meta.get("stage_before_stop"):
             meta["stage_before_stop"] = prev_stage
-        meta["status"] = "failed"
-        meta["stage"] = "interrupted"
-        meta["error"] = INTERRUPTED_JOB_ERROR
+        was_stop_requested = bool(meta.get("cancel_requested"))
+        meta["status"] = "stopped" if was_stop_requested else "failed"
+        meta["stage"] = "done" if was_stop_requested else "interrupted"
+        meta["error"] = STOPPED_JOB_ERROR if was_stop_requested else INTERRUPTED_JOB_ERROR
+        if was_stop_requested and not meta.get("finished_at"):
+            meta["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
             path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         except OSError:
@@ -3351,7 +3354,10 @@ def reap_orphaned_running_jobs() -> int:
         try:
             ts = time.strftime("%H:%M:%S")
             with (LOG_DIR / f"job-{job_id}.log").open("a", encoding="utf-8") as fh:
-                fh.write(f"[{ts}] FAILED {INTERRUPTED_JOB_ERROR}\n")
+                if was_stop_requested:
+                    fh.write(f"[{ts}] STOPPED\n")
+                else:
+                    fh.write(f"[{ts}] FAILED {INTERRUPTED_JOB_ERROR}\n")
         except OSError:
             pass
         marked += 1
