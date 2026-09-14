@@ -1421,8 +1421,10 @@ body.clone-open { overflow: hidden; }
 body.env-overlay-open { overflow: hidden; }
 .gamma-suite-options { display: grid; gap: 8px; padding: 10px 0 10px 8px; margin-left: 50%; width: 150px; font-size: 12px; }
 .gamma-suite-options label { display: flex; align-items: center; gap: 6px; }
-.gamma-deploy-options { display: flex; align-items: center; gap: 8px; padding: 10px 0 10px 8px; margin-left: 50%; font-size: 14px; white-space: nowrap; }
-.gamma-deploy-options .release-mode-pick { grid-column: auto; width: 150px; margin: 0; padding-left: 0; }
+.gamma-deploy-options { display: grid; gap: 6px; padding: 10px 0 10px 8px; margin-left: 50%; width: 150px; min-width: 150px; font-size: 14px; }
+.gamma-deploy-options .release-mode-pick { grid-column: auto; width: 100%; min-width: 0; margin: 0; padding-left: 0; }
+.gamma-deploy-options .release-mode-pick .pl-env-picker,
+.gamma-deploy-options .release-mode-pick .pl-env-trigger { width: 100%; min-width: 0; }
 .gamma-deploy-options .release-mode-pick::before { display: none; }
 .gamma-result-link { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .gamma-result-link a { color: var(--primary, #008899); text-decoration: underline; overflow-wrap: anywhere; }
