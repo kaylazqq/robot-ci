@@ -272,6 +272,74 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertTrue(any("apply -f" in command for command in commands))
         self.assertFalse(any("set image" in command for command in commands))
 
+    def test_resolve_source_falls_back_to_baseline_when_active_missing(self) -> None:
+        baseline = {
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "semantic-schedule"},
+            "spec": {"template": {"spec": {"containers": [{"name": "container-1", "image": "old"}]}}},
+        }
+
+        def run_remote(command: str, _timeout: int = 60) -> tuple[int, str, str]:
+            if "get deploy semantic-schedule-v-gone" in command:
+                return 1, "", 'Error from server (NotFound): deployments.apps "semantic-schedule-v-gone" not found'
+            if "get deploy semantic-schedule " in command or command.rstrip().endswith("get deploy semantic-schedule -o json"):
+                return 0, json.dumps(baseline), ""
+            return 1, "", "unexpected"
+
+        logs: list[str] = []
+        name, payload = cce_rollout.resolve_source_deployment(
+            run_remote,
+            namespace="default",
+            active="semantic-schedule-v-gone",
+            baseline="semantic-schedule",
+            log=logs.append,
+        )
+        self.assertEqual("semantic-schedule", name)
+        self.assertEqual(baseline, payload)
+        self.assertTrue(any("活动负载" in line and "基准负载" in line for line in logs))
+
+    def test_resolve_source_uses_unique_approximate_match(self) -> None:
+        only = {
+            "metadata": {
+                "name": "semantic-schedule-v-202609151200",
+                "labels": {cce_rollout.PARALLEL_SOURCE_LABEL: "semantic-schedule"},
+            },
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "x"}]}}},
+            "status": {"readyReplicas": 1},
+        }
+
+        def run_remote(command: str, _timeout: int = 60) -> tuple[int, str, str]:
+            if "get deploy " in command and " -o json" in command and "get deploy -o json" not in command:
+                return 1, "", "not found"
+            if "get deploy -o json" in command:
+                return 0, json.dumps({"items": [only]}), ""
+            return 1, "", "unexpected"
+
+        name, payload = cce_rollout.resolve_source_deployment(
+            run_remote, namespace="default", active="semantic-schedule-v-gone", baseline="semantic-schedule"
+        )
+        self.assertEqual("semantic-schedule-v-202609151200", name)
+        self.assertEqual(only, payload)
+
+    def test_resolve_source_errors_when_approximate_matches_multiple(self) -> None:
+        items = [
+            {"metadata": {"name": "semantic-schedule-v-1"}},
+            {"metadata": {"name": "semantic-schedule-v-2"}},
+        ]
+
+        def run_remote(command: str, _timeout: int = 60) -> tuple[int, str, str]:
+            if "get deploy " in command and "get deploy -o json" not in command:
+                return 1, "", "not found"
+            if "get deploy -o json" in command:
+                return 0, json.dumps({"items": items}), ""
+            return 1, "", "unexpected"
+
+        with self.assertRaises(cce_rollout.CceRolloutError) as ctx:
+            cce_rollout.resolve_source_deployment(
+                run_remote, namespace="default", active="gone", baseline="semantic-schedule"
+            )
+        self.assertIn("多个负载", str(ctx.exception))
+
     def test_deploy_job_results_requires_creds(self) -> None:
         with patch.object(cce_rollout, "default_key_candidates", return_value=[]):
             ok, err = cce_rollout.deploy_job_results(

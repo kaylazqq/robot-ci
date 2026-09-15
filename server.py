@@ -169,9 +169,14 @@ ARCHIVE_IMAGE_HOLD_PREFIX = "ci-archive-hold-"
 # Mattermost compile uses a shared 8G build.swap and ~3.6G RAM; a second
 # concurrent job swapoff/OOM-kills webpack. Override via services.json
 # `max_concurrent` when needed.
-DEFAULT_SERVICE_CONCURRENCY = {"mattermost": 1, "kibana-service": 1}
-DEFAULT_SERVICE_MAX_CONCURRENT = 1
+DEFAULT_SERVICE_CONCURRENCY = {
+    "mattermost": 1,
+    "kibana-service": 1,
+    "grafana-service": 1,
+}
+DEFAULT_SERVICE_MAX_CONCURRENT = 5
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+DEFAULT_PIPELINE_TEMPLATE_NAME = "个人构建流水线"
 
 DAEMON_VERSION_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 FLEET_RUNTIME_CACHE_MARKERS = (".build-source.sha256", ".build-image-ids")
@@ -935,8 +940,30 @@ def _parallel_rollout_remote(record: Mapping[str, Any]) -> tuple[dict[str, Any],
     return env, run_remote, namespace
 
 
-def parallel_rollout_live_state(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
-    record = get_parallel_rollout(rollout_id)
+_rollout_live_cache: dict[str, tuple[float, dict[str, Any], str]] = {}
+_rollout_live_cache_lock = threading.Lock()
+_ROLLOUT_LIVE_TTL_SEC = 8.0
+
+
+def invalidate_rollout_live_cache(rollout_id: str = "") -> None:
+    rid = str(rollout_id or "").strip()
+    with _rollout_live_cache_lock:
+        if not rid:
+            _rollout_live_cache.clear()
+            return
+        _rollout_live_cache.pop(rid, None)
+
+
+def parallel_rollout_live_state(
+    rollout_id: str, *, use_cache: bool = True
+) -> tuple[dict[str, Any] | None, str]:
+    rid = str(rollout_id or "").strip()
+    if use_cache and rid:
+        with _rollout_live_cache_lock:
+            cached = _rollout_live_cache.get(rid)
+        if cached and (time.time() - cached[0]) < _ROLLOUT_LIVE_TTL_SEC:
+            return deepcopy(cached[1]), cached[2]
+    record = get_parallel_rollout(rid)
     if record is None:
         return None, "平滑发布记录不存在"
     try:
@@ -949,13 +976,53 @@ def parallel_rollout_live_state(rollout_id: str) -> tuple[dict[str, Any] | None,
         )
     except cce_rollout.CceRolloutError as exc:
         return None, str(exc)
-    old = cce_rollout.deployment_summary(old_payload) if old_payload else {
-        "name": record["source_workload"], "exists": False,
-    }
-    new = cce_rollout.deployment_summary(new_payload) if new_payload else {
-        "name": record["candidate_workload"], "exists": False,
-    }
-    return {**record, "namespace": namespace, "old": old, "new": new}, ""
+
+    def _images_from_manifest(raw: Any) -> list[str]:
+        if not raw:
+            return []
+        try:
+            payload = json.loads(str(raw)) if not isinstance(raw, dict) else raw
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return [
+            img
+            for _name, img in cce_rollout.containers_from_deploy_json(payload)
+            if img
+        ]
+
+    if old_payload:
+        old = cce_rollout.deployment_summary(old_payload)
+    else:
+        old_images = _images_from_manifest(record.get("old_manifest_json"))
+        old = {
+            "name": record["source_workload"],
+            "exists": False,
+            "desired_replicas": 0,
+            "ready_replicas": 0,
+            "available_replicas": 0,
+            "images": old_images,
+            "release_id": "",
+            "source_workload": "",
+        }
+    if new_payload:
+        new = cce_rollout.deployment_summary(new_payload)
+    else:
+        stored_image = str(record.get("image") or "").strip()
+        new = {
+            "name": record["candidate_workload"],
+            "exists": False,
+            "desired_replicas": 0,
+            "ready_replicas": 0,
+            "available_replicas": 0,
+            "images": [stored_image] if stored_image else [],
+            "release_id": "",
+            "source_workload": str(record.get("source_workload") or ""),
+        }
+    state = {**record, "namespace": namespace, "old": old, "new": new}
+    if rid:
+        with _rollout_live_cache_lock:
+            _rollout_live_cache[rid] = (time.time(), deepcopy(state), "")
+    return state, ""
 
 
 def scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tuple[dict[str, Any] | None, str]:
@@ -974,7 +1041,8 @@ def scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tuple
         cce_rollout.scale_deployment(run_remote, namespace=namespace, deploy=workload, replicas=amount)
     except cce_rollout.CceRolloutError as exc:
         return None, str(exc)
-    return parallel_rollout_live_state(rollout_id)
+    invalidate_rollout_live_cache(rollout_id)
+    return parallel_rollout_live_state(rollout_id, use_cache=False)
 
 
 def offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
@@ -1010,7 +1078,8 @@ def offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | None
         return None, str(exc)
     mark_parallel_rollout_old_deleted(rollout_id)
     set_environment_active_workload(str(record["environment_id"]), str(record["candidate_workload"]))
-    return parallel_rollout_live_state(rollout_id)
+    invalidate_rollout_live_cache(rollout_id)
+    return parallel_rollout_live_state(rollout_id, use_cache=False)
 
 
 def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
@@ -1046,7 +1115,8 @@ def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, s
             conn.commit(); conn.close()
     except Exception as exc:
         return None, str(exc)
-    return parallel_rollout_live_state(rollout_id)
+    invalidate_rollout_live_cache(rollout_id)
+    return parallel_rollout_live_state(rollout_id, use_cache=False)
 
 
 def execute_parallel_rollout_rollback(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
@@ -1626,6 +1696,8 @@ JOB_PUBLIC_FIELDS = (
     "rollback_requested",
     "rollback_completed",
     "rollback_failed",
+    "template_id",
+    "template_name",
 )
 
 JOB_COMPACT_FIELDS = (
@@ -1665,6 +1737,8 @@ JOB_COMPACT_FIELDS = (
     "rollback_requested",
     "rollback_completed",
     "rollback_failed",
+    "template_id",
+    "template_name",
 )
 
 
@@ -1769,7 +1843,9 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
         ("compare", "版本对比"),
         ("offline", "老版本下线"),
     ),
-    "rollback": (),
+    "rollback": (
+        ("rollback", "一键回滚"),
+    ),
     "archive": (
         ("save", "归档镜像"),
     ),
@@ -2101,6 +2177,8 @@ def _subtask_rows(
             if _gamma_selected(job, "test") and any(item[0] == "test" for item in defs)
             else 0
         )
+    elif step_id == "release":
+        fail_index = 0
     else:
         fail_index = len(defs) - 1
     statuses = _spread_status_to_subtasks(status, len(defs), fail_index=fail_index)
@@ -2150,6 +2228,21 @@ def _subtask_rows(
             by_id["deploy"]["status"] = "done"
             by_id["compare"]["status"] = "done"
             by_id["offline"]["status"] = "queued" if rollout_status == "active" else "done"
+        elif status == "failed":
+            by_id["deploy"]["status"] = "failed"
+            by_id["compare"]["status"] = "skipped"
+            by_id["offline"]["status"] = "skipped"
+        return rows
+    if step_id == "rollback":
+        by_id = {row["id"]: row for row in rows}
+        if (job or {}).get("rollback_failed"):
+            by_id["rollback"]["status"] = "failed"
+        elif (job or {}).get("rollback_completed"):
+            by_id["rollback"]["status"] = "done"
+        elif (job or {}).get("rollback_requested"):
+            by_id["rollback"]["status"] = "running"
+        elif status == "skipped":
+            by_id["rollback"]["status"] = "skipped"
         return rows
     if step_id != "test":
         return rows
@@ -2634,11 +2727,24 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
 
         _apply_gamma_override(statuses, job, live=is_running)
         if "release" in statuses:
-            if job.get("cancel_requested"): statuses["release"] = "skipped"
-            elif job_status == "failed" and stage == "release": statuses["release"] = "failed"
-            elif is_running and stage == "release": statuses["release"] = "running"
-            elif is_running and stage != "release": statuses["release"] = "pending"
-            elif job.get("production_released"): statuses["release"] = "done"
+            if job.get("cancel_requested"):
+                statuses["release"] = "skipped"
+            elif job.get("production_released"):
+                statuses["release"] = "done"
+            elif job_status == "failed" and stage == "release":
+                statuses["release"] = "failed"
+            elif job_status == "failed" and _release_selected(job) and not job.get("production_released"):
+                # Build results may be ok while production release failed; do not keep release=done.
+                if stage in ("release", "done") or str(job.get("error") or "").startswith("生产发布"):
+                    statuses["release"] = "failed"
+                elif stage == "gamma" and (_gamma_selected(job, "deploy") or _gamma_selected(job, "test")):
+                    statuses["release"] = "skipped"
+                else:
+                    statuses["release"] = "failed"
+            elif is_running and stage == "release":
+                statuses["release"] = "running"
+            elif is_running and stage != "release":
+                statuses["release"] = "pending"
         if "rollback" in statuses:
             if job.get("rollback_failed"): statuses["rollback"] = "failed"
             elif job.get("rollback_completed") or rollback_observed: statuses["rollback"] = "done"
@@ -2759,7 +2865,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def service_concurrency_cap(service_id: str) -> int | None:
-    """Per-service cap. Every microservice defaults to 1 concurrent job."""
+    """Per-service live-job cap. Default 5; exclusive services stay at 1."""
     for item in load_services():
         if item.get("id") != service_id:
             continue
@@ -2772,6 +2878,35 @@ def service_concurrency_cap(service_id: str) -> int | None:
             break
         return value if value > 0 else DEFAULT_SERVICE_MAX_CONCURRENT
     return DEFAULT_SERVICE_CONCURRENCY.get(service_id, DEFAULT_SERVICE_MAX_CONCURRENT)
+
+
+def _service_live_count_locked(service_id: str, *, exclude_job_id: str = "") -> int:
+    """Count running/queued jobs for a service (includes offline-wait pipelines)."""
+    sid = str(service_id or "").strip()
+    if not sid:
+        return 0
+    return sum(
+        1
+        for job in _jobs.values()
+        if job.get("status") in ("running", "queued")
+        and sid in _job_service_ids(job)
+        and str(job.get("id") or "") != str(exclude_job_id or "")
+    )
+
+
+def job_within_service_caps(job_id: str) -> bool:
+    """True when acquiring a slot would not exceed any per-service cap."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return False
+        for sid in _job_service_ids(job):
+            cap = service_concurrency_cap(sid)
+            if not cap:
+                continue
+            if _service_live_count_locked(sid, exclude_job_id=job_id) >= cap:
+                return False
+    return True
 
 
 def other_job_uses_build_swap(job_id: str) -> bool:
@@ -2822,14 +2957,19 @@ def max_concurrent_jobs() -> int:
         return 5
 
 
-def active_job_summary(client_id: str = "", service_id: str = "") -> dict[str, Any] | None:
+def active_job_summary(
+    client_id: str = "", service_id: str = "", template_id: str = ""
+) -> dict[str, Any] | None:
     """Return the occupying job for a service (running or queued)."""
     want = _normalize_client_id(client_id)
     sid = str(service_id or "").strip()
+    tid = str(template_id or "").strip()
     with _jobs_lock:
         live = _live_jobs_locked()
         if sid:
             live = [job for job in live if sid in _job_service_ids(job)]
+        if tid:
+            live = [job for job in live if _job_template_id(job) == tid]
         if not live:
             return None
         if want and not sid:
@@ -2837,6 +2977,11 @@ def active_job_summary(client_id: str = "", service_id: str = "") -> dict[str, A
             if mine:
                 return deepcopy({key: mine[0].get(key) for key in JOB_COMPACT_FIELDS})
             return None
+        # Prefer newest live job for this filter.
+        live.sort(
+            key=lambda item: (str(item.get("created_at") or ""), str(item.get("id") or "")),
+            reverse=True,
+        )
         return deepcopy({key: live[0].get(key) for key in JOB_COMPACT_FIELDS})
 
 
@@ -2854,32 +2999,12 @@ def list_running_job_summaries(client_id: str = "", service_id: str = "") -> lis
 
 def register_concurrent_job(job: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Register a job. Each microservice may have at most one live (running/queued)
-    job. Global parallelism is enforced later via FIFO slots, not by rejecting
-    the request.
+    Register a job. Per-service caps are enforced in wait_for_build_slot so
+    excess jobs enter queued/waiting instead of being rejected at submit time.
     """
-    incoming = _job_service_ids(job)
-    caps = {sid: service_concurrency_cap(sid) for sid in incoming}
     job.setdefault("slot_held", False)
     job.setdefault("queue_position", 0)
     with _jobs_lock:
-        live = _live_jobs_locked()
-        for service_id, cap in caps.items():
-            if not cap:
-                continue
-            same = [item for item in live if service_id in _job_service_ids(item)]
-            if len(same) >= cap:
-                return {
-                    "error": (
-                        f"{service_id} 正在编译（{len(same)}/{cap}），"
-                        "请等当前任务结束后再提交"
-                    ),
-                    "error_code": "service_busy",
-                    "service": service_id,
-                    "active_jobs": [
-                        deepcopy({key: item.get(key) for key in JOB_COMPACT_FIELDS}) for item in same
-                    ],
-                }
         _jobs[str(job["id"])] = job
     return None
 
@@ -2936,7 +3061,7 @@ def release_build_slot(job_id: str) -> None:
 
 
 def wait_for_build_slot(job_id: str) -> bool:
-    """FIFO wait until this job may occupy a global execution slot."""
+    """FIFO wait until this job may occupy a global + per-service execution slot."""
     logged_wait = False
     with log_substep("slot"):
         with _slot_lock:
@@ -2955,7 +3080,8 @@ def wait_for_build_slot(job_id: str) -> bool:
                         if job_id in _slot_queue:
                             _slot_queue.remove(job_id)
                         return False
-                if held < limit and _slot_queue and _slot_queue[0] == job_id:
+                service_ok = job_within_service_caps(job_id)
+                if held < limit and service_ok and _slot_queue and _slot_queue[0] == job_id:
                     _slot_queue.pop(0)
                     set_job(
                         job_id,
@@ -2967,6 +3093,16 @@ def wait_for_build_slot(job_id: str) -> bool:
                     append_job_log(job_id, f"acquired build slot ({held + 1}/{limit})")
                     _slot_cond.notify_all()
                     return True
+                # If head of queue is blocked by per-service cap, rotate it behind
+                # the next eligible waiter so other services can proceed.
+                if (
+                    _slot_queue
+                    and _slot_queue[0] == job_id
+                    and held < limit
+                    and not service_ok
+                    and len(_slot_queue) > 1
+                ):
+                    _slot_queue.append(_slot_queue.pop(0))
                 pos = _queue_position_locked(job_id)
                 set_job(
                     job_id,
@@ -2976,9 +3112,10 @@ def wait_for_build_slot(job_id: str) -> bool:
                     queue_position=pos,
                 )
                 if not logged_wait:
+                    reason = "service concurrency full" if not service_ok else f"build slot full ({held}/{limit})"
                     append_job_log(
                         job_id,
-                        f"build slot full ({held}/{limit}); queued at position {pos}",
+                        f"{reason}; queued at position {pos}",
                     )
                     logged_wait = True
                 _slot_cond.wait(timeout=1.0)
@@ -3431,6 +3568,15 @@ def _job_duration_sec(meta: dict[str, Any]) -> int | None:
     return max(0, int(end - start))
 
 
+def _job_template_name(meta: Mapping[str, Any] | None) -> str:
+    name = str((meta or {}).get("template_name") or "").strip()
+    return name or DEFAULT_PIPELINE_TEMPLATE_NAME
+
+
+def _job_template_id(meta: Mapping[str, Any] | None) -> str:
+    return str((meta or {}).get("template_id") or "").strip()
+
+
 def _history_row(meta: dict[str, Any], mtime: float = 0.0) -> dict[str, Any]:
     return {
         "id": str(meta.get("id") or ""),
@@ -3450,18 +3596,22 @@ def _history_row(meta: dict[str, Any], mtime: float = 0.0) -> dict[str, Any]:
         "commit_sha": meta.get("commit_sha"),
         "remote": meta.get("remote"),
         "archive": meta.get("archive"),
+        "template_id": _job_template_id(meta),
+        "template_name": _job_template_name(meta),
     }
 
 
 def list_build_history(
     client_id: str = "",
     service_id: str = "",
+    template_id: str = "",
     page: int = 1,
     page_size: int = HISTORY_DEFAULT_PAGE_SIZE,
 ) -> dict[str, Any]:
     """Paginated jobs for the whole platform. Optional client_id / service_id filters."""
     want = _normalize_client_id(client_id)
     sid = str(service_id or "").strip()
+    tid = str(template_id or "").strip()
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     with _jobs_lock:
@@ -3469,6 +3619,8 @@ def list_build_history(
             if want and _normalize_client_id(job.get("client_id")) != want:
                 continue
             if sid and sid not in _job_service_ids(job):
+                continue
+            if tid and _job_template_id(job) != tid:
                 continue
             job_id = str(job.get("id") or "")
             if not job_id:
@@ -3488,6 +3640,8 @@ def list_build_history(
         if want and _normalize_client_id(row.get("client_id")) != want:
             continue
         if sid and sid not in _job_service_ids(row):
+            continue
+        if tid and _job_template_id(row) != tid:
             continue
         rows.append(row)
         seen.add(job_id)
@@ -3513,6 +3667,7 @@ def list_build_history(
         "page_count": page_count,
         "client_id": want or None,
         "service_id": sid or None,
+        "template_id": tid or None,
     }
 
 
@@ -3593,6 +3748,8 @@ def persist_job_meta(job_id: str) -> None:
             "rollback_completed",
             "rollback_failed",
             "frozen_inputs",
+            "template_id",
+            "template_name",
         )
         meta = {k: job.get(k) for k in keys}
         # Keep running-job JSON small so history listing stays cheap.
@@ -3692,6 +3849,8 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "rollback_completed": bool(meta.get("rollback_completed")),
         "rollback_failed": bool(meta.get("rollback_failed")),
         "frozen_inputs": meta.get("frozen_inputs") or {},
+        "template_id": _job_template_id(meta),
+        "template_name": _job_template_name(meta),
         "log": log_lines,
     }
 
@@ -7379,10 +7538,13 @@ def run_push_job(
             if job_cancel_requested(job_id):
                 raise JobStopped()
             if not gamma_ok:
+                failed_stage = str((_job_copy(job_id).get("stage") or "gamma") or "gamma")
+                if str(gamma_err or "").startswith("生产发布"):
+                    failed_stage = "release"
                 set_job(
                     job_id,
                     status="failed",
-                    stage="gamma",
+                    stage=failed_stage,
                     current="",
                     error=gamma_err,
                     remote="; ".join(remotes),
@@ -7598,10 +7760,18 @@ class Handler(SimpleHTTPRequestHandler):
 
         m_rollouts = re.fullmatch(r"/api/environments/([^/]+)/rollouts", path)
         if m_rollouts:
+            job_id = str((query.get("job_id") or [""])[0]).strip()
+            live_raw = str((query.get("live") or ["1"])[0]).strip().lower()
+            want_live = live_raw not in ("0", "false", "no")
             rows: list[dict[str, Any]] = []
             for record in list_parallel_rollouts(m_rollouts.group(1)):
-                state, err = parallel_rollout_live_state(str(record["id"]))
-                rows.append(state if state is not None else {**record, "error": err})
+                if job_id and str(record.get("job_id") or "") != job_id:
+                    continue
+                if want_live:
+                    state, err = parallel_rollout_live_state(str(record["id"]))
+                    rows.append(state if state is not None else {**record, "error": err})
+                else:
+                    rows.append(dict(record))
             self._json(200, {"rollouts": rows})
             return
 
@@ -7803,6 +7973,7 @@ class Handler(SimpleHTTPRequestHandler):
 
             client_id = _normalize_client_id((query.get("client_id") or [""])[0])
             service_id = str((query.get("service_id") or [""])[0]).strip()
+            template_id = str((query.get("template_id") or [""])[0]).strip()
             page = _query_int("page", 1)
             if "page_size" in query:
                 page_size = _query_int("page_size", HISTORY_DEFAULT_PAGE_SIZE)
@@ -7813,6 +7984,7 @@ class Handler(SimpleHTTPRequestHandler):
                 list_build_history(
                     client_id=client_id,
                     service_id=service_id,
+                    template_id=template_id,
                     page=page,
                     page_size=page_size,
                 ),
@@ -7879,7 +8051,10 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/running-job":
             client_id = _normalize_client_id((query.get("client_id") or [""])[0])
             service_id = str((query.get("service_id") or [""])[0]).strip()
-            payload = active_job_summary(client_id=client_id, service_id=service_id)
+            template_id = str((query.get("template_id") or [""])[0]).strip()
+            payload = active_job_summary(
+                client_id=client_id, service_id=service_id, template_id=template_id
+            )
             if payload:
                 self._json(200, payload)
                 return
@@ -8386,6 +8561,12 @@ class Handler(SimpleHTTPRequestHandler):
             ids = ",".join(it["service_id"] for it in items)
             service_ids = [it["service_id"] for it in items]
             branches = ",".join(it["branch"] for it in items)
+            template_id = str(data.get("template_id") or "").strip()
+            template_name = str(data.get("template_name") or "").strip()
+            if template_id and not template_name and user:
+                tpl = get_pipeline_template(user, template_id)
+                if tpl:
+                    template_name = str(tpl.get("name") or "").strip()
             new_job = {
                 'frozen_inputs': frozen_inputs,
                 "id": job_id,
@@ -8396,6 +8577,8 @@ class Handler(SimpleHTTPRequestHandler):
                 "service_id": ids,
                 "service_ids": service_ids,
                 "branch": branches,
+                "template_id": template_id,
+                "template_name": template_name,
                 "status": "running",
                 "stage": "starting",
                 "error": None,

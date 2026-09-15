@@ -15,6 +15,7 @@ let currentJobId = "";
 let currentJob = null;
 let pinnedJobId = "";
 let serviceActiveJobId = "";
+let templateActiveJobId = "";
 let pollTimer = null;
 let pollGeneration = 0;
 let viewGeneration = 0;
@@ -459,7 +460,8 @@ function updateActionButtons() {
   const svc = currentService();
   const live = jobIsLive(currentJob);
   const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
-  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runPreviewActive || cloneLayerOpen();
+  // Only block Run when THIS pipeline template already has a live job.
+  if ($("btnRun")) $("btnRun").disabled = !svc || !!templateActiveJobId || runPreviewActive || cloneLayerOpen();
   const tpl = selectedPipelineTemplate();
   const tplBusy = !svc || runPreviewActive || cloneLayerOpen();
   if ($("tplTrigger")) $("tplTrigger").disabled = tplBusy;
@@ -599,7 +601,6 @@ function decoratePipelineTask(task, logStep, stageId) {
   };
 }
 function visiblePipelineTasks(step) {
-  if (step.id === "rollback") return [];
   const hidden = HIDDEN_PIPELINE_TASKS[step.id] || new Set();
   const raw = Array.isArray(step.subtasks) && step.subtasks.length
     ? step.subtasks
@@ -613,6 +614,13 @@ function visiblePipelineTasks(step) {
       label: "归档镜像",
       status: step.status || "pending",
     }, "archive", "archive")];
+  }
+  if (step.id === "rollback") {
+    return [decoratePipelineTask({
+      id: "rollback",
+      label: "一键回滚",
+      status: step.status || "pending",
+    }, "rollback", "rollback")];
   }
   if (step.id === "gamma") {
     return tasks.filter((task) => task.status !== "skipped");
@@ -701,7 +709,7 @@ function previewPipelineData() {
       { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
       { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
       { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
-      { id: "rollback", label: "一键回滚", status: "skipped", subtasks: [] },
+      { id: "rollback", label: "一键回滚", status: "skipped", subtasks: [task("rollback", "一键回滚")] },
     ],
   };
 }
@@ -857,7 +865,7 @@ function syncRunLayerChrome() {
 }
 function openRunWindow(templateId) {
   const svc = currentService();
-  if (!svc || serviceActiveJobId) return;
+  if (!svc || templateActiveJobId) return;
   const layer = $("runLayer");
   if (!layer) return;
   if (runLayerOpen() || cloneLayerOpen()) return;
@@ -1004,7 +1012,14 @@ function renderPipelineTemplates() {
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         const id = btn.getAttribute("data-tpl-id") || "";
-        if (id) selectedTemplateId = id;
+        if (id && id !== selectedTemplateId) {
+          selectedTemplateId = id;
+          templateActiveJobId = "";
+          hideTplMenu();
+          renderPipelineTemplates();
+          if (!isAllServices() && currentServiceId) loadServiceJob();
+          return;
+        }
         hideTplMenu();
         renderPipelineTemplates();
       });
@@ -1103,12 +1118,46 @@ function confirmDeleteTemplate(id) {
     }
   });
 }
-function createStatusIcon(status, kind, doc) {
+function createStatusIcon(status, kind, doc, opts) {
   doc = doc || document;
   const icon = doc.createElement("span");
-  icon.className = (kind || "pl-icon") + " is-" + (status || "pending");
+  const cont = !!(opts && opts.continueIcon) && (status === "queued" || status === "waiting");
+  icon.className = (kind || "pl-icon") + " is-" + (status || "pending") + (cont ? " is-continue" : "");
+  if (cont) {
+    icon.setAttribute("aria-label", "等待继续");
+    icon.textContent = "";
+    return icon;
+  }
   icon.textContent = status === "done" ? "✓" : (status === "failed" || status === "warn") ? "✕" : status === "skipped" ? "–" : (status === "running" || status === "queued") ? "●" : "";
   return icon;
+}
+function createEllipsisColumn(doc) {
+  doc = doc || document;
+  const col = doc.createElement("div");
+  col.className = "pl-col pl-ellipsis";
+  const cap = doc.createElement("div");
+  cap.className = "pl-caption";
+  const title = doc.createElement("div");
+  title.className = "pl-title";
+  title.textContent = "···";
+  title.title = "执行测试 / 构建镜像 / 推送 SWR";
+  const dur = doc.createElement("div");
+  dur.className = "pl-dur";
+  dur.innerHTML = "&nbsp;";
+  cap.append(title, dur);
+  const spine = doc.createElement("div");
+  spine.className = "pl-spine";
+  const left = doc.createElement("div");
+  left.className = "pl-rail left is-wait";
+  const right = doc.createElement("div");
+  right.className = "pl-rail right is-wait";
+  const icon = doc.createElement("span");
+  icon.className = "pl-ellipsis-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.append(doc.createElement("span"), doc.createElement("span"), doc.createElement("span"));
+  spine.append(left, icon, right);
+  col.append(cap, spine);
+  return col;
 }
 function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc) {
   doc = doc || document;
@@ -1135,7 +1184,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
   const right = doc.createElement("div");
   right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
-  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc), right);
+  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc, { continueIcon: status === "queued" }), right);
   col.appendChild(spine);
   const drop = doc.createElement("div");
   drop.className = "pl-drop";
@@ -1170,7 +1219,9 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
       row.classList.add("is-selectable");
       row.appendChild(createPreviewCheck(stage.id, task.id, doc));
     } else {
-      row.appendChild(createStatusIcon(task.status, "pl-task-icon", doc));
+      row.appendChild(createStatusIcon(task.status, "pl-task-icon", doc, {
+        continueIcon: task.status === "queued",
+      }));
     }
     const name = doc.createElement("span");
     name.className = "pl-task-name";
@@ -1388,7 +1439,7 @@ function createApprovalGate(gate, incomingComplete, outgoingComplete, jobId, doc
   left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
   const right = doc.createElement("div");
   right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
-  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc), right);
+  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc, { continueIcon: true }), right);
   col.append(cap, spine);
   col.title = status === "queued"
     ? "等待生产发布权限责任人确认，点击继续"
@@ -1430,24 +1481,41 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   scroll.className = "pl-scroll";
   const graph = doc.createElement("div");
   graph.className = "pl-graph";
-  const isComplete = (stage) => Boolean(stage && (stage.status === "done" || stage.status === "skipped"));
+  const isRailDone = (node) => Boolean(node && node.status === "done");
   const gates = preview || !Array.isArray(pipeline.gates) ? [] : pipeline.gates;
   const nodes = [];
+  const previewCollapse = new Set(["test", "build", "push"]);
+  let collapsedPreview = false;
   stages.forEach((stage) => {
+    if (preview && previewCollapse.has(stage.id)) {
+      if (!collapsedPreview) {
+        nodes.push({ kind: "ellipsis", data: { id: "ellipsis", status: "pending" } });
+        collapsedPreview = true;
+      }
+      return;
+    }
     gates.filter((gate) => gate.before === stage.id).forEach((gate) => nodes.push({ kind: "gate", data: gate }));
     nodes.push({ kind: "stage", data: stage });
   });
-  graph.appendChild(createEndpoint("start", !preview, doc));
+  const progressed = !preview && stages.some((stage) => {
+    const st = stage && stage.status;
+    return st && st !== "pending" && st !== "skipped";
+  });
+  graph.appendChild(createEndpoint("start", progressed, doc));
   nodes.forEach((node, index) => {
     const stage = node.data;
     const previous = nodes[index - 1] && nodes[index - 1].data;
-    const incomingComplete = !preview && (index === 0 || isComplete(previous));
-    const outgoingComplete = !preview && isComplete(stage);
+    const incomingComplete = !preview && (index === 0 ? progressed : isRailDone(previous));
+    const outgoingComplete = !preview && isRailDone(stage);
+    if (node.kind === "ellipsis") {
+      graph.appendChild(createEllipsisColumn(doc));
+      return;
+    }
     graph.appendChild(node.kind === "gate"
       ? createApprovalGate(stage, incomingComplete, outgoingComplete, meta.job_id || currentJobId, doc)
       : createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc));
   });
-  graph.appendChild(createEndpoint("end", !preview && isComplete(stages[stages.length - 1]) && status === "ok", doc));
+  graph.appendChild(createEndpoint("end", !preview && status === "ok" && stages.some((stage) => isRailDone(stage)), doc));
   scroll.appendChild(graph);
   root.appendChild(scroll);
 }
@@ -1509,13 +1577,15 @@ function renderPager(el, pager, meta, onChange) {
 function renderHistory(items, meta) {
   const body = $("historyBody");
   if (!body) return;
+  const cols = isAllServices() ? 9 : 8;
   if (!items.length) {
-    body.innerHTML = '<tr><td colspan="' + (isAllServices() ? 8 : 7) + '" class="hint">暂无构建记录。</td></tr>';
+    body.innerHTML = '<tr><td colspan="' + cols + '" class="hint">暂无构建记录。</td></tr>';
   } else {
     body.innerHTML = items.map((item) => (
       "<tr>" +
       '<td class="hist-time">' + esc(item.created_at || "—") + "</td>" +
       '<td class="hist-service-cell">' + esc(item.service_id || "—") + "</td>" +
+      clipTd(item.template_name || "—", "hist-pipeline") +
       clipTd(item.branch, "hist-branch") +
       '<td class="' + historyStatusClass(item.status) + '">' + esc(historyStatusLabel(item.status)) + "</td>" +
       '<td class="mono">' + esc(shortSha(item.commit_sha)) + "</td>" +
@@ -1572,7 +1642,7 @@ async function refreshHistory() {
       renderHistory(data.jobs || [], data);
     } catch (_) {
       if (!viewIsCurrent(gen, sid)) return;
-      if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + (isAllServices() ? 8 : 7) + '" class="hint">加载失败，请刷新。</td></tr>';
+      if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + (isAllServices() ? 9 : 8) + '" class="hint">加载失败，请刷新。</td></tr>';
     }
   });
 }
@@ -1766,7 +1836,7 @@ function fillServiceSelect() {
   renderFavoriteServices();
 }
 function clearStaleLists() {
-  const historyColumns = isAllServices() ? 8 : 7;
+  const historyColumns = isAllServices() ? 9 : 8;
   const artifactColumns = isAllServices() ? 7 : 6;
   if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + historyColumns + '" class="hint">加载中…</td></tr>';
   if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="' + artifactColumns + '" class="hint">加载中…</td></tr>';
@@ -1794,6 +1864,7 @@ function activateService(id) {
   servicePermissions = [];
   pinnedJobId = "";
   serviceActiveJobId = "";
+  templateActiveJobId = "";
   viewGeneration += 1;
   historyPager.page = 1;
   artifactsPager.page = 1;
@@ -1928,7 +1999,7 @@ function applyJob(job, { loading } = {}) {
     if (root) { root.hidden = true; root.replaceChildren(); }
     if (empty) {
       empty.hidden = false;
-      empty.textContent = loading ? "正在加载流水线…" : "当前服务无构建历史记录";
+      empty.textContent = loading ? "正在加载流水线…" : "当前分支无构建历史记录";
     }
     return;
   }
@@ -1982,14 +2053,27 @@ async function openJob(jobId, { fromHistory } = {}) {
 async function refreshServiceOccupancy() {
   if (!sessionLive || isAllServices() || !currentServiceId) {
     serviceActiveJobId = "";
+    templateActiveJobId = "";
     updateActionButtons();
     return;
   }
+  const tid = selectedTemplateId || "";
   try {
-    const running = await api("/api/running-job?service_id=" + encodeURIComponent(currentServiceId));
-    serviceActiveJobId = (running && running.id) || "";
+    const running = await api(
+      "/api/running-job?service_id=" + encodeURIComponent(currentServiceId) +
+      (tid ? "&template_id=" + encodeURIComponent(tid) : "")
+    );
+    templateActiveJobId = (running && running.id) || "";
+    // Keep a service-level occupancy hint for UI chrome that still needs it.
+    if (tid) {
+      const any = await api("/api/running-job?service_id=" + encodeURIComponent(currentServiceId));
+      serviceActiveJobId = (any && any.id) || "";
+    } else {
+      serviceActiveJobId = templateActiveJobId;
+    }
   } catch (_) {
     serviceActiveJobId = "";
+    templateActiveJobId = "";
   }
   updateActionButtons();
 }
@@ -1997,6 +2081,7 @@ async function refreshServiceOccupancy() {
 async function loadServiceJob() {
   const gen = viewGeneration;
   const sid = currentServiceId;
+  const tid = selectedTemplateId || "";
   stopPolling();
   pinnedJobId = "";
   if (!sessionLive || !sid || sid === ALL_SERVICES_ID) {
@@ -2008,21 +2093,24 @@ async function loadServiceJob() {
   const started = Date.now();
   if (currentJob && !jobBelongsToService(currentJob, sid)) applyJob(null, { loading: true });
   else if (!currentJob) applyJob(null, { loading: true });
+  const stillHere = () => viewIsCurrent(gen, sid) && (selectedTemplateId || "") === tid;
   try {
-    const running = await api("/api/running-job?service_id=" + encodeURIComponent(sid));
-    if (!viewIsCurrent(gen, sid)) return;
-    serviceActiveJobId = (running && running.id) || "";
+    const qs = "service_id=" + encodeURIComponent(sid) +
+      (tid ? "&template_id=" + encodeURIComponent(tid) : "");
+    const running = await api("/api/running-job?" + qs);
+    if (!stillHere()) return;
+    templateActiveJobId = (running && running.id) || "";
     updateActionButtons();
     if (running && running.id && await openJob(running.id)) return;
-    if (!viewIsCurrent(gen, sid)) return;
-    const hist = await api("/api/jobs?service_id=" + encodeURIComponent(sid) + "&page=1&page_size=1");
-    if (!viewIsCurrent(gen, sid)) return;
+    if (!stillHere()) return;
+    const hist = await api("/api/jobs?" + qs + "&page=1&page_size=1");
+    if (!stillHere()) return;
     const latest = hist.jobs && hist.jobs[0];
     if (latest && latest.id && await openJob(latest.id)) return;
-    if (!viewIsCurrent(gen, sid)) return;
+    if (!stillHere()) return;
     applyJob(null);
   } catch (e) {
-    if (!viewIsCurrent(gen, sid)) return;
+    if (!stillHere()) return;
     const empty = $("pipelineEmpty");
     const root = $("liveJobPipeline");
     if (root) { root.hidden = true; root.replaceChildren(); }
@@ -2298,6 +2386,7 @@ async function startRun(branch) {
   }
     submitting = true;
   try {
+    const tpl = findPipelineTemplate(runLayerTemplateId) || selectedPipelineTemplate();
     const resp = await api("/api/push", {
       method: "POST",
       body: JSON.stringify({
@@ -2305,6 +2394,8 @@ async function startRun(branch) {
         branch: selectedBranch,
         version: rememberedDaemonVersion() || svc.last_version || "",
         login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
+        template_id: (tpl && tpl.id) || selectedTemplateId || "",
+        template_name: (tpl && tpl.name) || "",
         optional_steps: {
           gamma_deploy: !!runPreviewSelection.gammaDeploy,
           production_release: !!runPreviewSelection.deploy,
@@ -2324,6 +2415,7 @@ async function startRun(branch) {
     runPreviewActive = false;
     runLayerMode = "run";
     runLayerTemplateId = "";
+    if (tpl && tpl.id) selectedTemplateId = tpl.id;
     applyServiceChrome();
     pinnedJobId = "";
     setTab("pipeline");
@@ -2634,22 +2726,13 @@ async function openStepModal(stageId, taskId) {
   tableWrap.hidden = true;
   const logEl = document.createElement("pre");
   logEl.className = "log step-log";
+  logEl.textContent = "加载中…";
   pane.append(tableWrap, logEl);
   wrap.append(list, pane);
   openModal("步骤详情", wrap, { wide: true });
 
-  let releaseRollouts = [];
-  if (stage.id === "release" || stage.id === "rollback") {
-    const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
-      (((currentJob || {}).optional_steps || {}).release_environment_id || "");
-    if (envId) {
-      try {
-        const data = await api('/api/environments/' + encodeURIComponent(envId) + '/rollouts');
-        releaseRollouts = (data.rollouts || []).filter((item) => item.job_id === currentJobId);
-      } catch (_) { releaseRollouts = []; }
-    }
-  }
-  const releaseState = String((releaseRollouts[0] || {}).status || "");
+  // Use job-stored rollout status only — never block the left step list on CCE.
+  const releaseState = String(((((currentJob || {}).gamma_rollouts || [])[0] || {}).status) || "");
   if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)) taskId = "release-compare:results";
   if (stage.id === "release" && taskId === "compare") taskId = "release-compare:results";
   if (stage.id === "rollback") taskId = "rollback:results";
@@ -2664,14 +2747,17 @@ async function openStepModal(stageId, taskId) {
     pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
     const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
       (((currentJob || {}).optional_steps || {}).release_environment_id || "");
-    if (!envId) return;
     const rolloutPanel = document.createElement("div");
     rolloutPanel.className = "env-rollouts step-rollouts";
-    rolloutPanel.dataset.envRolloutList = envId;
+    rolloutPanel.dataset.envRolloutList = envId || "";
     rolloutPanel.dataset.jobId = currentJobId;
     rolloutPanel.dataset.compareMode = mode;
     rolloutPanel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
     pane.appendChild(rolloutPanel);
+    if (!envId) {
+      rolloutPanel.innerHTML = '<p class="hint error">未找到发布环境，无法加载版本对比。</p>';
+      return;
+    }
     await loadEnvRollouts(envId, rolloutPanel, mode);
   };
 
@@ -2732,6 +2818,9 @@ async function openStepModal(stageId, taskId) {
       await showReleaseComparison(selectedTask.startsWith("rollback") ? "rollback" : "release");
       return;
     }
+    logEl.hidden = false;
+    logEl.textContent = "加载中…";
+    tableWrap.hidden = true;
     const caseSel = parseCaseSelection(selectedTask);
     const selected = caseSel
       ? (stage.tasks || []).find((task) => task.id === (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId))
@@ -2965,7 +3054,12 @@ function rolloutWorkloadHtml(rollout, side, item, allowScale) {
   const old = side === 'old';
   const exists = !!item.exists;
   const replicas = Number.isFinite(Number(item.desired_replicas)) ? Number(item.desired_replicas) : 0;
-  const image = Array.isArray(item.images) && item.images.length ? item.images.join(', ') : '—';
+  let image = Array.isArray(item.images) && item.images.length ? item.images.join(', ') : '';
+  if (!image) {
+    if (!old && rollout && rollout.image) image = String(rollout.image);
+    else if (Array.isArray(item.images)) image = '—';
+    else image = '—';
+  }
   return '<div class="env-rollout-workload ' + (old ? 'is-old' : 'is-new') + '">' +
     '<strong>' + (old ? '旧版本负载' : '新版本负载') + '</strong><span>' + esc(item.name || '—') + '</span>' +
     '<small>镜像：' + esc(image) + '</small><small>实例：' + (exists ? replicas + '（Ready ' + Number(item.ready_replicas || 0) + '）' : '已不存在') + '</small>' +
@@ -2994,24 +3088,37 @@ function renderEnvRollouts(panel, rows, error, mode) {
     const card = btn.closest('[data-rollout-id]'); const name = card && card.querySelector('.is-old span');
     if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？', {title:'老版本下线', confirmLabel:'确认下线'})) return;
     btn.disabled = true;
-    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode); await openJob(currentJobId); }
-    catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
+    try {
+      await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' });
+      closeModal();
+      await openJob(currentJobId, { fromHistory: true });
+    }
+    catch (e) { setEnvError(e.message); alert(e.message || '下线失败'); } finally { btn.disabled = false; }
   }));
   panel.querySelectorAll('[data-rollout-rollback]').forEach((btn) => btn.addEventListener('click', async () => {
     const card=btn.closest('[data-rollout-id]');
     if(!await askEnvConfirm('将恢复该流水线下线的旧版本，并删除环境当前运行的新版本。确认继续？', {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
-    btn.disabled=true; try { const data=await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'}); if(data.approval_required){ closeModal(); await openJob(currentJobId); return; } await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode); await openJob(currentJobId); }
+    btn.disabled=true; try {
+      const data=await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'});
+      if(data.approval_required){ closeModal(); await openJob(currentJobId, { fromHistory: true }); return; }
+      closeModal();
+      await openJob(currentJobId, { fromHistory: true });
+    }
     catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
 }
 
 async function loadEnvRollouts(id, panel, mode) {
   if (!id || !panel) return;
-  panel.hidden = false; panel.replaceChildren();
+  panel.hidden = false;
+  if (!panel.querySelector('.env-secret-hint') || !/加载中/.test(panel.textContent || '')) {
+    panel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
+  }
   try {
-    const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts');
     const jobId = panel.dataset.jobId || '';
-    const rows = jobId ? (data.rollouts || []).filter((item) => item.job_id === jobId) : (data.rollouts || []);
+    const qs = jobId ? ('?job_id=' + encodeURIComponent(jobId) + '&live=1') : '?live=1';
+    const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts' + qs);
+    const rows = data.rollouts || [];
     renderEnvRollouts(panel, rows, '', mode);
   }
   catch (e) { renderEnvRollouts(panel, [], e.message, mode); }
@@ -3146,28 +3253,118 @@ async function loadPermissions() {
   const data = await api('/api/permissions?service_id=' + encodeURIComponent(currentServiceId));
   servicePermissions = data.permissions || [];
   const accounts = data.accounts || [];
+  const specs = [
+    { permission_id: 'production_release', permission: '生产发布权限' },
+    { permission_id: 'environment_manage', permission: '环境管理权限' },
+  ];
+  const byId = {};
+  servicePermissions.forEach((row) => { byId[row.permission_id] = row; });
   root.innerHTML = '<table class="art-table permission-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody></tbody></table>';
   const tbody = root.querySelector('tbody');
-  servicePermissions.forEach((row) => {
-    const editable = (row.owners || []).includes(currentUser);
+  specs.forEach((spec) => {
+    const row = byId[spec.permission_id] || spec;
+    const initialOwners = [...(row.owners || [])];
+    const editable = initialOwners.includes(currentUser);
     const tr = document.createElement('tr');
+    const nameTd = document.createElement('td');
+    nameTd.innerHTML = '<strong>' + esc(row.permission || spec.permission) + '</strong>';
     const owners = document.createElement('td');
     owners.className = 'permission-owner-cell';
-    const chips = document.createElement('div'); chips.className = 'permission-chips';
-    (row.owners || []).forEach((owner) => {
-      const chip=document.createElement('span'); chip.className='permission-chip'; chip.textContent=owner;
-      const remove=document.createElement('button'); remove.type='button'; remove.textContent='×'; remove.title='移除 '+owner; remove.disabled=!editable || row.owners.length <= 1;
-      remove.addEventListener('click',()=>chip.remove()); chip.appendChild(remove); chips.appendChild(chip);
+    const editor = document.createElement('div');
+    editor.className = 'permission-owner-editor';
+    const inputWrap = document.createElement('div');
+    inputWrap.className = 'permission-owner-input' + (editable ? '' : ' is-disabled');
+    const account = document.createElement('input');
+    account.type = 'text';
+    account.className = 'input permission-account';
+    account.placeholder = editable ? '输入账号，回车添加' : '';
+    account.disabled = !editable;
+    inputWrap.appendChild(account);
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'btn permission-save';
+    save.textContent = '保存修改';
+    const currentOwners = () => [...inputWrap.querySelectorAll('.permission-chip')].map((c) => c.firstChild.nodeValue);
+    const syncSave = () => {
+      const next = currentOwners();
+      const dirty = next.length !== initialOwners.length || next.some((name, idx) => name !== initialOwners[idx]);
+      save.disabled = !editable || !dirty || next.length < 1;
+      save.classList.toggle('is-dirty', editable && dirty && next.length >= 1);
+      save.classList.toggle('primary', editable && dirty && next.length >= 1);
+    };
+    const addChip = (name) => {
+      const chip = document.createElement('span');
+      chip.className = 'permission-chip';
+      chip.appendChild(document.createTextNode(name));
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = '×';
+      remove.title = '移除 ' + name;
+      remove.disabled = !editable;
+      remove.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (!editable) return;
+        if (currentOwners().length <= 1) {
+          const err = $('permissionError');
+          err.hidden = false;
+          err.textContent = '至少保留一名责任人';
+          return;
+        }
+        chip.remove();
+        syncSave();
+      });
+      chip.appendChild(remove);
+      inputWrap.insertBefore(chip, account);
+    };
+    const tryAddOwner = () => {
+      if (!editable) return;
+      const name = account.value.trim();
+      const err = $('permissionError');
+      if (!name) return;
+      if (!accounts.includes(name)) {
+        err.hidden = false;
+        err.textContent = '账号不存在';
+        account.focus();
+        return;
+      }
+      if (currentOwners().includes(name)) {
+        err.hidden = false;
+        err.textContent = '该账号已是责任人';
+        return;
+      }
+      err.hidden = true;
+      err.textContent = '';
+      addChip(name);
+      account.value = '';
+      syncSave();
+    };
+    initialOwners.forEach(addChip);
+    account.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        tryAddOwner();
+      }
     });
-    const actions=document.createElement('div'); actions.className='permission-actions';
-    const account=document.createElement('input'); account.type='text'; account.className='input permission-account'; account.placeholder='输入账号'; account.disabled=!editable;
-    const add=document.createElement('button'); add.type='button'; add.className='btn ghost'; add.textContent='添加责任人'; add.disabled=!editable;
-    add.addEventListener('click',()=>{ const name=account.value.trim(); const err=$('permissionError'); if(!name) return; if(!accounts.includes(name)){ err.hidden=false; err.textContent='账号不存在'; account.focus(); return; } if([...chips.querySelectorAll('.permission-chip')].some(c=>c.firstChild.nodeValue===name)){ err.hidden=false; err.textContent='该账号已是责任人'; return; } err.hidden=true; err.textContent=''; const chip=document.createElement('span'); chip.className='permission-chip'; chip.textContent=name; const remove=document.createElement('button'); remove.type='button'; remove.textContent='×'; remove.title='移除 '+name; remove.addEventListener('click',()=>chip.remove()); chip.appendChild(remove); chips.appendChild(chip); account.value=''; });
-    const save=document.createElement('button'); save.type='button'; save.className='btn primary'; save.textContent='保存修改'; save.disabled=!editable;
-    save.addEventListener('click',async()=>{ const next=[...chips.querySelectorAll('.permission-chip')].map(c=>c.firstChild.nodeValue); try { await api('/api/permissions',{method:'POST',body:JSON.stringify({service_id:currentServiceId,permission_id:row.permission_id,owners:next})}); await loadPermissions(); } catch(e){ const err=$('permissionError'); err.hidden=false; err.textContent=e.message; } });
-    actions.append(account,add,save); owners.append(chips,actions);
-    tr.innerHTML='<td><strong>'+esc(row.permission)+'</strong></td>';
-    tr.appendChild(owners); tbody.appendChild(tr);
+    inputWrap.addEventListener('click', () => { if (editable) account.focus(); });
+    save.addEventListener('click', async () => {
+      const next = currentOwners();
+      try {
+        await api('/api/permissions', {
+          method: 'POST',
+          body: JSON.stringify({ service_id: currentServiceId, permission_id: row.permission_id || spec.permission_id, owners: next }),
+        });
+        await loadPermissions();
+      } catch (e) {
+        const err = $('permissionError');
+        err.hidden = false;
+        err.textContent = e.message;
+      }
+    });
+    syncSave();
+    editor.append(inputWrap, save);
+    owners.appendChild(editor);
+    tr.append(nameTd, owners);
+    tbody.appendChild(tr);
   });
 }
 function openEnvCreate() {
