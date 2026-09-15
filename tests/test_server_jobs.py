@@ -555,7 +555,7 @@ class JobPipelineTests(unittest.TestCase):
     def test_gamma_optional_steps_selected_done(self) -> None:
         job = make_job("pipe-gamma-on", status="ok")
         job["stage"] = "done"
-        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": False}
+        job["optional_steps"] = {"production_release": True, "gamma_deploy": False, "gamma_test": False}
         job["results"] = [{"service_id": "memory-service", "ok": True}]
         payload = server.job_payload(job, compact=True)
         steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
@@ -565,7 +565,7 @@ class JobPipelineTests(unittest.TestCase):
     def test_gamma_running_after_push_results(self) -> None:
         job = make_job("pipe-gamma-live", status="running")
         job["stage"] = "release"
-        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": True}
+        job["optional_steps"] = {"production_release": True, "gamma_deploy": True, "gamma_test": True}
         job["results"] = [
             {
                 "service_id": "memory-service",
@@ -583,7 +583,7 @@ class JobPipelineTests(unittest.TestCase):
         job = make_job("pipe-gamma-fail", status="failed")
         job["stage"] = "release"
         job["error"] = "kubectl 升级 memory-service 失败"
-        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": False}
+        job["optional_steps"] = {"production_release": True, "gamma_deploy": False, "gamma_test": False}
         job["results"] = [{"service_id": "memory-service", "ok": True}]
         payload = server.job_payload(job, compact=True)
         self.assertEqual("failed", payload["status"])

@@ -77,6 +77,7 @@ class PipelineTemplateApiTests(unittest.TestCase):
         self.assertTrue(release["builtin"])
         self.assertTrue(release["gamma_deploy"])
         self.assertTrue(release["gamma_test"])
+        self.assertTrue(release["production_release"])
 
         with self._open(
             "/api/pipeline-templates/" + personal["id"],
@@ -108,6 +109,7 @@ class PipelineTemplateApiTests(unittest.TestCase):
         self.assertEqual("custom", copied["kind"])
         self.assertFalse(copied["builtin"])
         self.assertTrue(copied["gamma_deploy"])
+        self.assertTrue(copied["production_release"])
 
         with self.assertRaises(HTTPError) as denied:
             self._open(

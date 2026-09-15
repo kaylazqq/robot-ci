@@ -280,7 +280,8 @@ class GammaAfterBuildTests(unittest.TestCase):
     def test_deploys_selected_environment(self) -> None:
         job = _job("gamma-run", service_id="semantic-schedule")
         job["optional_steps"] = {
-            "gamma_deploy": True,
+            "production_release": True,
+            "gamma_deploy": False,
             "gamma_test": False,
             "environment_id": "env1",
             "deployment_mode": "inplace",
@@ -339,12 +340,13 @@ class GammaAfterBuildTests(unittest.TestCase):
         self.assertEqual("jump-from-env", hop_kwargs.get("jump_password"))
         self.assertEqual("node-from-env", hop_kwargs.get("node_password"))
         with server._jobs_lock:
-            self.assertEqual("gamma", server._jobs["gamma-run"]["stage"])
+            self.assertEqual("release", server._jobs["gamma-run"]["stage"])
 
     def test_parallel_deploy_uses_cce_without_gamma_platform(self) -> None:
         job = _job("gamma-parallel", service_id="semantic-schedule")
         job["optional_steps"] = {
-            "gamma_deploy": True,
+            "production_release": True,
+            "gamma_deploy": False,
             "gamma_test": False,
             "environment_id": "env1",
             "deployment_mode": "parallel",
@@ -361,7 +363,7 @@ class GammaAfterBuildTests(unittest.TestCase):
         self.assertTrue(ok, err)
         deploy.assert_called_once()
 
-    def test_parallel_deploy_then_test_calls_gamma_test_only(self) -> None:
+    def test_gamma_deploy_then_test_stays_in_gamma_driver(self) -> None:
         job = _job("gamma-parallel-test", service_id="semantic-schedule")
         job["optional_steps"] = {
             "gamma_deploy": True,
@@ -386,7 +388,8 @@ class GammaAfterBuildTests(unittest.TestCase):
                         )
         self.assertTrue(ok, err)
         self.assertEqual(1, len(calls))
-        self.assertFalse(calls[0]["gamma_deploy"])
+        self.assertTrue(calls[0]["gamma_deploy"])
+        self.assertFalse(calls[0]["production_release"])
 
     def test_prepare_slot_is_done_after_gamma_starts(self) -> None:
         job = _job("gamma-progressed")
@@ -402,7 +405,7 @@ class GammaAfterBuildTests(unittest.TestCase):
             "status": "running",
             "cancel_requested": True,
             "results": [{"service_id": "memory-service", "ok": True}],
-            "optional_steps": {"gamma_deploy": True, "gamma_test": False, "environment_id": "env1"},
+            "optional_steps": {"production_release": True, "gamma_deploy": False, "gamma_test": False, "environment_id": "env1"},
         })
         with patch.object(server, "load_services", return_value=[{"id": "memory-service", "title": "memory"}]):
             pipeline = server.build_job_pipeline(job)

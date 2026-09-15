@@ -986,8 +986,8 @@ def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, s
 
 
 BUILTIN_PIPELINE_TEMPLATES = (
-    {"kind": "personal", "name": "个人构建流水线", "gamma_deploy": 0, "gamma_test": 0},
-    {"kind": "release", "name": "生产发布", "gamma_deploy": 1, "gamma_test": 1},
+    {"kind": "personal", "name": "个人构建流水线", "gamma_deploy": 0, "gamma_test": 0, "production_release": 0},
+    {"kind": "release", "name": "生产发布", "gamma_deploy": 1, "gamma_test": 1, "production_release": 1},
 )
 
 
@@ -1010,6 +1010,10 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(pipeline_templates)")}
+    if "production_release" not in cols:
+        conn.execute("ALTER TABLE pipeline_templates ADD COLUMN production_release INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE pipeline_templates SET production_release=1 WHERE kind='release' AND builtin=1")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pipeline_templates_user_svc "
         "ON pipeline_templates (username, service_id)"
@@ -1026,6 +1030,7 @@ def _pipeline_template_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "branch": str(row["branch"] or "").strip(),
         "gamma_deploy": bool(row["gamma_deploy"]),
         "gamma_test": bool(row["gamma_test"]),
+        "production_release": bool(row["production_release"]),
         "environment_id": str(row["environment_id"] or "").strip(),
         "builtin": bool(row["builtin"]),
         "created_at": str(row["created_at"] or ""),
@@ -1042,8 +1047,8 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
         """
         INSERT INTO pipeline_templates (
             id, username, service_id, name, kind, branch,
-            gamma_deploy, gamma_test, environment_id, builtin, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            gamma_deploy, gamma_test, production_release, environment_id, builtin, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"],
@@ -1054,6 +1059,7 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
             item["branch"],
             1 if item["gamma_deploy"] else 0,
             1 if item["gamma_test"] else 0,
+            1 if item.get("production_release") else 0,
             item["environment_id"],
             1 if item["builtin"] else 0,
             item["created_at"],
@@ -1103,6 +1109,7 @@ def ensure_default_pipeline_templates(username: str, service_id: str) -> None:
                         "branch": "",
                         "gamma_deploy": spec["gamma_deploy"],
                         "gamma_test": spec["gamma_test"],
+                        "production_release": spec["production_release"],
                         "environment_id": "",
                         "builtin": True,
                         "created_at": now,
@@ -1171,6 +1178,7 @@ def _normalize_template_fields(data: dict[str, Any], *, require_name: bool = Fal
         "branch": branch,
         "gamma_deploy": bool((data or {}).get("gamma_deploy")),
         "gamma_test": bool((data or {}).get("gamma_test")),
+        "production_release": bool((data or {}).get("production_release")),
         "environment_id": str((data or {}).get("environment_id") or "").strip(),
     }, ""
 
@@ -1190,7 +1198,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
             conn.execute(
                 """
                 UPDATE pipeline_templates SET
-                    name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?,
+                    name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?, production_release = ?,
                     environment_id = ?, updated_at = ?
                 WHERE id = ? AND username = ?
                 """,
@@ -1199,6 +1207,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                     fields["branch"],
                     1 if fields["gamma_deploy"] else 0,
                     1 if fields["gamma_test"] else 0,
+                    1 if fields["production_release"] else 0,
                     fields["environment_id"],
                     now,
                     item["id"],
@@ -1517,6 +1526,7 @@ JOB_PUBLIC_FIELDS = (
     "test_kinds",
     "gamma_runs",
     "gamma_deployed",
+    "production_released",
     "gamma_rollouts",
     "cancel_requested",
     "optional_steps",
@@ -1549,6 +1559,7 @@ JOB_COMPACT_FIELDS = (
     "test_kinds",
     "gamma_runs",
     "gamma_deployed",
+    "production_released",
     "gamma_rollouts",
     "cancel_requested",
     "slot_held",
@@ -1641,7 +1652,7 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
         ("push", "推送镜像"),
         ("verify", "推送确认"),
     ),
-    "gamma": (("test", "gamma测试"),),
+    "gamma": (("deploy", "gamma部署"), ("test", "gamma测试")),
     "release": (
         ("deploy", "部署新版本"),
         ("traffic", "调整新旧实例"),
@@ -1712,9 +1723,10 @@ def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
     if deployment_mode not in {"parallel", "inplace"}:
         raise ValueError("Unknown deployment mode")
     gamma_test = bool(raw.get("gamma_test"))
-    production_release = bool(raw.get("production_release", raw.get("gamma_deploy")))
+    gamma_deploy = bool(raw.get("gamma_deploy")) or gamma_test
+    production_release = bool(raw.get("production_release"))
     return {
-        "gamma_deploy": production_release,
+        "gamma_deploy": gamma_deploy,
         "production_release": production_release,
         "gamma_test": gamma_test,
         "environment_id": str(raw.get("release_environment_id") or raw.get("environment_id") or "").strip(),
@@ -1732,6 +1744,10 @@ def _gamma_selected(job: dict[str, Any] | None, task_id: str) -> bool:
     if task_id == "test":
         return bool(opts.get("gamma_test"))
     return False
+
+
+def _release_selected(job: dict[str, Any] | None) -> bool:
+    return bool(_normalize_optional_steps((job or {}).get("optional_steps")).get("production_release"))
 
 
 def _apply_gamma_override(statuses: dict[str, str], job: dict[str, Any] | None, *, live: bool) -> None:
@@ -1778,7 +1794,7 @@ def _job_needs_production_approval(job: dict[str, Any]) -> bool:
     opts = _normalize_optional_steps(job.get("optional_steps"))
     ids = []
     if opts.get("gamma_test"): ids.append(opts.get("gamma_environment_id"))
-    if opts.get("gamma_deploy"): ids.append(opts.get("release_environment_id"))
+    if opts.get("production_release"): ids.append(opts.get("release_environment_id"))
     return any((get_environment(str(env_id)) or {}).get("environment_type") == "production" for env_id in ids if env_id)
 
 
@@ -2430,7 +2446,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             step_defs = [item for item in step_defs if item[0] != "approval"]
         if not _gamma_selected(job, "test"):
             step_defs = [item for item in step_defs if item[0] != "gamma"]
-        if not _gamma_selected(job, "deploy"):
+        if not _release_selected(job):
             step_defs = [item for item in step_defs if item[0] != "release"]
         skip_push = _service_skip_push(svc)
 
@@ -2487,7 +2503,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             elif job_status == "failed" and stage == "release": statuses["release"] = "failed"
             elif is_running and stage == "release": statuses["release"] = "running"
             elif is_running and stage != "release": statuses["release"] = "pending"
-            elif job.get("gamma_deployed"): statuses["release"] = "done"
+            elif job.get("production_released"): statuses["release"] = "done"
         if "gamma" in statuses and is_running and stage == "release":
             statuses["gamma"] = "done"
         if (
@@ -3387,6 +3403,7 @@ def persist_job_meta(job_id: str) -> None:
             "test_kinds",
             "gamma_runs",
             "gamma_deployed",
+            "production_released",
             "gamma_rollouts",
             "cancel_requested",
             "stage_before_stop",
@@ -3481,6 +3498,7 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "test_kinds": meta.get("test_kinds") or [],
         "gamma_runs": meta.get("gamma_runs") or [],
         "gamma_deployed": bool(meta.get("gamma_deployed")),
+        "production_released": bool(meta.get("production_released")),
         "gamma_rollouts": meta.get("gamma_rollouts") or [],
         "step_logs": meta.get("step_logs") or {},
         "cancel_requested": bool(meta.get("cancel_requested")),
@@ -6892,7 +6910,7 @@ def maybe_run_gamma_after_build(
     """Run selected gamma steps after a successful push. Returns (ok, error)."""
     job = _job_copy(job_id)
     opts = _normalize_optional_steps(job.get("optional_steps"))
-    if not opts.get("gamma_deploy") and not opts.get("gamma_test"):
+    if not opts.get("gamma_deploy") and not opts.get("gamma_test") and not opts.get("production_release"):
         return True, ""
     if job_cancel_requested(job_id):
         raise JobStopped()
@@ -6917,7 +6935,7 @@ def maybe_run_gamma_after_build(
     if env_id:
         env = get_environment(env_id, include_secrets=True)
 
-    if opts.get("gamma_test"):
+    if opts.get("gamma_deploy") or opts.get("gamma_test"):
         gamma_env = get_environment(gamma_env_id, include_secrets=True) if gamma_env_id else None
         if not gamma_env_id:
             return False, "gamma测试失败: 未选择环境"
@@ -6932,7 +6950,7 @@ def maybe_run_gamma_after_build(
         from gamma_real import available, run as run_real_gamma
         if not available(gamma_env_id):
             return False, "该环境尚未配置真实 Gamma 驱动；未执行 Gamma 测试"
-        test_opts = {**opts, "environment_id": gamma_env_id, "gamma_deploy": False, "production_release": False}
+        test_opts = {**opts, "environment_id": gamma_env_id, "production_release": False}
         release_build_slot(job_id)
         with log_substep("test"):
             ok, error = run_real_gamma(job_id, results, test_opts,
@@ -6943,18 +6961,19 @@ def maybe_run_gamma_after_build(
             return ok, error
         set_job(job_id, stage="release")
 
-    if opts.get("gamma_deploy"):
+    if opts.get("production_release"):
+        set_job(job_id, stage="release")
         with log_substep("deploy"):
             if not env_id:
-                append_job_log(job_id, "ERROR gamma部署失败: 未选择环境")
-                return False, "gamma部署失败: 未选择环境"
+                append_job_log(job_id, "ERROR 生产发布失败: 未选择环境")
+                return False, "生产发布失败: 未选择环境"
             if not env:
-                append_job_log(job_id, f"ERROR gamma部署失败: 环境不存在 ({env_id})")
-                return False, f"gamma部署失败: 环境不存在 ({env_id})"
+                append_job_log(job_id, f"ERROR 生产发布失败: 环境不存在 ({env_id})")
+                return False, f"生产发布失败: 环境不存在 ({env_id})"
             env_sid = str(env.get("service_id") or "").strip()
             job_sids = set(_job_service_ids(job))
             if env_sid and env_sid not in job_sids:
-                msg = f"gamma部署失败: 环境属于 {env_sid}，与当前微服务不符"
+                msg = f"生产发布失败: 环境属于 {env_sid}，与当前微服务不符"
                 append_job_log(job_id, f"ERROR {msg}")
                 return False, msg
             if str(env.get("environment_type") or "dev") == "production":
@@ -7001,7 +7020,7 @@ def maybe_run_gamma_after_build(
                 append_job_log(job_id, f"ERROR {err}")
                 return False, err
             append_job_log(job_id, "生产发布成功")
-            set_job(job_id, gamma_deployed=True, gamma_rollouts=created_rollouts)
+            set_job(job_id, production_released=True, gamma_rollouts=created_rollouts)
             if created_rollouts:
                 release_build_slot(job_id)
                 append_job_log(job_id, "WAIT 老版本下线")
@@ -7014,28 +7033,6 @@ def maybe_run_gamma_after_build(
                     time.sleep(2)
                 append_job_log(job_id, "OK 老版本下线")
 
-    if False and opts.get("gamma_test"):
-        # CCE deployment is deliberately independent from the test Pipeline.
-        # The Hub receives a test-only handoff after deployment succeeds.
-        from gamma_real import available, run as run_real_gamma
-        if not available(env_id):
-            return False, "该环境尚未配置真实 Gamma 驱动；部署已完成，未执行 Gamma 测试"
-        test_opts = {**opts, "gamma_deploy": False}
-        release_build_slot(job_id)
-        with log_substep("test"):
-            try:
-                return run_real_gamma(
-                    job_id,
-                    results,
-                    test_opts,
-                    lambda line: append_job_log(job_id, line),
-                    lambda state: set_job(job_id, gamma_e2e=state),
-                    lambda: job_cancel_requested(job_id),
-                )
-            except Exception as exc:
-                message = "Gamma 测试接入失败: " + str(exc)
-                append_job_log(job_id, message)
-                return False, message
     return True, ""
 
 

@@ -25,7 +25,7 @@ let environments = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
-let runPreviewSelection = { deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
+let runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
 let pipelineTemplates = [];
 let selectedTemplateId = "";
 let runLayerMode = "run";
@@ -658,31 +658,30 @@ function buildPipelineStages(pipeline, jobStatus, stopping) {
   return stages;
 }
 function isSelectablePreviewTask(stageId, taskId) {
-  return (stageId === "gamma" && taskId === "test") || (stageId === "release" && taskId === "deploy");
+  return (stageId === "gamma" && (taskId === "deploy" || taskId === "test")) || (stageId === "release" && taskId === "deploy");
 }
-function previewTaskChecked(taskId) {
-  return taskId === "deploy" ? !!runPreviewSelection.deploy : !!runPreviewSelection.test;
+function previewTaskChecked(stageId, taskId) {
+  if (stageId === "release") return !!runPreviewSelection.deploy;
+  return taskId === "deploy" ? !!runPreviewSelection.gammaDeploy : !!runPreviewSelection.test;
 }
-function createPreviewCheck(taskId, doc) {
+function createPreviewCheck(stageId, taskId, doc) {
   doc = doc || document;
   const box = doc.createElement("button");
   box.type = "button";
-  box.className = "pl-check" + (previewTaskChecked(taskId) ? " is-on" : "");
-  box.setAttribute("aria-pressed", previewTaskChecked(taskId) ? "true" : "false");
-  box.setAttribute("aria-label", taskId === "deploy" ? "生产发布" : "gamma测试");
+  box.className = "pl-check" + (previewTaskChecked(stageId, taskId) ? " is-on" : "");
+  box.setAttribute("aria-pressed", previewTaskChecked(stageId, taskId) ? "true" : "false");
+  box.setAttribute("aria-label", stageId === "release" ? "生产发布" : taskId === "deploy" ? "gamma部署" : "gamma测试");
   box.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17.5 19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   box.addEventListener("click", (ev) => {
     ev.stopPropagation();
-    togglePreviewTask(taskId);
+    togglePreviewTask(stageId, taskId);
   });
   return box;
 }
-function togglePreviewTask(taskId) {
-  if (taskId === "deploy") runPreviewSelection.deploy = !runPreviewSelection.deploy;
-  if (taskId === "test") runPreviewSelection.test = !runPreviewSelection.test;
-  if (!runPreviewSelection.deploy && !runPreviewSelection.test) {
-    runPreviewSelection.environmentId = "";
-  }
+function togglePreviewTask(stageId, taskId) {
+  if (stageId === "release") runPreviewSelection.deploy = !runPreviewSelection.deploy;
+  else if (taskId === "deploy") { runPreviewSelection.gammaDeploy=!runPreviewSelection.gammaDeploy; if(!runPreviewSelection.gammaDeploy) runPreviewSelection.test=false; }
+  else if (taskId === "test") { runPreviewSelection.test=!runPreviewSelection.test; if(runPreviewSelection.test) runPreviewSelection.gammaDeploy=true; }
   renderRunPage();
 }
 function previewPipelineData() {
@@ -696,7 +695,7 @@ function previewPipelineData() {
       ...((runPreviewSelection.test && (environments.find(e=>e.id===runPreviewSelection.gammaEnvironmentId)||{}).environment_type==='production') || (runPreviewSelection.deploy && (environments.find(e=>e.id===runPreviewSelection.environmentId)||{}).environment_type==='production') ? [{ id:"approval", label:"人工卡点", status:"pending", subtasks:[task("approve","等待生产发布审批")] }] : []),
       { id: "push", label: "推送 SWR", status: "pending", subtasks: [task("tag", "标记镜像"), task("push", "推送镜像"), task("verify", "推送确认")] },
       { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
-      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("test", "gamma测试")] },
+      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
       { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
     ],
   };
@@ -829,7 +828,8 @@ function defaultPersonalTemplate() {
 }
 function applyTemplateDefaults(tpl) {
   runPreviewSelection = {
-    deploy: !!(tpl && tpl.gamma_deploy),
+    gammaDeploy: !!(tpl && tpl.gamma_deploy),
+    deploy: !!(tpl && tpl.production_release),
     test: !!(tpl && tpl.gamma_test),
     environmentId: (tpl && tpl.environment_id) || "",
     gammaEnvironmentId: (tpl && tpl.environment_id) || "",
@@ -918,7 +918,7 @@ function cancelRunPreview() {
   previewBranchServiceId = "";
   runLayerMode = "run";
   runLayerTemplateId = "";
-  runPreviewSelection = { deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
+  runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
   setPreviewHint("");
   closeRunPopup();
   applyServiceChrome();
@@ -930,11 +930,10 @@ function confirmRunPreview() {
     saveEditedTemplate().catch((e) => setPreviewHint(e.message || "保存失败"));
     return;
   }
-  const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
   if (runPreviewSelection.test && (runPreviewSelection.gammaEnvironmentId === 'ci-e2e' || (runPreviewSelection.mode || 'browser-e2e') === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
     setPreviewHint('请至少选择一个 E2E 用例'); return;
   }
-  if (runPreviewSelection.test && !runPreviewSelection.gammaEnvironmentId) {
+  if (runPreviewSelection.gammaDeploy && !runPreviewSelection.gammaEnvironmentId) {
     setPreviewHint("请为 gamma 集成测试选择环境");
     return;
   }
@@ -962,7 +961,7 @@ async function saveEditedTemplate() {
     body: JSON.stringify({
       name,
       branch,
-      gamma_deploy: !!runPreviewSelection.deploy,
+      gamma_deploy: !!runPreviewSelection.gammaDeploy,
       production_release: !!runPreviewSelection.deploy,
       gamma_test: !!runPreviewSelection.test,
       environment_id: runPreviewSelection.environmentId || "",
@@ -1110,7 +1109,8 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   doc = doc || document;
   const status = stage.status || "pending";
   const col = doc.createElement("div");
-  col.className = "pl-col is-" + status + (stage.id === "gamma" ? " is-gamma" : "");
+  col.className = "pl-col is-" + status +
+    (stage.id === "gamma" ? " is-gamma" : stage.id === "release" ? " is-release" : "");
   if (!preview) {
     col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
   }
@@ -1141,7 +1141,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   drop.appendChild(diamond);
   const tree = doc.createElement("div");
   tree.className = "pl-tree";
-  if (preview && ((stage.id === "gamma" && runPreviewSelection.test) || (stage.id === "release" && runPreviewSelection.deploy))) {
+  if (preview && ((stage.id === "gamma" && runPreviewSelection.gammaDeploy) || (stage.id === "release" && runPreviewSelection.deploy))) {
     const envRow = doc.createElement("div");
     envRow.className = "pl-task pl-env-row";
     envRow.appendChild(doc.createElement("span"));
@@ -1155,7 +1155,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     row.appendChild(doc.createElement("span"));
     if (preview && isSelectablePreviewTask(stage.id, task.id)) {
       row.classList.add("is-selectable");
-      row.appendChild(createPreviewCheck(task.id, doc));
+      row.appendChild(createPreviewCheck(stage.id, task.id, doc));
     } else {
       row.appendChild(createStatusIcon(task.status, "pl-task-icon", doc));
     }
@@ -1166,7 +1166,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     row.addEventListener("click", (ev) => {
       ev.stopPropagation();
       if (preview && isSelectablePreviewTask(stage.id, task.id)) {
-        togglePreviewTask(task.id);
+        togglePreviewTask(stage.id, task.id);
         return;
       }
       onStep && onStep(stage.id, task.id);
@@ -1178,11 +1178,11 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     runPreviewSelection.mode = 'browser-e2e';
   }
   if (preview && stage.id === 'release' && runPreviewSelection.deploy) {
-    const group = doc.createElement('div');
-    group.className = 'gamma-deploy-options';
-    group.append(doc.createTextNode('CCE 部署方式：'));
-    group.append(createReleaseModePicker(doc));
-    tree.append(group);
+    const modeRow=doc.createElement('div'); modeRow.className='pl-task pl-env-row';
+    modeRow.appendChild(doc.createElement('span'));
+    modeRow.appendChild(createStatusIcon('pending','pl-task-icon',doc));
+    modeRow.appendChild(createReleaseModePicker(doc));
+    tree.append(modeRow);
   }
   if (preview && stage.id === 'gamma' && runPreviewSelection.test && runPreviewSelection.mode === 'browser-e2e') {
     const group = doc.createElement('div'); group.className = 'gamma-suite-options';
@@ -1908,15 +1908,6 @@ function applyJob(job, { loading } = {}) {
     }
     $('liveJobPipeline').append(row);
   }
-  if (Array.isArray(job.gamma_rollouts) && job.gamma_rollouts.length) {
-    const panel=document.createElement('div'); panel.className='env-rollouts pipeline-rollouts';
-    panel.innerHTML='<p class="env-secret-hint">正在读取生产发布负载…</p>';
-    $('liveJobPipeline').append(panel);
-    const envId=job.gamma_rollouts[0].environment_id;
-    api('/api/environments/'+encodeURIComponent(envId)+'/rollouts').then(data=>{
-      renderEnvRollouts(panel,(data.rollouts||[]).filter(item=>item.job_id===job.id));
-    }).catch(e=>renderEnvRollouts(panel,[],e.message));
-  }
 }
 
 async function openJob(jobId, { fromHistory } = {}) {
@@ -2272,7 +2263,7 @@ async function startRun(branch) {
         version: rememberedDaemonVersion() || svc.last_version || "",
         login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
         optional_steps: {
-          gamma_deploy: !!runPreviewSelection.deploy,
+          gamma_deploy: !!runPreviewSelection.gammaDeploy,
           production_release: !!runPreviewSelection.deploy,
           gamma_test: !!runPreviewSelection.test,
           environment_id: runPreviewSelection.environmentId || "",
@@ -2675,6 +2666,19 @@ async function openStepModal(stageId, taskId) {
         ? "失败原因：\n" + job.error
         : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。");
       paintLog(logEl, lines.length ? lines.join("\n") : emptyLog, follow);
+      pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
+      if (stage.id === "release") {
+        const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
+          (((currentJob || {}).optional_steps || {}).release_environment_id || "");
+        if (envId) {
+          const rolloutPanel = document.createElement("div");
+          rolloutPanel.className = "env-rollouts step-rollouts";
+          rolloutPanel.dataset.envRolloutList = envId;
+          rolloutPanel.dataset.jobId = currentJobId;
+          pane.appendChild(rolloutPanel);
+          await loadEnvRollouts(envId, rolloutPanel);
+        }
+      }
     } catch (e) {
       tableWrap.hidden = true;
       logEl.hidden = false;
@@ -2911,7 +2915,12 @@ function renderEnvRollouts(panel, rows, error) {
 async function loadEnvRollouts(id, panel) {
   if (!id || !panel) return;
   panel.hidden = false; panel.innerHTML = '<p class="env-secret-hint">正在读取 CCE 工作负载…</p>';
-  try { const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts'); renderEnvRollouts(panel, data.rollouts || []); }
+  try {
+    const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts');
+    const jobId = panel.dataset.jobId || '';
+    const rows = jobId ? (data.rollouts || []).filter((item) => item.job_id === jobId) : (data.rollouts || []);
+    renderEnvRollouts(panel, rows);
+  }
   catch (e) { renderEnvRollouts(panel, [], e.message); }
 }
 function bindEnvForm() {

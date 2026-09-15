@@ -12,14 +12,15 @@ import gamma_real
 
 
 class GammaBridgeTests(unittest.TestCase):
-    def test_gamma_test_and_production_release_are_independent(self):
+    def test_gamma_test_requires_gamma_deploy_but_not_production_release(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
         tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_normalize_optional_steps']
         scope = {'Any': object}
         exec(compile(tree, 'server.py', 'exec'), scope)
         normalized = scope['_normalize_optional_steps']({'gamma_deploy': False, 'gamma_test': True})
-        self.assertFalse(normalized['gamma_deploy'])
+        self.assertTrue(normalized['gamma_deploy'])
         self.assertTrue(normalized['gamma_test'])
+        self.assertFalse(normalized['production_release'])
 
     def test_real_gamma_stop_returns_without_waiting_for_pipeline(self):
         progress = Mock()
@@ -37,7 +38,7 @@ class GammaBridgeTests(unittest.TestCase):
         self.assertEqual('CI build stopped', error)
         self.assertEqual('interrupted', progress.call_args.args[0]['state'])
 
-    def test_deploy_only_never_falls_back_when_gamma_driver_missing(self):
+    def test_gamma_deploy_requires_gamma_driver(self):
         import gamma_real
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
         tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
@@ -54,10 +55,11 @@ class GammaBridgeTests(unittest.TestCase):
              patch.object(gamma_real, 'available', return_value=False) as available, \
              patch.object(gamma_real, 'run') as gamma_run:
             ok, message = scope['maybe_run_gamma_after_build']('job', [])
-        self.assertTrue(ok, message)
-        scope['cce_rollout'].deploy_job_results.assert_called_once()
+        self.assertFalse(ok)
+        self.assertIn('真实 Gamma 驱动', message)
+        scope['cce_rollout'].deploy_job_results.assert_not_called()
         owns.assert_not_called()
-        available.assert_not_called()
+        available.assert_called_once_with('dedicated')
         gamma_run.assert_not_called()
 
     def test_browser_e2e_is_default_and_repository_path_disabled(self):

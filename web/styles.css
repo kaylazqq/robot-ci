@@ -1054,7 +1054,8 @@ body.clone-open { overflow: hidden; }
   padding: 28px 0 36px;
 }
 .run-page-footer .btn { min-width: 140px; padding: 12px 28px; }
-.pl-col.is-gamma { width: 15.2rem; }
+.pl-col.is-gamma,
+.pl-col.is-release { width: 18rem; }
 .pl-env-row { height: auto; min-height: 40px; }
 .pl-env-pick {
   grid-column: 3;
