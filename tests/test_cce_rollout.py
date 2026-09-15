@@ -6,7 +6,7 @@ import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cce_rollout
 import server
@@ -31,6 +31,28 @@ def _job(job_id: str, service_id: str = "memory-service") -> dict:
 
 
 class CceRolloutHelperTests(unittest.TestCase):
+    def test_historical_rollback_restores_source_and_deletes_current_active_workload(self) -> None:
+        record = {
+            "id": "rollout-1", "environment_id": "env-1", "source_workload": "service-v1",
+            "candidate_workload": "service-v2", "old_manifest_json": json.dumps({
+                "apiVersion": "apps/v1", "metadata": {"name": "service-v1"}, "spec": {}
+            }),
+        }
+        remote = Mock(return_value=(0, "applied", ""))
+        conn = Mock()
+        with patch.object(server, "get_parallel_rollout", return_value=record), \
+             patch.object(server, "_parallel_rollout_remote", return_value=({"workload_name": "service-v3"}, remote, "default")), \
+             patch.object(server.cce_rollout, "get_deployment_payload", return_value={"metadata": {"name": "service-v3"}}), \
+             patch.object(server.cce_rollout, "delete_deployment") as delete, \
+             patch.object(server, "set_environment_active_workload") as set_active, \
+             patch.object(server, "_connect_db", return_value=conn), \
+             patch.object(server, "parallel_rollout_live_state", return_value=({"status": "rolled_back"}, "")):
+            item, error = server.rollback_parallel_rollout("rollout-1")
+        self.assertEqual("", error)
+        self.assertEqual("rolled_back", item["status"])
+        delete.assert_called_once_with(remote, namespace="default", deploy="service-v3")
+        set_active.assert_called_once_with("env-1", "service-v1")
+
     def test_parse_ssh_target(self) -> None:
         self.assertEqual(("root", "122.9.139.49", 22), cce_rollout.parse_ssh_target("root@122.9.139.49"))
         self.assertEqual(("root", "122.9.139.49", 22), cce_rollout.parse_ssh_target("122.9.139.49"))

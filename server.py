@@ -732,25 +732,48 @@ def delete_environment(env_id: str) -> bool:
 
 
 def list_service_permissions(service_id: str) -> list[dict[str, Any]]:
+    specs = (
+        ("production_release", "生产发布权限"),
+        ("environment_manage", "环境管理权限"),
+    )
     init_store()
     with _db_lock:
         conn = _connect_db()
         try:
-            rows = conn.execute("SELECT username FROM service_permissions WHERE service_id=? AND permission='production_release' ORDER BY username", (service_id,)).fetchall()
-            if not rows:
-                owner = "l30042018" if int(CFG.get("port") or 0) == 18889 else "l00855954"
-                conn.execute("INSERT OR IGNORE INTO service_permissions(service_id,permission,username) VALUES (?,'production_release',?)", (service_id, owner))
-                conn.commit()
-                rows = conn.execute("SELECT username FROM service_permissions WHERE service_id=? AND permission='production_release'", (service_id,)).fetchall()
+            preferred_owner = "l30042018" if int(CFG.get("port") or 0) == 18889 else "l00855954"
+            known_users = [str(row[0]) for row in conn.execute("SELECT username FROM users ORDER BY username")]
+            owner = preferred_owner if preferred_owner in known_users else (
+                DEFAULT_USERNAME if DEFAULT_USERNAME in known_users else (known_users[0] if known_users else preferred_owner)
+            )
+            result = []
+            for permission_id, label in specs:
+                rows = conn.execute(
+                    "SELECT username FROM service_permissions WHERE service_id=? AND permission=? ORDER BY username",
+                    (service_id, permission_id),
+                ).fetchall()
+                if not rows:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO service_permissions(service_id,permission,username) VALUES (?,?,?)",
+                        (service_id, permission_id, owner),
+                    )
+                    rows = conn.execute(
+                        "SELECT username FROM service_permissions WHERE service_id=? AND permission=? ORDER BY username",
+                        (service_id, permission_id),
+                    ).fetchall()
+                result.append({"permission": label, "permission_id": permission_id, "owners": [str(row["username"]) for row in rows]})
+            conn.commit()
         finally:
             conn.close()
-    return [{"permission": "生产发布权限", "permission_id": "production_release", "owners": [str(row["username"]) for row in rows]}]
+    return result
 
 
-def update_service_permission(service_id: str, owners: Any, actor: str) -> tuple[list[dict[str, Any]] | None, str]:
-    current = list_service_permissions(service_id)[0]["owners"]
+def update_service_permission(service_id: str, permission_id: str, owners: Any, actor: str) -> tuple[list[dict[str, Any]] | None, str]:
+    if permission_id not in {"production_release", "environment_manage"}:
+        return None, "未知权限"
+    permissions = list_service_permissions(service_id)
+    current = next((item["owners"] for item in permissions if item["permission_id"] == permission_id), [])
     if current and actor not in current:
-        return None, "只有当前生产发布权限责任人可以修改"
+        return None, "只有当前权限责任人可以修改"
     clean = sorted({str(item).strip() for item in (owners or []) if str(item).strip()})
     if not clean:
         return None, "至少保留一名责任人"
@@ -760,8 +783,11 @@ def update_service_permission(service_id: str, owners: Any, actor: str) -> tuple
     with _db_lock:
         conn = _connect_db()
         try:
-            conn.execute("DELETE FROM service_permissions WHERE service_id=? AND permission='production_release'", (service_id,))
-            conn.executemany("INSERT INTO service_permissions(service_id,permission,username) VALUES (?,'production_release',?)", [(service_id, item) for item in clean])
+            conn.execute("DELETE FROM service_permissions WHERE service_id=? AND permission=?", (service_id, permission_id))
+            conn.executemany(
+                "INSERT INTO service_permissions(service_id,permission,username) VALUES (?,?,?)",
+                [(service_id, permission_id, item) for item in clean],
+            )
             conn.commit()
         finally:
             conn.close()
@@ -965,7 +991,9 @@ def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, s
     if not record or not str(record.get("old_manifest_json") or ""):
         return None, "没有可回滚的下线版本"
     try:
-        _env, run_remote, _namespace = _parallel_rollout_remote(record)
+        env, run_remote, namespace = _parallel_rollout_remote(record)
+        current_workload = str(env.get("workload_name") or "").strip()
+        restored_workload = str(record.get("source_workload") or "").strip()
         payload = json.loads(str(record["old_manifest_json"]))
         payload.pop("status", None)
         meta = payload.get("metadata") or {}
@@ -976,6 +1004,15 @@ def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, s
         code, out, err = run_remote(f"printf %s {shlex.quote(encoded)} | base64 -d | kubectl apply -f -", 120)
         if code != 0:
             return None, (err or out or "回滚失败")
+        if current_workload and current_workload != restored_workload:
+            current = cce_rollout.get_deployment_payload(
+                run_remote, namespace=namespace, deploy=current_workload
+            )
+            if current is not None:
+                cce_rollout.delete_deployment(
+                    run_remote, namespace=namespace, deploy=current_workload
+                )
+        set_environment_active_workload(str(record["environment_id"]), restored_workload)
         with _db_lock:
             conn = _connect_db()
             conn.execute("UPDATE parallel_rollouts SET status='rolled_back', rolled_back_at=? WHERE id=?", (time.strftime("%Y-%m-%d %H:%M:%S"), rollout_id))
@@ -1571,7 +1608,15 @@ JOB_COMPACT_FIELDS = (
 
 
 def _has_production_permission(service_id: str, username: str) -> bool:
-    return username in list_service_permissions(service_id)[0]["owners"]
+    return _has_service_permission(service_id, "production_release", username)
+
+
+def _has_service_permission(service_id: str, permission_id: str, username: str) -> bool:
+    item = next(
+        (row for row in list_service_permissions(service_id) if row["permission_id"] == permission_id),
+        None,
+    )
+    return bool(item and username in item["owners"])
 
 
 def wait_for_production_approval(job_id: str, env: dict[str, Any], purpose: str) -> None:
@@ -2027,6 +2072,20 @@ def _subtask_rows(
                     row['status'] = 'running'
                 else:
                     row['status'] = 'pending'
+        return rows
+    if step_id == "release":
+        rollout = None
+        rollout_refs = (job or {}).get("gamma_rollouts") or []
+        if rollout_refs:
+            rollout_id = str((rollout_refs[0] or {}).get("id") or "")
+            rollout = get_parallel_rollout(rollout_id) if rollout_id else None
+        rollout_status = str((rollout or {}).get("status") or "")
+        by_id = {row["id"]: row for row in rows}
+        if (job or {}).get("production_released") or rollout_refs:
+            by_id["deploy"]["status"] = "done"
+            by_id["traffic"]["status"] = "done"
+            by_id["offline"]["status"] = "queued" if rollout_status == "active" else "done"
+            by_id["rollback"]["status"] = "done" if rollout_status == "rolled_back" else "pending"
         return rows
     if step_id != "test":
         return rows
@@ -7379,7 +7438,10 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path == "/api/permissions":
             service_id = str((query.get("service_id") or [""])[0]).strip()
-            self._json(200, {"permissions": list_service_permissions(service_id) if service_id else []})
+            self._json(200, {
+                "permissions": list_service_permissions(service_id) if service_id else [],
+                "accounts": [item["username"] for item in _load_users()],
+            })
             return
 
         m_rollouts = re.fullmatch(r"/api/environments/([^/]+)/rollouts", path)
@@ -7820,6 +7882,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/environments":
+            service_id = str(data.get("service_id") or "").strip()
+            if not _has_service_permission(service_id, "environment_manage", user):
+                self._json(403, {"error": "没有环境管理权限"})
+                return
             item, err = create_environment(data, username=user)
             if err or item is None:
                 self._json(400, {"ok": False, "error": err})
@@ -7829,7 +7895,8 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path == "/api/permissions":
             service_id = str(data.get("service_id") or "").strip()
-            items, err = update_service_permission(service_id, data.get("owners"), user)
+            permission_id = str(data.get("permission_id") or "production_release").strip()
+            items, err = update_service_permission(service_id, permission_id, data.get("owners"), user)
             if err:
                 self._json(403, {"error": err})
                 return
@@ -7874,6 +7941,10 @@ class Handler(SimpleHTTPRequestHandler):
 
         m_env_del = re.fullmatch(r"/api/environments/([^/]+)/delete", path)
         if m_env_del:
+            env = get_environment(m_env_del.group(1))
+            if not env or not _has_service_permission(str(env.get("service_id") or ""), "environment_manage", user):
+                self._json(403, {"error": "没有环境管理权限"})
+                return
             if delete_environment(m_env_del.group(1)):
                 self._json(200, {"ok": True})
                 return
@@ -7882,6 +7953,10 @@ class Handler(SimpleHTTPRequestHandler):
 
         m_env = re.fullmatch(r"/api/environments/([^/]+)", path)
         if m_env:
+            env = get_environment(m_env.group(1))
+            if not env or not _has_service_permission(str(env.get("service_id") or ""), "environment_manage", user):
+                self._json(403, {"error": "没有环境管理权限"})
+                return
             item, err = update_environment(m_env.group(1), data)
             if err == "环境不存在":
                 self._json(404, {"ok": False, "error": err})

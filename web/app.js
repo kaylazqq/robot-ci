@@ -22,6 +22,7 @@ let sessionLive = false;
 let logCursor = 0;
 let submitting = false;
 let environments = [];
+let servicePermissions = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
@@ -358,7 +359,10 @@ function applyServiceChrome() {
   if ($("pipelineActions")) $("pipelineActions").hidden = all || tab !== "pipeline";
   if ($("jobMetaBar")) $("jobMetaBar").hidden = all || tab !== "pipeline";
   const createBtn = $("btnEnvCreate");
-  if (createBtn) createBtn.hidden = all;
+  if (createBtn) {
+    createBtn.hidden = all;
+    createBtn.disabled = !all && (!servicePermissions.length || !canManageEnvironments());
+  }
   renderFavoriteServices();
 }
 
@@ -1141,7 +1145,17 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   drop.appendChild(diamond);
   const tree = doc.createElement("div");
   tree.className = "pl-tree";
-  if (preview && ((stage.id === "gamma" && runPreviewSelection.gammaDeploy) || (stage.id === "release" && runPreviewSelection.deploy))) {
+  if (preview && stage.id === "release" && runPreviewSelection.deploy) {
+    const optionsRow = doc.createElement("div");
+    optionsRow.className = "pl-task pl-release-options";
+    optionsRow.appendChild(doc.createElement("span"));
+    optionsRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
+    const options = doc.createElement("div");
+    options.className = "pl-release-pickers";
+    options.append(createGammaEnvPicker(doc, stage.id), createReleaseModePicker(doc));
+    optionsRow.appendChild(options);
+    tree.appendChild(optionsRow);
+  } else if (preview && stage.id === "gamma" && runPreviewSelection.gammaDeploy) {
     const envRow = doc.createElement("div");
     envRow.className = "pl-task pl-env-row";
     envRow.appendChild(doc.createElement("span"));
@@ -1176,13 +1190,6 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   if (preview && stage.id === 'gamma' && runPreviewSelection.test) {
     // Repository CID gamma is temporarily disabled; keep production :80 browser E2E only.
     runPreviewSelection.mode = 'browser-e2e';
-  }
-  if (preview && stage.id === 'release' && runPreviewSelection.deploy) {
-    const modeRow=doc.createElement('div'); modeRow.className='pl-task pl-env-row';
-    modeRow.appendChild(doc.createElement('span'));
-    modeRow.appendChild(createStatusIcon('pending','pl-task-icon',doc));
-    modeRow.appendChild(createReleaseModePicker(doc));
-    tree.append(modeRow);
   }
   if (preview && stage.id === 'gamma' && runPreviewSelection.test && runPreviewSelection.mode === 'browser-e2e') {
     const group = doc.createElement('div'); group.className = 'gamma-suite-options';
@@ -1734,6 +1741,7 @@ function activateService(id) {
   currentServiceId = id;
   selectedTemplateId = "";
   pipelineTemplates = [];
+  servicePermissions = [];
   pinnedJobId = "";
   serviceActiveJobId = "";
   viewGeneration += 1;
@@ -2595,10 +2603,39 @@ async function openStepModal(stageId, taskId) {
   wrap.append(list, pane);
   openModal("步骤详情", wrap, { wide: true });
 
+  let releaseRollouts = [];
+  if (stage.id === "release") {
+    const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
+      (((currentJob || {}).optional_steps || {}).release_environment_id || "");
+    if (envId) {
+      try {
+        const data = await api('/api/environments/' + encodeURIComponent(envId) + '/rollouts');
+        releaseRollouts = (data.rollouts || []).filter((item) => item.job_id === currentJobId);
+      } catch (_) { releaseRollouts = []; }
+    }
+  }
+  const releaseState = String((releaseRollouts[0] || {}).status || "");
+  if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)) taskId = "traffic";
+  if (stage.id === "release" && taskId === "rollback" && releaseState !== "rolled_back") taskId = "traffic";
   let selectedTask = normalizeStepSelection(taskId, stage);
   if (parseCaseSelection(selectedTask)) logEl.hidden = true;
   const follow = newLogFollowState();
   bindLogFollow(logEl, follow);
+
+  const showReleaseComparison = async () => {
+    tableWrap.hidden = true;
+    logEl.hidden = true;
+    pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
+    const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
+      (((currentJob || {}).optional_steps || {}).release_environment_id || "");
+    if (!envId) return;
+    const rolloutPanel = document.createElement("div");
+    rolloutPanel.className = "env-rollouts step-rollouts";
+    rolloutPanel.dataset.envRolloutList = envId;
+    rolloutPanel.dataset.jobId = currentJobId;
+    pane.appendChild(rolloutPanel);
+    await loadEnvRollouts(envId, rolloutPanel);
+  };
 
   const paintList = () => {
     list.replaceChildren();
@@ -2624,7 +2661,10 @@ async function openStepModal(stageId, taskId) {
         return;
       }
       appendStepButton(list, task.label || task.id, task.status, "sub", selectedTask === task.id, () => {
-        selectedTask = task.id;
+        selectedTask = stage.id === "release" && task.id === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)
+          ? "traffic"
+          : stage.id === "release" && task.id === "rollback" && releaseState !== "rolled_back"
+            ? "traffic" : task.id;
         paintList();
         loadStep();
       });
@@ -2632,6 +2672,11 @@ async function openStepModal(stageId, taskId) {
   };
 
   const loadStep = async () => {
+    pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
+    if (stage.id === "release" && selectedTask === "traffic") {
+      await showReleaseComparison();
+      return;
+    }
     const caseSel = parseCaseSelection(selectedTask);
     const selected = caseSel
       ? (stage.tasks || []).find((task) => task.id === (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId))
@@ -2667,18 +2712,6 @@ async function openStepModal(stageId, taskId) {
         : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。");
       paintLog(logEl, lines.length ? lines.join("\n") : emptyLog, follow);
       pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
-      if (stage.id === "release") {
-        const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
-          (((currentJob || {}).optional_steps || {}).release_environment_id || "");
-        if (envId) {
-          const rolloutPanel = document.createElement("div");
-          rolloutPanel.className = "env-rollouts step-rollouts";
-          rolloutPanel.dataset.envRolloutList = envId;
-          rolloutPanel.dataset.jobId = currentJobId;
-          pane.appendChild(rolloutPanel);
-          await loadEnvRollouts(envId, rolloutPanel);
-        }
-      }
     } catch (e) {
       tableWrap.hidden = true;
       logEl.hidden = false;
@@ -2853,13 +2886,15 @@ function envFormHtml(env) {
   );
 }
 function envCardHtml(env) {
+  const locked = !canManageEnvironments();
+  const lockAttrs = locked ? ' disabled aria-label="没有环境管理权限"' : '';
   return (
     '<article class="env-card" data-env-id="' + esc(env.id) + '">' +
     '<div class="env-card-head">' +
     '<div class="env-card-name">' + esc(env.name || "未命名环境") + ' <span class="env-tag">' + esc(env.environment_type || 'dev') + '</span></div>' +
     '<div class="env-card-actions">' +
-    '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="编辑">' + envIconPencil() + "</button>" +
-    '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除">' + envIconTrash() + "</button>" +
+    '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="编辑"' + lockAttrs + '>' + envIconPencil() + "</button>" +
+    '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除"' + lockAttrs + '>' + envIconTrash() + "</button>" +
     "</div></div>" +
     '<div class="env-card-meta">' +
     '<div class="env-meta-row"><span class="env-meta-label">微服务:</span><strong class="env-meta-value">' + esc(serviceTitle(services.find((item) => item.id === env.service_id) || { id: env.service_id, title: env.service_id }) || "—") + "</strong></div>" +
@@ -2900,21 +2935,22 @@ function renderEnvRollouts(panel, rows, error) {
   }));
   panel.querySelectorAll('[data-rollout-offline]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const name = card && card.querySelector('.is-old span');
-    if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？此操作会删除 Deployment，无法恢复。')) return;
+    if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？', {title:'老版本下线', confirmLabel:'确认下线'})) return;
     btn.disabled = true;
     try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); await loadEnvironments(); }
     catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
   }));
   panel.querySelectorAll('[data-rollout-rollback]').forEach((btn) => btn.addEventListener('click', async () => {
-    const card=btn.closest('[data-rollout-id]'); if(!await askEnvConfirm('确认重新部署已下线的旧版本？')) return;
-    btn.disabled=true; try { await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'}); location.reload(); }
+    const card=btn.closest('[data-rollout-id]');
+    if(!await askEnvConfirm('将恢复该流水线下线的旧版本，并删除环境当前运行的新版本。确认继续？', {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
+    btn.disabled=true; try { await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'}); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); }
     catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
 }
 
 async function loadEnvRollouts(id, panel) {
   if (!id || !panel) return;
-  panel.hidden = false; panel.innerHTML = '<p class="env-secret-hint">正在读取 CCE 工作负载…</p>';
+  panel.hidden = false; panel.replaceChildren();
   try {
     const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts');
     const jobId = panel.dataset.jobId || '';
@@ -3029,24 +3065,62 @@ async function loadEnvironments() {
     renderEnvironments();
     return;
   }
-  const data = await api("/api/environments?service_id=" + encodeURIComponent(currentServiceId));
+  const [data, permissionData] = await Promise.all([
+    api("/api/environments?service_id=" + encodeURIComponent(currentServiceId)),
+    api('/api/permissions?service_id=' + encodeURIComponent(currentServiceId)),
+  ]);
+  servicePermissions = permissionData.permissions || [];
   environments = data.environments || [];
+  const createBtn = $("btnEnvCreate");
+  if (createBtn) {
+    createBtn.disabled = !canManageEnvironments();
+    createBtn.title = canManageEnvironments() ? "" : "没有环境管理权限";
+  }
   renderEnvironments();
+}
+function permissionOwners(permissionId) {
+  return ((servicePermissions.find((item) => item.permission_id === permissionId) || {}).owners || []);
+}
+function canManageEnvironments() {
+  return permissionOwners('environment_manage').includes(currentUser);
 }
 async function loadPermissions() {
   const root = $("permissionGrid"); if (!root || !currentServiceId || isAllServices()) return;
   const data = await api('/api/permissions?service_id=' + encodeURIComponent(currentServiceId));
-  const row = (data.permissions || [])[0] || { permission: '生产发布权限', owners: [] };
-  root.innerHTML = '<table class="art-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody><tr><td>生产发布权限</td><td><input id="permissionOwners" class="input" value="' + esc((row.owners || []).join(', ')) + '"/><button id="btnPermissionSave" class="btn primary">保存</button></td></tr></tbody></table>';
-  bind('btnPermissionSave', async () => {
-    const owners = (($('permissionOwners').value || '').split(/[,，;\s]+/).filter(Boolean));
-    try { await api('/api/permissions', {method:'POST', body:JSON.stringify({service_id:currentServiceId, owners})}); await loadPermissions(); }
-    catch(e) { const err=$('permissionError'); err.hidden=false; err.textContent=e.message; }
+  servicePermissions = data.permissions || [];
+  const accounts = data.accounts || [];
+  root.innerHTML = '<table class="art-table permission-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody></tbody></table>';
+  const tbody = root.querySelector('tbody');
+  servicePermissions.forEach((row) => {
+    const editable = (row.owners || []).includes(currentUser);
+    const tr = document.createElement('tr');
+    const owners = document.createElement('td');
+    owners.className = 'permission-owner-cell';
+    const chips = document.createElement('div'); chips.className = 'permission-chips';
+    (row.owners || []).forEach((owner) => {
+      const chip=document.createElement('span'); chip.className='permission-chip'; chip.textContent=owner;
+      const remove=document.createElement('button'); remove.type='button'; remove.textContent='×'; remove.title='移除 '+owner; remove.disabled=!editable || row.owners.length <= 1;
+      remove.addEventListener('click',()=>chip.remove()); chip.appendChild(remove); chips.appendChild(chip);
+    });
+    const actions=document.createElement('div'); actions.className='permission-actions';
+    const select=document.createElement('select'); select.className='input permission-account'; select.disabled=!editable;
+    select.innerHTML='<option value="">选择已有账号</option>'+accounts.map((name)=>'<option value="'+esc(name)+'">'+esc(name)+'</option>').join('');
+    const add=document.createElement('button'); add.type='button'; add.className='btn ghost'; add.textContent='添加责任人'; add.disabled=!editable;
+    add.addEventListener('click',()=>{ const name=select.value; if(!name || [...chips.querySelectorAll('.permission-chip')].some(c=>c.firstChild.nodeValue===name)) return; const chip=document.createElement('span'); chip.className='permission-chip'; chip.textContent=name; const remove=document.createElement('button'); remove.type='button'; remove.textContent='×'; remove.title='移除 '+name; remove.addEventListener('click',()=>chip.remove()); chip.appendChild(remove); chips.appendChild(chip); select.value=''; });
+    const save=document.createElement('button'); save.type='button'; save.className='btn primary'; save.textContent='保存修改'; save.disabled=!editable;
+    save.addEventListener('click',async()=>{ const next=[...chips.querySelectorAll('.permission-chip')].map(c=>c.firstChild.nodeValue); try { await api('/api/permissions',{method:'POST',body:JSON.stringify({service_id:currentServiceId,permission_id:row.permission_id,owners:next})}); await loadPermissions(); } catch(e){ const err=$('permissionError'); err.hidden=false; err.textContent=e.message; } });
+    actions.append(select,add,save); owners.append(chips,actions);
+    tr.innerHTML='<td><strong>'+esc(row.permission)+'</strong><small>'+(editable?'可管理责任人':'仅当前责任人可修改')+'</small></td>';
+    tr.appendChild(owners); tbody.appendChild(tr);
   });
 }
 function openEnvCreate() {
   if (isAllServices() || !currentService()) {
     setEnvError("请先选择一个微服务，再创建它的环境。");
+    return;
+  }
+  if (!canManageEnvironments()) {
+    setEnvError("没有环境管理权限");
     return;
   }
   openEnvOverlay(emptyEnvDraft());
@@ -3088,12 +3162,20 @@ function closeEnvConfirm(ok) {
   envConfirmResolver = null;
   if (resolve) resolve(!!ok);
 }
-function askEnvConfirm(message) {
+function askEnvConfirm(message, options = {}) {
   return new Promise((resolve) => {
     if (envConfirmResolver) envConfirmResolver(false);
     envConfirmResolver = resolve;
     const text = $("envConfirmText");
     if (text) text.textContent = message;
+    const title = $("envConfirmTitle");
+    if (title) title.textContent = options.title || "删除环境";
+    const confirm = $("btnEnvConfirmOk");
+    if (confirm) {
+      confirm.textContent = options.confirmLabel || "删除";
+      confirm.classList.toggle("danger", options.danger !== false);
+      confirm.classList.toggle("primary", options.danger === false);
+    }
     if ($("envConfirm")) $("envConfirm").hidden = false;
     syncEnvOverlayLock();
     if ($("btnEnvConfirmCancel")) $("btnEnvConfirmCancel").focus();

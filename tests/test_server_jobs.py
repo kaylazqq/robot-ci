@@ -446,6 +446,19 @@ class JobPayloadTests(unittest.TestCase):
 
 
 class JobPipelineTests(unittest.TestCase):
+    def test_release_waits_yellow_and_rollback_stays_gray_until_used(self) -> None:
+        job = make_job("pipe-release-wait", status="running")
+        job.update({
+            "stage": "release", "production_released": True,
+            "gamma_rollouts": [{"id": "rollout-1"}],
+            "optional_steps": {"production_release": True},
+        })
+        with patch.object(server, "get_parallel_rollout", return_value={"status": "active"}):
+            rows = server._subtask_rows("release", "running", job)
+        statuses = {row["id"]: row["status"] for row in rows}
+        self.assertEqual("queued", statuses["offline"])
+        self.assertEqual("pending", statuses["rollback"])
+
     def test_running_job_marks_active_stage(self) -> None:
         job = make_job("pipe-run")
         job["stage"] = "building"

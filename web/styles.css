@@ -1054,8 +1054,8 @@ body.clone-open { overflow: hidden; }
   padding: 28px 0 36px;
 }
 .run-page-footer .btn { min-width: 140px; padding: 12px 28px; }
-.pl-col.is-gamma,
-.pl-col.is-release { width: 18rem; }
+.pl-col.is-gamma { width: 18rem; }
+.pl-col.is-release { width: 30rem; }
 .pl-env-row { height: auto; min-height: 40px; }
 .pl-env-pick {
   grid-column: 3;
@@ -1311,6 +1311,58 @@ body.clone-open { overflow: hidden; }
   font-size: 13px;
   color: #345d88;
 }
+.pl-release-options { margin-bottom: 2px; }
+.pl-release-pickers {
+  grid-column: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding-left: 12px;
+  position: relative;
+  z-index: 4;
+}
+.pl-release-pickers::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 12px;
+  height: 3px;
+  transform: translateY(-50%);
+  background: var(--rail);
+}
+.pl-release-pickers > .pl-env-pick { grid-column: auto; padding-left: 0; }
+.pl-release-pickers > .pl-env-pick::before { display: none; }
+.pl-release-pickers > .pl-env-pick:first-child { flex: 0 0 9.5rem; }
+.pl-release-pickers > .release-mode-pick { flex: 0 0 12.5rem; }
+.branch-option:disabled,
+.branch-option:disabled:hover,
+.branch-option:disabled:focus {
+  color: var(--neutral-text);
+  background: var(--disabled-surface);
+  cursor: not-allowed;
+  opacity: .55;
+}
+.permission-table td:first-child { width: 12rem; vertical-align: top; }
+.permission-table td:first-child small { display: block; margin-top: 5px; color: var(--muted); }
+.permission-owner-cell { min-width: 30rem; }
+.permission-chips { display: flex; flex-wrap: wrap; gap: 8px; min-height: 34px; margin-bottom: 10px; }
+.permission-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px 5px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-alt);
+  color: var(--text);
+}
+.permission-chip button { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; padding: 0; }
+.permission-chip button:not(:disabled):hover { color: var(--danger); }
+.permission-chip button:disabled { cursor: not-allowed; opacity: .35; }
+.permission-actions { display: flex; align-items: center; gap: 8px; }
+.permission-account { width: 13rem; }
 .env-rollout-head-actions { display: flex; align-items: center; gap: 10px; }
 .env-rollout-head-actions .btn { font-size: 12px; padding: 5px 12px; }
 .env-rollout-workload {
