@@ -12,7 +12,7 @@ import gamma_real
 
 
 class GammaBridgeTests(unittest.TestCase):
-    def test_test_selection_always_enables_deployment(self):
+    def test_gamma_test_requires_gamma_deploy_but_not_production_release(self):
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
         tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_normalize_optional_steps']
         scope = {'Any': object}
@@ -20,6 +20,7 @@ class GammaBridgeTests(unittest.TestCase):
         normalized = scope['_normalize_optional_steps']({'gamma_deploy': False, 'gamma_test': True})
         self.assertTrue(normalized['gamma_deploy'])
         self.assertTrue(normalized['gamma_test'])
+        self.assertFalse(normalized['production_release'])
 
     def test_real_gamma_stop_returns_without_waiting_for_pipeline(self):
         progress = Mock()
@@ -37,7 +38,7 @@ class GammaBridgeTests(unittest.TestCase):
         self.assertEqual('CI build stopped', error)
         self.assertEqual('interrupted', progress.call_args.args[0]['state'])
 
-    def test_deploy_only_never_falls_back_when_gamma_driver_missing(self):
+    def test_gamma_deploy_requires_gamma_driver(self):
         import gamma_real
         tree = ast.parse((Path(__file__).resolve().parents[1] / 'server.py').read_text(encoding='utf-8'))
         tree.body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in
@@ -54,10 +55,11 @@ class GammaBridgeTests(unittest.TestCase):
              patch.object(gamma_real, 'available', return_value=False) as available, \
              patch.object(gamma_real, 'run') as gamma_run:
             ok, message = scope['maybe_run_gamma_after_build']('job', [])
-        self.assertTrue(ok, message)
-        scope['cce_rollout'].deploy_job_results.assert_called_once()
+        self.assertFalse(ok)
+        self.assertIn('真实 Gamma 驱动', message)
+        scope['cce_rollout'].deploy_job_results.assert_not_called()
         owns.assert_not_called()
-        available.assert_not_called()
+        available.assert_called_once_with('dedicated')
         gamma_run.assert_not_called()
 
     def test_browser_e2e_is_default_and_repository_path_disabled(self):
@@ -86,7 +88,7 @@ class GammaBridgeTests(unittest.TestCase):
              patch.object(gamma_real, 'run', return_value=(True, '')) as browser:
             self.assertEqual(scope['maybe_run_gamma_after_build']('test', [{'service_id': 'service', 'ok': True}]), (True, ''))
             browser.assert_called_once()
-            scope['cce_rollout'].deploy_job_results.assert_called_once()
+            scope['cce_rollout'].deploy_job_results.assert_not_called()
             scope['run_gamma_tests'].assert_not_called()
             scope['record_gamma_run'].assert_not_called()
         with self.assertRaises(ValueError):
@@ -117,7 +119,7 @@ class GammaBridgeTests(unittest.TestCase):
         with patch.object(gamma_real, 'available', return_value=True), patch.object(gamma_real, 'run', return_value=(False, 'E02 failed')) as run:
             self.assertEqual(env['maybe_run_gamma_after_build']('test', [{'ok': True}]), (False, 'E02 failed'))
             run.assert_called_once()
-            env['cce_rollout'].deploy_job_results.assert_called_once()
+            env['cce_rollout'].deploy_job_results.assert_not_called()
             env['release_build_slot'].assert_called_once_with('test')
 
     def test_unconfigured_cce_test_blocks_before_deployment(self):
@@ -136,7 +138,7 @@ class GammaBridgeTests(unittest.TestCase):
         ok, error = env['maybe_run_gamma_after_build']('test', [])
         self.assertFalse(ok)
         self.assertIn('未执行 Gamma 测试', error)
-        env['cce_rollout'].deploy_job_results.assert_called_once()
+        env['cce_rollout'].deploy_job_results.assert_not_called()
 
     def test_options(self):
         self.assertEqual(gamma_e2e.options({})['gamma_suites'],['E01','E02','E03'])

@@ -15,6 +15,7 @@ let currentJobId = "";
 let currentJob = null;
 let pinnedJobId = "";
 let serviceActiveJobId = "";
+let templateActiveJobId = "";
 let pollTimer = null;
 let pollGeneration = 0;
 let viewGeneration = 0;
@@ -22,10 +23,11 @@ let sessionLive = false;
 let logCursor = 0;
 let submitting = false;
 let environments = [];
+let servicePermissions = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
-let runPreviewSelection = { deploy: false, test: false, environmentId: "", deploymentMode: "parallel" };
+let runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
 let pipelineTemplates = [];
 let selectedTemplateId = "";
 let runLayerMode = "run";
@@ -312,7 +314,7 @@ function closeUserMenu() {
 }
 
 function isBuildListTab(name) {
-  return name === "history" || name === "artifacts" || name === "envs";
+  return name === "history" || name === "artifacts" || name === "envs" || name === "permissions";
 }
 function normalizeBuildTab(next) {
   return isBuildListTab(next) ? next : "pipeline";
@@ -354,10 +356,14 @@ function applyServiceChrome() {
   if ($("viewHistory")) $("viewHistory").hidden = tab !== "history";
   if ($("viewArtifacts")) $("viewArtifacts").hidden = tab !== "artifacts";
   if ($("viewEnvs")) $("viewEnvs").hidden = tab !== "envs";
+  if ($("viewPermissions")) $("viewPermissions").hidden = tab !== "permissions";
   if ($("pipelineActions")) $("pipelineActions").hidden = all || tab !== "pipeline";
   if ($("jobMetaBar")) $("jobMetaBar").hidden = all || tab !== "pipeline";
   const createBtn = $("btnEnvCreate");
-  if (createBtn) createBtn.hidden = all;
+  if (createBtn) {
+    createBtn.hidden = all;
+    createBtn.disabled = !all && (!servicePermissions.length || !canManageEnvironments());
+  }
   renderFavoriteServices();
 }
 
@@ -384,6 +390,7 @@ function setTab(next) {
     if (tab === "history") refreshHistory().catch(() => {});
     if (tab === "artifacts") refreshArtifacts().catch(() => {});
     if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
+    if (tab === "permissions") loadPermissions().catch(() => {});
     if (tab === "pipeline" && !isAllServices()) {
       loadPipelineTemplates().catch(() => {});
       if (pinnedJobId) {
@@ -425,7 +432,7 @@ function readHash() {
   const service = decodeURIComponent(parts[1] || "");
   let nextTab = "pipeline";
   let job = "";
-  if (parts[2] === "history" || parts[2] === "artifacts" || parts[2] === "envs") nextTab = parts[2];
+  if (["history", "artifacts", "envs", "permissions"].includes(parts[2])) nextTab = parts[2];
   else if (parts[2] === "job" && parts[3]) job = decodeURIComponent(parts[3]);
   return { nav: "build", service, tab: nextTab, job };
 }
@@ -453,7 +460,8 @@ function updateActionButtons() {
   const svc = currentService();
   const live = jobIsLive(currentJob);
   const stopping = !!(currentJob && (currentJob.cancel_requested || currentJob.stage === "stopping"));
-  if ($("btnRun")) $("btnRun").disabled = !svc || !!serviceActiveJobId || runPreviewActive || cloneLayerOpen();
+  // Only block Run when THIS pipeline template already has a live job.
+  if ($("btnRun")) $("btnRun").disabled = !svc || !!templateActiveJobId || runPreviewActive || cloneLayerOpen();
   const tpl = selectedPipelineTemplate();
   const tplBusy = !svc || runPreviewActive || cloneLayerOpen();
   if ($("tplTrigger")) $("tplTrigger").disabled = tplBusy;
@@ -607,6 +615,13 @@ function visiblePipelineTasks(step) {
       status: step.status || "pending",
     }, "archive", "archive")];
   }
+  if (step.id === "rollback") {
+    return [decoratePipelineTask({
+      id: "rollback",
+      label: "一键回滚",
+      status: step.status || "pending",
+    }, "rollback", "rollback")];
+  }
   if (step.id === "gamma") {
     return tasks.filter((task) => task.status !== "skipped");
   }
@@ -656,37 +671,30 @@ function buildPipelineStages(pipeline, jobStatus, stopping) {
   return stages;
 }
 function isSelectablePreviewTask(stageId, taskId) {
-  return stageId === "gamma" && (taskId === "deploy" || taskId === "test");
+  return (stageId === "gamma" && (taskId === "deploy" || taskId === "test")) || (stageId === "release" && taskId === "deploy");
 }
-function previewTaskChecked(taskId) {
-  return taskId === "deploy" ? !!runPreviewSelection.deploy : !!runPreviewSelection.test;
+function previewTaskChecked(stageId, taskId) {
+  if (stageId === "release") return !!runPreviewSelection.deploy;
+  return taskId === "deploy" ? !!runPreviewSelection.gammaDeploy : !!runPreviewSelection.test;
 }
-function createPreviewCheck(taskId, doc) {
+function createPreviewCheck(stageId, taskId, doc) {
   doc = doc || document;
   const box = doc.createElement("button");
   box.type = "button";
-  box.className = "pl-check" + (previewTaskChecked(taskId) ? " is-on" : "");
-  box.setAttribute("aria-pressed", previewTaskChecked(taskId) ? "true" : "false");
-  box.setAttribute("aria-label", taskId === "deploy" ? "gamma部署" : "gamma测试");
+  box.className = "pl-check" + (previewTaskChecked(stageId, taskId) ? " is-on" : "");
+  box.setAttribute("aria-pressed", previewTaskChecked(stageId, taskId) ? "true" : "false");
+  box.setAttribute("aria-label", stageId === "release" ? "生产发布" : taskId === "deploy" ? "gamma部署" : "gamma测试");
   box.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17.5 19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   box.addEventListener("click", (ev) => {
     ev.stopPropagation();
-    togglePreviewTask(taskId);
+    togglePreviewTask(stageId, taskId);
   });
   return box;
 }
-function togglePreviewTask(taskId) {
-  if (taskId === "deploy") {
-    runPreviewSelection.deploy = !runPreviewSelection.deploy;
-    if (!runPreviewSelection.deploy) runPreviewSelection.test = false;
-  }
-  if (taskId === "test") {
-    runPreviewSelection.test = !runPreviewSelection.test;
-    if (runPreviewSelection.test) runPreviewSelection.deploy = true;
-  }
-  if (!runPreviewSelection.deploy && !runPreviewSelection.test) {
-    runPreviewSelection.environmentId = "";
-  }
+function togglePreviewTask(stageId, taskId) {
+  if (stageId === "release") runPreviewSelection.deploy = !runPreviewSelection.deploy;
+  else if (taskId === "deploy") { runPreviewSelection.gammaDeploy=!runPreviewSelection.gammaDeploy; if(!runPreviewSelection.gammaDeploy) runPreviewSelection.test=false; }
+  else if (taskId === "test") { runPreviewSelection.test=!runPreviewSelection.test; if(runPreviewSelection.test) runPreviewSelection.gammaDeploy=true; }
   renderRunPage();
 }
 function previewPipelineData() {
@@ -698,8 +706,10 @@ function previewPipelineData() {
       { id: "test", label: "测试执行", status: "pending", subtasks: [task("plan", "加载build.yaml"), task("runner", "启动测试"), task("ut-cases", "执行UT"), task("dt-cases", "执行DT")] },
       { id: "build", label: "构建镜像", status: "pending", subtasks: [task("script", "执行构建脚本"), task("docker", "Docker构建"), task("verify", "产物校验")] },
       { id: "push", label: "推送 SWR", status: "pending", subtasks: [task("tag", "标记镜像"), task("push", "推送镜像"), task("verify", "推送确认")] },
-      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
       { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
+      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
+      { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
+      { id: "rollback", label: "一键回滚", status: "skipped", subtasks: [task("rollback", "一键回滚")] },
     ],
   };
 }
@@ -830,12 +840,13 @@ function defaultPersonalTemplate() {
   return pipelineTemplates.find((item) => item.kind === "personal" && item.builtin) || pipelineTemplates[0] || null;
 }
 function applyTemplateDefaults(tpl) {
-  const test = !!(tpl && tpl.gamma_test);
   runPreviewSelection = {
-    deploy: !!(tpl && tpl.gamma_deploy) || test,
-    test,
+    gammaDeploy: !!(tpl && tpl.gamma_deploy),
+    deploy: !!(tpl && tpl.production_release),
+    test: !!(tpl && tpl.gamma_test),
     environmentId: (tpl && tpl.environment_id) || "",
-    deploymentMode: "parallel",
+    gammaEnvironmentId: (tpl && tpl.environment_id) || "",
+    deploymentMode: "",
   };
 }
 function syncRunLayerChrome() {
@@ -854,7 +865,7 @@ function syncRunLayerChrome() {
 }
 function openRunWindow(templateId) {
   const svc = currentService();
-  if (!svc || serviceActiveJobId) return;
+  if (!svc || templateActiveJobId) return;
   const layer = $("runLayer");
   if (!layer) return;
   if (runLayerOpen() || cloneLayerOpen()) return;
@@ -920,7 +931,7 @@ function cancelRunPreview() {
   previewBranchServiceId = "";
   runLayerMode = "run";
   runLayerTemplateId = "";
-  runPreviewSelection = { deploy: false, test: false, environmentId: "", deploymentMode: "parallel" };
+  runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
   setPreviewHint("");
   closeRunPopup();
   applyServiceChrome();
@@ -932,12 +943,15 @@ function confirmRunPreview() {
     saveEditedTemplate().catch((e) => setPreviewHint(e.message || "保存失败"));
     return;
   }
-  const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
-  if (runPreviewSelection.test && (runPreviewSelection.environmentId === 'ci-e2e' || (runPreviewSelection.mode || 'browser-e2e') === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
+  if (runPreviewSelection.test && (runPreviewSelection.gammaEnvironmentId === 'ci-e2e' || (runPreviewSelection.mode || 'browser-e2e') === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
     setPreviewHint('请至少选择一个 E2E 用例'); return;
   }
-  if (wantsGamma && !runPreviewSelection.environmentId) {
-    setPreviewHint("请先选择环境");
+  if (runPreviewSelection.gammaDeploy && !runPreviewSelection.gammaEnvironmentId) {
+    setPreviewHint("请为 gamma 集成测试选择环境");
+    return;
+  }
+  if (runPreviewSelection.deploy && (!runPreviewSelection.environmentId || !runPreviewSelection.deploymentMode)) {
+    setPreviewHint("请为生产发布选择环境和部署方式");
     return;
   }
   const branch = (previewBranchPicker && previewBranchPicker.value) || "";
@@ -960,9 +974,12 @@ async function saveEditedTemplate() {
     body: JSON.stringify({
       name,
       branch,
-      gamma_deploy: !!runPreviewSelection.deploy,
+      gamma_deploy: !!runPreviewSelection.gammaDeploy,
+      production_release: !!runPreviewSelection.deploy,
       gamma_test: !!runPreviewSelection.test,
       environment_id: runPreviewSelection.environmentId || "",
+      release_environment_id: runPreviewSelection.environmentId || "",
+      gamma_environment_id: runPreviewSelection.gammaEnvironmentId || "",
     }),
   });
   if (data.template) {
@@ -995,7 +1012,14 @@ function renderPipelineTemplates() {
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         const id = btn.getAttribute("data-tpl-id") || "";
-        if (id) selectedTemplateId = id;
+        if (id && id !== selectedTemplateId) {
+          selectedTemplateId = id;
+          templateActiveJobId = "";
+          hideTplMenu();
+          renderPipelineTemplates();
+          if (!isAllServices() && currentServiceId) loadServiceJob();
+          return;
+        }
         hideTplMenu();
         renderPipelineTemplates();
       });
@@ -1094,18 +1118,52 @@ function confirmDeleteTemplate(id) {
     }
   });
 }
-function createStatusIcon(status, kind, doc) {
+function createStatusIcon(status, kind, doc, opts) {
   doc = doc || document;
   const icon = doc.createElement("span");
-  icon.className = (kind || "pl-icon") + " is-" + (status || "pending");
+  const cont = !!(opts && opts.continueIcon) && (status === "queued" || status === "waiting");
+  icon.className = (kind || "pl-icon") + " is-" + (status || "pending") + (cont ? " is-continue" : "");
+  if (cont) {
+    icon.setAttribute("aria-label", "等待继续");
+    icon.textContent = "";
+    return icon;
+  }
   icon.textContent = status === "done" ? "✓" : (status === "failed" || status === "warn") ? "✕" : status === "skipped" ? "–" : (status === "running" || status === "queued") ? "●" : "";
   return icon;
+}
+function createEllipsisColumn(doc) {
+  doc = doc || document;
+  const col = doc.createElement("div");
+  col.className = "pl-col pl-ellipsis";
+  const cap = doc.createElement("div");
+  cap.className = "pl-caption";
+  const title = doc.createElement("div");
+  title.className = "pl-title";
+  title.textContent = "···";
+  title.title = "执行测试 / 构建镜像 / 推送 SWR";
+  const dur = doc.createElement("div");
+  dur.className = "pl-dur";
+  dur.innerHTML = "&nbsp;";
+  cap.append(title, dur);
+  const spine = doc.createElement("div");
+  spine.className = "pl-spine";
+  const left = doc.createElement("div");
+  left.className = "pl-rail left is-wait";
+  const right = doc.createElement("div");
+  right.className = "pl-rail right is-wait";
+  const icon = doc.createElement("span");
+  icon.className = "pl-ellipsis-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.append(doc.createElement("span"), doc.createElement("span"), doc.createElement("span"));
+  spine.append(left, icon, right);
+  col.append(cap, spine);
+  return col;
 }
 function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc) {
   doc = doc || document;
   const status = stage.status || "pending";
   const col = doc.createElement("div");
-  col.className = "pl-col is-" + status + (stage.id === "gamma" ? " is-gamma" : "");
+  col.className = "pl-col is-" + status;
   if (!preview) {
     col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
   }
@@ -1126,7 +1184,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
   const right = doc.createElement("div");
   right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
-  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc), right);
+  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc, { continueIcon: status === "queued" }), right);
   col.appendChild(spine);
   const drop = doc.createElement("div");
   drop.className = "pl-drop";
@@ -1136,12 +1194,21 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   drop.appendChild(diamond);
   const tree = doc.createElement("div");
   tree.className = "pl-tree";
-  if (preview && stage.id === "gamma") {
+  if (preview && stage.id === "release" && runPreviewSelection.deploy) {
+    [createGammaEnvPicker(doc, stage.id), createReleaseModePicker(doc)].forEach((picker) => {
+      const optionsRow = doc.createElement("div");
+      optionsRow.className = "pl-task pl-env-row pl-release-options";
+      optionsRow.appendChild(doc.createElement("span"));
+      optionsRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
+      optionsRow.appendChild(picker);
+      tree.appendChild(optionsRow);
+    });
+  } else if (preview && stage.id === "gamma" && runPreviewSelection.gammaDeploy) {
     const envRow = doc.createElement("div");
     envRow.className = "pl-task pl-env-row";
     envRow.appendChild(doc.createElement("span"));
     envRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
-    envRow.appendChild(createGammaEnvPicker(doc));
+    envRow.appendChild(createGammaEnvPicker(doc, stage.id));
     tree.appendChild(envRow);
   }
   (stage.tasks || []).forEach((task) => {
@@ -1150,9 +1217,11 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     row.appendChild(doc.createElement("span"));
     if (preview && isSelectablePreviewTask(stage.id, task.id)) {
       row.classList.add("is-selectable");
-      row.appendChild(createPreviewCheck(task.id, doc));
+      row.appendChild(createPreviewCheck(stage.id, task.id, doc));
     } else {
-      row.appendChild(createStatusIcon(task.status, "pl-task-icon", doc));
+      row.appendChild(createStatusIcon(task.status, "pl-task-icon", doc, {
+        continueIcon: task.status === "queued",
+      }));
     }
     const name = doc.createElement("span");
     name.className = "pl-task-name";
@@ -1161,7 +1230,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     row.addEventListener("click", (ev) => {
       ev.stopPropagation();
       if (preview && isSelectablePreviewTask(stage.id, task.id)) {
-        togglePreviewTask(task.id);
+        togglePreviewTask(stage.id, task.id);
         return;
       }
       onStep && onStep(stage.id, task.id);
@@ -1171,13 +1240,6 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   if (preview && stage.id === 'gamma' && runPreviewSelection.test) {
     // Repository CID gamma is temporarily disabled; keep production :80 browser E2E only.
     runPreviewSelection.mode = 'browser-e2e';
-  }
-  if (preview && stage.id === 'gamma' && runPreviewSelection.deploy) {
-    const group = doc.createElement('div');
-    group.className = 'gamma-deploy-options';
-    group.append(doc.createTextNode('CCE 部署方式：'));
-    group.append(createReleaseModePicker(doc));
-    tree.append(group);
   }
   if (preview && stage.id === 'gamma' && runPreviewSelection.test && runPreviewSelection.mode === 'browser-e2e') {
     const group = doc.createElement('div'); group.className = 'gamma-suite-options';
@@ -1201,11 +1263,12 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   col.appendChild(drop);
   return col;
 }
-function selectedEnvName() {
-  const env = environments.find((item) => item.id === runPreviewSelection.environmentId);
+function selectedEnvName(kind) {
+  const id = kind === "gamma" ? runPreviewSelection.gammaEnvironmentId : runPreviewSelection.environmentId;
+  const env = environments.find((item) => item.id === id);
   return env ? (env.name || "未命名环境") : "";
 }
-function createGammaEnvPicker(doc) {
+function createGammaEnvPicker(doc, kind) {
   doc = doc || document;
   const win = doc.defaultView || window;
   const wrap = doc.createElement("div");
@@ -1221,7 +1284,7 @@ function createGammaEnvPicker(doc) {
   label.className = "pl-env-trigger-label";
   const choices = environments;
   const empty = !choices.length;
-  label.textContent = selectedEnvName() || (empty ? "还没有环境" : "选择环境");
+  label.textContent = selectedEnvName(kind) || (empty ? "还没有环境" : "选择环境");
   trigger.disabled = empty;
   trigger.appendChild(label);
   const chevron = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -1251,12 +1314,14 @@ function createGammaEnvPicker(doc) {
   choices.forEach((env) => {
     const option = doc.createElement("button");
     option.type = "button";
-    option.className = "branch-option" + (runPreviewSelection.environmentId === env.id ? " active" : "");
+    const selectedId = kind === "gamma" ? runPreviewSelection.gammaEnvironmentId : runPreviewSelection.environmentId;
+    option.className = "branch-option" + (selectedId === env.id ? " active" : "");
     option.setAttribute("role", "option");
     option.textContent = env.name || "未命名环境";
     option.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      runPreviewSelection.environmentId = env.id;
+      if (kind === "gamma") runPreviewSelection.gammaEnvironmentId = env.id;
+      else runPreviewSelection.environmentId = env.id;
       label.textContent = env.name || "未命名环境";
       menu.querySelectorAll(".branch-option").forEach((item) => item.classList.toggle("active", item === option));
       setPreviewHint("");
@@ -1287,14 +1352,14 @@ function createGammaEnvPicker(doc) {
 function createReleaseModePicker(doc) {
   doc = doc || document;
   const win = doc.defaultView || window;
-  const choices = [{ id: 'parallel', name: '平滑升级' }, { id: 'inplace', name: '替换升级' }];
+  const choices = [{ id: 'parallel', name: '平滑升级' }, { id: 'inplace', name: '替换升级', disabled: true }];
   const wrap = doc.createElement('div'); wrap.className = 'pl-env-pick release-mode-pick';
   const picker = doc.createElement('div'); picker.className = 'pl-env-picker';
   const trigger = doc.createElement('button'); trigger.type = 'button';
   trigger.className = 'input branch-trigger pl-env-trigger';
   trigger.setAttribute('aria-haspopup', 'listbox'); trigger.setAttribute('aria-expanded', 'false');
   const label = doc.createElement('span'); label.className = 'pl-env-trigger-label';
-  label.textContent = (choices.find((item) => item.id === runPreviewSelection.deploymentMode) || choices[0]).name;
+  label.textContent = (choices.find((item) => item.id === runPreviewSelection.deploymentMode) || {}).name || '选择部署方式';
   trigger.appendChild(label);
   const chevron = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
   chevron.setAttribute('viewBox', '0 0 24 24'); chevron.setAttribute('aria-hidden', 'true');
@@ -1312,6 +1377,7 @@ function createReleaseModePicker(doc) {
     const option = doc.createElement('button'); option.type = 'button';
     option.className = 'branch-option' + ((runPreviewSelection.deploymentMode || 'parallel') === choice.id ? ' active' : '');
     option.setAttribute('role', 'option'); option.textContent = choice.name;
+    option.disabled = !!choice.disabled;
     option.addEventListener('click', (ev) => {
       ev.stopPropagation(); runPreviewSelection.deploymentMode = choice.id; label.textContent = choice.name;
       close(); trigger.focus(); renderRunPage();
@@ -1353,6 +1419,48 @@ function createEndpoint(kind, lit, doc) {
   col.appendChild(spine);
   return col;
 }
+function createApprovalGate(gate, incomingComplete, outgoingComplete, jobId, doc) {
+  doc = doc || document;
+  const status = gate.status || "pending";
+  const col = doc.createElement("div");
+  col.className = "pl-gate is-" + status + (status === "queued" ? " is-actionable" : "");
+  const cap = doc.createElement("div");
+  cap.className = "pl-caption";
+  const title = doc.createElement("div");
+  title.className = "pl-title";
+  title.textContent = "人工卡点";
+  const dur = doc.createElement("div");
+  dur.className = "pl-dur is-" + status;
+  dur.textContent = status === "queued" ? "等待中" : status === "done" ? "已通过" : "";
+  cap.append(title, dur);
+  const spine = doc.createElement("div");
+  spine.className = "pl-spine";
+  const left = doc.createElement("div");
+  left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
+  const right = doc.createElement("div");
+  right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
+  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc, { continueIcon: true }), right);
+  col.append(cap, spine);
+  col.title = status === "queued"
+    ? "等待生产发布权限责任人确认，点击继续"
+    : (gate.operator ? "审批人：" + gate.operator + (gate.approved_at ? " · " + gate.approved_at : "") : "");
+  if (status === "queued") {
+    col.tabIndex = 0;
+    col.setAttribute("role", "button");
+    const approve = async () => {
+      if (col.classList.contains("is-busy")) return;
+      col.classList.add("is-busy");
+      try {
+        await api("/api/jobs/" + encodeURIComponent(jobId) + "/approval", { method: "POST", body: JSON.stringify({ action: "continue" }) });
+        await openJob(jobId);
+      } catch (e) { alert(e.message || "无权继续该人工卡点"); }
+      finally { col.classList.remove("is-busy"); }
+    };
+    col.addEventListener("click", approve);
+    col.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); approve(); } });
+  }
+  return col;
+}
 function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   const root = $(containerId);
   if (!root) return;
@@ -1373,15 +1481,41 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   scroll.className = "pl-scroll";
   const graph = doc.createElement("div");
   graph.className = "pl-graph";
-  const isComplete = (stage) => Boolean(stage && stage.status === "done");
-  graph.appendChild(createEndpoint("start", !preview, doc));
-  stages.forEach((stage, index) => {
-    const previous = stages[index - 1];
-    const incomingComplete = !preview && (index === 0 || isComplete(previous));
-    const outgoingComplete = !preview && isComplete(stage);
-    graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc));
+  const isRailDone = (node) => Boolean(node && node.status === "done");
+  const gates = preview || !Array.isArray(pipeline.gates) ? [] : pipeline.gates;
+  const nodes = [];
+  const previewCollapse = new Set(["test", "build", "push"]);
+  let collapsedPreview = false;
+  stages.forEach((stage) => {
+    if (preview && previewCollapse.has(stage.id)) {
+      if (!collapsedPreview) {
+        nodes.push({ kind: "ellipsis", data: { id: "ellipsis", status: "pending" } });
+        collapsedPreview = true;
+      }
+      return;
+    }
+    gates.filter((gate) => gate.before === stage.id).forEach((gate) => nodes.push({ kind: "gate", data: gate }));
+    nodes.push({ kind: "stage", data: stage });
   });
-  graph.appendChild(createEndpoint("end", !preview && isComplete(stages[stages.length - 1]) && status === "ok", doc));
+  const progressed = !preview && stages.some((stage) => {
+    const st = stage && stage.status;
+    return st && st !== "pending" && st !== "skipped";
+  });
+  graph.appendChild(createEndpoint("start", progressed, doc));
+  nodes.forEach((node, index) => {
+    const stage = node.data;
+    const previous = nodes[index - 1] && nodes[index - 1].data;
+    const incomingComplete = !preview && (index === 0 ? progressed : isRailDone(previous));
+    const outgoingComplete = !preview && isRailDone(stage);
+    if (node.kind === "ellipsis") {
+      graph.appendChild(createEllipsisColumn(doc));
+      return;
+    }
+    graph.appendChild(node.kind === "gate"
+      ? createApprovalGate(stage, incomingComplete, outgoingComplete, meta.job_id || currentJobId, doc)
+      : createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc));
+  });
+  graph.appendChild(createEndpoint("end", !preview && status === "ok" && stages.some((stage) => isRailDone(stage)), doc));
   scroll.appendChild(graph);
   root.appendChild(scroll);
 }
@@ -1443,13 +1577,15 @@ function renderPager(el, pager, meta, onChange) {
 function renderHistory(items, meta) {
   const body = $("historyBody");
   if (!body) return;
+  const cols = isAllServices() ? 9 : 8;
   if (!items.length) {
-    body.innerHTML = '<tr><td colspan="' + (isAllServices() ? 8 : 7) + '" class="hint">暂无构建记录。</td></tr>';
+    body.innerHTML = '<tr><td colspan="' + cols + '" class="hint">暂无构建记录。</td></tr>';
   } else {
     body.innerHTML = items.map((item) => (
       "<tr>" +
       '<td class="hist-time">' + esc(item.created_at || "—") + "</td>" +
       '<td class="hist-service-cell">' + esc(item.service_id || "—") + "</td>" +
+      clipTd(item.template_name || "—", "hist-pipeline") +
       clipTd(item.branch, "hist-branch") +
       '<td class="' + historyStatusClass(item.status) + '">' + esc(historyStatusLabel(item.status)) + "</td>" +
       '<td class="mono">' + esc(shortSha(item.commit_sha)) + "</td>" +
@@ -1506,7 +1642,7 @@ async function refreshHistory() {
       renderHistory(data.jobs || [], data);
     } catch (_) {
       if (!viewIsCurrent(gen, sid)) return;
-      if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + (isAllServices() ? 8 : 7) + '" class="hint">加载失败，请刷新。</td></tr>';
+      if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + (isAllServices() ? 9 : 8) + '" class="hint">加载失败，请刷新。</td></tr>';
     }
   });
 }
@@ -1700,7 +1836,7 @@ function fillServiceSelect() {
   renderFavoriteServices();
 }
 function clearStaleLists() {
-  const historyColumns = isAllServices() ? 8 : 7;
+  const historyColumns = isAllServices() ? 9 : 8;
   const artifactColumns = isAllServices() ? 7 : 6;
   if ($("historyBody")) $("historyBody").innerHTML = '<tr><td colspan="' + historyColumns + '" class="hint">加载中…</td></tr>';
   if ($("artifactsBody")) $("artifactsBody").innerHTML = '<tr><td colspan="' + artifactColumns + '" class="hint">加载中…</td></tr>';
@@ -1725,8 +1861,10 @@ function activateService(id) {
   currentServiceId = id;
   selectedTemplateId = "";
   pipelineTemplates = [];
+  servicePermissions = [];
   pinnedJobId = "";
   serviceActiveJobId = "";
+  templateActiveJobId = "";
   viewGeneration += 1;
   historyPager.page = 1;
   artifactsPager.page = 1;
@@ -1861,7 +1999,7 @@ function applyJob(job, { loading } = {}) {
     if (root) { root.hidden = true; root.replaceChildren(); }
     if (empty) {
       empty.hidden = false;
-      empty.textContent = loading ? "正在加载流水线…" : "当前服务无构建历史记录";
+      empty.textContent = loading ? "正在加载流水线…" : "当前分支无构建历史记录";
     }
     return;
   }
@@ -1883,20 +2021,6 @@ function applyJob(job, { loading } = {}) {
       link.textContent='查看 Gamma E2E 流程与报告';row.append(link);
     }
     $('liveJobPipeline').append(row);
-  }
-  if (Array.isArray(job.gamma_rollouts) && job.gamma_rollouts.length) {
-    const row = document.createElement('div'); row.className = 'gamma-result-link';
-    const state = document.createElement('span');
-    const names = job.gamma_rollouts.map((item) => {
-      const oldName = item.source_workload || '旧版本';
-      const newName = (item.new && item.new.name) || item.candidate_workload || '新版本';
-      return oldName + ' → ' + newName;
-    });
-    state.textContent = '平滑发布已创建：' + names.join('；'); row.append(state);
-    const manage = document.createElement('button'); manage.type = 'button'; manage.className = 'btn ghost';
-    manage.textContent = '查看并管理新旧版本';
-    manage.addEventListener('click', () => { setTab('envs'); loadEnvironments().catch((e) => setEnvError(e.message)); });
-    row.append(manage); $('liveJobPipeline').append(row);
   }
 }
 
@@ -1929,14 +2053,27 @@ async function openJob(jobId, { fromHistory } = {}) {
 async function refreshServiceOccupancy() {
   if (!sessionLive || isAllServices() || !currentServiceId) {
     serviceActiveJobId = "";
+    templateActiveJobId = "";
     updateActionButtons();
     return;
   }
+  const tid = selectedTemplateId || "";
   try {
-    const running = await api("/api/running-job?service_id=" + encodeURIComponent(currentServiceId));
-    serviceActiveJobId = (running && running.id) || "";
+    const running = await api(
+      "/api/running-job?service_id=" + encodeURIComponent(currentServiceId) +
+      (tid ? "&template_id=" + encodeURIComponent(tid) : "")
+    );
+    templateActiveJobId = (running && running.id) || "";
+    // Keep a service-level occupancy hint for UI chrome that still needs it.
+    if (tid) {
+      const any = await api("/api/running-job?service_id=" + encodeURIComponent(currentServiceId));
+      serviceActiveJobId = (any && any.id) || "";
+    } else {
+      serviceActiveJobId = templateActiveJobId;
+    }
   } catch (_) {
     serviceActiveJobId = "";
+    templateActiveJobId = "";
   }
   updateActionButtons();
 }
@@ -1944,6 +2081,7 @@ async function refreshServiceOccupancy() {
 async function loadServiceJob() {
   const gen = viewGeneration;
   const sid = currentServiceId;
+  const tid = selectedTemplateId || "";
   stopPolling();
   pinnedJobId = "";
   if (!sessionLive || !sid || sid === ALL_SERVICES_ID) {
@@ -1955,21 +2093,24 @@ async function loadServiceJob() {
   const started = Date.now();
   if (currentJob && !jobBelongsToService(currentJob, sid)) applyJob(null, { loading: true });
   else if (!currentJob) applyJob(null, { loading: true });
+  const stillHere = () => viewIsCurrent(gen, sid) && (selectedTemplateId || "") === tid;
   try {
-    const running = await api("/api/running-job?service_id=" + encodeURIComponent(sid));
-    if (!viewIsCurrent(gen, sid)) return;
-    serviceActiveJobId = (running && running.id) || "";
+    const qs = "service_id=" + encodeURIComponent(sid) +
+      (tid ? "&template_id=" + encodeURIComponent(tid) : "");
+    const running = await api("/api/running-job?" + qs);
+    if (!stillHere()) return;
+    templateActiveJobId = (running && running.id) || "";
     updateActionButtons();
     if (running && running.id && await openJob(running.id)) return;
-    if (!viewIsCurrent(gen, sid)) return;
-    const hist = await api("/api/jobs?service_id=" + encodeURIComponent(sid) + "&page=1&page_size=1");
-    if (!viewIsCurrent(gen, sid)) return;
+    if (!stillHere()) return;
+    const hist = await api("/api/jobs?" + qs + "&page=1&page_size=1");
+    if (!stillHere()) return;
     const latest = hist.jobs && hist.jobs[0];
     if (latest && latest.id && await openJob(latest.id)) return;
-    if (!viewIsCurrent(gen, sid)) return;
+    if (!stillHere()) return;
     applyJob(null);
   } catch (e) {
-    if (!viewIsCurrent(gen, sid)) return;
+    if (!stillHere()) return;
     const empty = $("pipelineEmpty");
     const root = $("liveJobPipeline");
     if (root) { root.hidden = true; root.replaceChildren(); }
@@ -2245,6 +2386,7 @@ async function startRun(branch) {
   }
     submitting = true;
   try {
+    const tpl = findPipelineTemplate(runLayerTemplateId) || selectedPipelineTemplate();
     const resp = await api("/api/push", {
       method: "POST",
       body: JSON.stringify({
@@ -2252,10 +2394,15 @@ async function startRun(branch) {
         branch: selectedBranch,
         version: rememberedDaemonVersion() || svc.last_version || "",
         login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
+        template_id: (tpl && tpl.id) || selectedTemplateId || "",
+        template_name: (tpl && tpl.name) || "",
         optional_steps: {
-          gamma_deploy: !!runPreviewSelection.deploy,
+          gamma_deploy: !!runPreviewSelection.gammaDeploy,
+          production_release: !!runPreviewSelection.deploy,
           gamma_test: !!runPreviewSelection.test,
           environment_id: runPreviewSelection.environmentId || "",
+          release_environment_id: runPreviewSelection.environmentId || "",
+          gamma_environment_id: runPreviewSelection.gammaEnvironmentId || "",
           deployment_mode: runPreviewSelection.deploymentMode || "parallel",
           gamma_suites: runPreviewSelection.suites || ['E01','E02','E03'],
           gamma_mode: runPreviewSelection.mode || 'browser-e2e',
@@ -2268,6 +2415,7 @@ async function startRun(branch) {
     runPreviewActive = false;
     runLayerMode = "run";
     runLayerTemplateId = "";
+    if (tpl && tpl.id) selectedTemplateId = tpl.id;
     applyServiceChrome();
     pinnedJobId = "";
     setTab("pipeline");
@@ -2578,22 +2726,57 @@ async function openStepModal(stageId, taskId) {
   tableWrap.hidden = true;
   const logEl = document.createElement("pre");
   logEl.className = "log step-log";
+  logEl.textContent = "加载中…";
   pane.append(tableWrap, logEl);
   wrap.append(list, pane);
   openModal("步骤详情", wrap, { wide: true });
 
+  // Use job-stored rollout status only — never block the left step list on CCE.
+  const releaseState = String(((((currentJob || {}).gamma_rollouts || [])[0] || {}).status) || "");
+  if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)) taskId = "release-compare:results";
+  if (stage.id === "release" && taskId === "compare") taskId = "release-compare:results";
+  if (stage.id === "rollback") taskId = "rollback:results";
   let selectedTask = normalizeStepSelection(taskId, stage);
   if (parseCaseSelection(selectedTask)) logEl.hidden = true;
   const follow = newLogFollowState();
   bindLogFollow(logEl, follow);
 
+  const showReleaseComparison = async (mode) => {
+    tableWrap.hidden = true;
+    logEl.hidden = true;
+    pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
+    const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
+      (((currentJob || {}).optional_steps || {}).release_environment_id || "");
+    const rolloutPanel = document.createElement("div");
+    rolloutPanel.className = "env-rollouts step-rollouts";
+    rolloutPanel.dataset.envRolloutList = envId || "";
+    rolloutPanel.dataset.jobId = currentJobId;
+    rolloutPanel.dataset.compareMode = mode;
+    rolloutPanel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
+    pane.appendChild(rolloutPanel);
+    if (!envId) {
+      rolloutPanel.innerHTML = '<p class="hint error">未找到发布环境，无法加载版本对比。</p>';
+      return;
+    }
+    await loadEnvRollouts(envId, rolloutPanel, mode);
+  };
+
   const paintList = () => {
     list.replaceChildren();
     appendStepButton(list, stage.label || stage.id, stage.status, "", selectedTask === stage.id, () => {
-      selectedTask = stage.id;
+      selectedTask = stage.id === "rollback" ? "rollback:results" : stage.id;
       paintList();
       loadStep();
     });
+    if (stage.id === "rollback") {
+      appendStepButton(list, "版本对比", "", "sub", selectedTask === "rollback:results", () => {
+        selectedTask = "rollback:results"; paintList(); loadStep();
+      });
+      appendStepButton(list, "日志详情", "", "sub", selectedTask === "rollback:log", () => {
+        selectedTask = "rollback:log"; paintList(); loadStep();
+      });
+      return;
+    }
     (stage.tasks || []).forEach((task) => {
       const caseTaskId = stage.id === "gamma" && task.id === "test" ? "gamma-test" : task.id;
       if (isCaseTaskId(task.id, stage.id)) {
@@ -2610,8 +2793,19 @@ async function openStepModal(stageId, taskId) {
         });
         return;
       }
+      if (stage.id === "release" && task.id === "compare") {
+        appendStepHeading(list, "版本对比", task.status, "sub");
+        appendStepButton(list, "版本对比", "", "sub nested", selectedTask === "release-compare:results", () => {
+          selectedTask = "release-compare:results"; paintList(); loadStep();
+        });
+        appendStepButton(list, "日志详情", "", "sub nested", selectedTask === "release-compare:log", () => {
+          selectedTask = "release-compare:log"; paintList(); loadStep();
+        });
+        return;
+      }
       appendStepButton(list, task.label || task.id, task.status, "sub", selectedTask === task.id, () => {
-        selectedTask = task.id;
+        selectedTask = stage.id === "release" && task.id === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)
+          ? "release-compare:results" : task.id;
         paintList();
         loadStep();
       });
@@ -2619,12 +2813,21 @@ async function openStepModal(stageId, taskId) {
   };
 
   const loadStep = async () => {
+    pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
+    if (selectedTask === "release-compare:results" || selectedTask === "rollback:results") {
+      await showReleaseComparison(selectedTask.startsWith("rollback") ? "rollback" : "release");
+      return;
+    }
+    logEl.hidden = false;
+    logEl.textContent = "加载中…";
+    tableWrap.hidden = true;
     const caseSel = parseCaseSelection(selectedTask);
     const selected = caseSel
       ? (stage.tasks || []).find((task) => task.id === (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId))
       : (stage.tasks || []).find((task) => task.id === selectedTask);
-    const logStep = (selected && selected.logStep) || stage.logStep || stage.id;
-    const sub = caseSel ? (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId) : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
+    const specialLog = selectedTask === "release-compare:log" || selectedTask === "rollback:log";
+    const logStep = specialLog ? (selectedTask.startsWith("rollback") ? "rollback" : "release") : ((selected && selected.logStep) || stage.logStep || stage.id);
+    const sub = specialLog ? (selectedTask.startsWith("rollback") ? "log" : "compare") : caseSel ? (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId) : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
     try {
       const job = await api("/api/jobs/" + currentJobId + "?step=" + encodeURIComponent(logStep) + (sub ? "&sub=" + encodeURIComponent(sub) : "") + "&view=ui");
       const lines = Array.isArray(job.log) ? job.log : [];
@@ -2653,6 +2856,7 @@ async function openStepModal(stageId, taskId) {
         ? "失败原因：\n" + job.error
         : (sub ? "该小步骤暂无独立日志。" : "该步骤暂无日志。");
       paintLog(logEl, lines.length ? lines.join("\n") : emptyLog, follow);
+      pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
     } catch (e) {
       tableWrap.hidden = true;
       logEl.hidden = false;
@@ -2752,6 +2956,7 @@ function emptyEnvDraft() {
   const sid = svc ? svc.id : "";
   return {
     name: "",
+    environment_type: "dev",
     service_id: sid,
     region: "cn-southwest-2",
     cluster_name: "",
@@ -2766,6 +2971,7 @@ function collectEnvForm() {
     .filter(Boolean);
   return {
     name: ($("envName") && $("envName").value || "").trim(),
+    environment_type: ($("envType") && $("envType").value) || "dev",
     service_id: currentServiceId && !isAllServices() ? currentServiceId : "",
     region: ($("envRegion") && $("envRegion").value) || "cn-southwest-2",
     cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
@@ -2799,6 +3005,7 @@ function envFormHtml(env) {
   return (
     '<div class="env-form-card">' +
     '<div class="env-meta-row"><span class="env-meta-label">所属微服务:</span><strong class="env-meta-value">' + esc(owned || "—") + "</strong></div>" +
+    '<label class="label" for="envType">环境标签</label><select id="envType" class="input"><option value="dev"' + (data.environment_type !== 'production' ? ' selected' : '') + '>dev</option><option value="production"' + (data.environment_type === 'production' ? ' selected' : '') + '>production</option></select>' +
     '<label class="label" for="envRegion">Region</label>' +
     '<select id="envRegion" class="input"><option value="cn-southwest-2">贵阳一</option></select>' +
     '<label class="label" for="envCluster">集群名称</label>' +
@@ -2824,66 +3031,97 @@ function envFormHtml(env) {
   );
 }
 function envCardHtml(env) {
+  const locked = !canManageEnvironments();
+  const lockAttrs = locked ? ' disabled aria-label="没有环境管理权限"' : '';
   return (
     '<article class="env-card" data-env-id="' + esc(env.id) + '">' +
     '<div class="env-card-head">' +
-    '<div class="env-card-name">' + esc(env.name || "未命名环境") + "</div>" +
+    '<div class="env-card-name">' + esc(env.name || "未命名环境") + ' <span class="env-tag">' + esc(env.environment_type || 'dev') + '</span></div>' +
     '<div class="env-card-actions">' +
-    '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="编辑">' + envIconPencil() + "</button>" +
-    '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除">' + envIconTrash() + "</button>" +
+    '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="编辑"' + lockAttrs + '>' + envIconPencil() + "</button>" +
+    '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除"' + lockAttrs + '>' + envIconTrash() + "</button>" +
     "</div></div>" +
     '<div class="env-card-meta">' +
     '<div class="env-meta-row"><span class="env-meta-label">微服务:</span><strong class="env-meta-value">' + esc(serviceTitle(services.find((item) => item.id === env.service_id) || { id: env.service_id, title: env.service_id }) || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">Region:</span><strong class="env-meta-value">' + esc(env.region_label || env.region || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">集群:</span><strong class="env-meta-value">' + esc(env.cluster_name || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">负载:</span><strong class="env-meta-value">' + esc(env.workload_name || "—") + "</strong></div>" +
-    '</div><div class="env-rollout-actions"><button type="button" class="btn ghost" data-env-rollouts="' + esc(env.id) + '">查看新旧版本</button></div>' +
-    '<div class="env-rollouts" data-env-rollout-list="' + esc(env.id) + '" hidden></div></article>'
+    '</div></article>'
   );
 }
 
-function rolloutWorkloadHtml(rollout, side, item) {
+function rolloutWorkloadHtml(rollout, side, item, allowScale) {
   const old = side === 'old';
   const exists = !!item.exists;
   const replicas = Number.isFinite(Number(item.desired_replicas)) ? Number(item.desired_replicas) : 0;
-  const image = Array.isArray(item.images) && item.images.length ? item.images.join(', ') : '—';
+  let image = Array.isArray(item.images) && item.images.length ? item.images.join(', ') : '';
+  if (!image) {
+    if (!old && rollout && rollout.image) image = String(rollout.image);
+    else if (Array.isArray(item.images)) image = '—';
+    else image = '—';
+  }
   return '<div class="env-rollout-workload ' + (old ? 'is-old' : 'is-new') + '">' +
     '<strong>' + (old ? '旧版本负载' : '新版本负载') + '</strong><span>' + esc(item.name || '—') + '</span>' +
     '<small>镜像：' + esc(image) + '</small><small>实例：' + (exists ? replicas + '（Ready ' + Number(item.ready_replicas || 0) + '）' : '已不存在') + '</small>' +
-    (exists ? '<div class="env-rollout-scale"><input class="input" type="number" min="0" max="1000" value="' + replicas + '" data-rollout-replicas="' + side + '" /><button type="button" class="btn ghost" data-rollout-scale="' + side + '">设置实例数</button></div>' : '') +
+    (exists && allowScale ? '<div class="env-rollout-scale"><input class="input" type="number" min="0" max="1000" value="' + replicas + '" data-rollout-replicas="' + side + '" /><button type="button" class="btn ghost" data-rollout-scale="' + side + '">设置实例数</button></div>' : '') +
     '</div>';
 }
 
-function renderEnvRollouts(panel, rows, error) {
+function renderEnvRollouts(panel, rows, error, mode) {
   if (!panel) return;
+  mode = mode || panel.dataset.compareMode || 'release';
   if (error) { panel.innerHTML = '<p class="hint error">' + esc(error) + '</p>'; return; }
   if (!rows || !rows.length) { panel.innerHTML = '<p class="env-secret-hint">暂无由 CI 创建的平滑发布负载。</p>'; return; }
   panel.innerHTML = rows.map((row) => row.error
     ? '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>'
-    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>平滑发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : '新旧版本并行中') + '</span>' + (row.old && row.old.exists && row.status !== 'old_deleted' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}) + rolloutWorkloadHtml(row, 'new', row.new || {}) + '</section>'
+    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : row.status === 'rolled_back' ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.status === 'active' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + (mode === 'rollback' && row.status === 'old_deleted' ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release') + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release') + '</section>'
   ).join('');
   panel.querySelectorAll('[data-rollout-scale]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const target = btn.getAttribute('data-rollout-scale');
     const input = card && card.querySelector('[data-rollout-replicas="' + target + '"]'); const replicas = input ? Number(input.value) : NaN;
     if (!Number.isInteger(replicas) || replicas < 0 || replicas > 1000) { setEnvError('实例数必须是 0 到 1000 的整数'); return; }
     btn.disabled = true;
-    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/scale', { method: 'POST', body: JSON.stringify({ target, replicas }) }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); }
+    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/scale', { method: 'POST', body: JSON.stringify({ target, replicas }) }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode); }
     catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
   }));
   panel.querySelectorAll('[data-rollout-offline]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const name = card && card.querySelector('.is-old span');
-    if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？此操作会删除 Deployment，无法恢复。')) return;
+    if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？', {title:'老版本下线', confirmLabel:'确认下线'})) return;
     btn.disabled = true;
-    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); await loadEnvironments(); }
-    catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
+    try {
+      await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' });
+      closeModal();
+      await openJob(currentJobId, { fromHistory: true });
+    }
+    catch (e) { setEnvError(e.message); alert(e.message || '下线失败'); } finally { btn.disabled = false; }
+  }));
+  panel.querySelectorAll('[data-rollout-rollback]').forEach((btn) => btn.addEventListener('click', async () => {
+    const card=btn.closest('[data-rollout-id]');
+    if(!await askEnvConfirm('将恢复该流水线下线的旧版本，并删除环境当前运行的新版本。确认继续？', {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
+    btn.disabled=true; try {
+      const data=await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'});
+      if(data.approval_required){ closeModal(); await openJob(currentJobId, { fromHistory: true }); return; }
+      closeModal();
+      await openJob(currentJobId, { fromHistory: true });
+    }
+    catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
 }
 
-async function loadEnvRollouts(id, panel) {
+async function loadEnvRollouts(id, panel, mode) {
   if (!id || !panel) return;
-  panel.hidden = false; panel.innerHTML = '<p class="env-secret-hint">正在读取 CCE 工作负载…</p>';
-  try { const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts'); renderEnvRollouts(panel, data.rollouts || []); }
-  catch (e) { renderEnvRollouts(panel, [], e.message); }
+  panel.hidden = false;
+  if (!panel.querySelector('.env-secret-hint') || !/加载中/.test(panel.textContent || '')) {
+    panel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
+  }
+  try {
+    const jobId = panel.dataset.jobId || '';
+    const qs = jobId ? ('?job_id=' + encodeURIComponent(jobId) + '&live=1') : '?live=1';
+    const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts' + qs);
+    const rows = data.rollouts || [];
+    renderEnvRollouts(panel, rows, '', mode);
+  }
+  catch (e) { renderEnvRollouts(panel, [], e.message, mode); }
 }
 function bindEnvForm() {
   const list = $("envNodeList");
@@ -2991,13 +3229,151 @@ async function loadEnvironments() {
     renderEnvironments();
     return;
   }
-  const data = await api("/api/environments?service_id=" + encodeURIComponent(currentServiceId));
+  const [data, permissionData] = await Promise.all([
+    api("/api/environments?service_id=" + encodeURIComponent(currentServiceId)),
+    api('/api/permissions?service_id=' + encodeURIComponent(currentServiceId)),
+  ]);
+  servicePermissions = permissionData.permissions || [];
   environments = data.environments || [];
+  const createBtn = $("btnEnvCreate");
+  if (createBtn) {
+    createBtn.disabled = !canManageEnvironments();
+    createBtn.title = canManageEnvironments() ? "" : "没有环境管理权限";
+  }
   renderEnvironments();
+}
+function permissionOwners(permissionId) {
+  return ((servicePermissions.find((item) => item.permission_id === permissionId) || {}).owners || []);
+}
+function canManageEnvironments() {
+  return permissionOwners('environment_manage').includes(currentUser);
+}
+async function loadPermissions() {
+  const root = $("permissionGrid"); if (!root || !currentServiceId || isAllServices()) return;
+  const data = await api('/api/permissions?service_id=' + encodeURIComponent(currentServiceId));
+  servicePermissions = data.permissions || [];
+  const accounts = data.accounts || [];
+  const specs = [
+    { permission_id: 'production_release', permission: '生产发布权限' },
+    { permission_id: 'environment_manage', permission: '环境管理权限' },
+  ];
+  const byId = {};
+  servicePermissions.forEach((row) => { byId[row.permission_id] = row; });
+  root.innerHTML = '<table class="art-table permission-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody></tbody></table>';
+  const tbody = root.querySelector('tbody');
+  specs.forEach((spec) => {
+    const row = byId[spec.permission_id] || spec;
+    const initialOwners = [...(row.owners || [])];
+    const editable = initialOwners.includes(currentUser);
+    const tr = document.createElement('tr');
+    const nameTd = document.createElement('td');
+    nameTd.innerHTML = '<strong>' + esc(row.permission || spec.permission) + '</strong>';
+    const owners = document.createElement('td');
+    owners.className = 'permission-owner-cell';
+    const editor = document.createElement('div');
+    editor.className = 'permission-owner-editor';
+    const inputWrap = document.createElement('div');
+    inputWrap.className = 'permission-owner-input' + (editable ? '' : ' is-disabled');
+    const account = document.createElement('input');
+    account.type = 'text';
+    account.className = 'input permission-account';
+    account.placeholder = editable ? '输入账号，回车添加' : '';
+    account.disabled = !editable;
+    inputWrap.appendChild(account);
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'btn permission-save';
+    save.textContent = '保存修改';
+    const currentOwners = () => [...inputWrap.querySelectorAll('.permission-chip')].map((c) => c.firstChild.nodeValue);
+    const syncSave = () => {
+      const next = currentOwners();
+      const dirty = next.length !== initialOwners.length || next.some((name, idx) => name !== initialOwners[idx]);
+      save.disabled = !editable || !dirty || next.length < 1;
+      save.classList.toggle('is-dirty', editable && dirty && next.length >= 1);
+      save.classList.toggle('primary', editable && dirty && next.length >= 1);
+    };
+    const addChip = (name) => {
+      const chip = document.createElement('span');
+      chip.className = 'permission-chip';
+      chip.appendChild(document.createTextNode(name));
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = '×';
+      remove.title = '移除 ' + name;
+      remove.disabled = !editable;
+      remove.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (!editable) return;
+        if (currentOwners().length <= 1) {
+          const err = $('permissionError');
+          err.hidden = false;
+          err.textContent = '至少保留一名责任人';
+          return;
+        }
+        chip.remove();
+        syncSave();
+      });
+      chip.appendChild(remove);
+      inputWrap.insertBefore(chip, account);
+    };
+    const tryAddOwner = () => {
+      if (!editable) return;
+      const name = account.value.trim();
+      const err = $('permissionError');
+      if (!name) return;
+      if (!accounts.includes(name)) {
+        err.hidden = false;
+        err.textContent = '账号不存在';
+        account.focus();
+        return;
+      }
+      if (currentOwners().includes(name)) {
+        err.hidden = false;
+        err.textContent = '该账号已是责任人';
+        return;
+      }
+      err.hidden = true;
+      err.textContent = '';
+      addChip(name);
+      account.value = '';
+      syncSave();
+    };
+    initialOwners.forEach(addChip);
+    account.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        tryAddOwner();
+      }
+    });
+    inputWrap.addEventListener('click', () => { if (editable) account.focus(); });
+    save.addEventListener('click', async () => {
+      const next = currentOwners();
+      try {
+        await api('/api/permissions', {
+          method: 'POST',
+          body: JSON.stringify({ service_id: currentServiceId, permission_id: row.permission_id || spec.permission_id, owners: next }),
+        });
+        await loadPermissions();
+      } catch (e) {
+        const err = $('permissionError');
+        err.hidden = false;
+        err.textContent = e.message;
+      }
+    });
+    syncSave();
+    editor.append(inputWrap, save);
+    owners.appendChild(editor);
+    tr.append(nameTd, owners);
+    tbody.appendChild(tr);
+  });
 }
 function openEnvCreate() {
   if (isAllServices() || !currentService()) {
     setEnvError("请先选择一个微服务，再创建它的环境。");
+    return;
+  }
+  if (!canManageEnvironments()) {
+    setEnvError("没有环境管理权限");
     return;
   }
   openEnvOverlay(emptyEnvDraft());
@@ -3039,12 +3415,20 @@ function closeEnvConfirm(ok) {
   envConfirmResolver = null;
   if (resolve) resolve(!!ok);
 }
-function askEnvConfirm(message) {
+function askEnvConfirm(message, options = {}) {
   return new Promise((resolve) => {
     if (envConfirmResolver) envConfirmResolver(false);
     envConfirmResolver = resolve;
     const text = $("envConfirmText");
     if (text) text.textContent = message;
+    const title = $("envConfirmTitle");
+    if (title) title.textContent = options.title || "删除环境";
+    const confirm = $("btnEnvConfirmOk");
+    if (confirm) {
+      confirm.textContent = options.confirmLabel || "删除";
+      confirm.classList.toggle("danger", options.danger !== false);
+      confirm.classList.toggle("primary", options.danger === false);
+    }
     if ($("envConfirm")) $("envConfirm").hidden = false;
     syncEnvOverlayLock();
     if ($("btnEnvConfirmCancel")) $("btnEnvConfirmCancel").focus();

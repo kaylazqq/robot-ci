@@ -446,6 +446,57 @@ class JobPayloadTests(unittest.TestCase):
 
 
 class JobPipelineTests(unittest.TestCase):
+    def test_gamma_deploy_only_keeps_gamma_and_places_production_gate_before_it(self) -> None:
+        job = make_job("pipe-gamma-deploy", status="running")
+        job.update({
+            "stage": "gamma",
+            "optional_steps": {
+                "gamma_deploy": True, "gamma_test": False,
+                "gamma_environment_id": "prod-env",
+            },
+            "approval_gates": {"gamma": {"status": "waiting"}},
+        })
+        env = {"id": "prod-env", "name": "prod", "environment_type": "production"}
+        with patch.object(server, "get_environment", return_value=env):
+            payload = server.job_payload(job, compact=True)["pipeline"]
+        gamma = next(row for row in payload["steps"] if row["id"] == "gamma")
+        self.assertEqual(["deploy"], [row["id"] for row in gamma["subtasks"]])
+        self.assertEqual("pending", gamma["status"])
+        self.assertEqual(
+            [{"id": "gamma", "before": "gamma", "purpose": "gamma集成测试", "environment": "prod", "status": "queued", "operator": "", "approved_at": ""}],
+            payload["gates"],
+        )
+
+    def test_release_waits_yellow_and_rollback_stays_gray_until_used(self) -> None:
+        job = make_job("pipe-release-wait", status="running")
+        job.update({
+            "stage": "release", "production_released": True,
+            "gamma_rollouts": [{"id": "rollout-1"}],
+            "optional_steps": {"production_release": True},
+        })
+        with patch.object(server, "get_parallel_rollout", return_value={"status": "active"}):
+            rows = server._subtask_rows("release", "running", job)
+        statuses = {row["id"]: row["status"] for row in rows}
+        self.assertEqual("queued", statuses["offline"])
+        self.assertEqual("done", statuses["compare"])
+        self.assertNotIn("rollback", statuses)
+        pipeline = server.job_payload(job, compact=True)["pipeline"]
+        big_steps = {row["id"]: row["status"] for row in pipeline["steps"]}
+        self.assertEqual("skipped", big_steps["rollback"])
+
+    def test_historical_rolled_back_release_marks_big_rollback_done(self) -> None:
+        job = make_job("pipe-release-rolled-back", status="ok")
+        job.update({
+            "production_released": True,
+            "optional_steps": {"production_release": True, "release_environment_id": "env-prod"},
+        })
+        with patch.object(server, "list_parallel_rollouts", return_value=[{
+            "id": "rollout-old", "job_id": "pipe-release-rolled-back", "status": "rolled_back",
+        }]):
+            pipeline = server.job_payload(job, compact=True)["pipeline"]
+        statuses = {row["id"]: row["status"] for row in pipeline["steps"]}
+        self.assertEqual("done", statuses["rollback"])
+
     def test_running_job_marks_active_stage(self) -> None:
         job = make_job("pipe-run")
         job["stage"] = "building"
@@ -555,19 +606,17 @@ class JobPipelineTests(unittest.TestCase):
     def test_gamma_optional_steps_selected_done(self) -> None:
         job = make_job("pipe-gamma-on", status="ok")
         job["stage"] = "done"
-        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": False}
+        job["optional_steps"] = {"production_release": True, "gamma_deploy": False, "gamma_test": False}
         job["results"] = [{"service_id": "memory-service", "ok": True}]
         payload = server.job_payload(job, compact=True)
         steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
-        self.assertEqual("done", steps["gamma"]["status"])
-        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
-        self.assertEqual(["deploy"], list(sub))
-        self.assertEqual("done", sub["deploy"])
+        self.assertEqual("done", steps["release"]["status"])
+        self.assertNotIn("gamma", steps)
 
     def test_gamma_running_after_push_results(self) -> None:
         job = make_job("pipe-gamma-live", status="running")
-        job["stage"] = "gamma"
-        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": True}
+        job["stage"] = "release"
+        job["optional_steps"] = {"production_release": True, "gamma_deploy": True, "gamma_test": True}
         job["results"] = [
             {
                 "service_id": "memory-service",
@@ -577,26 +626,22 @@ class JobPipelineTests(unittest.TestCase):
         ]
         payload = server.job_payload(job, compact=True)
         steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
-        self.assertEqual("running", steps["gamma"]["status"])
+        self.assertEqual("running", steps["release"]["status"])
         self.assertEqual("done", steps["push"]["status"])
-        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
-        self.assertEqual("running", sub["deploy"])
-        self.assertEqual("pending", sub["test"])
+        self.assertEqual("done", steps["gamma"]["status"])
 
     def test_gamma_failed_after_successful_push(self) -> None:
         job = make_job("pipe-gamma-fail", status="failed")
-        job["stage"] = "gamma"
+        job["stage"] = "release"
         job["error"] = "kubectl 升级 memory-service 失败"
-        job["optional_steps"] = {"gamma_deploy": True, "gamma_test": False}
+        job["optional_steps"] = {"production_release": True, "gamma_deploy": False, "gamma_test": False}
         job["results"] = [{"service_id": "memory-service", "ok": True}]
         payload = server.job_payload(job, compact=True)
         self.assertEqual("failed", payload["status"])
         steps = {step["id"]: step for step in payload["pipeline"]["steps"]}
-        self.assertEqual("failed", steps["gamma"]["status"])
+        self.assertEqual("failed", steps["release"]["status"])
         self.assertEqual("done", steps["push"]["status"])
-        sub = {item["id"]: item["status"] for item in steps["gamma"]["subtasks"]}
-        self.assertEqual(["deploy"], list(sub))
-        self.assertEqual("failed", sub["deploy"])
+        self.assertNotIn("gamma", steps)
 
     def test_failed_sync_marks_first_step_failed(self) -> None:
         job = make_job("pipe-fail", status="failed")

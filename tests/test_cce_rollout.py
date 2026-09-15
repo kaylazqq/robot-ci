@@ -1,11 +1,12 @@
 import json
+import re
 import sys
 import tempfile
 import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cce_rollout
 import server
@@ -30,6 +31,28 @@ def _job(job_id: str, service_id: str = "memory-service") -> dict:
 
 
 class CceRolloutHelperTests(unittest.TestCase):
+    def test_historical_rollback_restores_source_and_deletes_current_active_workload(self) -> None:
+        record = {
+            "id": "rollout-1", "environment_id": "env-1", "source_workload": "service-v1",
+            "candidate_workload": "service-v2", "old_manifest_json": json.dumps({
+                "apiVersion": "apps/v1", "metadata": {"name": "service-v1"}, "spec": {}
+            }),
+        }
+        remote = Mock(return_value=(0, "applied", ""))
+        conn = Mock()
+        with patch.object(server, "get_parallel_rollout", return_value=record), \
+             patch.object(server, "_parallel_rollout_remote", return_value=({"workload_name": "service-v3"}, remote, "default")), \
+             patch.object(server.cce_rollout, "get_deployment_payload", return_value={"metadata": {"name": "service-v3"}}), \
+             patch.object(server.cce_rollout, "delete_deployment") as delete, \
+             patch.object(server, "set_environment_active_workload") as set_active, \
+             patch.object(server, "_connect_db", return_value=conn), \
+             patch.object(server, "parallel_rollout_live_state", return_value=({"status": "rolled_back"}, "")):
+            item, error = server.rollback_parallel_rollout("rollout-1")
+        self.assertEqual("", error)
+        self.assertEqual("rolled_back", item["status"])
+        delete.assert_called_once_with(remote, namespace="default", deploy="service-v3")
+        set_active.assert_called_once_with("env-1", "service-v1")
+
     def test_parse_ssh_target(self) -> None:
         self.assertEqual(("root", "122.9.139.49", 22), cce_rollout.parse_ssh_target("root@122.9.139.49"))
         self.assertEqual(("root", "122.9.139.49", 22), cce_rollout.parse_ssh_target("122.9.139.49"))
@@ -121,7 +144,7 @@ class CceRolloutHelperTests(unittest.TestCase):
             source, source_name="semantic-schedule", release_id="ab12cd34ef56",
             image="registry/schedule:new", container="container-1", replicas=1,
         )
-        self.assertEqual("semantic-schedule-r-ab12cd34ef56", manifest["metadata"]["name"])
+        self.assertRegex(manifest["metadata"]["name"], r"^semantic-schedule-v-20\d{10}$")
         labels = manifest["spec"]["template"]["metadata"]["labels"]
         self.assertEqual("schedule", labels["app"])
         self.assertEqual("ab12cd34ef56", labels[cce_rollout.PARALLEL_RELEASE_LABEL])
@@ -129,6 +152,31 @@ class CceRolloutHelperTests(unittest.TestCase):
         images = {row["name"]: row["image"] for row in manifest["spec"]["template"]["spec"]["containers"]}
         self.assertEqual("registry/schedule:new", images["container-1"])
         self.assertEqual("elastic/filebeat:8", images["filebeat"])
+
+    def test_parallel_manifest_names_from_configured_baseline_not_active_workload(self) -> None:
+        source = {
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "service-v-202609151000", "labels": {"app": "service"}},
+            "spec": {
+                "selector": {"matchLabels": {"app": "service"}},
+                "template": {"metadata": {"labels": {"app": "service"}}, "spec": {
+                    "containers": [{"name": "app", "image": "registry/service:old"}],
+                }},
+            },
+        }
+        manifest = cce_rollout.deployment_manifest_for_parallel_release(
+            source,
+            source_name="service-v-202609151000",
+            base_name="service",
+            release_id="job-202609151053",
+            image="registry/service:new",
+            container="app",
+        )
+        self.assertEqual("service-v-202609151053", manifest["metadata"]["name"])
+        self.assertEqual(
+            "service-v-202609151000",
+            manifest["metadata"]["labels"][cce_rollout.PARALLEL_SOURCE_LABEL],
+        )
 
     def test_resolve_credentials_prefers_env(self) -> None:
         creds = cce_rollout.resolve_credentials(
@@ -204,9 +252,9 @@ class CceRolloutHelperTests(unittest.TestCase):
         def hop(command, **_kwargs):  # noqa: ANN001
             commands.append(command)
             if "get deploy" in command and "-o json" in command:
-                if "semantic-schedule-r-ab12cd34" in command:
+                if "semantic-schedule-v-" in command:
                     candidate = json.loads(json.dumps(source))
-                    candidate["metadata"]["name"] = "semantic-schedule-r-ab12cd34"
+                    candidate["metadata"]["name"] = re.search(r"get deploy ([^ ]+)", command).group(1)
                     candidate["status"] = {"readyReplicas": 1, "availableReplicas": 1}
                     return 0, json.dumps(candidate), ""
                 return 0, json.dumps(source), ""
@@ -220,9 +268,77 @@ class CceRolloutHelperTests(unittest.TestCase):
             mode="parallel", release_id="ab12cd34", on_parallel_created=created.append,
         )
         self.assertTrue(ok, err)
-        self.assertEqual("semantic-schedule-r-ab12cd34", created[0]["name"])
+        self.assertRegex(created[0]["name"], r"^semantic-schedule-v-20\d{10}$")
         self.assertTrue(any("apply -f" in command for command in commands))
         self.assertFalse(any("set image" in command for command in commands))
+
+    def test_resolve_source_falls_back_to_baseline_when_active_missing(self) -> None:
+        baseline = {
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "semantic-schedule"},
+            "spec": {"template": {"spec": {"containers": [{"name": "container-1", "image": "old"}]}}},
+        }
+
+        def run_remote(command: str, _timeout: int = 60) -> tuple[int, str, str]:
+            if "get deploy semantic-schedule-v-gone" in command:
+                return 1, "", 'Error from server (NotFound): deployments.apps "semantic-schedule-v-gone" not found'
+            if "get deploy semantic-schedule " in command or command.rstrip().endswith("get deploy semantic-schedule -o json"):
+                return 0, json.dumps(baseline), ""
+            return 1, "", "unexpected"
+
+        logs: list[str] = []
+        name, payload = cce_rollout.resolve_source_deployment(
+            run_remote,
+            namespace="default",
+            active="semantic-schedule-v-gone",
+            baseline="semantic-schedule",
+            log=logs.append,
+        )
+        self.assertEqual("semantic-schedule", name)
+        self.assertEqual(baseline, payload)
+        self.assertTrue(any("活动负载" in line and "基准负载" in line for line in logs))
+
+    def test_resolve_source_uses_unique_approximate_match(self) -> None:
+        only = {
+            "metadata": {
+                "name": "semantic-schedule-v-202609151200",
+                "labels": {cce_rollout.PARALLEL_SOURCE_LABEL: "semantic-schedule"},
+            },
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "x"}]}}},
+            "status": {"readyReplicas": 1},
+        }
+
+        def run_remote(command: str, _timeout: int = 60) -> tuple[int, str, str]:
+            if "get deploy " in command and " -o json" in command and "get deploy -o json" not in command:
+                return 1, "", "not found"
+            if "get deploy -o json" in command:
+                return 0, json.dumps({"items": [only]}), ""
+            return 1, "", "unexpected"
+
+        name, payload = cce_rollout.resolve_source_deployment(
+            run_remote, namespace="default", active="semantic-schedule-v-gone", baseline="semantic-schedule"
+        )
+        self.assertEqual("semantic-schedule-v-202609151200", name)
+        self.assertEqual(only, payload)
+
+    def test_resolve_source_errors_when_approximate_matches_multiple(self) -> None:
+        items = [
+            {"metadata": {"name": "semantic-schedule-v-1"}},
+            {"metadata": {"name": "semantic-schedule-v-2"}},
+        ]
+
+        def run_remote(command: str, _timeout: int = 60) -> tuple[int, str, str]:
+            if "get deploy " in command and "get deploy -o json" not in command:
+                return 1, "", "not found"
+            if "get deploy -o json" in command:
+                return 0, json.dumps({"items": items}), ""
+            return 1, "", "unexpected"
+
+        with self.assertRaises(cce_rollout.CceRolloutError) as ctx:
+            cce_rollout.resolve_source_deployment(
+                run_remote, namespace="default", active="gone", baseline="semantic-schedule"
+            )
+        self.assertIn("多个负载", str(ctx.exception))
 
     def test_deploy_job_results_requires_creds(self) -> None:
         with patch.object(cce_rollout, "default_key_candidates", return_value=[]):
@@ -279,7 +395,8 @@ class GammaAfterBuildTests(unittest.TestCase):
     def test_deploys_selected_environment(self) -> None:
         job = _job("gamma-run", service_id="semantic-schedule")
         job["optional_steps"] = {
-            "gamma_deploy": True,
+            "production_release": True,
+            "gamma_deploy": False,
             "gamma_test": False,
             "environment_id": "env1",
             "deployment_mode": "inplace",
@@ -338,12 +455,13 @@ class GammaAfterBuildTests(unittest.TestCase):
         self.assertEqual("jump-from-env", hop_kwargs.get("jump_password"))
         self.assertEqual("node-from-env", hop_kwargs.get("node_password"))
         with server._jobs_lock:
-            self.assertEqual("gamma", server._jobs["gamma-run"]["stage"])
+            self.assertEqual("release", server._jobs["gamma-run"]["stage"])
 
     def test_parallel_deploy_uses_cce_without_gamma_platform(self) -> None:
         job = _job("gamma-parallel", service_id="semantic-schedule")
         job["optional_steps"] = {
-            "gamma_deploy": True,
+            "production_release": True,
+            "gamma_deploy": False,
             "gamma_test": False,
             "environment_id": "env1",
             "deployment_mode": "parallel",
@@ -360,7 +478,7 @@ class GammaAfterBuildTests(unittest.TestCase):
         self.assertTrue(ok, err)
         deploy.assert_called_once()
 
-    def test_parallel_deploy_then_test_calls_gamma_test_only(self) -> None:
+    def test_gamma_deploy_then_test_stays_in_gamma_driver(self) -> None:
         job = _job("gamma-parallel-test", service_id="semantic-schedule")
         job["optional_steps"] = {
             "gamma_deploy": True,
@@ -385,7 +503,8 @@ class GammaAfterBuildTests(unittest.TestCase):
                         )
         self.assertTrue(ok, err)
         self.assertEqual(1, len(calls))
-        self.assertFalse(calls[0]["gamma_deploy"])
+        self.assertTrue(calls[0]["gamma_deploy"])
+        self.assertFalse(calls[0]["production_release"])
 
     def test_prepare_slot_is_done_after_gamma_starts(self) -> None:
         job = _job("gamma-progressed")
@@ -401,12 +520,12 @@ class GammaAfterBuildTests(unittest.TestCase):
             "status": "running",
             "cancel_requested": True,
             "results": [{"service_id": "memory-service", "ok": True}],
-            "optional_steps": {"gamma_deploy": True, "gamma_test": False, "environment_id": "env1"},
+            "optional_steps": {"production_release": True, "gamma_deploy": False, "gamma_test": False, "environment_id": "env1"},
         })
         with patch.object(server, "load_services", return_value=[{"id": "memory-service", "title": "memory"}]):
             pipeline = server.build_job_pipeline(job)
-        gamma = next(step for step in pipeline["steps"] if step["id"] == "gamma")
-        self.assertEqual("skipped", gamma["status"])
+        release = next(step for step in pipeline["steps"] if step["id"] == "release")
+        self.assertEqual("skipped", release["status"])
 
     def test_restart_preserves_requested_stop_as_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -104,6 +104,7 @@
             <button type="button" class="subtab" data-tab="history">构建历史</button>
             <button type="button" class="subtab" data-tab="artifacts">产物管理</button>
             <button type="button" class="subtab" data-tab="envs">环境管理</button>
+            <button type="button" class="subtab" data-tab="permissions">权限管理</button>
           </nav>
         </div>
         <div class="toolbar toolbar-2" id="pipelineActions">
@@ -155,7 +156,7 @@
 
         <div class="view-pane" id="viewPipeline">
           <section class="job-pipeline" id="liveJobPipeline" aria-label="构建流水线" hidden></section>
-          <p class="pipeline-blank" id="pipelineEmpty">当前服务无构建历史记录</p>
+          <p class="pipeline-blank" id="pipelineEmpty">当前分支无构建历史记录</p>
         </div>
         <div class="view-pane" id="viewHistory" hidden>
           <div class="list-head list-head-actions">
@@ -169,6 +170,7 @@
               <colgroup>
                 <col class="hist-col-time" />
                 <col class="hist-col-svc" />
+                <col class="hist-col-pipeline" />
                 <col class="hist-col-branch" />
                 <col class="hist-col-status" />
                 <col class="hist-col-sha" />
@@ -180,6 +182,7 @@
                 <tr>
                   <th>时间</th>
                   <th class="hist-service-column">微服务</th>
+                  <th>流水线</th>
                   <th>分支</th>
                   <th>状态</th>
                   <th>Commit</th>
@@ -236,6 +239,10 @@
           </div>
           <p class="hint error" id="envError" hidden></p>
           <div class="env-grid" id="envGrid"></div>
+        </div>
+        <div class="view-pane page-envs" id="viewPermissions" hidden>
+          <p class="hint error" id="permissionError" hidden></p>
+          <div id="permissionGrid"></div>
         </div>
       </section>
 
@@ -328,6 +335,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=202609145"></script>
+  <script src="/app.js?v=202609151"></script>
 </body>
 </html>

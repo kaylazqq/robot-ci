@@ -18,8 +18,10 @@ class EnvironmentApiTests(unittest.TestCase):
         self.users_path = Path(self.tmp.name) / "users.json"
         self.db_patch = patch.object(server, "DB_PATH", self.db_path)
         self.users_patch = patch.object(server, "USERS_PATH", self.users_path)
+        self.cfg_port_patch = patch.dict(server.CFG, {"port": 18889})
         self.db_patch.start()
         self.users_patch.start()
+        self.cfg_port_patch.start()
         with server._sessions_lock:
             server._sessions.clear()
         server.ensure_default_users()
@@ -35,6 +37,7 @@ class EnvironmentApiTests(unittest.TestCase):
         self.thread.join(timeout=2)
         self.users_patch.stop()
         self.db_patch.stop()
+        self.cfg_port_patch.stop()
         self.tmp.cleanup()
 
     def _open(self, path: str, data=None, method="GET", cookie=""):
@@ -56,6 +59,13 @@ class EnvironmentApiTests(unittest.TestCase):
 
     def test_environment_crud_and_guiyang_region(self) -> None:
         cookie = self._login()
+        with self._open("/api/permissions?service_id=semantic-schedule", cookie=cookie) as response:
+            permissions = json.loads(response.read().decode())
+        self.assertEqual(
+            ["production_release", "environment_manage"],
+            [item["permission_id"] for item in permissions["permissions"]],
+        )
+        self.assertIn(server.DEFAULT_USERNAME, permissions["accounts"])
         with self._open("/api/environments", cookie=cookie) as response:
             empty = json.loads(response.read().decode())
         self.assertEqual([], empty["environments"])

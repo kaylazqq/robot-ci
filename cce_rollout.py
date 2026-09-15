@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -489,10 +490,11 @@ PARALLEL_SOURCE_LABEL = "robot-ci.io/source-workload"
 def parallel_deployment_name(source: str, release_id: str) -> str:
     """Build a deterministic DNS label no longer than a Deployment name permits."""
     base = re.sub(r"[^a-z0-9-]+", "-", str(source or "").lower()).strip("-")
-    token = re.sub(r"[^a-z0-9]+", "", str(release_id or "").lower())[:12]
+    match = re.search(r"(20\d{10})", str(release_id or ""))
+    token = match.group(1) if match else time.strftime("%Y%m%d%H%M")
     if not base or not token:
         raise CceRolloutError("无法生成新版本负载名称")
-    suffix = f"-r-{token}"
+    suffix = f"-v-{token}"
     return (base[: 63 - len(suffix)].rstrip("-") + suffix)[:63]
 
 
@@ -500,6 +502,7 @@ def deployment_manifest_for_parallel_release(
     source_payload: Mapping[str, Any],
     *,
     source_name: str,
+    base_name: str = "",
     release_id: str,
     image: str,
     container: str,
@@ -525,7 +528,7 @@ def deployment_manifest_for_parallel_release(
         if isinstance(row, dict) and row.get("name") == container:
             row["image"] = image
 
-    name = parallel_deployment_name(source_name, release_id)
+    name = parallel_deployment_name(base_name or source_name, release_id)
     release = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(release_id)).strip("-_.")[:63]
     if not release:
         raise CceRolloutError("发布标识不合法")
@@ -600,22 +603,133 @@ def get_deployment_payload(run_remote: RemoteFn, *, namespace: str, deploy: str)
     return payload
 
 
+def list_namespace_deployments(run_remote: RemoteFn, *, namespace: str) -> list[dict[str, Any]]:
+    code, out, err = run_remote(
+        f"kubectl -n {shlex.quote(namespace)} get deploy -o json", 90
+    )
+    if code != 0:
+        detail = (err or out or "").strip() or f"exit {code}"
+        raise CceRolloutError(f"列出 Deployment 失败: {detail}")
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise CceRolloutError("Deployment 列表返回的不是 JSON") from exc
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _deployment_name(payload: Mapping[str, Any]) -> str:
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+    return str(metadata.get("name") or "").strip()
+
+
+def discover_related_deployments(
+    run_remote: RemoteFn,
+    *,
+    namespace: str,
+    baseline: str,
+) -> list[dict[str, Any]]:
+    """Approximate CCE Deployments related to a baseline workload name.
+
+    Matches parallel-release naming (``baseline-v-*``) and the
+    ``robot-ci.io/source-workload`` label. Exact baseline name is excluded —
+    callers should already have tried that lookup.
+    """
+    base = str(baseline or "").strip()
+    if not base:
+        return []
+    related: list[dict[str, Any]] = []
+    for item in list_namespace_deployments(run_remote, namespace=namespace):
+        name = _deployment_name(item)
+        if not name or name == base:
+            continue
+        labels = ((item.get("metadata") or {}).get("labels") or {}) if isinstance(item.get("metadata"), Mapping) else {}
+        source = str(labels.get(PARALLEL_SOURCE_LABEL) or "").strip()
+        if source == base or name.startswith(base + "-v-"):
+            related.append(item)
+    related.sort(key=_deployment_name)
+    return related
+
+
+def resolve_source_deployment(
+    run_remote: RemoteFn,
+    *,
+    namespace: str,
+    active: str,
+    baseline: str,
+    log: Callable[[str], None] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve the source Deployment for a release.
+
+    Order:
+    1. exact ``active_workload_name``
+    2. exact baseline ``workload_name``
+    3. approximate CCE query by baseline — use only when exactly one match
+    """
+    write = log or (lambda _line: None)
+    active_name = str(active or "").strip()
+    baseline_name = str(baseline or "").strip()
+    tried: list[str] = []
+
+    for name in (active_name, baseline_name):
+        if not name or name in tried:
+            continue
+        tried.append(name)
+        payload = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+        if payload is not None:
+            if active_name and name != active_name:
+                write(f"活动负载 {active_name} 不存在，改用基准负载 {name}")
+            return name, payload
+        if name == active_name and baseline_name and baseline_name != active_name:
+            write(f"活动负载 {active_name} 不存在，尝试基准负载 {baseline_name}")
+        else:
+            write(f"负载 {name} 不存在")
+
+    discover_base = baseline_name or active_name
+    if not discover_base:
+        raise CceRolloutError("环境未配置负载名称，无法定位源负载")
+
+    related = discover_related_deployments(run_remote, namespace=namespace, baseline=discover_base)
+    names = [_deployment_name(item) for item in related]
+    if len(related) == 1:
+        name = names[0]
+        write(f"基准负载不存在，近似查询唯一命中 {name}，用作源负载")
+        return name, related[0]
+    if len(related) > 1:
+        raise CceRolloutError(
+            f"活动负载与基准负载均不存在，按基准名 {discover_base} 近似查询到多个负载："
+            f"{', '.join(names)}。请更新环境中的负载名称后重试"
+        )
+
+    hint = " / ".join(tried) if tried else discover_base
+    raise CceRolloutError(
+        f"源负载不存在（已查：{hint}），按基准名 {discover_base} 近似查询也无结果。"
+        "请更新环境中的负载名称后重试"
+    )
+
+
 def create_parallel_deployment(
     run_remote: RemoteFn,
     *,
     namespace: str,
     source: str,
+    base_name: str = "",
     release_id: str,
     image: str,
     container: str,
     replicas: int,
     timeout: str,
+    source_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = get_deployment_payload(run_remote, namespace=namespace, deploy=source)
+    payload = dict(source_payload) if isinstance(source_payload, Mapping) else get_deployment_payload(
+        run_remote, namespace=namespace, deploy=source
+    )
     if payload is None:
         raise CceRolloutError(f"源 Deployment 不存在: {source}")
     manifest = deployment_manifest_for_parallel_release(
-        payload, source_name=source, release_id=release_id,
+        payload, source_name=source, base_name=base_name, release_id=release_id,
         image=image, container=container, replicas=replicas,
     )
     name = str(manifest["metadata"]["name"])
@@ -677,7 +791,8 @@ def deploy_job_results(
     write = log or (lambda _line: None)
     jump_host = str(environment.get("jump_host") or "").strip()
     nodes = [str(item).strip() for item in (environment.get("nodes") or []) if str(item).strip()]
-    workload = str(environment.get("workload_name") or "").strip()
+    workload = str(environment.get("active_workload_name") or environment.get("workload_name") or "").strip()
+    base_workload = str(environment.get("workload_name") or workload).strip()
     env_name = str(environment.get("name") or workload or "environment")
     cluster = str(environment.get("cluster_name") or "").strip()
     if not jump_host:
@@ -740,7 +855,19 @@ def deploy_job_results(
     for service_id, deploy, image, preferred in planned:
         write(f"gamma部署 {service_id} → deploy/{deploy} image={image} mode={mode}")
         try:
-            containers = inspect_containers(run_remote, namespace, deploy)
+            source_name, source_payload = resolve_source_deployment(
+                run_remote,
+                namespace=namespace,
+                active=deploy,
+                baseline=base_workload,
+                log=write,
+            )
+            if source_name != deploy:
+                write(f"实际源负载切换为 deploy/{source_name}")
+                deploy = source_name
+            containers = containers_from_deploy_json(source_payload)
+            if not containers:
+                raise CceRolloutError(f"Deployment {deploy} 没有 containers")
             container = pick_container(containers, image=image, preferred=preferred)
             current = next((img for name, img in containers if name == container), "")
             if current:
@@ -751,11 +878,13 @@ def deploy_job_results(
                     run_remote,
                     namespace=namespace,
                     source=deploy,
+                    base_name=base_workload,
                     release_id=release_id,
                     image=image,
                     container=container,
                     replicas=1,
                     timeout=rollout_timeout,
+                    source_payload=source_payload,
                 )
                 created.update({
                     "service_id": service_id, "source_workload": deploy,
