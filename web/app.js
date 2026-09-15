@@ -232,6 +232,20 @@ function jobBelongsToService(job, serviceId) {
   if (!job || !serviceId || serviceId === ALL_SERVICES_ID) return false;
   return jobServiceIds(job).includes(serviceId);
 }
+function jobTemplateId(job) {
+  return String((job && job.template_id) || "").trim();
+}
+function jobBelongsToSelectedTemplate(job) {
+  const tid = selectedTemplateId || "";
+  if (!tid || !job) return true;
+  const jobTid = jobTemplateId(job);
+  // Legacy jobs without template_id stay visible only on the personal builtin pipeline.
+  if (!jobTid) {
+    const tpl = selectedPipelineTemplate();
+    return !!(tpl && tpl.kind === "personal" && tpl.builtin);
+  }
+  return jobTid === tid;
+}
 function viewIsCurrent(gen, serviceId) {
   return sessionLive && gen === viewGeneration && serviceId === currentServiceId;
 }
@@ -1015,6 +1029,9 @@ function renderPipelineTemplates() {
         if (id && id !== selectedTemplateId) {
           selectedTemplateId = id;
           templateActiveJobId = "";
+          pinnedJobId = "";
+          stopPolling();
+          applyJob(null, { loading: true });
           hideTplMenu();
           renderPipelineTemplates();
           if (!isAllServices() && currentServiceId) loadServiceJob();
@@ -1985,9 +2002,10 @@ function stopPolling() {
   pollTimer = null;
 }
 
-function applyJob(job, { loading } = {}) {
+function applyJob(job, { loading, force } = {}) {
   if (job && !sessionLive) return;
   if (job && !isAllServices() && currentServiceId && !jobBelongsToService(job, currentServiceId)) return;
+  if (job && !force && !isAllServices() && !jobBelongsToSelectedTemplate(job)) return;
   currentJob = job;
   currentJobId = job && job.id || "";
   renderJobMeta(job);
@@ -2028,6 +2046,7 @@ async function openJob(jobId, { fromHistory } = {}) {
   if (!jobId || !sessionLive) return false;
   const gen = viewGeneration;
   const sidBefore = currentServiceId;
+  const tidBefore = selectedTemplateId || "";
   stopPolling();
   const job = await api("/api/jobs/" + jobId + "?compact=1");
   if (!sessionLive) return false;
@@ -2036,15 +2055,32 @@ async function openJob(jobId, { fromHistory } = {}) {
     if (sid && sid !== currentServiceId && services.some((item) => item.id === sid)) {
       activateService(sid);
     }
+    if (!isAllServices() && currentServiceId) {
+      await loadPipelineTemplates().catch(() => {});
+    }
+    const jobTid = jobTemplateId(job);
+    if (jobTid) {
+      selectedTemplateId = jobTid;
+      renderPipelineTemplates();
+    } else {
+      const personal = defaultPersonalTemplate();
+      if (personal) {
+        selectedTemplateId = personal.id;
+        renderPipelineTemplates();
+      }
+    }
     pinnedJobId = jobId;
-    applyJob(job);
+    templateActiveJobId = jobIsLive(job) ? jobId : "";
+    applyJob(job, { force: true });
     setTab("pipeline");
     if (jobIsLive(job)) startPolling(jobId);
     refreshServiceOccupancy().catch(() => {});
     return true;
   }
   if (!viewIsCurrent(gen, sidBefore)) return false;
+  if ((selectedTemplateId || "") !== tidBefore) return false;
   if (!isAllServices() && sid && sid !== currentServiceId) return false;
+  if (!isAllServices() && !jobBelongsToSelectedTemplate(job)) return false;
   applyJob(job);
   if (jobIsLive(job)) startPolling(jobId);
   return true;
@@ -2129,12 +2165,21 @@ function startPolling(jobId) {
   stopPolling();
   if (!sessionLive) return;
   const generation = pollGeneration;
+  const expectedService = currentServiceId;
+  const expectedTemplate = selectedTemplateId || "";
   const tick = async () => {
     if (!sessionLive || generation !== pollGeneration) return;
+    if (currentServiceId !== expectedService) return;
+    if ((selectedTemplateId || "") !== expectedTemplate) return;
     try {
       const job = await api("/api/jobs/" + jobId + "?compact=1&view=ui&log_after=0");
       if (!sessionLive || generation !== pollGeneration) return;
+      if (currentServiceId !== expectedService) return;
+      if ((selectedTemplateId || "") !== expectedTemplate) return;
       if (!isAllServices() && !jobBelongsToService(job, currentServiceId)) return;
+      if (!isAllServices() && !jobBelongsToSelectedTemplate(job)) return;
+      // Ignore stale polls after the UI already moved to another job.
+      if (currentJobId && currentJobId !== jobId && pinnedJobId !== jobId) return;
       applyJob(job);
       if (jobIsLive(job)) pollTimer = setTimeout(tick, 1500);
       else refreshServiceOccupancy().catch(() => {});
@@ -3032,14 +3077,16 @@ function envFormHtml(env) {
 }
 function envCardHtml(env) {
   const locked = !canManageEnvironments();
-  const lockAttrs = locked ? ' disabled aria-label="没有环境管理权限"' : '';
+  const editTitle = locked ? "没有环境管理权限" : "编辑";
+  const deleteTitle = locked ? "没有环境管理权限" : "删除";
+  const lockAttrs = locked ? " disabled aria-disabled=\"true\"" : "";
   return (
     '<article class="env-card" data-env-id="' + esc(env.id) + '">' +
     '<div class="env-card-head">' +
     '<div class="env-card-name">' + esc(env.name || "未命名环境") + ' <span class="env-tag">' + esc(env.environment_type || 'dev') + '</span></div>' +
     '<div class="env-card-actions">' +
-    '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="编辑"' + lockAttrs + '>' + envIconPencil() + "</button>" +
-    '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除"' + lockAttrs + '>' + envIconTrash() + "</button>" +
+    '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="' + esc(editTitle) + '"' + lockAttrs + '>' + envIconPencil() + "</button>" +
+    '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="' + esc(deleteTitle) + '"' + lockAttrs + '>' + envIconTrash() + "</button>" +
     "</div></div>" +
     '<div class="env-card-meta">' +
     '<div class="env-meta-row"><span class="env-meta-label">微服务:</span><strong class="env-meta-value">' + esc(serviceTitle(services.find((item) => item.id === env.service_id) || { id: env.service_id, title: env.service_id }) || "—") + "</strong></div>" +
@@ -3176,6 +3223,10 @@ function openEnvOverlay(env) {
   const body = $("envOverlayBody");
   const title = $("envOverlayTitle");
   if (!overlay || !body || !title) return;
+  if (!canManageEnvironments()) {
+    setEnvError("没有环境管理权限");
+    return;
+  }
   envDraftOpen = !env || !env.id;
   envEditingId = env && env.id ? env.id : "";
   title.textContent = envEditingId ? "编辑环境" : "创建环境";
@@ -3205,14 +3256,26 @@ function renderEnvironments() {
   }
   grid.innerHTML = environments.map(envCardHtml).join("");
   grid.querySelectorAll("[data-env-edit]").forEach((btn) => {
+    if (btn.disabled) return;
     btn.addEventListener("click", () => {
+      if (!canManageEnvironments()) {
+        setEnvError("没有环境管理权限");
+        return;
+      }
       const id = btn.getAttribute("data-env-edit") || "";
       const env = environments.find((item) => item.id === id);
       if (env) openEnvOverlay(env);
     });
   });
   grid.querySelectorAll("[data-env-delete]").forEach((btn) => {
-    btn.addEventListener("click", () => deleteEnvironment(btn.getAttribute("data-env-delete") || "").catch((e) => setEnvError(e.message)));
+    if (btn.disabled) return;
+    btn.addEventListener("click", () => {
+      if (!canManageEnvironments()) {
+        setEnvError("没有环境管理权限");
+        return;
+      }
+      deleteEnvironment(btn.getAttribute("data-env-delete") || "").catch((e) => setEnvError(e.message));
+    });
   });
   grid.querySelectorAll("[data-env-rollouts]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -3436,6 +3499,10 @@ function askEnvConfirm(message, options = {}) {
 }
 async function deleteEnvironment(id) {
   if (!id) return;
+  if (!canManageEnvironments()) {
+    setEnvError("没有环境管理权限");
+    return;
+  }
   const env = environments.find((item) => item.id === id);
   const name = (env && env.name) || id;
   const ok = await askEnvConfirm("确定删除环境「" + name + "」？删除后无法恢复。");

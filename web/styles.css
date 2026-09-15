@@ -1323,6 +1323,17 @@ body.clone-open { overflow: hidden; }
   place-items: center;
 }
 .env-icon-btn svg { width: 15px; height: 15px; display: block; }
+.env-icon-btn:disabled,
+.env-icon-btn:disabled:hover,
+.env-icon-btn:disabled:focus-visible,
+.env-icon-btn.danger:disabled:hover,
+.env-icon-btn.danger:disabled:focus-visible {
+  opacity: 0.38;
+  cursor: not-allowed;
+  pointer-events: none;
+  background: #d7e8ff;
+  color: #8aa4c0;
+}
 .env-icon-btn:hover,
 .env-icon-btn:focus-visible { background: #b9d6ff; color: #1554b5; }
 .env-icon-btn.danger:hover,
