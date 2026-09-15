@@ -408,7 +408,7 @@ function setTab(next) {
     if (tab === "pipeline" && !isAllServices()) {
       loadPipelineTemplates().catch(() => {});
       if (pinnedJobId) {
-        if (currentJobId !== pinnedJobId) openJob(pinnedJobId).catch(() => {});
+        if (currentJobId !== pinnedJobId) openJob(pinnedJobId, { fromHistory: true }).catch(() => {});
       } else {
         loadServiceJob();
       }
