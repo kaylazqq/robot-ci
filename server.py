@@ -2969,7 +2969,7 @@ def active_job_summary(
         if sid:
             live = [job for job in live if sid in _job_service_ids(job)]
         if tid:
-            live = [job for job in live if _job_template_id(job) == tid]
+            live = [job for job in live if _job_matches_template_filter(job, tid)]
         if not live:
             return None
         if want and not sid:
@@ -3577,6 +3577,159 @@ def _job_template_id(meta: Mapping[str, Any] | None) -> str:
     return str((meta or {}).get("template_id") or "").strip()
 
 
+def personal_builtin_template(username: str, service_id: str) -> dict[str, Any] | None:
+    """Return the built-in personal pipeline for a user+service, creating it if needed."""
+    user = str(username or "").strip()
+    sid = str(service_id or "").strip()
+    if not sid:
+        return None
+    if user:
+        ensure_default_pipeline_templates(user, sid)
+        for item in list_pipeline_templates(user, sid):
+            if item.get("kind") == "personal" and item.get("builtin"):
+                return item
+        return None
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute(
+                """
+                SELECT * FROM pipeline_templates
+                WHERE service_id = ? AND kind = 'personal' AND builtin = 1
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (sid,),
+            ).fetchone()
+        finally:
+            conn.close()
+    return _pipeline_template_from_row(row) if row else None
+
+
+def _fallback_pipeline_username() -> str:
+    users = _load_users()
+    for item in users:
+        name = str(item.get("username") or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def _template_is_personal_builtin(template_id: str) -> bool:
+    """True when template_id points at the built-in personal pipeline."""
+    tid = str(template_id or "").strip()
+    if not tid:
+        return False
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute(
+                "SELECT kind, builtin FROM pipeline_templates WHERE id = ?",
+                (tid,),
+            ).fetchone()
+        finally:
+            conn.close()
+    return bool(row and str(row["kind"] or "") == "personal" and int(row["builtin"] or 0) == 1)
+
+
+def _job_matches_template_filter(meta: Mapping[str, Any] | None, template_id: str) -> bool:
+    """
+    Match jobs to a pipeline template filter.
+    Untagged legacy jobs (empty template_id) belong to the personal builtin pipeline,
+    matching how history labels them as 个人构建流水线.
+    """
+    tid = str(template_id or "").strip()
+    if not tid:
+        return True
+    job_tid = _job_template_id(meta)
+    if job_tid == tid:
+        return True
+    if not job_tid and _template_is_personal_builtin(tid):
+        return True
+    return False
+
+
+def backfill_untagged_job_templates() -> dict[str, int]:
+    """
+    Persist template_id/template_name onto historical jobs that were created before
+    pipeline templates were recorded. Untagged jobs map to 个人构建流水线.
+    """
+    updated = 0
+    skipped = 0
+    cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+
+    def _resolve(username: str, service_id: str) -> dict[str, Any] | None:
+        key = (username, service_id)
+        if key not in cache:
+            cache[key] = personal_builtin_template(username, service_id)
+        return cache[key]
+
+    def _patch_meta(meta: dict[str, Any]) -> bool:
+        nonlocal updated, skipped
+        if _job_template_id(meta):
+            skipped += 1
+            return False
+        sids = _job_service_ids(meta)
+        sid = sids[0] if sids else str(meta.get("service_id") or "").strip()
+        if not sid:
+            skipped += 1
+            return False
+        user = str(meta.get("operator") or "").strip() or _fallback_pipeline_username()
+        tpl = _resolve(user, sid) if user else None
+        if not tpl:
+            skipped += 1
+            return False
+        meta["template_id"] = str(tpl.get("id") or "")
+        meta["template_name"] = str(tpl.get("name") or DEFAULT_PIPELINE_TEMPLATE_NAME)
+        updated += 1
+        return True
+
+    with _jobs_lock:
+        live_jobs = [dict(job) for job in _jobs.values()]
+    for snap in live_jobs:
+        job_id = str(snap.get("id") or "")
+        if not job_id or not _patch_meta(snap):
+            continue
+        with _jobs_lock:
+            live = _jobs.get(job_id)
+            if live is not None and not _job_template_id(live):
+                live["template_id"] = snap["template_id"]
+                live["template_name"] = snap["template_name"]
+        persist_job_meta(job_id)
+
+    for path in LOG_DIR.glob("job-*.json"):
+        match = re.fullmatch(r"job-([0-9a-fA-F]{8,32})\.json", path.name)
+        if not match:
+            continue
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            skipped += 1
+            continue
+        if not isinstance(meta, dict):
+            skipped += 1
+            continue
+        meta.setdefault("id", match.group(1))
+        if not _patch_meta(meta):
+            continue
+        try:
+            path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            skipped += 1
+            continue
+        with _history_disk_cache_lock:
+            _history_disk_cache.pop(str(path), None)
+        with _jobs_lock:
+            live = _jobs.get(str(meta.get("id") or ""))
+            if live is not None and not _job_template_id(live):
+                live["template_id"] = meta["template_id"]
+                live["template_name"] = meta["template_name"]
+
+    return {"updated": updated, "skipped": skipped}
+
+
 def _history_row(meta: dict[str, Any], mtime: float = 0.0) -> dict[str, Any]:
     return {
         "id": str(meta.get("id") or ""),
@@ -3620,7 +3773,7 @@ def list_build_history(
                 continue
             if sid and sid not in _job_service_ids(job):
                 continue
-            if tid and _job_template_id(job) != tid:
+            if tid and not _job_matches_template_filter(job, tid):
                 continue
             job_id = str(job.get("id") or "")
             if not job_id:
@@ -3641,7 +3794,7 @@ def list_build_history(
             continue
         if sid and sid not in _job_service_ids(row):
             continue
-        if tid and _job_template_id(row) != tid:
+        if tid and not _job_matches_template_filter(row, tid):
             continue
         rows.append(row)
         seen.add(job_id)
@@ -8674,6 +8827,12 @@ def main() -> None:
     reaped = reap_orphaned_running_jobs()
     if reaped:
         print(f"[swr-push-helper] marked {reaped} interrupted job(s) after restart", flush=True)
+    backfilled = backfill_untagged_job_templates()
+    if backfilled.get("updated"):
+        print(
+            f"[swr-push-helper] backfilled job template_id: updated={backfilled['updated']} skipped={backfilled['skipped']}",
+            flush=True,
+        )
     pruned_artifacts = prune_artifacts_log()
     pruned_history = prune_all_build_histories()
     if pruned_artifacts or pruned_history:

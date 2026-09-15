@@ -406,12 +406,16 @@ function setTab(next) {
     if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
     if (tab === "permissions") loadPermissions().catch(() => {});
     if (tab === "pipeline" && !isAllServices()) {
-      loadPipelineTemplates().catch(() => {});
-      if (pinnedJobId) {
-        if (currentJobId !== pinnedJobId) openJob(pinnedJobId, { fromHistory: true }).catch(() => {});
-      } else {
-        loadServiceJob();
-      }
+      loadPipelineTemplates()
+        .catch(() => {})
+        .then(() => {
+          if (tab !== "pipeline" || isAllServices()) return;
+          if (pinnedJobId) {
+            if (currentJobId !== pinnedJobId) openJob(pinnedJobId, { fromHistory: true }).catch(() => {});
+          } else {
+            loadServiceJob();
+          }
+        });
     }
   }
   writeHash();
@@ -1685,9 +1689,9 @@ async function refreshArtifacts() {
 async function refreshPipeline() {
   if (!sessionLive || isAllServices() || !currentServiceId) return;
   await withRefresh($("btnRefreshPipeline"), async () => {
-    const target = pinnedJobId || currentJobId;
-    if (target) {
-      await openJob(target);
+    // Prefer pinned history jobs; otherwise reload the selected pipeline's latest.
+    if (pinnedJobId) {
+      await openJob(pinnedJobId, { fromHistory: true });
       await refreshServiceOccupancy();
       return;
     }
@@ -1916,8 +1920,12 @@ function selectService(id) {
   writeHash();
   refreshServiceOccupancy().catch(() => {});
   if (tab === "pipeline") {
-    loadPipelineTemplates().catch(() => {});
-    loadServiceJob();
+    loadPipelineTemplates()
+      .catch(() => {})
+      .then(() => {
+        if (currentServiceId !== id || tab !== "pipeline") return;
+        loadServiceJob();
+      });
   }
   else {
     stopPolling();
@@ -2117,6 +2125,10 @@ async function refreshServiceOccupancy() {
 async function loadServiceJob() {
   const gen = viewGeneration;
   const sid = currentServiceId;
+  // Wait for templates so personal pipeline id is known before filtering.
+  if (!pipelineTemplates.length && sid && sid !== ALL_SERVICES_ID) {
+    await loadPipelineTemplates().catch(() => {});
+  }
   const tid = selectedTemplateId || "";
   stopPolling();
   pinnedJobId = "";
@@ -2127,8 +2139,7 @@ async function loadServiceJob() {
   const btn = $("btnRefreshPipeline");
   beginRefresh(btn);
   const started = Date.now();
-  if (currentJob && !jobBelongsToService(currentJob, sid)) applyJob(null, { loading: true });
-  else if (!currentJob) applyJob(null, { loading: true });
+  applyJob(null, { loading: true });
   const stillHere = () => viewIsCurrent(gen, sid) && (selectedTemplateId || "") === tid;
   try {
     const qs = "service_id=" + encodeURIComponent(sid) +
