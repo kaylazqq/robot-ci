@@ -302,6 +302,7 @@ def init_store() -> None:
             )
             _ensure_environment_secret_columns(conn)
             _ensure_environment_service_column(conn)
+            _ensure_environment_workload_columns(conn)
             _ensure_environment_type_column(conn)
             _ensure_rollout_recovery_columns(conn)
             _ensure_pipeline_templates_table(conn)
@@ -440,6 +441,28 @@ def _ensure_environment_service_column(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE environments SET service_id = ? WHERE id = ?", (inferred, row["id"]))
 
 
+def _baseline_workload_name(name: str) -> str:
+    value = str(name or "").strip()
+    while re.search(r"-v-20\d{10}$", value):
+        value = re.sub(r"-v-20\d{10}$", "", value)
+    return value
+
+
+def _ensure_environment_workload_columns(conn: sqlite3.Connection) -> None:
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environments)")}
+    if "active_workload_name" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN active_workload_name TEXT NOT NULL DEFAULT ''")
+    rows = conn.execute("SELECT id, workload_name, active_workload_name FROM environments").fetchall()
+    for row in rows:
+        configured = str(row["workload_name"] or "").strip()
+        active = str(row["active_workload_name"] or "").strip() or configured
+        baseline = _baseline_workload_name(configured) or configured
+        conn.execute(
+            "UPDATE environments SET workload_name=?, active_workload_name=? WHERE id=?",
+            (baseline, active, row["id"]),
+        )
+
+
 def _ensure_environment_type_column(conn: sqlite3.Connection) -> None:
     cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environments)")}
     if "environment_type" not in cols:
@@ -521,6 +544,7 @@ def _environment_from_row(row: sqlite3.Row, *, include_secrets: bool = False) ->
         "region_label": str(row["region_label"] or _env_region_label(str(row["region"]))),
         "cluster_name": str(row["cluster_name"]),
         "workload_name": str(row["workload_name"]),
+        "active_workload_name": _row_text(row, "active_workload_name") or str(row["workload_name"]),
         "environment_type": _row_text(row, "environment_type", "dev"),
         "jump_host": str(row["jump_host"]),
         "nodes": [str(item) for item in nodes if str(item).strip()],
@@ -579,6 +603,7 @@ def _validate_environment_payload(
         "region_label": _env_region_label(region),
         "cluster_name": cluster_name,
         "workload_name": workload_name,
+        "active_workload_name": workload_name,
         "jump_host": jump_host,
         "jump_password": jump_password,
         "node_password": node_password,
@@ -640,10 +665,10 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
             conn.execute(
                 """
                 INSERT INTO environments (
-                    id, name, service_id, region, region_label, cluster_name, workload_name,
+                    id, name, service_id, region, region_label, cluster_name, workload_name, active_workload_name,
                     jump_host, jump_password, node_password, nodes_json,
                     environment_type, created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
@@ -653,6 +678,7 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
                     item["region_label"],
                     item["cluster_name"],
                     item["workload_name"],
+                    item["active_workload_name"],
                     item["jump_host"],
                     item["jump_password"],
                     item["node_password"],
@@ -678,6 +704,7 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
         return None, err
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     item = {**existing, **payload, "updated_at": now}
+    item["active_workload_name"] = existing.get("active_workload_name") or existing.get("workload_name") or payload.get("workload_name") or ""
     item["service_id"] = existing.get("service_id") or payload.get("service_id") or ""
     if not payload.get("jump_password"):
         item["jump_password"] = existing.get("jump_password") or ""
@@ -873,7 +900,7 @@ def set_environment_active_workload(env_id: str, workload_name: str) -> None:
         conn = _connect_db()
         try:
             conn.execute(
-                "UPDATE environments SET workload_name = ?, updated_at = ? WHERE id = ?",
+                "UPDATE environments SET active_workload_name = ?, updated_at = ? WHERE id = ?",
                 (str(workload_name), now, str(env_id)),
             )
             conn.commit()
@@ -992,7 +1019,7 @@ def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, s
         return None, "没有可回滚的下线版本"
     try:
         env, run_remote, namespace = _parallel_rollout_remote(record)
-        current_workload = str(env.get("workload_name") or "").strip()
+        current_workload = str(env.get("active_workload_name") or env.get("workload_name") or "").strip()
         restored_workload = str(record.get("source_workload") or "").strip()
         payload = json.loads(str(record["old_manifest_json"]))
         payload.pop("status", None)
@@ -1020,6 +1047,32 @@ def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, s
     except Exception as exc:
         return None, str(exc)
     return parallel_rollout_live_state(rollout_id)
+
+
+def execute_parallel_rollout_rollback(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
+    """Execute rollback and record it against the dedicated rollback stage."""
+    record = get_parallel_rollout(rollout_id)
+    if record is None:
+        return None, "平滑发布记录不存在"
+    job_id = str(record.get("job_id") or "")
+    if job_id:
+        set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
+        append_job_step_log(job_id, "rollback", "log", "开始一键回滚：恢复下线版本并删除当前版本")
+    item, err = rollback_parallel_rollout(rollout_id)
+    if err or item is None:
+        if job_id:
+            append_job_step_log(job_id, "rollback", "log", f"一键回滚失败：{err}")
+            set_job(job_id, rollback_failed=True)
+        return None, err
+    if job_id:
+        append_job_step_log(
+            job_id,
+            "rollback",
+            "log",
+            f"一键回滚完成：已恢复 {record.get('source_workload')}，当前版本已清理",
+        )
+        set_job(job_id, rollback_completed=True, rollback_failed=False)
+    return item, ""
 
 
 BUILTIN_PIPELINE_TEMPLATES = (
@@ -1569,6 +1622,10 @@ JOB_PUBLIC_FIELDS = (
     "optional_steps",
     "gamma_e2e",
     "approval",
+    "approval_gates",
+    "rollback_requested",
+    "rollback_completed",
+    "rollback_failed",
 )
 
 JOB_COMPACT_FIELDS = (
@@ -1604,6 +1661,10 @@ JOB_COMPACT_FIELDS = (
     "optional_steps",
     "gamma_e2e",
     "approval",
+    "approval_gates",
+    "rollback_requested",
+    "rollback_completed",
+    "rollback_failed",
 )
 
 
@@ -1619,13 +1680,19 @@ def _has_service_permission(service_id: str, permission_id: str, username: str) 
     return bool(item and username in item["owners"])
 
 
-def wait_for_production_approval(job_id: str, env: dict[str, Any], purpose: str) -> None:
+def _set_approval_gate(job_id: str, gate_id: str, payload: dict[str, Any]) -> None:
+    job = _job_copy(job_id)
+    gates = dict(job.get("approval_gates") or {})
+    gates[gate_id] = {**dict(gates.get(gate_id) or {}), **payload, "id": gate_id}
+    set_job(job_id, approval_gates=gates)
+
+
+def wait_for_production_approval(job_id: str, env: dict[str, Any], purpose: str, gate_id: str) -> None:
     if str(env.get("environment_type") or "dev") != "production":
         return
-    job = _job_copy(job_id)
-    resume_stage = str(job.get("stage") or "gamma")
-    set_job(job_id, stage="approval")
-    set_job(job_id, approval={"status": "waiting", "purpose": purpose, "environment": env.get("name")})
+    approval = {"status": "waiting", "purpose": purpose, "environment": env.get("name"), "gate_id": gate_id}
+    _set_approval_gate(job_id, gate_id, approval)
+    set_job(job_id, approval=approval)
     append_job_log(job_id, f"WAIT production approval: {purpose}")
     while True:
         if job_cancel_requested(job_id):
@@ -1633,7 +1700,6 @@ def wait_for_production_approval(job_id: str, env: dict[str, Any], purpose: str)
         state = str((_job_copy(job_id).get("approval") or {}).get("status") or "")
         if state == "approved":
             append_job_log(job_id, f"OK production approval: {purpose}")
-            set_job(job_id, stage=resume_stage)
             return
         time.sleep(1)
 
@@ -1650,11 +1716,11 @@ PIPELINE_STEP_DEFS: tuple[tuple[str, str, str], ...] = (
     ("sync", "拉代码", "git"),
     ("test", "测试执行", "test"),
     ("build", "构建镜像", "build"),
-    ("approval", "人工卡点", "test"),
     ("push", "推送 SWR", "push"),
     ("archive", "本地归档", "archive"),
     ("gamma", "gamma集成测试", "gamma"),
     ("release", "生产发布", "gamma"),
+    ("rollback", "一键回滚", "gamma"),
 )
 
 PIPELINE_PREPARE_DEFS: tuple[tuple[str, str, str], ...] = (
@@ -1700,11 +1766,10 @@ PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
     "gamma": (("deploy", "gamma部署"), ("test", "gamma测试")),
     "release": (
         ("deploy", "部署新版本"),
-        ("traffic", "调整新旧实例"),
+        ("compare", "版本对比"),
         ("offline", "老版本下线"),
-        ("rollback", "一键回滚"),
     ),
-    "approval": (("approve", "等待生产发布审批"),),
+    "rollback": (),
     "archive": (
         ("save", "归档镜像"),
     ),
@@ -1716,10 +1781,10 @@ STAGE_TO_PIPELINE_STEP = {
     "syncing": "sync",
     "testing": "test",
     "building": "build",
-    "approval": "approval",
     "pushing": "push",
     "gamma": "gamma",
     "release": "release",
+    "rollback": "rollback",
     "archiving": "archive",
 }
 _TERMINAL_PIPELINE_STAGES = {"interrupted", "stopping", "done", ""}
@@ -1798,7 +1863,7 @@ def _release_selected(job: dict[str, Any] | None) -> bool:
 def _apply_gamma_override(statuses: dict[str, str], job: dict[str, Any] | None, *, live: bool) -> None:
     if "gamma" not in statuses:
         return
-    selected = _gamma_selected(job, "test")
+    selected = _gamma_selected(job, "deploy") or _gamma_selected(job, "test")
     if not selected:
         statuses["gamma"] = "skipped"
         return
@@ -2083,9 +2148,8 @@ def _subtask_rows(
         by_id = {row["id"]: row for row in rows}
         if (job or {}).get("production_released") or rollout_refs:
             by_id["deploy"]["status"] = "done"
-            by_id["traffic"]["status"] = "done"
+            by_id["compare"]["status"] = "done"
             by_id["offline"]["status"] = "queued" if rollout_status == "active" else "done"
-            by_id["rollback"]["status"] = "done" if rollout_status == "rolled_back" else "pending"
         return rows
     if step_id != "test":
         return rows
@@ -2480,6 +2544,23 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
 
     results = job.get("results") or []
     results_by_id = {str(item.get("service_id")): item for item in results if item.get("service_id")}
+    rollout_records = [
+        get_parallel_rollout(str(item.get("id") or ""))
+        for item in (job.get("gamma_rollouts") or [])
+        if str(item.get("id") or "")
+    ]
+    if not rollout_records and job.get("id") and _release_selected(job):
+        historical_env_id = str(
+            _normalize_optional_steps(job.get("optional_steps")).get("release_environment_id") or ""
+        )
+        if historical_env_id:
+            rollout_records = [
+                record for record in list_parallel_rollouts(historical_env_id)
+                if str(record.get("job_id") or "") == str(job.get("id") or "")
+            ]
+    rollback_observed = any(
+        str((record or {}).get("status") or "") == "rolled_back" for record in rollout_records
+    )
 
     current_raw = str(job.get("current") or "")
     current_sid = current_raw.split("@", 1)[0].strip() if current_raw else ""
@@ -2501,12 +2582,10 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         svc = catalog.get(service_id)
         title = str((svc or {}).get("title") or service_id)
         step_defs = _pipeline_steps_for_service(svc)
-        if not _job_needs_production_approval(job):
-            step_defs = [item for item in step_defs if item[0] != "approval"]
-        if not _gamma_selected(job, "test"):
+        if not (_gamma_selected(job, "deploy") or _gamma_selected(job, "test")):
             step_defs = [item for item in step_defs if item[0] != "gamma"]
         if not _release_selected(job):
-            step_defs = [item for item in step_defs if item[0] != "release"]
+            step_defs = [item for item in step_defs if item[0] not in {"release", "rollback"}]
         skip_push = _service_skip_push(svc)
 
         if service_id in results_by_id:
@@ -2554,15 +2633,21 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             svc_status = "pending"
 
         _apply_gamma_override(statuses, job, live=is_running)
-        if "approval" in statuses:
-            approval_status = str((job.get("approval") or {}).get("status") or "")
-            statuses["approval"] = "running" if approval_status == "waiting" else "done" if approval_status == "approved" else statuses["approval"]
         if "release" in statuses:
             if job.get("cancel_requested"): statuses["release"] = "skipped"
             elif job_status == "failed" and stage == "release": statuses["release"] = "failed"
             elif is_running and stage == "release": statuses["release"] = "running"
             elif is_running and stage != "release": statuses["release"] = "pending"
             elif job.get("production_released"): statuses["release"] = "done"
+        if "rollback" in statuses:
+            if job.get("rollback_failed"): statuses["rollback"] = "failed"
+            elif job.get("rollback_completed") or rollback_observed: statuses["rollback"] = "done"
+            elif job.get("rollback_requested"): statuses["rollback"] = "running"
+            else: statuses["rollback"] = "skipped"
+        waiting_gates = job.get("approval_gates") or {}
+        for gated_step in ("gamma", "release", "rollback"):
+            if gated_step in statuses and str((waiting_gates.get(gated_step) or {}).get("status") or "") == "waiting":
+                statuses[gated_step] = "pending"
         if "gamma" in statuses and is_running and stage == "release":
             statuses["gamma"] = "done"
         if (
@@ -2618,6 +2703,37 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     focus_svc = catalog.get(focus_sid or "")
     prepare = _prepare_lane_for_job(job, service_ids, catalog)
     steps = list(focus.get("steps") or []) if focus else []
+    gates = []
+    opts = _normalize_optional_steps(job.get("optional_steps"))
+    gate_state = dict(job.get("approval_gates") or {})
+    gate_specs = []
+    if (_gamma_selected(job, "deploy") or _gamma_selected(job, "test")):
+        gamma_env = get_environment(str(opts.get("gamma_environment_id") or ""))
+        if gamma_env and gamma_env.get("environment_type") == "production":
+            gate_specs.append(("gamma", "gamma集成测试", gamma_env))
+    if _release_selected(job):
+        release_env = get_environment(str(opts.get("release_environment_id") or ""))
+        if release_env and release_env.get("environment_type") == "production":
+            gate_specs.append(("release", "生产发布", release_env))
+            if job.get("rollback_requested") or rollback_observed:
+                gate_specs.append(("rollback", "一键回滚", release_env))
+    for gate_id, purpose, env in gate_specs:
+        state = dict(gate_state.get(gate_id) or {})
+        gate_status = "queued" if state.get("status") == "waiting" else "done" if state.get("status") == "approved" else "pending"
+        target_status = str(next((row.get("status") for row in steps if row.get("id") == gate_id), ""))
+        if not state and job_status == "ok" and target_status == "done":
+            gate_status = "done"
+        if gate_status == "queued" and (job.get("cancel_requested") or job_status == "stopped"):
+            gate_status = "skipped"
+        gates.append({
+            "id": gate_id,
+            "before": gate_id,
+            "purpose": purpose,
+            "environment": env.get("name") or "",
+            "status": gate_status,
+            "operator": state.get("operator") or "",
+            "approved_at": state.get("approved_at") or "",
+        })
     return {
         "progress": progress_text,
         "current_service": current_sid,
@@ -2635,6 +2751,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
         },
         "prepare": prepare,
         "steps": steps,
+        "gates": gates,
         "services": services_out,
         "summary": _pipeline_summary(steps, prepare),
         "artifacts": _pipeline_artifacts(focus_result, focus_svc),
@@ -3470,6 +3587,11 @@ def persist_job_meta(job_id: str) -> None:
             "queue_position",
             "optional_steps",
             "gamma_e2e",
+            "approval",
+            "approval_gates",
+            "rollback_requested",
+            "rollback_completed",
+            "rollback_failed",
             "frozen_inputs",
         )
         meta = {k: job.get(k) for k in keys}
@@ -3564,6 +3686,11 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "stage_before_stop": meta.get("stage_before_stop"),
         "optional_steps": meta.get("optional_steps") or {},
         "gamma_e2e": meta.get("gamma_e2e"),
+        "approval": meta.get("approval") or {},
+        "approval_gates": meta.get("approval_gates") or {},
+        "rollback_requested": bool(meta.get("rollback_requested")),
+        "rollback_completed": bool(meta.get("rollback_completed")),
+        "rollback_failed": bool(meta.get("rollback_failed")),
         "frozen_inputs": meta.get("frozen_inputs") or {},
         "log": log_lines,
     }
@@ -4587,6 +4714,31 @@ def append_job_log(job_id: str, line: str) -> None:
                 fh.write(text + "\n")
         except OSError:
             pass
+
+
+def append_job_step_log(job_id: str, step_id: str, sub_id: str, line: str) -> None:
+    """Append an operator action to one exact pipeline node without changing the job stage."""
+    ts = time.strftime("%H:%M:%S")
+    text = f"[{ts}] {line}"
+    log_file = ""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job.setdefault("log", []).append(text)
+        _append_ui_log(job, text)
+        logs = job.setdefault("step_logs", {})
+        logs.setdefault(step_id, []).append(text)
+        if sub_id:
+            logs.setdefault(f"{step_id}:{sub_id}", []).append(text)
+        log_file = str(job.get("log_file") or "")
+    if log_file:
+        try:
+            with Path(log_file).open("a", encoding="utf-8") as fh:
+                fh.write(text + "\n")
+        except OSError:
+            pass
+    persist_job_meta(job_id)
 
 
 def set_job(job_id: str, **fields: Any) -> None:
@@ -7005,7 +7157,7 @@ def maybe_run_gamma_after_build(
         if env_sid and env_sid not in job_sids:
             return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
         if str(gamma_env.get("environment_type") or "dev") == "production":
-            wait_for_production_approval(job_id, gamma_env, "gamma集成测试")
+            wait_for_production_approval(job_id, gamma_env, "gamma集成测试", "gamma")
         from gamma_real import available, run as run_real_gamma
         if not available(gamma_env_id):
             return False, "该环境尚未配置真实 Gamma 驱动；未执行 Gamma 测试"
@@ -7036,7 +7188,7 @@ def maybe_run_gamma_after_build(
                 append_job_log(job_id, f"ERROR {msg}")
                 return False, msg
             if str(env.get("environment_type") or "dev") == "production":
-                wait_for_production_approval(job_id, env, "生产发布")
+                wait_for_production_approval(job_id, env, "生产发布", "release")
             creds = cce_rollout.overlay_environment_passwords(
                 cce_rollout.resolve_credentials(CFG, os.environ),
                 env,
@@ -7908,12 +8060,18 @@ class Handler(SimpleHTTPRequestHandler):
             record = get_parallel_rollout(m_rollout_scale.group(1))
             if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
                 self._json(403, {"error": "没有生产发布权限"}); return
+            job_id = str(record.get("job_id") or "")
+            target = str(data.get("target") or "")
+            replicas = data.get("replicas")
+            append_job_step_log(job_id, "release", "compare", f"调整{'旧' if target == 'old' else '新'}版本实例数为 {replicas}")
             item, err = scale_parallel_rollout(
-                m_rollout_scale.group(1), str(data.get("target") or ""), data.get("replicas")
+                m_rollout_scale.group(1), target, replicas
             )
             if err or item is None:
+                append_job_step_log(job_id, "release", "compare", f"调整实例数失败：{err}")
                 self._json(400 if err != "平滑发布记录不存在" else 404, {"ok": False, "error": err})
                 return
+            append_job_step_log(job_id, "release", "compare", "实例数调整完成")
             self._json(200, {"ok": True, "rollout": item})
             return
 
@@ -7922,10 +8080,14 @@ class Handler(SimpleHTTPRequestHandler):
             record = get_parallel_rollout(m_rollout_offline.group(1))
             if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
                 self._json(403, {"error": "没有生产发布权限"}); return
+            job_id = str(record.get("job_id") or "")
+            append_job_step_log(job_id, "release", "offline", f"开始下线旧版本 {record.get('source_workload')}")
             item, err = offline_parallel_rollout_old(m_rollout_offline.group(1))
             if err or item is None:
+                append_job_step_log(job_id, "release", "offline", f"旧版本下线失败：{err}")
                 self._json(400 if err != "平滑发布记录不存在" else 404, {"ok": False, "error": err})
                 return
+            append_job_step_log(job_id, "release", "offline", f"旧版本 {record.get('source_workload')} 已下线")
             self._json(200, {"ok": True, "rollout": item})
             return
 
@@ -7934,7 +8096,24 @@ class Handler(SimpleHTTPRequestHandler):
             record = get_parallel_rollout(m_rollout_rollback.group(1))
             if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
                 self._json(403, {"error": "没有生产发布权限"}); return
-            item, err = rollback_parallel_rollout(m_rollout_rollback.group(1))
+            env = get_environment(str(record.get("environment_id") or "")) or {}
+            job_id = str(record.get("job_id") or "")
+            if str(env.get("environment_type") or "dev") == "production":
+                job = _job_copy(job_id)
+                state = dict((job.get("approval_gates") or {}).get("rollback") or {})
+                if state.get("status") != "approved":
+                    approval = {
+                        "status": "waiting", "purpose": "一键回滚",
+                        "environment": env.get("name") or "", "gate_id": "rollback",
+                        "rollout_id": str(record.get("id") or ""),
+                    }
+                    set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
+                    _set_approval_gate(job_id, "rollback", approval)
+                    set_job(job_id, approval=approval)
+                    append_job_step_log(job_id, "rollback", "log", "等待生产环境一键回滚人工确认")
+                    self._json(200, {"ok": True, "approval_required": True})
+                    return
+            item, err = execute_parallel_rollout_rollback(m_rollout_rollback.group(1))
             if err or item is None:
                 self._json(400, {"error": err}); return
             self._json(200, {"ok": True, "rollout": item}); return
@@ -8075,6 +8254,17 @@ class Handler(SimpleHTTPRequestHandler):
             approval = dict(job.get("approval") or {})
             approval.update({"status": "approved", "operator": user, "approved_at": time.strftime("%Y-%m-%d %H:%M:%S")})
             set_job(job_id, approval=approval)
+            gate_id = str(approval.get("gate_id") or "")
+            if gate_id:
+                _set_approval_gate(job_id, gate_id, approval)
+            if gate_id == "rollback":
+                rollout_id = str(approval.get("rollout_id") or "")
+                item, err = execute_parallel_rollout_rollback(rollout_id)
+                if err or item is None:
+                    self._json(400, {"ok": False, "error": err})
+                    return
+                self._json(200, {"ok": True, "approval": approval, "rollout": item})
+                return
             self._json(200, {"ok": True, "approval": approval})
             return
 
@@ -8225,6 +8415,13 @@ class Handler(SimpleHTTPRequestHandler):
                 "test_runs": [],
                 "gamma_runs": [],
                 "gamma_deployed": False,
+                "production_released": False,
+                "gamma_rollouts": [],
+                "approval": {},
+                "approval_gates": {},
+                "rollback_requested": False,
+                "rollback_completed": False,
+                "rollback_failed": False,
                 "log": [],
                 "ui_log": [],
                 "step_logs": {},

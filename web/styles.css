@@ -810,12 +810,22 @@ html.is-run-window #pageSwr { display: none !important; }
 .pl-col, .pl-end {
   --pl-task-h: 1.75rem;
   flex: 1 0 auto;
-  width: 12.8rem;
+  width: 17rem;
   display: grid;
   grid-template-rows: 2.6rem 1.3rem auto;
   align-items: stretch;
 }
 .pl-end { width: 3.2rem; flex: 0 0 3.2rem; overflow: hidden; }
+.pl-gate {
+  flex: 0 0 7rem;
+  width: 7rem;
+  display: grid;
+  grid-template-rows: 2.6rem 1.3rem;
+}
+.pl-gate.is-actionable { cursor: pointer; }
+.pl-gate.is-actionable:hover .pl-stage-icon,
+.pl-gate.is-actionable:focus-visible .pl-stage-icon { box-shadow: 0 0 0 5px rgba(233, 176, 0, .24); }
+.pl-gate.is-busy { pointer-events: none; opacity: .7; }
 .pl-end.is-start .pl-spine { grid-template-columns: var(--pl-dot) 1fr; }
 .pl-end.is-end .pl-spine { grid-template-columns: 1fr var(--pl-dot); }
 .pl-end.is-start .pl-rail.left,
@@ -1054,14 +1064,12 @@ body.clone-open { overflow: hidden; }
   padding: 28px 0 36px;
 }
 .run-page-footer .btn { min-width: 140px; padding: 12px 28px; }
-.pl-col.is-gamma { width: 18rem; }
-.pl-col.is-release { width: 30rem; }
 .pl-env-row { height: auto; min-height: 40px; }
 .pl-env-pick {
   grid-column: 3;
   position: relative;
   z-index: 3;
-  width: 100%;
+  width: 10.5rem;
   min-width: 0;
   margin: 0;
   padding-left: 12px;
@@ -1311,31 +1319,8 @@ body.clone-open { overflow: hidden; }
   font-size: 13px;
   color: #345d88;
 }
+.release-mode-pick { width: 12rem; }
 .pl-release-options { margin-bottom: 2px; }
-.pl-release-pickers {
-  grid-column: 3;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  padding-left: 12px;
-  position: relative;
-  z-index: 4;
-}
-.pl-release-pickers::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 50%;
-  width: 12px;
-  height: 3px;
-  transform: translateY(-50%);
-  background: var(--rail);
-}
-.pl-release-pickers > .pl-env-pick { grid-column: auto; padding-left: 0; }
-.pl-release-pickers > .pl-env-pick::before { display: none; }
-.pl-release-pickers > .pl-env-pick:first-child { flex: 0 0 9.5rem; }
-.pl-release-pickers > .release-mode-pick { flex: 0 0 12.5rem; }
 .branch-option:disabled,
 .branch-option:disabled:hover,
 .branch-option:disabled:focus {
@@ -1381,6 +1366,7 @@ body.clone-open { overflow: hidden; }
 .env-rollout-scale { display: flex; gap: 6px; align-items: center; }
 .env-rollout-scale .input { width: 78px; min-width: 0; padding: 6px 7px; }
 .env-rollout-scale .btn, .env-rollout-workload > .btn { font-size: 12px; padding: 6px 8px; }
+.step-rollouts { padding: 20px 24px; }
 .env-node-row {
   display: flex;
   gap: 8px;

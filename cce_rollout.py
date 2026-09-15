@@ -502,6 +502,7 @@ def deployment_manifest_for_parallel_release(
     source_payload: Mapping[str, Any],
     *,
     source_name: str,
+    base_name: str = "",
     release_id: str,
     image: str,
     container: str,
@@ -527,7 +528,7 @@ def deployment_manifest_for_parallel_release(
         if isinstance(row, dict) and row.get("name") == container:
             row["image"] = image
 
-    name = parallel_deployment_name(source_name, release_id)
+    name = parallel_deployment_name(base_name or source_name, release_id)
     release = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(release_id)).strip("-_.")[:63]
     if not release:
         raise CceRolloutError("发布标识不合法")
@@ -607,6 +608,7 @@ def create_parallel_deployment(
     *,
     namespace: str,
     source: str,
+    base_name: str = "",
     release_id: str,
     image: str,
     container: str,
@@ -617,7 +619,7 @@ def create_parallel_deployment(
     if payload is None:
         raise CceRolloutError(f"源 Deployment 不存在: {source}")
     manifest = deployment_manifest_for_parallel_release(
-        payload, source_name=source, release_id=release_id,
+        payload, source_name=source, base_name=base_name, release_id=release_id,
         image=image, container=container, replicas=replicas,
     )
     name = str(manifest["metadata"]["name"])
@@ -679,7 +681,8 @@ def deploy_job_results(
     write = log or (lambda _line: None)
     jump_host = str(environment.get("jump_host") or "").strip()
     nodes = [str(item).strip() for item in (environment.get("nodes") or []) if str(item).strip()]
-    workload = str(environment.get("workload_name") or "").strip()
+    workload = str(environment.get("active_workload_name") or environment.get("workload_name") or "").strip()
+    base_workload = str(environment.get("workload_name") or workload).strip()
     env_name = str(environment.get("name") or workload or "environment")
     cluster = str(environment.get("cluster_name") or "").strip()
     if not jump_host:
@@ -753,6 +756,7 @@ def deploy_job_results(
                     run_remote,
                     namespace=namespace,
                     source=deploy,
+                    base_name=base_workload,
                     release_id=release_id,
                     image=image,
                     container=container,

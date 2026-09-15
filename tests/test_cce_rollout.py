@@ -153,6 +153,31 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertEqual("registry/schedule:new", images["container-1"])
         self.assertEqual("elastic/filebeat:8", images["filebeat"])
 
+    def test_parallel_manifest_names_from_configured_baseline_not_active_workload(self) -> None:
+        source = {
+            "apiVersion": "apps/v1",
+            "metadata": {"name": "service-v-202609151000", "labels": {"app": "service"}},
+            "spec": {
+                "selector": {"matchLabels": {"app": "service"}},
+                "template": {"metadata": {"labels": {"app": "service"}}, "spec": {
+                    "containers": [{"name": "app", "image": "registry/service:old"}],
+                }},
+            },
+        }
+        manifest = cce_rollout.deployment_manifest_for_parallel_release(
+            source,
+            source_name="service-v-202609151000",
+            base_name="service",
+            release_id="job-202609151053",
+            image="registry/service:new",
+            container="app",
+        )
+        self.assertEqual("service-v-202609151053", manifest["metadata"]["name"])
+        self.assertEqual(
+            "service-v-202609151000",
+            manifest["metadata"]["labels"][cce_rollout.PARALLEL_SOURCE_LABEL],
+        )
+
     def test_resolve_credentials_prefers_env(self) -> None:
         creds = cce_rollout.resolve_credentials(
             {"cce_ssh_password": "from-cfg"},

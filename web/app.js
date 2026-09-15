@@ -599,6 +599,7 @@ function decoratePipelineTask(task, logStep, stageId) {
   };
 }
 function visiblePipelineTasks(step) {
+  if (step.id === "rollback") return [];
   const hidden = HIDDEN_PIPELINE_TASKS[step.id] || new Set();
   const raw = Array.isArray(step.subtasks) && step.subtasks.length
     ? step.subtasks
@@ -696,11 +697,11 @@ function previewPipelineData() {
       { id: "sync", label: "拉代码", status: "pending", subtasks: [task("clone", "克隆仓库"), task("sha", "记录提交")] },
       { id: "test", label: "测试执行", status: "pending", subtasks: [task("plan", "加载build.yaml"), task("runner", "启动测试"), task("ut-cases", "执行UT"), task("dt-cases", "执行DT")] },
       { id: "build", label: "构建镜像", status: "pending", subtasks: [task("script", "执行构建脚本"), task("docker", "Docker构建"), task("verify", "产物校验")] },
-      ...((runPreviewSelection.test && (environments.find(e=>e.id===runPreviewSelection.gammaEnvironmentId)||{}).environment_type==='production') || (runPreviewSelection.deploy && (environments.find(e=>e.id===runPreviewSelection.environmentId)||{}).environment_type==='production') ? [{ id:"approval", label:"人工卡点", status:"pending", subtasks:[task("approve","等待生产发布审批")] }] : []),
       { id: "push", label: "推送 SWR", status: "pending", subtasks: [task("tag", "标记镜像"), task("push", "推送镜像"), task("verify", "推送确认")] },
       { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
       { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
       { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
+      { id: "rollback", label: "一键回滚", status: "skipped", subtasks: [] },
     ],
   };
 }
@@ -1113,8 +1114,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   doc = doc || document;
   const status = stage.status || "pending";
   const col = doc.createElement("div");
-  col.className = "pl-col is-" + status +
-    (stage.id === "gamma" ? " is-gamma" : stage.id === "release" ? " is-release" : "");
+  col.className = "pl-col is-" + status;
   if (!preview) {
     col.addEventListener("click", () => onStep && onStep(stage.id, stage.tasks && stage.tasks[0] && stage.tasks[0].id));
   }
@@ -1146,15 +1146,14 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   const tree = doc.createElement("div");
   tree.className = "pl-tree";
   if (preview && stage.id === "release" && runPreviewSelection.deploy) {
-    const optionsRow = doc.createElement("div");
-    optionsRow.className = "pl-task pl-release-options";
-    optionsRow.appendChild(doc.createElement("span"));
-    optionsRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
-    const options = doc.createElement("div");
-    options.className = "pl-release-pickers";
-    options.append(createGammaEnvPicker(doc, stage.id), createReleaseModePicker(doc));
-    optionsRow.appendChild(options);
-    tree.appendChild(optionsRow);
+    [createGammaEnvPicker(doc, stage.id), createReleaseModePicker(doc)].forEach((picker) => {
+      const optionsRow = doc.createElement("div");
+      optionsRow.className = "pl-task pl-env-row pl-release-options";
+      optionsRow.appendChild(doc.createElement("span"));
+      optionsRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
+      optionsRow.appendChild(picker);
+      tree.appendChild(optionsRow);
+    });
   } else if (preview && stage.id === "gamma" && runPreviewSelection.gammaDeploy) {
     const envRow = doc.createElement("div");
     envRow.className = "pl-task pl-env-row";
@@ -1369,6 +1368,48 @@ function createEndpoint(kind, lit, doc) {
   col.appendChild(spine);
   return col;
 }
+function createApprovalGate(gate, incomingComplete, outgoingComplete, jobId, doc) {
+  doc = doc || document;
+  const status = gate.status || "pending";
+  const col = doc.createElement("div");
+  col.className = "pl-gate is-" + status + (status === "queued" ? " is-actionable" : "");
+  const cap = doc.createElement("div");
+  cap.className = "pl-caption";
+  const title = doc.createElement("div");
+  title.className = "pl-title";
+  title.textContent = "人工卡点";
+  const dur = doc.createElement("div");
+  dur.className = "pl-dur is-" + status;
+  dur.textContent = status === "queued" ? "等待中" : status === "done" ? "已通过" : "";
+  cap.append(title, dur);
+  const spine = doc.createElement("div");
+  spine.className = "pl-spine";
+  const left = doc.createElement("div");
+  left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
+  const right = doc.createElement("div");
+  right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
+  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc), right);
+  col.append(cap, spine);
+  col.title = status === "queued"
+    ? "等待生产发布权限责任人确认，点击继续"
+    : (gate.operator ? "审批人：" + gate.operator + (gate.approved_at ? " · " + gate.approved_at : "") : "");
+  if (status === "queued") {
+    col.tabIndex = 0;
+    col.setAttribute("role", "button");
+    const approve = async () => {
+      if (col.classList.contains("is-busy")) return;
+      col.classList.add("is-busy");
+      try {
+        await api("/api/jobs/" + encodeURIComponent(jobId) + "/approval", { method: "POST", body: JSON.stringify({ action: "continue" }) });
+        await openJob(jobId);
+      } catch (e) { alert(e.message || "无权继续该人工卡点"); }
+      finally { col.classList.remove("is-busy"); }
+    };
+    col.addEventListener("click", approve);
+    col.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); approve(); } });
+  }
+  return col;
+}
 function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   const root = $(containerId);
   if (!root) return;
@@ -1389,13 +1430,22 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   scroll.className = "pl-scroll";
   const graph = doc.createElement("div");
   graph.className = "pl-graph";
-  const isComplete = (stage) => Boolean(stage && stage.status === "done");
+  const isComplete = (stage) => Boolean(stage && (stage.status === "done" || stage.status === "skipped"));
+  const gates = preview || !Array.isArray(pipeline.gates) ? [] : pipeline.gates;
+  const nodes = [];
+  stages.forEach((stage) => {
+    gates.filter((gate) => gate.before === stage.id).forEach((gate) => nodes.push({ kind: "gate", data: gate }));
+    nodes.push({ kind: "stage", data: stage });
+  });
   graph.appendChild(createEndpoint("start", !preview, doc));
-  stages.forEach((stage, index) => {
-    const previous = stages[index - 1];
+  nodes.forEach((node, index) => {
+    const stage = node.data;
+    const previous = nodes[index - 1] && nodes[index - 1].data;
     const incomingComplete = !preview && (index === 0 || isComplete(previous));
     const outgoingComplete = !preview && isComplete(stage);
-    graph.appendChild(createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc));
+    graph.appendChild(node.kind === "gate"
+      ? createApprovalGate(stage, incomingComplete, outgoingComplete, meta.job_id || currentJobId, doc)
+      : createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc));
   });
   graph.appendChild(createEndpoint("end", !preview && isComplete(stages[stages.length - 1]) && status === "ok", doc));
   scroll.appendChild(graph);
@@ -1886,21 +1936,6 @@ function applyJob(job, { loading } = {}) {
   renderJobPipeline("liveJobPipeline", job.pipeline, job.status, (stageId, taskId) => {
     openStepModal(stageId, taskId);
   }, { stopping: !!(job.cancel_requested || job.stage === "stopping") });
-  if (job.approval && job.approval.status === 'waiting') {
-    const gate=document.createElement('div'); gate.className='gamma-result-link approval-gate';
-    gate.innerHTML='<span>🟡 等待人工卡点 · '+esc(job.approval.purpose || '生产操作')+' · '+esc(job.approval.environment || '')+'</span>'+
-      '<button class="btn primary" data-approval="continue">可继续</button><button class="btn danger" data-approval="stop">可停止</button>';
-    gate.querySelectorAll('[data-approval]').forEach(btn=>btn.addEventListener('click',async()=>{
-      btn.disabled=true; try { await api('/api/jobs/'+encodeURIComponent(job.id)+'/approval',{method:'POST',body:JSON.stringify({action:btn.dataset.approval})}); await openJob(job.id); } catch(e){ alert(e.message); }
-    }));
-    gate.querySelectorAll('[data-approval]').forEach(btn=>btn.disabled=true);
-    const sid=(job.service_ids||[job.service_id||''])[0];
-    api('/api/permissions?service_id='+encodeURIComponent(sid)).then(data=>{
-      const owners=((data.permissions||[])[0]||{}).owners||[];
-      if(owners.includes(currentUser)) gate.querySelectorAll('[data-approval]').forEach(btn=>btn.disabled=false);
-    }).catch(()=>{});
-    $('liveJobPipeline').append(gate);
-  }
   if (job.gamma_e2e) {
     const row=document.createElement('div'); row.className='gamma-result-link';
     const state=document.createElement('span');
@@ -2604,7 +2639,7 @@ async function openStepModal(stageId, taskId) {
   openModal("步骤详情", wrap, { wide: true });
 
   let releaseRollouts = [];
-  if (stage.id === "release") {
+  if (stage.id === "release" || stage.id === "rollback") {
     const envId = ((((currentJob || {}).gamma_rollouts || [])[0] || {}).environment_id) ||
       (((currentJob || {}).optional_steps || {}).release_environment_id || "");
     if (envId) {
@@ -2615,14 +2650,15 @@ async function openStepModal(stageId, taskId) {
     }
   }
   const releaseState = String((releaseRollouts[0] || {}).status || "");
-  if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)) taskId = "traffic";
-  if (stage.id === "release" && taskId === "rollback" && releaseState !== "rolled_back") taskId = "traffic";
+  if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)) taskId = "release-compare:results";
+  if (stage.id === "release" && taskId === "compare") taskId = "release-compare:results";
+  if (stage.id === "rollback") taskId = "rollback:results";
   let selectedTask = normalizeStepSelection(taskId, stage);
   if (parseCaseSelection(selectedTask)) logEl.hidden = true;
   const follow = newLogFollowState();
   bindLogFollow(logEl, follow);
 
-  const showReleaseComparison = async () => {
+  const showReleaseComparison = async (mode) => {
     tableWrap.hidden = true;
     logEl.hidden = true;
     pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
@@ -2633,17 +2669,28 @@ async function openStepModal(stageId, taskId) {
     rolloutPanel.className = "env-rollouts step-rollouts";
     rolloutPanel.dataset.envRolloutList = envId;
     rolloutPanel.dataset.jobId = currentJobId;
+    rolloutPanel.dataset.compareMode = mode;
+    rolloutPanel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
     pane.appendChild(rolloutPanel);
-    await loadEnvRollouts(envId, rolloutPanel);
+    await loadEnvRollouts(envId, rolloutPanel, mode);
   };
 
   const paintList = () => {
     list.replaceChildren();
     appendStepButton(list, stage.label || stage.id, stage.status, "", selectedTask === stage.id, () => {
-      selectedTask = stage.id;
+      selectedTask = stage.id === "rollback" ? "rollback:results" : stage.id;
       paintList();
       loadStep();
     });
+    if (stage.id === "rollback") {
+      appendStepButton(list, "版本对比", "", "sub", selectedTask === "rollback:results", () => {
+        selectedTask = "rollback:results"; paintList(); loadStep();
+      });
+      appendStepButton(list, "日志详情", "", "sub", selectedTask === "rollback:log", () => {
+        selectedTask = "rollback:log"; paintList(); loadStep();
+      });
+      return;
+    }
     (stage.tasks || []).forEach((task) => {
       const caseTaskId = stage.id === "gamma" && task.id === "test" ? "gamma-test" : task.id;
       if (isCaseTaskId(task.id, stage.id)) {
@@ -2660,11 +2707,19 @@ async function openStepModal(stageId, taskId) {
         });
         return;
       }
+      if (stage.id === "release" && task.id === "compare") {
+        appendStepHeading(list, "版本对比", task.status, "sub");
+        appendStepButton(list, "版本对比", "", "sub nested", selectedTask === "release-compare:results", () => {
+          selectedTask = "release-compare:results"; paintList(); loadStep();
+        });
+        appendStepButton(list, "日志详情", "", "sub nested", selectedTask === "release-compare:log", () => {
+          selectedTask = "release-compare:log"; paintList(); loadStep();
+        });
+        return;
+      }
       appendStepButton(list, task.label || task.id, task.status, "sub", selectedTask === task.id, () => {
         selectedTask = stage.id === "release" && task.id === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)
-          ? "traffic"
-          : stage.id === "release" && task.id === "rollback" && releaseState !== "rolled_back"
-            ? "traffic" : task.id;
+          ? "release-compare:results" : task.id;
         paintList();
         loadStep();
       });
@@ -2673,16 +2728,17 @@ async function openStepModal(stageId, taskId) {
 
   const loadStep = async () => {
     pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
-    if (stage.id === "release" && selectedTask === "traffic") {
-      await showReleaseComparison();
+    if (selectedTask === "release-compare:results" || selectedTask === "rollback:results") {
+      await showReleaseComparison(selectedTask.startsWith("rollback") ? "rollback" : "release");
       return;
     }
     const caseSel = parseCaseSelection(selectedTask);
     const selected = caseSel
       ? (stage.tasks || []).find((task) => task.id === (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId))
       : (stage.tasks || []).find((task) => task.id === selectedTask);
-    const logStep = (selected && selected.logStep) || stage.logStep || stage.id;
-    const sub = caseSel ? (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId) : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
+    const specialLog = selectedTask === "release-compare:log" || selectedTask === "rollback:log";
+    const logStep = specialLog ? (selectedTask.startsWith("rollback") ? "rollback" : "release") : ((selected && selected.logStep) || stage.logStep || stage.id);
+    const sub = specialLog ? (selectedTask.startsWith("rollback") ? "log" : "compare") : caseSel ? (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId) : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
     try {
       const job = await api("/api/jobs/" + currentJobId + "?step=" + encodeURIComponent(logStep) + (sub ? "&sub=" + encodeURIComponent(sub) : "") + "&view=ui");
       const lines = Array.isArray(job.log) ? job.log : [];
@@ -2905,7 +2961,7 @@ function envCardHtml(env) {
   );
 }
 
-function rolloutWorkloadHtml(rollout, side, item) {
+function rolloutWorkloadHtml(rollout, side, item, allowScale) {
   const old = side === 'old';
   const exists = !!item.exists;
   const replicas = Number.isFinite(Number(item.desired_replicas)) ? Number(item.desired_replicas) : 0;
@@ -2913,51 +2969,52 @@ function rolloutWorkloadHtml(rollout, side, item) {
   return '<div class="env-rollout-workload ' + (old ? 'is-old' : 'is-new') + '">' +
     '<strong>' + (old ? '旧版本负载' : '新版本负载') + '</strong><span>' + esc(item.name || '—') + '</span>' +
     '<small>镜像：' + esc(image) + '</small><small>实例：' + (exists ? replicas + '（Ready ' + Number(item.ready_replicas || 0) + '）' : '已不存在') + '</small>' +
-    (exists ? '<div class="env-rollout-scale"><input class="input" type="number" min="0" max="1000" value="' + replicas + '" data-rollout-replicas="' + side + '" /><button type="button" class="btn ghost" data-rollout-scale="' + side + '">设置实例数</button></div>' : '') +
+    (exists && allowScale ? '<div class="env-rollout-scale"><input class="input" type="number" min="0" max="1000" value="' + replicas + '" data-rollout-replicas="' + side + '" /><button type="button" class="btn ghost" data-rollout-scale="' + side + '">设置实例数</button></div>' : '') +
     '</div>';
 }
 
-function renderEnvRollouts(panel, rows, error) {
+function renderEnvRollouts(panel, rows, error, mode) {
   if (!panel) return;
+  mode = mode || panel.dataset.compareMode || 'release';
   if (error) { panel.innerHTML = '<p class="hint error">' + esc(error) + '</p>'; return; }
   if (!rows || !rows.length) { panel.innerHTML = '<p class="env-secret-hint">暂无由 CI 创建的平滑发布负载。</p>'; return; }
   panel.innerHTML = rows.map((row) => row.error
     ? '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>'
-    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : row.status === 'rolled_back' ? '已回滚' : '等待老版本下线') + '</span>' + (row.old && row.old.exists && row.status === 'active' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + (row.status === 'old_deleted' ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}) + rolloutWorkloadHtml(row, 'new', row.new || {}) + '</section>'
+    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : row.status === 'rolled_back' ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.status === 'active' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + (mode === 'rollback' && row.status === 'old_deleted' ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release') + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release') + '</section>'
   ).join('');
   panel.querySelectorAll('[data-rollout-scale]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const target = btn.getAttribute('data-rollout-scale');
     const input = card && card.querySelector('[data-rollout-replicas="' + target + '"]'); const replicas = input ? Number(input.value) : NaN;
     if (!Number.isInteger(replicas) || replicas < 0 || replicas > 1000) { setEnvError('实例数必须是 0 到 1000 的整数'); return; }
     btn.disabled = true;
-    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/scale', { method: 'POST', body: JSON.stringify({ target, replicas }) }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); }
+    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/scale', { method: 'POST', body: JSON.stringify({ target, replicas }) }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode); }
     catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
   }));
   panel.querySelectorAll('[data-rollout-offline]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const name = card && card.querySelector('.is-old span');
     if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？', {title:'老版本下线', confirmLabel:'确认下线'})) return;
     btn.disabled = true;
-    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); await loadEnvironments(); }
+    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode); await openJob(currentJobId); }
     catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
   }));
   panel.querySelectorAll('[data-rollout-rollback]').forEach((btn) => btn.addEventListener('click', async () => {
     const card=btn.closest('[data-rollout-id]');
     if(!await askEnvConfirm('将恢复该流水线下线的旧版本，并删除环境当前运行的新版本。确认继续？', {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
-    btn.disabled=true; try { await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'}); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); }
+    btn.disabled=true; try { const data=await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'}); if(data.approval_required){ closeModal(); await openJob(currentJobId); return; } await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode); await openJob(currentJobId); }
     catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
 }
 
-async function loadEnvRollouts(id, panel) {
+async function loadEnvRollouts(id, panel, mode) {
   if (!id || !panel) return;
   panel.hidden = false; panel.replaceChildren();
   try {
     const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts');
     const jobId = panel.dataset.jobId || '';
     const rows = jobId ? (data.rollouts || []).filter((item) => item.job_id === jobId) : (data.rollouts || []);
-    renderEnvRollouts(panel, rows);
+    renderEnvRollouts(panel, rows, '', mode);
   }
-  catch (e) { renderEnvRollouts(panel, [], e.message); }
+  catch (e) { renderEnvRollouts(panel, [], e.message, mode); }
 }
 function bindEnvForm() {
   const list = $("envNodeList");
@@ -3103,14 +3160,13 @@ async function loadPermissions() {
       remove.addEventListener('click',()=>chip.remove()); chip.appendChild(remove); chips.appendChild(chip);
     });
     const actions=document.createElement('div'); actions.className='permission-actions';
-    const select=document.createElement('select'); select.className='input permission-account'; select.disabled=!editable;
-    select.innerHTML='<option value="">选择已有账号</option>'+accounts.map((name)=>'<option value="'+esc(name)+'">'+esc(name)+'</option>').join('');
+    const account=document.createElement('input'); account.type='text'; account.className='input permission-account'; account.placeholder='输入账号'; account.disabled=!editable;
     const add=document.createElement('button'); add.type='button'; add.className='btn ghost'; add.textContent='添加责任人'; add.disabled=!editable;
-    add.addEventListener('click',()=>{ const name=select.value; if(!name || [...chips.querySelectorAll('.permission-chip')].some(c=>c.firstChild.nodeValue===name)) return; const chip=document.createElement('span'); chip.className='permission-chip'; chip.textContent=name; const remove=document.createElement('button'); remove.type='button'; remove.textContent='×'; remove.title='移除 '+name; remove.addEventListener('click',()=>chip.remove()); chip.appendChild(remove); chips.appendChild(chip); select.value=''; });
+    add.addEventListener('click',()=>{ const name=account.value.trim(); const err=$('permissionError'); if(!name) return; if(!accounts.includes(name)){ err.hidden=false; err.textContent='账号不存在'; account.focus(); return; } if([...chips.querySelectorAll('.permission-chip')].some(c=>c.firstChild.nodeValue===name)){ err.hidden=false; err.textContent='该账号已是责任人'; return; } err.hidden=true; err.textContent=''; const chip=document.createElement('span'); chip.className='permission-chip'; chip.textContent=name; const remove=document.createElement('button'); remove.type='button'; remove.textContent='×'; remove.title='移除 '+name; remove.addEventListener('click',()=>chip.remove()); chip.appendChild(remove); chips.appendChild(chip); account.value=''; });
     const save=document.createElement('button'); save.type='button'; save.className='btn primary'; save.textContent='保存修改'; save.disabled=!editable;
     save.addEventListener('click',async()=>{ const next=[...chips.querySelectorAll('.permission-chip')].map(c=>c.firstChild.nodeValue); try { await api('/api/permissions',{method:'POST',body:JSON.stringify({service_id:currentServiceId,permission_id:row.permission_id,owners:next})}); await loadPermissions(); } catch(e){ const err=$('permissionError'); err.hidden=false; err.textContent=e.message; } });
-    actions.append(select,add,save); owners.append(chips,actions);
-    tr.innerHTML='<td><strong>'+esc(row.permission)+'</strong><small>'+(editable?'可管理责任人':'仅当前责任人可修改')+'</small></td>';
+    actions.append(account,add,save); owners.append(chips,actions);
+    tr.innerHTML='<td><strong>'+esc(row.permission)+'</strong></td>';
     tr.appendChild(owners); tbody.appendChild(tr);
   });
 }

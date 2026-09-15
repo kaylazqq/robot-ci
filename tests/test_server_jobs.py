@@ -446,6 +446,27 @@ class JobPayloadTests(unittest.TestCase):
 
 
 class JobPipelineTests(unittest.TestCase):
+    def test_gamma_deploy_only_keeps_gamma_and_places_production_gate_before_it(self) -> None:
+        job = make_job("pipe-gamma-deploy", status="running")
+        job.update({
+            "stage": "gamma",
+            "optional_steps": {
+                "gamma_deploy": True, "gamma_test": False,
+                "gamma_environment_id": "prod-env",
+            },
+            "approval_gates": {"gamma": {"status": "waiting"}},
+        })
+        env = {"id": "prod-env", "name": "prod", "environment_type": "production"}
+        with patch.object(server, "get_environment", return_value=env):
+            payload = server.job_payload(job, compact=True)["pipeline"]
+        gamma = next(row for row in payload["steps"] if row["id"] == "gamma")
+        self.assertEqual(["deploy"], [row["id"] for row in gamma["subtasks"]])
+        self.assertEqual("pending", gamma["status"])
+        self.assertEqual(
+            [{"id": "gamma", "before": "gamma", "purpose": "gamma集成测试", "environment": "prod", "status": "queued", "operator": "", "approved_at": ""}],
+            payload["gates"],
+        )
+
     def test_release_waits_yellow_and_rollback_stays_gray_until_used(self) -> None:
         job = make_job("pipe-release-wait", status="running")
         job.update({
@@ -457,7 +478,24 @@ class JobPipelineTests(unittest.TestCase):
             rows = server._subtask_rows("release", "running", job)
         statuses = {row["id"]: row["status"] for row in rows}
         self.assertEqual("queued", statuses["offline"])
-        self.assertEqual("pending", statuses["rollback"])
+        self.assertEqual("done", statuses["compare"])
+        self.assertNotIn("rollback", statuses)
+        pipeline = server.job_payload(job, compact=True)["pipeline"]
+        big_steps = {row["id"]: row["status"] for row in pipeline["steps"]}
+        self.assertEqual("skipped", big_steps["rollback"])
+
+    def test_historical_rolled_back_release_marks_big_rollback_done(self) -> None:
+        job = make_job("pipe-release-rolled-back", status="ok")
+        job.update({
+            "production_released": True,
+            "optional_steps": {"production_release": True, "release_environment_id": "env-prod"},
+        })
+        with patch.object(server, "list_parallel_rollouts", return_value=[{
+            "id": "rollout-old", "job_id": "pipe-release-rolled-back", "status": "rolled_back",
+        }]):
+            pipeline = server.job_payload(job, compact=True)["pipeline"]
+        statuses = {row["id"]: row["status"] for row in pipeline["steps"]}
+        self.assertEqual("done", statuses["rollback"])
 
     def test_running_job_marks_active_stage(self) -> None:
         job = make_job("pipe-run")
