@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -489,10 +490,11 @@ PARALLEL_SOURCE_LABEL = "robot-ci.io/source-workload"
 def parallel_deployment_name(source: str, release_id: str) -> str:
     """Build a deterministic DNS label no longer than a Deployment name permits."""
     base = re.sub(r"[^a-z0-9-]+", "-", str(source or "").lower()).strip("-")
-    token = re.sub(r"[^a-z0-9]+", "", str(release_id or "").lower())[:12]
+    match = re.search(r"(20\d{10})", str(release_id or ""))
+    token = match.group(1) if match else time.strftime("%Y%m%d%H%M")
     if not base or not token:
         raise CceRolloutError("无法生成新版本负载名称")
-    suffix = f"-r-{token}"
+    suffix = f"-v-{token}"
     return (base[: 63 - len(suffix)].rstrip("-") + suffix)[:63]
 
 

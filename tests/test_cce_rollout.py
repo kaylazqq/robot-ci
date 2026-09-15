@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import tempfile
 import types
@@ -121,7 +122,7 @@ class CceRolloutHelperTests(unittest.TestCase):
             source, source_name="semantic-schedule", release_id="ab12cd34ef56",
             image="registry/schedule:new", container="container-1", replicas=1,
         )
-        self.assertEqual("semantic-schedule-r-ab12cd34ef56", manifest["metadata"]["name"])
+        self.assertRegex(manifest["metadata"]["name"], r"^semantic-schedule-v-20\d{10}$")
         labels = manifest["spec"]["template"]["metadata"]["labels"]
         self.assertEqual("schedule", labels["app"])
         self.assertEqual("ab12cd34ef56", labels[cce_rollout.PARALLEL_RELEASE_LABEL])
@@ -204,9 +205,9 @@ class CceRolloutHelperTests(unittest.TestCase):
         def hop(command, **_kwargs):  # noqa: ANN001
             commands.append(command)
             if "get deploy" in command and "-o json" in command:
-                if "semantic-schedule-r-ab12cd34" in command:
+                if "semantic-schedule-v-" in command:
                     candidate = json.loads(json.dumps(source))
-                    candidate["metadata"]["name"] = "semantic-schedule-r-ab12cd34"
+                    candidate["metadata"]["name"] = re.search(r"get deploy ([^ ]+)", command).group(1)
                     candidate["status"] = {"readyReplicas": 1, "availableReplicas": 1}
                     return 0, json.dumps(candidate), ""
                 return 0, json.dumps(source), ""
@@ -220,7 +221,7 @@ class CceRolloutHelperTests(unittest.TestCase):
             mode="parallel", release_id="ab12cd34", on_parallel_created=created.append,
         )
         self.assertTrue(ok, err)
-        self.assertEqual("semantic-schedule-r-ab12cd34", created[0]["name"])
+        self.assertRegex(created[0]["name"], r"^semantic-schedule-v-20\d{10}$")
         self.assertTrue(any("apply -f" in command for command in commands))
         self.assertFalse(any("set image" in command for command in commands))
 
@@ -405,8 +406,8 @@ class GammaAfterBuildTests(unittest.TestCase):
         })
         with patch.object(server, "load_services", return_value=[{"id": "memory-service", "title": "memory"}]):
             pipeline = server.build_job_pipeline(job)
-        gamma = next(step for step in pipeline["steps"] if step["id"] == "gamma")
-        self.assertEqual("skipped", gamma["status"])
+        release = next(step for step in pipeline["steps"] if step["id"] == "release")
+        self.assertEqual("skipped", release["status"])
 
     def test_restart_preserves_requested_stop_as_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

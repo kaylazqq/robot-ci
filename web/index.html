@@ -104,6 +104,7 @@
             <button type="button" class="subtab" data-tab="history">构建历史</button>
             <button type="button" class="subtab" data-tab="artifacts">产物管理</button>
             <button type="button" class="subtab" data-tab="envs">环境管理</button>
+            <button type="button" class="subtab" data-tab="permissions">权限管理</button>
           </nav>
         </div>
         <div class="toolbar toolbar-2" id="pipelineActions">
@@ -237,6 +238,10 @@
           <p class="hint error" id="envError" hidden></p>
           <div class="env-grid" id="envGrid"></div>
         </div>
+        <div class="view-pane page-envs" id="viewPermissions" hidden>
+          <p class="hint error" id="permissionError" hidden></p>
+          <div id="permissionGrid"></div>
+        </div>
       </section>
 
     </div>
@@ -328,6 +333,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=202609145"></script>
+  <script src="/app.js?v=202609151"></script>
 </body>
 </html>

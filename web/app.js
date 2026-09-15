@@ -25,7 +25,7 @@ let environments = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
-let runPreviewSelection = { deploy: false, test: false, environmentId: "", deploymentMode: "parallel" };
+let runPreviewSelection = { deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
 let pipelineTemplates = [];
 let selectedTemplateId = "";
 let runLayerMode = "run";
@@ -312,7 +312,7 @@ function closeUserMenu() {
 }
 
 function isBuildListTab(name) {
-  return name === "history" || name === "artifacts" || name === "envs";
+  return name === "history" || name === "artifacts" || name === "envs" || name === "permissions";
 }
 function normalizeBuildTab(next) {
   return isBuildListTab(next) ? next : "pipeline";
@@ -354,6 +354,7 @@ function applyServiceChrome() {
   if ($("viewHistory")) $("viewHistory").hidden = tab !== "history";
   if ($("viewArtifacts")) $("viewArtifacts").hidden = tab !== "artifacts";
   if ($("viewEnvs")) $("viewEnvs").hidden = tab !== "envs";
+  if ($("viewPermissions")) $("viewPermissions").hidden = tab !== "permissions";
   if ($("pipelineActions")) $("pipelineActions").hidden = all || tab !== "pipeline";
   if ($("jobMetaBar")) $("jobMetaBar").hidden = all || tab !== "pipeline";
   const createBtn = $("btnEnvCreate");
@@ -384,6 +385,7 @@ function setTab(next) {
     if (tab === "history") refreshHistory().catch(() => {});
     if (tab === "artifacts") refreshArtifacts().catch(() => {});
     if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
+    if (tab === "permissions") loadPermissions().catch(() => {});
     if (tab === "pipeline" && !isAllServices()) {
       loadPipelineTemplates().catch(() => {});
       if (pinnedJobId) {
@@ -425,7 +427,7 @@ function readHash() {
   const service = decodeURIComponent(parts[1] || "");
   let nextTab = "pipeline";
   let job = "";
-  if (parts[2] === "history" || parts[2] === "artifacts" || parts[2] === "envs") nextTab = parts[2];
+  if (["history", "artifacts", "envs", "permissions"].includes(parts[2])) nextTab = parts[2];
   else if (parts[2] === "job" && parts[3]) job = decodeURIComponent(parts[3]);
   return { nav: "build", service, tab: nextTab, job };
 }
@@ -656,7 +658,7 @@ function buildPipelineStages(pipeline, jobStatus, stopping) {
   return stages;
 }
 function isSelectablePreviewTask(stageId, taskId) {
-  return stageId === "gamma" && (taskId === "deploy" || taskId === "test");
+  return (stageId === "gamma" && taskId === "test") || (stageId === "release" && taskId === "deploy");
 }
 function previewTaskChecked(taskId) {
   return taskId === "deploy" ? !!runPreviewSelection.deploy : !!runPreviewSelection.test;
@@ -667,7 +669,7 @@ function createPreviewCheck(taskId, doc) {
   box.type = "button";
   box.className = "pl-check" + (previewTaskChecked(taskId) ? " is-on" : "");
   box.setAttribute("aria-pressed", previewTaskChecked(taskId) ? "true" : "false");
-  box.setAttribute("aria-label", taskId === "deploy" ? "gamma部署" : "gamma测试");
+  box.setAttribute("aria-label", taskId === "deploy" ? "生产发布" : "gamma测试");
   box.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 10 17.5 19 7" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   box.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -676,14 +678,8 @@ function createPreviewCheck(taskId, doc) {
   return box;
 }
 function togglePreviewTask(taskId) {
-  if (taskId === "deploy") {
-    runPreviewSelection.deploy = !runPreviewSelection.deploy;
-    if (!runPreviewSelection.deploy) runPreviewSelection.test = false;
-  }
-  if (taskId === "test") {
-    runPreviewSelection.test = !runPreviewSelection.test;
-    if (runPreviewSelection.test) runPreviewSelection.deploy = true;
-  }
+  if (taskId === "deploy") runPreviewSelection.deploy = !runPreviewSelection.deploy;
+  if (taskId === "test") runPreviewSelection.test = !runPreviewSelection.test;
   if (!runPreviewSelection.deploy && !runPreviewSelection.test) {
     runPreviewSelection.environmentId = "";
   }
@@ -697,9 +693,11 @@ function previewPipelineData() {
       { id: "sync", label: "拉代码", status: "pending", subtasks: [task("clone", "克隆仓库"), task("sha", "记录提交")] },
       { id: "test", label: "测试执行", status: "pending", subtasks: [task("plan", "加载build.yaml"), task("runner", "启动测试"), task("ut-cases", "执行UT"), task("dt-cases", "执行DT")] },
       { id: "build", label: "构建镜像", status: "pending", subtasks: [task("script", "执行构建脚本"), task("docker", "Docker构建"), task("verify", "产物校验")] },
+      ...((runPreviewSelection.test && (environments.find(e=>e.id===runPreviewSelection.gammaEnvironmentId)||{}).environment_type==='production') || (runPreviewSelection.deploy && (environments.find(e=>e.id===runPreviewSelection.environmentId)||{}).environment_type==='production') ? [{ id:"approval", label:"人工卡点", status:"pending", subtasks:[task("approve","等待生产发布审批")] }] : []),
       { id: "push", label: "推送 SWR", status: "pending", subtasks: [task("tag", "标记镜像"), task("push", "推送镜像"), task("verify", "推送确认")] },
-      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
       { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
+      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("test", "gamma测试")] },
+      { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
     ],
   };
 }
@@ -830,12 +828,12 @@ function defaultPersonalTemplate() {
   return pipelineTemplates.find((item) => item.kind === "personal" && item.builtin) || pipelineTemplates[0] || null;
 }
 function applyTemplateDefaults(tpl) {
-  const test = !!(tpl && tpl.gamma_test);
   runPreviewSelection = {
-    deploy: !!(tpl && tpl.gamma_deploy) || test,
-    test,
+    deploy: !!(tpl && tpl.gamma_deploy),
+    test: !!(tpl && tpl.gamma_test),
     environmentId: (tpl && tpl.environment_id) || "",
-    deploymentMode: "parallel",
+    gammaEnvironmentId: (tpl && tpl.environment_id) || "",
+    deploymentMode: "",
   };
 }
 function syncRunLayerChrome() {
@@ -920,7 +918,7 @@ function cancelRunPreview() {
   previewBranchServiceId = "";
   runLayerMode = "run";
   runLayerTemplateId = "";
-  runPreviewSelection = { deploy: false, test: false, environmentId: "", deploymentMode: "parallel" };
+  runPreviewSelection = { deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
   setPreviewHint("");
   closeRunPopup();
   applyServiceChrome();
@@ -933,11 +931,15 @@ function confirmRunPreview() {
     return;
   }
   const wantsGamma = runPreviewSelection.deploy || runPreviewSelection.test;
-  if (runPreviewSelection.test && (runPreviewSelection.environmentId === 'ci-e2e' || (runPreviewSelection.mode || 'browser-e2e') === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
+  if (runPreviewSelection.test && (runPreviewSelection.gammaEnvironmentId === 'ci-e2e' || (runPreviewSelection.mode || 'browser-e2e') === 'browser-e2e') && !(runPreviewSelection.suites || ['E01','E02','E03']).length) {
     setPreviewHint('请至少选择一个 E2E 用例'); return;
   }
-  if (wantsGamma && !runPreviewSelection.environmentId) {
-    setPreviewHint("请先选择环境");
+  if (runPreviewSelection.test && !runPreviewSelection.gammaEnvironmentId) {
+    setPreviewHint("请为 gamma 集成测试选择环境");
+    return;
+  }
+  if (runPreviewSelection.deploy && (!runPreviewSelection.environmentId || !runPreviewSelection.deploymentMode)) {
+    setPreviewHint("请为生产发布选择环境和部署方式");
     return;
   }
   const branch = (previewBranchPicker && previewBranchPicker.value) || "";
@@ -961,8 +963,11 @@ async function saveEditedTemplate() {
       name,
       branch,
       gamma_deploy: !!runPreviewSelection.deploy,
+      production_release: !!runPreviewSelection.deploy,
       gamma_test: !!runPreviewSelection.test,
       environment_id: runPreviewSelection.environmentId || "",
+      release_environment_id: runPreviewSelection.environmentId || "",
+      gamma_environment_id: runPreviewSelection.gammaEnvironmentId || "",
     }),
   });
   if (data.template) {
@@ -1136,12 +1141,12 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   drop.appendChild(diamond);
   const tree = doc.createElement("div");
   tree.className = "pl-tree";
-  if (preview && stage.id === "gamma") {
+  if (preview && ((stage.id === "gamma" && runPreviewSelection.test) || (stage.id === "release" && runPreviewSelection.deploy))) {
     const envRow = doc.createElement("div");
     envRow.className = "pl-task pl-env-row";
     envRow.appendChild(doc.createElement("span"));
     envRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
-    envRow.appendChild(createGammaEnvPicker(doc));
+    envRow.appendChild(createGammaEnvPicker(doc, stage.id));
     tree.appendChild(envRow);
   }
   (stage.tasks || []).forEach((task) => {
@@ -1172,7 +1177,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     // Repository CID gamma is temporarily disabled; keep production :80 browser E2E only.
     runPreviewSelection.mode = 'browser-e2e';
   }
-  if (preview && stage.id === 'gamma' && runPreviewSelection.deploy) {
+  if (preview && stage.id === 'release' && runPreviewSelection.deploy) {
     const group = doc.createElement('div');
     group.className = 'gamma-deploy-options';
     group.append(doc.createTextNode('CCE 部署方式：'));
@@ -1201,11 +1206,12 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   col.appendChild(drop);
   return col;
 }
-function selectedEnvName() {
-  const env = environments.find((item) => item.id === runPreviewSelection.environmentId);
+function selectedEnvName(kind) {
+  const id = kind === "gamma" ? runPreviewSelection.gammaEnvironmentId : runPreviewSelection.environmentId;
+  const env = environments.find((item) => item.id === id);
   return env ? (env.name || "未命名环境") : "";
 }
-function createGammaEnvPicker(doc) {
+function createGammaEnvPicker(doc, kind) {
   doc = doc || document;
   const win = doc.defaultView || window;
   const wrap = doc.createElement("div");
@@ -1221,7 +1227,7 @@ function createGammaEnvPicker(doc) {
   label.className = "pl-env-trigger-label";
   const choices = environments;
   const empty = !choices.length;
-  label.textContent = selectedEnvName() || (empty ? "还没有环境" : "选择环境");
+  label.textContent = selectedEnvName(kind) || (empty ? "还没有环境" : "选择环境");
   trigger.disabled = empty;
   trigger.appendChild(label);
   const chevron = doc.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -1251,12 +1257,14 @@ function createGammaEnvPicker(doc) {
   choices.forEach((env) => {
     const option = doc.createElement("button");
     option.type = "button";
-    option.className = "branch-option" + (runPreviewSelection.environmentId === env.id ? " active" : "");
+    const selectedId = kind === "gamma" ? runPreviewSelection.gammaEnvironmentId : runPreviewSelection.environmentId;
+    option.className = "branch-option" + (selectedId === env.id ? " active" : "");
     option.setAttribute("role", "option");
     option.textContent = env.name || "未命名环境";
     option.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      runPreviewSelection.environmentId = env.id;
+      if (kind === "gamma") runPreviewSelection.gammaEnvironmentId = env.id;
+      else runPreviewSelection.environmentId = env.id;
       label.textContent = env.name || "未命名环境";
       menu.querySelectorAll(".branch-option").forEach((item) => item.classList.toggle("active", item === option));
       setPreviewHint("");
@@ -1287,14 +1295,14 @@ function createGammaEnvPicker(doc) {
 function createReleaseModePicker(doc) {
   doc = doc || document;
   const win = doc.defaultView || window;
-  const choices = [{ id: 'parallel', name: '平滑升级' }, { id: 'inplace', name: '替换升级' }];
+  const choices = [{ id: 'parallel', name: '平滑升级' }, { id: 'inplace', name: '替换升级', disabled: true }];
   const wrap = doc.createElement('div'); wrap.className = 'pl-env-pick release-mode-pick';
   const picker = doc.createElement('div'); picker.className = 'pl-env-picker';
   const trigger = doc.createElement('button'); trigger.type = 'button';
   trigger.className = 'input branch-trigger pl-env-trigger';
   trigger.setAttribute('aria-haspopup', 'listbox'); trigger.setAttribute('aria-expanded', 'false');
   const label = doc.createElement('span'); label.className = 'pl-env-trigger-label';
-  label.textContent = (choices.find((item) => item.id === runPreviewSelection.deploymentMode) || choices[0]).name;
+  label.textContent = (choices.find((item) => item.id === runPreviewSelection.deploymentMode) || {}).name || '选择部署方式';
   trigger.appendChild(label);
   const chevron = doc.createElementNS('http://www.w3.org/2000/svg', 'svg');
   chevron.setAttribute('viewBox', '0 0 24 24'); chevron.setAttribute('aria-hidden', 'true');
@@ -1312,6 +1320,7 @@ function createReleaseModePicker(doc) {
     const option = doc.createElement('button'); option.type = 'button';
     option.className = 'branch-option' + ((runPreviewSelection.deploymentMode || 'parallel') === choice.id ? ' active' : '');
     option.setAttribute('role', 'option'); option.textContent = choice.name;
+    option.disabled = !!choice.disabled;
     option.addEventListener('click', (ev) => {
       ev.stopPropagation(); runPreviewSelection.deploymentMode = choice.id; label.textContent = choice.name;
       close(); trigger.focus(); renderRunPage();
@@ -1869,6 +1878,21 @@ function applyJob(job, { loading } = {}) {
   renderJobPipeline("liveJobPipeline", job.pipeline, job.status, (stageId, taskId) => {
     openStepModal(stageId, taskId);
   }, { stopping: !!(job.cancel_requested || job.stage === "stopping") });
+  if (job.approval && job.approval.status === 'waiting') {
+    const gate=document.createElement('div'); gate.className='gamma-result-link approval-gate';
+    gate.innerHTML='<span>🟡 等待人工卡点 · '+esc(job.approval.purpose || '生产操作')+' · '+esc(job.approval.environment || '')+'</span>'+
+      '<button class="btn primary" data-approval="continue">可继续</button><button class="btn danger" data-approval="stop">可停止</button>';
+    gate.querySelectorAll('[data-approval]').forEach(btn=>btn.addEventListener('click',async()=>{
+      btn.disabled=true; try { await api('/api/jobs/'+encodeURIComponent(job.id)+'/approval',{method:'POST',body:JSON.stringify({action:btn.dataset.approval})}); await openJob(job.id); } catch(e){ alert(e.message); }
+    }));
+    gate.querySelectorAll('[data-approval]').forEach(btn=>btn.disabled=true);
+    const sid=(job.service_ids||[job.service_id||''])[0];
+    api('/api/permissions?service_id='+encodeURIComponent(sid)).then(data=>{
+      const owners=((data.permissions||[])[0]||{}).owners||[];
+      if(owners.includes(currentUser)) gate.querySelectorAll('[data-approval]').forEach(btn=>btn.disabled=false);
+    }).catch(()=>{});
+    $('liveJobPipeline').append(gate);
+  }
   if (job.gamma_e2e) {
     const row=document.createElement('div'); row.className='gamma-result-link';
     const state=document.createElement('span');
@@ -1885,18 +1909,13 @@ function applyJob(job, { loading } = {}) {
     $('liveJobPipeline').append(row);
   }
   if (Array.isArray(job.gamma_rollouts) && job.gamma_rollouts.length) {
-    const row = document.createElement('div'); row.className = 'gamma-result-link';
-    const state = document.createElement('span');
-    const names = job.gamma_rollouts.map((item) => {
-      const oldName = item.source_workload || '旧版本';
-      const newName = (item.new && item.new.name) || item.candidate_workload || '新版本';
-      return oldName + ' → ' + newName;
-    });
-    state.textContent = '平滑发布已创建：' + names.join('；'); row.append(state);
-    const manage = document.createElement('button'); manage.type = 'button'; manage.className = 'btn ghost';
-    manage.textContent = '查看并管理新旧版本';
-    manage.addEventListener('click', () => { setTab('envs'); loadEnvironments().catch((e) => setEnvError(e.message)); });
-    row.append(manage); $('liveJobPipeline').append(row);
+    const panel=document.createElement('div'); panel.className='env-rollouts pipeline-rollouts';
+    panel.innerHTML='<p class="env-secret-hint">正在读取生产发布负载…</p>';
+    $('liveJobPipeline').append(panel);
+    const envId=job.gamma_rollouts[0].environment_id;
+    api('/api/environments/'+encodeURIComponent(envId)+'/rollouts').then(data=>{
+      renderEnvRollouts(panel,(data.rollouts||[]).filter(item=>item.job_id===job.id));
+    }).catch(e=>renderEnvRollouts(panel,[],e.message));
   }
 }
 
@@ -2254,8 +2273,11 @@ async function startRun(branch) {
         login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
         optional_steps: {
           gamma_deploy: !!runPreviewSelection.deploy,
+          production_release: !!runPreviewSelection.deploy,
           gamma_test: !!runPreviewSelection.test,
           environment_id: runPreviewSelection.environmentId || "",
+          release_environment_id: runPreviewSelection.environmentId || "",
+          gamma_environment_id: runPreviewSelection.gammaEnvironmentId || "",
           deployment_mode: runPreviewSelection.deploymentMode || "parallel",
           gamma_suites: runPreviewSelection.suites || ['E01','E02','E03'],
           gamma_mode: runPreviewSelection.mode || 'browser-e2e',
@@ -2752,6 +2774,7 @@ function emptyEnvDraft() {
   const sid = svc ? svc.id : "";
   return {
     name: "",
+    environment_type: "dev",
     service_id: sid,
     region: "cn-southwest-2",
     cluster_name: "",
@@ -2766,6 +2789,7 @@ function collectEnvForm() {
     .filter(Boolean);
   return {
     name: ($("envName") && $("envName").value || "").trim(),
+    environment_type: ($("envType") && $("envType").value) || "dev",
     service_id: currentServiceId && !isAllServices() ? currentServiceId : "",
     region: ($("envRegion") && $("envRegion").value) || "cn-southwest-2",
     cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
@@ -2799,6 +2823,7 @@ function envFormHtml(env) {
   return (
     '<div class="env-form-card">' +
     '<div class="env-meta-row"><span class="env-meta-label">所属微服务:</span><strong class="env-meta-value">' + esc(owned || "—") + "</strong></div>" +
+    '<label class="label" for="envType">环境标签</label><select id="envType" class="input"><option value="dev"' + (data.environment_type !== 'production' ? ' selected' : '') + '>dev</option><option value="production"' + (data.environment_type === 'production' ? ' selected' : '') + '>production</option></select>' +
     '<label class="label" for="envRegion">Region</label>' +
     '<select id="envRegion" class="input"><option value="cn-southwest-2">贵阳一</option></select>' +
     '<label class="label" for="envCluster">集群名称</label>' +
@@ -2827,7 +2852,7 @@ function envCardHtml(env) {
   return (
     '<article class="env-card" data-env-id="' + esc(env.id) + '">' +
     '<div class="env-card-head">' +
-    '<div class="env-card-name">' + esc(env.name || "未命名环境") + "</div>" +
+    '<div class="env-card-name">' + esc(env.name || "未命名环境") + ' <span class="env-tag">' + esc(env.environment_type || 'dev') + '</span></div>' +
     '<div class="env-card-actions">' +
     '<button type="button" class="env-icon-btn" data-env-edit="' + esc(env.id) + '" title="编辑">' + envIconPencil() + "</button>" +
     '<button type="button" class="env-icon-btn danger" data-env-delete="' + esc(env.id) + '" title="删除">' + envIconTrash() + "</button>" +
@@ -2837,8 +2862,7 @@ function envCardHtml(env) {
     '<div class="env-meta-row"><span class="env-meta-label">Region:</span><strong class="env-meta-value">' + esc(env.region_label || env.region || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">集群:</span><strong class="env-meta-value">' + esc(env.cluster_name || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">负载:</span><strong class="env-meta-value">' + esc(env.workload_name || "—") + "</strong></div>" +
-    '</div><div class="env-rollout-actions"><button type="button" class="btn ghost" data-env-rollouts="' + esc(env.id) + '">查看新旧版本</button></div>' +
-    '<div class="env-rollouts" data-env-rollout-list="' + esc(env.id) + '" hidden></div></article>'
+    '</div></article>'
   );
 }
 
@@ -2860,7 +2884,7 @@ function renderEnvRollouts(panel, rows, error) {
   if (!rows || !rows.length) { panel.innerHTML = '<p class="env-secret-hint">暂无由 CI 创建的平滑发布负载。</p>'; return; }
   panel.innerHTML = rows.map((row) => row.error
     ? '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>'
-    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>平滑发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : '新旧版本并行中') + '</span>' + (row.old && row.old.exists && row.status !== 'old_deleted' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}) + rolloutWorkloadHtml(row, 'new', row.new || {}) + '</section>'
+    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : row.status === 'rolled_back' ? '已回滚' : '等待老版本下线') + '</span>' + (row.old && row.old.exists && row.status === 'active' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + (row.status === 'old_deleted' ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}) + rolloutWorkloadHtml(row, 'new', row.new || {}) + '</section>'
   ).join('');
   panel.querySelectorAll('[data-rollout-scale]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const target = btn.getAttribute('data-rollout-scale');
@@ -2876,6 +2900,11 @@ function renderEnvRollouts(panel, rows, error) {
     btn.disabled = true;
     try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel); await loadEnvironments(); }
     catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
+  }));
+  panel.querySelectorAll('[data-rollout-rollback]').forEach((btn) => btn.addEventListener('click', async () => {
+    const card=btn.closest('[data-rollout-id]'); if(!await askEnvConfirm('确认重新部署已下线的旧版本？')) return;
+    btn.disabled=true; try { await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'}); location.reload(); }
+    catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
 }
 
@@ -2994,6 +3023,17 @@ async function loadEnvironments() {
   const data = await api("/api/environments?service_id=" + encodeURIComponent(currentServiceId));
   environments = data.environments || [];
   renderEnvironments();
+}
+async function loadPermissions() {
+  const root = $("permissionGrid"); if (!root || !currentServiceId || isAllServices()) return;
+  const data = await api('/api/permissions?service_id=' + encodeURIComponent(currentServiceId));
+  const row = (data.permissions || [])[0] || { permission: '生产发布权限', owners: [] };
+  root.innerHTML = '<table class="art-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody><tr><td>生产发布权限</td><td><input id="permissionOwners" class="input" value="' + esc((row.owners || []).join(', ')) + '"/><button id="btnPermissionSave" class="btn primary">保存</button></td></tr></tbody></table>';
+  bind('btnPermissionSave', async () => {
+    const owners = (($('permissionOwners').value || '').split(/[,，;\s]+/).filter(Boolean));
+    try { await api('/api/permissions', {method:'POST', body:JSON.stringify({service_id:currentServiceId, owners})}); await loadPermissions(); }
+    catch(e) { const err=$('permissionError'); err.hidden=false; err.textContent=e.message; }
+  });
 }
 function openEnvCreate() {
   if (isAllServices() || !currentService()) {
