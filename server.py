@@ -6764,29 +6764,6 @@ def maybe_run_gamma_after_build(
         if env_sid and env_sid not in job_sids:
             return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
 
-    # A managed dev-gamma environment is mutated only by the persistent Hub
-    # queue. The same lease now covers deployment, E2E and rollback/cleanup.
-    if env_id:
-        from gamma_real import available, run as run_real_gamma
-        if available(env_id):
-            release_build_slot(job_id)
-            with log_substep("test" if opts.get("gamma_test") else "deploy"):
-                try:
-                    return run_real_gamma(
-                        job_id,
-                        results,
-                        opts,
-                        lambda line: append_job_log(job_id, line),
-                        lambda state: set_job(job_id, gamma_e2e=state),
-                        lambda: job_cancel_requested(job_id),
-                    )
-                except Exception as exc:
-                    message = "Gamma 队列接入失败: " + str(exc)
-                    append_job_log(job_id, message)
-                    return False, message
-        if opts.get("gamma_test"):
-            return False, "该环境尚未配置真实 Gamma 驱动；未部署镜像"
-
     if opts.get("gamma_deploy"):
         with log_substep("deploy"):
             if not env_id:
@@ -6845,6 +6822,28 @@ def maybe_run_gamma_after_build(
             append_job_log(job_id, "gamma部署成功")
             set_job(job_id, gamma_deployed=True, gamma_rollouts=created_rollouts)
 
+    if opts.get("gamma_test"):
+        # CCE deployment is deliberately independent from the test Pipeline.
+        # The Hub receives a test-only handoff after deployment succeeds.
+        from gamma_real import available, run as run_real_gamma
+        if not available(env_id):
+            return False, "该环境尚未配置真实 Gamma 驱动；部署已完成，未执行 Gamma 测试"
+        test_opts = {**opts, "gamma_deploy": False}
+        release_build_slot(job_id)
+        with log_substep("test"):
+            try:
+                return run_real_gamma(
+                    job_id,
+                    results,
+                    test_opts,
+                    lambda line: append_job_log(job_id, line),
+                    lambda state: set_job(job_id, gamma_e2e=state),
+                    lambda: job_cancel_requested(job_id),
+                )
+            except Exception as exc:
+                message = "Gamma 测试接入失败: " + str(exc)
+                append_job_log(job_id, message)
+                return False, message
     return True, ""
 
 

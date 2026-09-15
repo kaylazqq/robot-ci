@@ -50,10 +50,15 @@ class GammaBridgeTests(unittest.TestCase):
             'get_environment': Mock(return_value={'name': 'dev-gamma', 'service_id': 'service'}),
             'cce_rollout': Mock(deploy_job_results=Mock(return_value=(True, '')))}
         exec(compile(tree, 'server.py', 'exec'), scope)
-        with patch.object(gamma_real, 'owns_environment', return_value=True), patch.object(gamma_real, 'available', return_value=False):
+        with patch.object(gamma_real, 'owns_environment', return_value=True) as owns, \
+             patch.object(gamma_real, 'available', return_value=False) as available, \
+             patch.object(gamma_real, 'run') as gamma_run:
             ok, message = scope['maybe_run_gamma_after_build']('job', [])
         self.assertTrue(ok, message)
         scope['cce_rollout'].deploy_job_results.assert_called_once()
+        owns.assert_not_called()
+        available.assert_not_called()
+        gamma_run.assert_not_called()
 
     def test_browser_e2e_is_default_and_repository_path_disabled(self):
         import re
@@ -81,7 +86,7 @@ class GammaBridgeTests(unittest.TestCase):
              patch.object(gamma_real, 'run', return_value=(True, '')) as browser:
             self.assertEqual(scope['maybe_run_gamma_after_build']('test', [{'service_id': 'service', 'ok': True}]), (True, ''))
             browser.assert_called_once()
-            scope['cce_rollout'].deploy_job_results.assert_not_called()
+            scope['cce_rollout'].deploy_job_results.assert_called_once()
             scope['run_gamma_tests'].assert_not_called()
             scope['record_gamma_run'].assert_not_called()
         with self.assertRaises(ValueError):
@@ -112,7 +117,7 @@ class GammaBridgeTests(unittest.TestCase):
         with patch.object(gamma_real, 'available', return_value=True), patch.object(gamma_real, 'run', return_value=(False, 'E02 failed')) as run:
             self.assertEqual(env['maybe_run_gamma_after_build']('test', [{'ok': True}]), (False, 'E02 failed'))
             run.assert_called_once()
-            env['cce_rollout'].deploy_job_results.assert_not_called()
+            env['cce_rollout'].deploy_job_results.assert_called_once()
             env['release_build_slot'].assert_called_once_with('test')
 
     def test_unconfigured_cce_test_blocks_before_deployment(self):
@@ -130,8 +135,8 @@ class GammaBridgeTests(unittest.TestCase):
         exec(compile(tree, 'server.py', 'exec'), env)
         ok, error = env['maybe_run_gamma_after_build']('test', [])
         self.assertFalse(ok)
-        self.assertIn('未部署镜像', error)
-        env['cce_rollout'].deploy_job_results.assert_not_called()
+        self.assertIn('未执行 Gamma 测试', error)
+        env['cce_rollout'].deploy_job_results.assert_called_once()
 
     def test_options(self):
         self.assertEqual(gamma_e2e.options({})['gamma_suites'],['E01','E02','E03'])

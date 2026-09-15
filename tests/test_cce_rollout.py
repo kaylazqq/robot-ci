@@ -385,7 +385,7 @@ class GammaAfterBuildTests(unittest.TestCase):
                         )
         self.assertTrue(ok, err)
         self.assertEqual(1, len(calls))
-        self.assertTrue(calls[0]["gamma_deploy"])
+        self.assertFalse(calls[0]["gamma_deploy"])
 
     def test_prepare_slot_is_done_after_gamma_starts(self) -> None:
         job = _job("gamma-progressed")
