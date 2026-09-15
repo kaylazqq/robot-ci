@@ -81,7 +81,7 @@ class GammaBridgeTests(unittest.TestCase):
              patch.object(gamma_real, 'run', return_value=(True, '')) as browser:
             self.assertEqual(scope['maybe_run_gamma_after_build']('test', [{'service_id': 'service', 'ok': True}]), (True, ''))
             browser.assert_called_once()
-            scope['cce_rollout'].deploy_job_results.assert_called_once()
+            scope['cce_rollout'].deploy_job_results.assert_not_called()
             scope['run_gamma_tests'].assert_not_called()
             scope['record_gamma_run'].assert_not_called()
         with self.assertRaises(ValueError):
@@ -112,7 +112,7 @@ class GammaBridgeTests(unittest.TestCase):
         with patch.object(gamma_real, 'available', return_value=True), patch.object(gamma_real, 'run', return_value=(False, 'E02 failed')) as run:
             self.assertEqual(env['maybe_run_gamma_after_build']('test', [{'ok': True}]), (False, 'E02 failed'))
             run.assert_called_once()
-            env['cce_rollout'].deploy_job_results.assert_called_once()
+            env['cce_rollout'].deploy_job_results.assert_not_called()
             env['release_build_slot'].assert_called_once_with('test')
 
     def test_unconfigured_cce_test_blocks_before_deployment(self):
@@ -130,8 +130,8 @@ class GammaBridgeTests(unittest.TestCase):
         exec(compile(tree, 'server.py', 'exec'), env)
         ok, error = env['maybe_run_gamma_after_build']('test', [])
         self.assertFalse(ok)
-        self.assertIn('未执行 Gamma 测试', error)
-        env['cce_rollout'].deploy_job_results.assert_called_once()
+        self.assertIn('未部署镜像', error)
+        env['cce_rollout'].deploy_job_results.assert_not_called()
 
     def test_options(self):
         self.assertEqual(gamma_e2e.options({})['gamma_suites'],['E01','E02','E03'])
