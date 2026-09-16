@@ -8394,7 +8394,10 @@ class Handler(SimpleHTTPRequestHandler):
         m_rollout_scale = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/scale", path)
         if m_rollout_scale:
             record = get_parallel_rollout(m_rollout_scale.group(1))
-            if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
+            if not record:
+                self._json(404, {"error": "平滑发布记录不存在"}); return
+            env = get_environment(str(record.get("environment_id") or "")) or {}
+            if str(env.get("environment_type") or "dev") == "production" and not _has_production_permission(str(record.get("service_id") or ""), user):
                 self._json(403, {"error": "没有生产发布权限"}); return
             job_id = str(record.get("job_id") or "")
             target = str(data.get("target") or "")
@@ -8414,8 +8417,8 @@ class Handler(SimpleHTTPRequestHandler):
         m_rollout_offline = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/offline-old", path)
         if m_rollout_offline:
             record = get_parallel_rollout(m_rollout_offline.group(1))
-            if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
-                self._json(403, {"error": "没有生产发布权限"}); return
+            if not record:
+                self._json(404, {"error": "平滑发布记录不存在"}); return
             job_id = str(record.get("job_id") or "")
             append_job_step_log(job_id, "release", "offline", f"开始下线旧版本 {record.get('source_workload')}")
             item, err = offline_parallel_rollout_old(m_rollout_offline.group(1))
@@ -8430,8 +8433,8 @@ class Handler(SimpleHTTPRequestHandler):
         m_rollout_plan = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/rollback-plan", path)
         if m_rollout_plan:
             record = get_parallel_rollout(m_rollout_plan.group(1))
-            if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
-                self._json(403, {"error": "没有生产发布权限"}); return
+            if not record:
+                self._json(404, {"error": "平滑发布记录不存在"}); return
             try:
                 plan = rollout_recovery.preview(sys.modules[__name__], record["id"])
                 self._json(200, {"ok": True, "plan": plan})
@@ -8442,8 +8445,8 @@ class Handler(SimpleHTTPRequestHandler):
         m_rollout_rollback = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/rollback", path)
         if m_rollout_rollback:
             record = get_parallel_rollout(m_rollout_rollback.group(1))
-            if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
-                self._json(403, {"error": "没有生产发布权限"}); return
+            if not record:
+                self._json(404, {"error": "平滑发布记录不存在"}); return
             env = get_environment(str(record.get("environment_id") or "")) or {}
             job_id = str(record.get("job_id") or "")
             job = ensure_action_job(job_id)

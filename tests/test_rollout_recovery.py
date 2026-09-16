@@ -8,6 +8,7 @@ from copy import deepcopy
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.request import Request, build_opener, ProxyHandler
 
 import server
@@ -273,6 +274,63 @@ class RecoveryTests(unittest.TestCase):
                 self.assertTrue(post("/api/jobs/aaaaaaaa/approval", {"action": "continue"})["ok"])
                 self.assertEqual({"v1"}, set(self.live))
                 self.assertTrue(server.load_job_from_disk("aaaaaaaa")["rollback_completed"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join()
+
+    def test_release_actions_do_not_require_permission_before_production_rollback_approval(self):
+        with patch.object(server.Handler, "_require_api_user", return_value="unprivileged"), patch.object(server, "_has_production_permission", return_value=False):
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                opener = build_opener(ProxyHandler({}))
+                def post(path, data):
+                    req = Request(f"http://127.0.0.1:{httpd.server_port}" + path,
+                                  data=json.dumps(data).encode(), headers={"Content-Type": "application/json"})
+                    with opener.open(req, timeout=10) as response:
+                        return json.load(response)
+
+                # Old-version offline is a post-approval release action and
+                # does not require production permission.
+                second_base = "/api/parallel-rollouts/" + self.second["id"]
+                self.assertTrue(post(second_base + "/offline-old", {})["ok"])
+                self.assertEqual("old_deleted", server.get_parallel_rollout(self.second["id"])["status"])
+
+                # Production rollback may be initiated by anyone, but still
+                # creates a permission-protected approval gate.
+                first_base = "/api/parallel-rollouts/" + self.first["id"]
+                plan = post(first_base + "/rollback-plan", {})["plan"]
+                self.assertTrue(post(first_base + "/rollback", {"plan_token": plan["token"]})["approval_required"])
+                with self.assertRaises(HTTPError) as denied:
+                    post("/api/jobs/aaaaaaaa/approval", {"action": "continue"})
+                self.assertEqual(403, denied.exception.code)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join()
+
+    def test_nonproduction_rollback_executes_without_permission_or_approval(self):
+        with server._connect_db() as conn:
+            conn.execute("UPDATE environments SET environment_type='dev' WHERE id=?", (self.env["id"],))
+        with patch.object(server.Handler, "_require_api_user", return_value="unprivileged"), patch.object(server, "_has_production_permission", return_value=False):
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                opener = build_opener(ProxyHandler({}))
+                def post(path, data):
+                    req = Request(f"http://127.0.0.1:{httpd.server_port}" + path,
+                                  data=json.dumps(data).encode(), headers={"Content-Type": "application/json"})
+                    with opener.open(req, timeout=10) as response:
+                        return json.load(response)
+                base = "/api/parallel-rollouts/" + self.first["id"]
+                plan = post(base + "/rollback-plan", {})["plan"]
+                result = post(base + "/rollback", {"plan_token": plan["token"]})
+                self.assertTrue(result["ok"])
+                self.assertNotIn("approval_required", result)
+                self.assertEqual({"v1"}, set(self.live))
             finally:
                 httpd.shutdown()
                 httpd.server_close()
