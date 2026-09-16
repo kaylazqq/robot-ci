@@ -1290,7 +1290,10 @@ body.clone-open { overflow: hidden; }
   flex-direction: column;
   gap: 20px;
   box-shadow: 0 8px 22px rgba(40, 120, 232, 0.08);
+  cursor: pointer;
 }
+.env-card:hover { border-color: #2f75c9; box-shadow: 0 10px 26px rgba(40, 120, 232, 0.14); }
+.env-card:focus-visible { outline: 3px solid rgba(47, 117, 201, 0.28); outline-offset: 2px; }
 .env-card-head {
   display: flex;
   align-items: flex-start;
@@ -1364,6 +1367,12 @@ body.clone-open { overflow: hidden; }
   padding: 24px 4px;
 }
 .env-form-card { min-height: 0; }
+.env-view-card { display: grid; gap: 0; }
+.env-view-row { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 16px; padding: 10px 0; border-bottom: 1px solid #e4eaf1; }
+.env-view-row > span { color: var(--muted); }
+.env-view-row > strong { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.env-view-nodes strong { display: grid; gap: 5px; }
+.env-view-nodes code { width: fit-content; padding: 2px 6px; border-radius: 5px; background: #eef3f8; color: #23364d; }
 .env-form-card .label { margin-top: 10px; }
 .env-form-card .label:first-child { margin-top: 0; }
 .env-secret-hint {

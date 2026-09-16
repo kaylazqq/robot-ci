@@ -2789,7 +2789,7 @@ async function openStepModal(stageId, taskId) {
 
   // Use job-stored rollout status only — never block the left step list on CCE.
   const releaseState = String(((((currentJob || {}).gamma_rollouts || [])[0] || {}).status) || "");
-  if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)) taskId = "release-compare:results";
+  if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back", "superseded"].includes(releaseState)) taskId = "release-compare:results";
   if (stage.id === "release" && taskId === "compare") taskId = "release-compare:results";
   if (stage.id === "rollback") taskId = "rollback:results";
   let selectedTask = normalizeStepSelection(taskId, stage);
@@ -3086,13 +3086,29 @@ function envFormHtml(env) {
     "</div></div>"
   );
 }
+function envReadonlyHtml(env) {
+  const owned = serviceTitle(services.find((item) => item.id === env.service_id) || { id: env.service_id, title: env.service_id });
+  const nodes = Array.isArray(env.nodes) && env.nodes.length ? env.nodes : [];
+  const row = (label, value) => '<div class="env-view-row"><span>' + esc(label) + '</span><strong>' + esc(value || '—') + '</strong></div>';
+  return '<div class="env-view-card">' +
+    row('所属微服务', owned) + row('环境标签', env.environment_type || 'dev') +
+    row('Region', env.region_label || env.region) + row('集群名称', env.cluster_name) +
+    row('配置负载', env.workload_name) + row('当前活动负载', env.active_workload_name || env.workload_name) +
+    row('跳板机', env.jump_host) + row('跳板机密码', env.has_jump_password ? '已配置（不显示明文）' : '未配置') +
+    '<div class="env-view-row env-view-nodes"><span>节点列表</span><strong>' +
+      (nodes.length ? nodes.map((node) => '<code>' + esc(node) + '</code>').join('') : '—') + '</strong></div>' +
+    row('节点密码', env.has_node_password ? '已配置（不显示明文）' : '未配置') +
+    row('创建人', env.created_by) + row('创建时间', env.created_at) + row('更新时间', env.updated_at) +
+    '<p class="env-secret-hint">只读查看不包含跳板机密码和节点密码明文。</p>' +
+    '<div class="row env-form-actions"><button type="button" class="btn primary" id="btnEnvViewClose">关闭</button></div></div>';
+}
 function envCardHtml(env) {
   const locked = !canManageEnvironments();
   const editTitle = locked ? "没有环境管理权限" : "编辑";
   const deleteTitle = locked ? "没有环境管理权限" : "删除";
   const lockAttrs = locked ? " disabled aria-disabled=\"true\"" : "";
   return (
-    '<article class="env-card" data-env-id="' + esc(env.id) + '">' +
+    '<article class="env-card" data-env-id="' + esc(env.id) + '" role="button" tabindex="0" aria-label="查看环境 ' + esc(env.name || '未命名环境') + '">' +
     '<div class="env-card-head">' +
     '<div class="env-card-name">' + esc(env.name || "未命名环境") + ' <span class="env-tag">' + esc(env.environment_type || 'dev') + '</span></div>' +
     '<div class="env-card-actions">' +
@@ -3130,10 +3146,23 @@ function renderEnvRollouts(panel, rows, error, mode) {
   mode = mode || panel.dataset.compareMode || 'release';
   if (error) { panel.innerHTML = '<p class="hint error">' + esc(error) + '</p>'; return; }
   if (!rows || !rows.length) { panel.innerHTML = '<p class="env-secret-hint">暂无由 CI 创建的平滑发布负载。</p>'; return; }
-  panel.innerHTML = rows.map((row) => row.error
-    ? '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>'
-    : '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'old_deleted' ? '旧版本已下线' : row.status === 'rolled_back' ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.status === 'active' ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + (mode === 'rollback' && row.status === 'old_deleted' ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '') + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release') + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release') + '</section>'
-  ).join('');
+  panel.innerHTML = rows.map((row) => {
+    if (row.error) return '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>';
+    const rolledBack = row.status === 'rolled_back';
+    const rollbackButton = mode !== 'rollback' ? '' : rolledBack
+      ? '<button type="button" class="btn ghost" disabled aria-disabled="true" title="本次发布已经回滚">一键回滚</button>'
+      : row.can_rollback ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '';
+    return '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'superseded' ? '已完成 · 已由历史回滚结束' : row.status === 'old_deleted' ? '旧版本已下线' : rolledBack ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.can_manage ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + rollbackButton + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release' && row.can_manage) + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release' && row.can_manage) + '</section>';
+  }).join('');
+  panel.querySelectorAll('[data-rollout-id]').forEach((card) => {
+    const row = rows.find((item) => item.id === card.dataset.rolloutId);
+    if (row && ['restoring', 'cleaning', 'failed'].includes(row.recovery_phase)) {
+      const message = row.recovery_phase === 'failed'
+        ? '回滚未完成，可重新点击一键回滚重试：' + (row.recovery_error || '')
+        : '回滚进行中：' + (row.recovery_phase === 'restoring' ? '等待恢复版本就绪' : '清理其他版本');
+      card.insertAdjacentHTML('beforeend', '<p class="hint error">' + esc(message) + '</p>');
+    }
+  });
   panel.querySelectorAll('[data-rollout-scale]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const target = btn.getAttribute('data-rollout-scale');
     const input = card && card.querySelector('[data-rollout-replicas="' + target + '"]'); const replicas = input ? Number(input.value) : NaN;
@@ -3155,9 +3184,12 @@ function renderEnvRollouts(panel, rows, error, mode) {
   }));
   panel.querySelectorAll('[data-rollout-rollback]').forEach((btn) => btn.addEventListener('click', async () => {
     const card=btn.closest('[data-rollout-id]');
-    if(!await askEnvConfirm('将恢复该流水线下线的旧版本，并删除环境当前运行的新版本。确认继续？', {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
     btn.disabled=true; try {
-      const data=await api('/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId)+'/rollback',{method:'POST',body:'{}'});
+      const base='/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId);
+      const {plan}=await api(base+'/rollback-plan',{method:'POST',body:'{}'});
+      const message='恢复版本「'+plan.target+'」，就绪后清理：'+(plan.delete.join('、') || '无')+'。'+(plan.affected.length ? '另有 '+plan.affected.length+' 条待下线发布将结束为已完成。' : '')+'确认继续？';
+      if(!await askEnvConfirm(message, {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
+      const data=await api(base+'/rollback',{method:'POST',body:JSON.stringify({plan_token:plan.token})});
       if(data.approval_required){ closeModal(); await openJob(currentJobId, { fromHistory: true }); return; }
       closeModal();
       await openJob(currentJobId, { fromHistory: true });
@@ -3249,6 +3281,22 @@ function openEnvOverlay(env) {
   syncEnvOverlayLock();
   if ($("envRegion")) $("envRegion").focus();
 }
+function openEnvViewOverlay(env) {
+  const overlay = $("envOverlay");
+  const body = $("envOverlayBody");
+  const title = $("envOverlayTitle");
+  if (!overlay || !body || !title || !env) return;
+  envDraftOpen = false;
+  envEditingId = "";
+  title.textContent = "查看环境 · " + (env.name || "未命名环境");
+  setEnvError("");
+  setEnvFormError("");
+  body.innerHTML = envReadonlyHtml(env);
+  bind("btnEnvViewClose", () => closeEnvOverlay());
+  overlay.hidden = false;
+  syncEnvOverlayLock();
+  if ($("btnEnvViewClose")) $("btnEnvViewClose").focus();
+}
 function upsertEnvironment(item) {
   if (!item || !item.id) return;
   const idx = environments.findIndex((env) => env.id === item.id);
@@ -3266,9 +3314,25 @@ function renderEnvironments() {
     return;
   }
   grid.innerHTML = environments.map(envCardHtml).join("");
+  grid.querySelectorAll("[data-env-id]").forEach((card) => {
+    const view = () => {
+      const env = environments.find((item) => item.id === (card.getAttribute("data-env-id") || ""));
+      if (env) openEnvViewOverlay(env);
+    };
+    card.addEventListener("click", (ev) => {
+      if (ev.target.closest("button, input, select, a")) return;
+      view();
+    });
+    card.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      if (ev.target !== card) return;
+      ev.preventDefault(); view();
+    });
+  });
   grid.querySelectorAll("[data-env-edit]").forEach((btn) => {
     if (btn.disabled) return;
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
       if (!canManageEnvironments()) {
         setEnvError("没有环境管理权限");
         return;
@@ -3280,7 +3344,8 @@ function renderEnvironments() {
   });
   grid.querySelectorAll("[data-env-delete]").forEach((btn) => {
     if (btn.disabled) return;
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
       if (!canManageEnvironments()) {
         setEnvError("没有环境管理权限");
         return;

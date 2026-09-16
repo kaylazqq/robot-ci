@@ -13,6 +13,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - Windows dev hosts
 
 import cce_rollout
 import huawei_cce
+import rollout_recovery
 from cid_config import CidConfigError, build_test_plan, enabled_build_step, load_cid_config
 
 ROOT = Path(__file__).resolve().parent
@@ -481,6 +483,9 @@ def _ensure_rollout_recovery_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE parallel_rollouts ADD COLUMN old_manifest_json TEXT NOT NULL DEFAULT ''")
     if "rolled_back_at" not in cols:
         conn.execute("ALTER TABLE parallel_rollouts ADD COLUMN rolled_back_at TEXT NOT NULL DEFAULT ''")
+    for name in ("rollback_operation_json", "superseded_by"):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE parallel_rollouts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
 
 def _row_text(row: sqlite3.Row, key: str, default: str = "") -> str:
@@ -828,7 +833,7 @@ def update_service_permission(service_id: str, permission_id: str, owners: Any, 
 
 def create_parallel_rollout_record(
     *, job_id: str, environment_id: str, service_id: str, source_workload: str,
-    candidate_workload: str, image: str,
+    candidate_workload: str, image: str, source_manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Persist a created parallel Deployment so UI actions survive job completion."""
     item = {
@@ -853,6 +858,10 @@ def create_parallel_rollout_record(
                 )),
             )
             conn.commit()
+            if source_manifest:
+                conn.execute("UPDATE parallel_rollouts SET old_manifest_json=? WHERE id=?",
+                             (json.dumps(source_manifest, ensure_ascii=False), item["id"]))
+                conn.commit()
         finally:
             conn.close()
     return item
@@ -1018,7 +1027,12 @@ def parallel_rollout_live_state(
             "release_id": "",
             "source_workload": str(record.get("source_workload") or ""),
         }
-    state = {**record, "namespace": namespace, "old": old, "new": new}
+    operation = json.loads(record.get("rollback_operation_json") or "{}")
+    already_rolled_back = str(record.get("status") or "") == "rolled_back"
+    state = {**record, "namespace": namespace, "old": old, "new": new,
+             "recovery_phase": operation.get("phase", ""), "recovery_error": operation.get("error", ""),
+             "can_rollback": not already_rolled_back and bool(record.get("old_manifest_json") or old_payload),
+             "can_manage": str(record.get("status")) == "active" and not rollout_recovery.pending_operation(list_parallel_rollouts(str(record["environment_id"])))}
     if rid:
         with _rollout_live_cache_lock:
             _rollout_live_cache[rid] = (time.time(), deepcopy(state), "")
@@ -1026,6 +1040,10 @@ def parallel_rollout_live_state(
 
 
 def scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tuple[dict[str, Any] | None, str]:
+    return rollout_recovery.manage(sys.modules[__name__], rollout_id, _scale_parallel_rollout, target, replicas)
+
+
+def _scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tuple[dict[str, Any] | None, str]:
     if target not in {"old", "new"}:
         return None, "只能调整新版本或旧版本实例数"
     try:
@@ -1046,6 +1064,10 @@ def scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tuple
 
 
 def offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
+    return rollout_recovery.manage(sys.modules[__name__], rollout_id, _offline_parallel_rollout_old)
+
+
+def _offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
     record = get_parallel_rollout(rollout_id)
     if record is None:
         return None, "平滑发布记录不存在"
@@ -1069,7 +1091,7 @@ def offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | None
         with _db_lock:
             conn = _connect_db()
             try:
-                conn.execute("UPDATE parallel_rollouts SET old_manifest_json=? WHERE id=?", (json.dumps(old_payload, ensure_ascii=False), rollout_id))
+                conn.execute("UPDATE parallel_rollouts SET old_manifest_json=? WHERE id=? AND old_manifest_json=''", (json.dumps(old_payload, ensure_ascii=False), rollout_id))
                 conn.commit()
             finally:
                 conn.close()
@@ -1082,53 +1104,21 @@ def offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | None
     return parallel_rollout_live_state(rollout_id, use_cache=False)
 
 
-def rollback_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
-    record = get_parallel_rollout(rollout_id)
-    if not record or not str(record.get("old_manifest_json") or ""):
-        return None, "没有可回滚的下线版本"
-    try:
-        env, run_remote, namespace = _parallel_rollout_remote(record)
-        current_workload = str(env.get("active_workload_name") or env.get("workload_name") or "").strip()
-        restored_workload = str(record.get("source_workload") or "").strip()
-        payload = json.loads(str(record["old_manifest_json"]))
-        payload.pop("status", None)
-        meta = payload.get("metadata") or {}
-        for key in ("resourceVersion", "uid", "creationTimestamp", "generation", "managedFields"):
-            meta.pop(key, None)
-        import base64
-        encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode()
-        code, out, err = run_remote(f"printf %s {shlex.quote(encoded)} | base64 -d | kubectl apply -f -", 120)
-        if code != 0:
-            return None, (err or out or "回滚失败")
-        if current_workload and current_workload != restored_workload:
-            current = cce_rollout.get_deployment_payload(
-                run_remote, namespace=namespace, deploy=current_workload
-            )
-            if current is not None:
-                cce_rollout.delete_deployment(
-                    run_remote, namespace=namespace, deploy=current_workload
-                )
-        set_environment_active_workload(str(record["environment_id"]), restored_workload)
-        with _db_lock:
-            conn = _connect_db()
-            conn.execute("UPDATE parallel_rollouts SET status='rolled_back', rolled_back_at=? WHERE id=?", (time.strftime("%Y-%m-%d %H:%M:%S"), rollout_id))
-            conn.commit(); conn.close()
-    except Exception as exc:
-        return None, str(exc)
-    invalidate_rollout_live_cache(rollout_id)
-    return parallel_rollout_live_state(rollout_id, use_cache=False)
+def rollback_parallel_rollout(rollout_id: str, plan_token: str = "") -> tuple[dict[str, Any] | None, str]:
+    return rollout_recovery.execute(sys.modules[__name__], rollout_id, plan_token)
 
 
-def execute_parallel_rollout_rollback(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
+def execute_parallel_rollout_rollback(rollout_id: str, plan_token: str = "") -> tuple[dict[str, Any] | None, str]:
     """Execute rollback and record it against the dedicated rollback stage."""
     record = get_parallel_rollout(rollout_id)
     if record is None:
         return None, "平滑发布记录不存在"
     job_id = str(record.get("job_id") or "")
+    ensure_action_job(job_id)
     if job_id:
         set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
         append_job_step_log(job_id, "rollback", "log", "开始一键回滚：恢复下线版本并删除当前版本")
-    item, err = rollback_parallel_rollout(rollout_id)
+    item, err = rollback_parallel_rollout(rollout_id, plan_token)
     if err or item is None:
         if job_id:
             append_job_step_log(job_id, "rollback", "log", f"一键回滚失败：{err}")
@@ -7418,6 +7408,19 @@ def push_one_service(
     return result
 
 
+def ensure_action_job(job_id: str) -> dict[str, Any]:
+    """Load an archived job before persisting approvals or operator actions."""
+    with _jobs_lock:
+        if job_id in _jobs:
+            return dict(_jobs[job_id])
+    job = load_job_from_disk(job_id)
+    if not job:
+        return {}
+    job["log_file"] = str(LOG_DIR / f"job-{job_id}.log")
+    with _jobs_lock:
+        return dict(_jobs.setdefault(job_id, job))
+
+
 def _job_copy(job_id: str) -> dict[str, Any]:
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -7522,21 +7525,26 @@ def maybe_run_gamma_after_build(
                     source_workload=str(created.get("source_workload") or ""),
                     candidate_workload=str(created.get("name") or ""),
                     image=str(created.get("image") or ""),
+                    source_manifest=created.get("source_manifest"),
                 )
                 created_rollouts.append({**record, "new": created})
 
-            ok, err = cce_rollout.deploy_job_results(
-                environment=env,
-                results=results,
-                creds=creds,
-                namespace=namespace,
-                rollout_timeout=timeout,
-                hop=hop,
-                log=lambda line: append_job_log(job_id, line),
-                mode=str(opts.get("deployment_mode") or "parallel"),
-                release_id=job_id,
-                on_parallel_created=on_parallel_created,
-            )
+            with rollout_recovery.environment_lock(env_id):
+                env = get_environment(env_id, include_secrets=True) or env
+                if rollout_recovery.pending_operation(list_parallel_rollouts(env_id)):
+                    return False, "生产发布失败: 环境存在未完成的回滚，请先重试回滚"
+                ok, err = cce_rollout.deploy_job_results(
+                    environment=env,
+                    results=results,
+                    creds=creds,
+                    namespace=namespace,
+                    rollout_timeout=timeout,
+                    hop=hop,
+                    log=lambda line: append_job_log(job_id, line),
+                    mode=str(opts.get("deployment_mode") or "parallel"),
+                    release_id=job_id,
+                    on_parallel_created=on_parallel_created,
+                )
             if job_cancel_requested(job_id):
                 raise JobStopped()
             if not ok:
@@ -7551,10 +7559,10 @@ def maybe_run_gamma_after_build(
                     if job_cancel_requested(job_id):
                         raise JobStopped()
                     records = [get_parallel_rollout(str(item.get("id") or "")) for item in created_rollouts]
-                    if all(record and str(record.get("status") or "") in {"old_deleted", "rolled_back"} for record in records):
+                    if all(record and str(record.get("status") or "") in {"old_deleted", "rolled_back", "superseded"} for record in records):
                         break
                     time.sleep(2)
-                append_job_log(job_id, "OK 老版本下线")
+                append_job_log(job_id, "OK 已由历史回滚结束" if any(record.get("status") == "superseded" for record in records) else "OK 老版本下线")
 
     return True, ""
 
@@ -8419,6 +8427,18 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(200, {"ok": True, "rollout": item})
             return
 
+        m_rollout_plan = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/rollback-plan", path)
+        if m_rollout_plan:
+            record = get_parallel_rollout(m_rollout_plan.group(1))
+            if not record or not _has_production_permission(str(record.get("service_id") or ""), user):
+                self._json(403, {"error": "没有生产发布权限"}); return
+            try:
+                plan = rollout_recovery.preview(sys.modules[__name__], record["id"])
+                self._json(200, {"ok": True, "plan": plan})
+            except Exception as exc:
+                self._json(400, {"error": str(exc)})
+            return
+
         m_rollout_rollback = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/rollback", path)
         if m_rollout_rollback:
             record = get_parallel_rollout(m_rollout_rollback.group(1))
@@ -8426,22 +8446,29 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(403, {"error": "没有生产发布权限"}); return
             env = get_environment(str(record.get("environment_id") or "")) or {}
             job_id = str(record.get("job_id") or "")
+            job = ensure_action_job(job_id)
+            if not job:
+                self._json(400, {"error": "流水线历史记录不存在，无法保存回滚审批"}); return
+            try:
+                plan = rollout_recovery.preview(sys.modules[__name__], record["id"])
+                if str(data.get("plan_token") or "") != plan["token"]:
+                    raise ValueError("环境版本已变化，请重新预览并确认回滚")
+            except Exception as exc:
+                self._json(409, {"error": str(exc)}); return
             if str(env.get("environment_type") or "dev") == "production":
-                job = _job_copy(job_id)
-                state = dict((job.get("approval_gates") or {}).get("rollback") or {})
-                if state.get("status") != "approved":
-                    approval = {
-                        "status": "waiting", "purpose": "一键回滚",
-                        "environment": env.get("name") or "", "gate_id": "rollback",
-                        "rollout_id": str(record.get("id") or ""),
-                    }
-                    set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
-                    _set_approval_gate(job_id, "rollback", approval)
-                    set_job(job_id, approval=approval)
-                    append_job_step_log(job_id, "rollback", "log", "等待生产环境一键回滚人工确认")
-                    self._json(200, {"ok": True, "approval_required": True})
-                    return
-            item, err = execute_parallel_rollout_rollback(m_rollout_rollback.group(1))
+                approval = {
+                    "status": "waiting", "purpose": "一键回滚",
+                    "environment": env.get("name") or "", "gate_id": "rollback",
+                    "rollout_id": str(record.get("id") or ""),
+                    "plan_token": plan["token"],
+                }
+                set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
+                _set_approval_gate(job_id, "rollback", approval)
+                set_job(job_id, approval=approval)
+                append_job_step_log(job_id, "rollback", "log", "等待生产环境一键回滚人工确认")
+                self._json(200, {"ok": True, "approval_required": True})
+                return
+            item, err = execute_parallel_rollout_rollback(m_rollout_rollback.group(1), plan["token"])
             if err or item is None:
                 self._json(400, {"error": err}); return
             self._json(200, {"ok": True, "rollout": item}); return
@@ -8567,7 +8594,7 @@ class Handler(SimpleHTTPRequestHandler):
         m_approval = re.fullmatch(r"/api/jobs/([^/]+)/approval", path)
         if m_approval:
             job_id = m_approval.group(1)
-            job = _job_copy(job_id)
+            job = ensure_action_job(job_id)
             service_id = (_job_service_ids(job) or [""])[0]
             if not job or not _has_production_permission(service_id, user):
                 self._json(403, {"error": "没有生产发布权限"})
@@ -8579,15 +8606,24 @@ class Handler(SimpleHTTPRequestHandler):
             if action != "continue":
                 self._json(400, {"error": "未知审批操作"})
                 return
-            approval = dict(job.get("approval") or {})
-            approval.update({"status": "approved", "operator": user, "approved_at": time.strftime("%Y-%m-%d %H:%M:%S")})
-            set_job(job_id, approval=approval)
-            gate_id = str(approval.get("gate_id") or "")
-            if gate_id:
-                _set_approval_gate(job_id, gate_id, approval)
+            existing_approval = job.get("approval") or {}
+            if existing_approval.get("gate_id") == "rollback" and not existing_approval.get("plan_token"):
+                self._json(409, {"error": "此回滚审批缺少版本预览，请重新发起一键回滚"}); return
+            with _jobs_lock:
+                approval = dict((_jobs.get(job_id) or {}).get("approval") or {})
+                claimed = approval.get("status") == "waiting"
+                if claimed:
+                    approval.update({"status": "approved", "operator": user, "approved_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+                    _jobs[job_id]["approval"] = approval
+                    gate_id = str(approval.get("gate_id") or "")
+                    if gate_id:
+                        _jobs[job_id].setdefault("approval_gates", {})[gate_id] = {**approval, "id": gate_id}
+            if not claimed:
+                self._json(409, {"error": "该审批已处理，请刷新流水线"}); return
+            persist_job_meta(job_id)
             if gate_id == "rollback":
                 rollout_id = str(approval.get("rollout_id") or "")
-                item, err = execute_parallel_rollout_rollback(rollout_id)
+                item, err = execute_parallel_rollout_rollback(rollout_id, str(approval.get("plan_token") or ""))
                 if err or item is None:
                     self._json(400, {"ok": False, "error": err})
                     return
@@ -8825,6 +8861,7 @@ def main() -> None:
     print(f"[swr-push-helper] allow_remote={allow_remote}", flush=True)
     ensure_default_users()
     reaped = reap_orphaned_running_jobs()
+    rollout_recovery.reconcile_completed(sys.modules[__name__])
     if reaped:
         print(f"[swr-push-helper] marked {reaped} interrupted job(s) after restart", flush=True)
     backfilled = backfill_untagged_job_templates()

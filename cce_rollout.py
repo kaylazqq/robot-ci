@@ -12,8 +12,10 @@ import os
 import re
 import shlex
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import quote
 
 # CI service_id -> (Deployment, business container)
 SERVICE_MAP: dict[str, tuple[str, str]] = {
@@ -485,6 +487,7 @@ def set_image_and_rollout(
 
 PARALLEL_RELEASE_LABEL = "robot-ci.io/release"
 PARALLEL_SOURCE_LABEL = "robot-ci.io/source-workload"
+PARALLEL_ATTEMPT_ANNOTATION = "robot-ci.io/create-attempt"
 
 
 def parallel_deployment_name(source: str, release_id: str) -> str:
@@ -521,6 +524,9 @@ def deployment_manifest_for_parallel_release(
     spec = copy.deepcopy(dict(source_payload["spec"]))
     template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
     pod_spec = template.get("spec") if isinstance(template.get("spec"), dict) else {}
+    # A fixed nodeName bypasses the scheduler. Keep the source workload's
+    # affinity/selector/tolerations, but let its node pool choose capacity.
+    pod_spec.pop("nodeName", None)
     containers = pod_spec.get("containers") if isinstance(pod_spec.get("containers"), list) else []
     if not any(isinstance(row, dict) and row.get("name") == container for row in containers):
         raise CceRolloutError(f"容器 {container} 不在 Deployment {source_name} 中")
@@ -722,7 +728,9 @@ def create_parallel_deployment(
     replicas: int,
     timeout: str,
     source_payload: Mapping[str, Any] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    write = log or (lambda _line: None)
     payload = dict(source_payload) if isinstance(source_payload, Mapping) else get_deployment_payload(
         run_remote, namespace=namespace, deploy=source
     )
@@ -733,20 +741,124 @@ def create_parallel_deployment(
         image=image, container=container, replicas=replicas,
     )
     name = str(manifest["metadata"]["name"])
+    if name == source:
+        raise CceRolloutError(f"新旧负载名称相同 {name}，拒绝覆盖旧版本")
+    attempt = uuid.uuid4().hex
+    manifest["metadata"]["namespace"] = namespace
+    manifest["metadata"]["annotations"][PARALLEL_ATTEMPT_ANNOTATION] = attempt
     encoded = base64.b64encode(json.dumps(manifest, ensure_ascii=False).encode("utf-8")).decode("ascii")
-    command = (
-        f"printf %s {shlex.quote(encoded)} | base64 -d | kubectl -n {shlex.quote(namespace)} apply -f - && "
-        f"kubectl -n {shlex.quote(namespace)} rollout status deploy/{shlex.quote(name)} "
-        f"--timeout={shlex.quote(timeout)}"
+    uid = ""
+    try:
+        # Atomic create refuses minute-name collisions; never update another release.
+        command = f"printf %s {shlex.quote(encoded)} | base64 -d | kubectl -n {shlex.quote(namespace)} create -f -"
+        code, out, err = run_remote(command, 120)
+        if code != 0:
+            raise CceRolloutError((err or out or f"exit {code}").strip())
+        created = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+        if created is None or not _owns_parallel_attempt(created, manifest):
+            raise CceRolloutError("新版本创建后未找到或负载归属已变化")
+        uid = str(created.get("metadata", {}).get("uid") or "")
+        code, out, err = run_remote(
+            f"kubectl -n {shlex.quote(namespace)} rollout status deploy/{shlex.quote(name)} --timeout={shlex.quote(timeout)}",
+            rollout_timeout_seconds(timeout) + 60,
+        )
+        if code != 0:
+            raise CceRolloutError((err or out or f"exit {code}").strip())
+        ready = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+        if ready is None or not _owns_parallel_attempt(ready, manifest) or ready.get("metadata", {}).get("uid") != uid:
+            raise CceRolloutError("新版本就绪检查后负载不存在或归属已变化")
+        if replicas > 0 and int(ready.get("status", {}).get("readyReplicas") or 0) < replicas:
+            raise CceRolloutError("新版本负载尚未就绪")
+        return deployment_summary(ready, name=name)
+    except Exception as exc:
+        detail = str(exc)
+        write(f"新版本 {name} 创建/就绪失败：{detail}")
+        # Capture the actual Pending/CrashLoop/network cause before removing evidence.
+        diagnostic = parallel_failure_diagnostics(run_remote, namespace=namespace, manifest=manifest)
+        if diagnostic:
+            write(diagnostic)
+            detail += f"；{diagnostic}"
+        write(f"开始清理本次失败的新负载 {namespace}/{name}，保留旧版本 {source}")
+        try:
+            cleanup = cleanup_parallel_attempt(run_remote, namespace=namespace, manifest=manifest, expected_uid=uid)
+        except Exception as cleanup_error:
+            cleanup = f"清理失败，可能残留 {namespace}/{name}，请处理后再发布：{cleanup_error}"
+        write(cleanup)
+        raise CceRolloutError(f"创建新版本负载 {name} 失败: {detail}；{cleanup}") from exc
+
+
+def _owns_parallel_attempt(payload: Mapping[str, Any], manifest: Mapping[str, Any]) -> bool:
+    meta = payload.get("metadata") or {}
+    expected = manifest["metadata"]
+    return (
+        meta.get("name") == expected["name"]
+        and (meta.get("annotations") or {}).get(PARALLEL_ATTEMPT_ANNOTATION) == expected["annotations"][PARALLEL_ATTEMPT_ANNOTATION]
+        and (meta.get("labels") or {}).get(PARALLEL_RELEASE_LABEL) == expected["labels"][PARALLEL_RELEASE_LABEL]
+        and (meta.get("labels") or {}).get(PARALLEL_SOURCE_LABEL) == expected["labels"][PARALLEL_SOURCE_LABEL]
     )
-    code, out, err = run_remote(command, rollout_timeout_seconds(timeout) + 60)
+
+
+def parallel_failure_diagnostics(run_remote: RemoteFn, *, namespace: str, manifest: Mapping[str, Any]) -> str:
+    """Best-effort, bounded Pod/ReplicaSet events; failures must not skip cleanup."""
+    try:
+        name = manifest["metadata"]["name"]
+        deployment = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+        if deployment is None or not _owns_parallel_attempt(deployment, manifest):
+            return ""
+        uid = deployment["metadata"]["uid"]
+        selector = f"{PARALLEL_RELEASE_LABEL}={manifest['metadata']['labels'][PARALLEL_RELEASE_LABEL]}"
+        code, out, err = run_remote(f"kubectl -n {shlex.quote(namespace)} get rs,pods -l {shlex.quote(selector)} -o json", 30)
+        if code:
+            return f"故障详情获取失败：{(err or out).strip()[:300]}"
+        items = json.loads(out).get("items") or []
+        owned = {uid}
+        replicasets = [p for p in items if p.get("kind") == "ReplicaSet" and any(r.get("uid") == uid for r in p.get("metadata", {}).get("ownerReferences", []))]
+        owned.update(p["metadata"]["uid"] for p in replicasets)
+        pods = [p for p in items if p.get("kind") == "Pod" and any(r.get("uid") in owned for r in p.get("metadata", {}).get("ownerReferences", []))]
+        messages = []
+        objects = pods[:3] + replicasets[:1] + [deployment]
+        for obj in objects:
+            meta = obj["metadata"]
+            if obj.get("kind") == "Pod":
+                state = obj.get("status") or {}
+                reasons = [(c.get("state", {}).get("waiting") or {}).get("reason", "") for c in state.get("containerStatuses", [])]
+                messages.append(f"Pod {meta['name']} {state.get('phase', '')} {'/'.join(filter(None, reasons))}")
+            query = shlex.quote("involvedObject.uid=" + meta["uid"] + ",type=Warning")
+            code, out, _err = run_remote(f"kubectl -n {shlex.quote(namespace)} get events --field-selector {query} -o json", 20)
+            if code:
+                continue
+            events = sorted(json.loads(out).get("items") or [], key=lambda e: e.get("lastTimestamp") or e.get("eventTime") or "")
+            for event in events[-3:]:
+                messages.append(f"{event.get('reason', '')}: {str(event.get('message') or '')[:500]}")
+        return "；".join(messages)[:3000]
+    except Exception as exc:
+        return f"故障详情获取失败：{str(exc)[:300]}"
+
+
+def cleanup_parallel_attempt(
+    run_remote: RemoteFn, *, namespace: str, manifest: Mapping[str, Any], expected_uid: str = ""
+) -> str:
+    name = str(manifest["metadata"]["name"])
+    current = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+    if current is None:
+        return f"已确认新负载 {namespace}/{name} 不存在，无残留"
+    uid = str(current.get("metadata", {}).get("uid") or "")
+    if not _owns_parallel_attempt(current, manifest) or not uid or (expected_uid and expected_uid != uid):
+        raise CceRolloutError("同名负载不属于本次创建尝试，拒绝删除")
+    # UID precondition prevents deleting a replacement between GET and DELETE.
+    options = {"apiVersion": "v1", "kind": "DeleteOptions", "propagationPolicy": "Foreground", "preconditions": {"uid": uid}}
+    encoded = base64.b64encode(json.dumps(options).encode()).decode()
+    uri = f"/apis/apps/v1/namespaces/{quote(namespace, safe='')}/deployments/{quote(name, safe='')}"
+    code, out, err = run_remote(f"printf %s {shlex.quote(encoded)} | base64 -d | kubectl delete --raw {shlex.quote(uri)} -f -", 60)
     if code != 0:
-        detail = (err or out or "").strip() or f"exit {code}"
-        raise CceRolloutError(f"创建新版本负载 {name} 失败: {detail}")
-    created = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
-    if created is None:
-        raise CceRolloutError(f"新版本负载创建后未找到: {name}")
-    return deployment_summary(created, name=name)
+        if get_deployment_payload(run_remote, namespace=namespace, deploy=name) is None:
+            return f"已确认新负载 {namespace}/{name} 不存在，无残留"
+        raise CceRolloutError((err or out or f"exit {code}").strip())
+    code, out, err = run_remote(f"kubectl -n {shlex.quote(namespace)} wait --for=delete deployment/{shlex.quote(name)} --timeout=120s", 150)
+    remaining = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+    if remaining is not None:
+        raise CceRolloutError((err or out or "删除后仍存在该负载").strip())
+    return f"已清理本次失败的新负载 {namespace}/{name} 及其从属资源，旧版本未改动"
 
 
 def scale_deployment(
@@ -885,10 +997,12 @@ def deploy_job_results(
                     replicas=1,
                     timeout=rollout_timeout,
                     source_payload=source_payload,
+                    log=write,
                 )
                 created.update({
                     "service_id": service_id, "source_workload": deploy,
                     "container": container, "image": image,
+                    "source_manifest": source_payload,
                 })
                 if on_parallel_created:
                     on_parallel_created(created)
