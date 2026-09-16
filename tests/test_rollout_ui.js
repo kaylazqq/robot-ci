@@ -21,10 +21,25 @@ context.renderEnvRollouts(panel, [{...base, status:'active', recovery_phase:'res
 assert.match(panel.innerHTML, /回滚执行中/);
 assert.match(panel.innerHTML, /正在恢复目标版本/);
 assert.doesNotMatch(panel.innerHTML, /data-rollout-rollback/);
+context.renderEnvRollouts(panel, [{...base, status:'active', recovery_phase:'cleaning'}], '', 'rollback');
+assert.match(panel.innerHTML, /目标版本已就绪，正在清理其他版本/);
+context.renderEnvRollouts(panel, [{...base, status:'active', can_manage:true, offline_phase:'offlining'}], '', 'release');
+assert.match(panel.innerHTML, /正在删除旧版本/);
+assert.doesNotMatch(panel.innerHTML, /data-rollout-offline/);
+context.renderEnvRollouts(panel, [{...base, status:'old_deleted', can_manage:false, offline_phase:'completed', offline_updated_at:'2026-09-16 11:17:44'}], '', 'release');
+assert.match(panel.innerHTML, /下线完成/);
+assert.match(panel.innerHTML, /最近更新：2026-09-16 11:17:44/);
+// Operation card must sit below both version comparison cards.
+assert.match(panel.innerHTML, /旧版本负载[\s\S]*新版本负载[\s\S]*rollout-operation[\s\S]*下线完成/);
+assert.doesNotMatch(panel.innerHTML, /rollout-operation[\s\S]*旧版本负载/);
 context.renderEnvRollouts(panel, [{...base, status:'active', can_manage:true}], '', 'release');
 assert.match(panel.innerHTML, /data-rollout-offline/);
 assert.match(panel.innerHTML, /data-rollout-scale/);
 context.renderEnvRollouts(panel, [{...base, can_rollback:false}], '', 'rollback');
 assert.doesNotMatch(panel.innerHTML, /历史版本缺少恢复快照/);
 assert.doesNotMatch(panel.innerHTML, /data-rollout-rollback/);
+assert.equal(context.rolloutActionSettled({status:'old_deleted', offline_phase:'offlining'}, 'release'), false);
+assert.equal(context.rolloutActionSettled({status:'old_deleted', offline_phase:'completed'}, 'release'), true);
+assert.equal(context.rolloutActionSettled({status:'active', recovery_phase:'cleaning'}, 'rollback'), false);
+assert.equal(context.rolloutActionSettled({status:'rolled_back', recovery_phase:'completed'}, 'rollback'), true);
 console.log('Rollback UI states: passed');
