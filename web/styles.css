@@ -809,6 +809,10 @@ html.is-run-window #pageSwr { display: none !important; }
   width: 80%;
   padding: 4px 0 28px;
 }
+.pl-graph.is-package { width: max-content; }
+.pl-graph.is-package .pl-col { flex: 0 0 350px; width: 350px; }
+#runJobPipeline .pl-graph.is-package .pl-env-pick { width: 9rem; }
+#runJobPipeline .pl-graph.is-package .pl-env-pick.release-mode-pick { width: 11rem; }
 .pl-col, .pl-end {
   --pl-task-h: 1.75rem;
   flex: 1 0 auto;
@@ -1055,6 +1059,29 @@ body.run-open { overflow: hidden; }
   font-weight: 650;
 }
 .page-run .run-branch-row { max-width: 420px; }
+.required-mark { color: var(--danger); margin-left: 2px; }
+.deployment-type-options {
+  display: flex;
+  align-items: center;
+  gap: 30px;
+  min-height: 40px;
+}
+.deployment-type-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 15px;
+}
+.deployment-type-option input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--blue);
+  cursor: pointer;
+}
+.deployment-type-option:has(input:checked) { color: var(--blue); font-weight: 600; }
 .run-tpl-caption {
   margin: 0 0 14px;
   color: var(--muted);
@@ -1214,6 +1241,23 @@ body.clone-open { overflow: hidden; }
   position: fixed;
   z-index: 50;
 }
+.artifact-picker { display: block; }
+.artifact-picker[hidden] { display: none !important; }
+.artifact-menu { max-height: 360px; padding-top: 0; }
+.artifact-search-wrap {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.artifact-search { width: 100%; min-height: 34px; padding: 6px 10px; }
+.artifact-option-main { display: block; overflow: hidden; text-overflow: ellipsis; }
+.artifact-option-meta { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+.branch-option.active .artifact-option-meta,
+.branch-option:hover .artifact-option-meta { color: inherit; opacity: 0.8; }
+.artifact-empty { padding: 14px 12px; color: var(--muted); font-size: 13px; }
 .branch-option {
   display: block;
   width: 100%;

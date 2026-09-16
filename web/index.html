@@ -156,7 +156,7 @@
 
         <div class="view-pane" id="viewPipeline">
           <section class="job-pipeline" id="liveJobPipeline" aria-label="构建流水线" hidden></section>
-          <p class="pipeline-blank" id="pipelineEmpty">当前分支无构建历史记录</p>
+          <p class="pipeline-blank" id="pipelineEmpty">当前流水线无构建历史记录</p>
         </div>
         <div class="view-pane" id="viewHistory" hidden>
           <div class="list-head list-head-actions">
@@ -256,8 +256,21 @@
         <label class="label" for="runTemplateName">流水线名称</label>
         <input id="runTemplateName" class="input" maxlength="60" autocomplete="off" />
       </div>
-      <div class="run-block">
-        <label class="label" for="previewBranch">选择分支</label>
+      <div class="run-block" id="deploymentTypeBlock">
+        <span class="label">部署类型<span class="required-mark">*</span></span>
+        <div class="deployment-type-options" role="radiogroup" aria-label="部署类型">
+          <label class="deployment-type-option">
+            <input type="radio" name="deploymentType" value="code" checked />
+            <span>代码部署</span>
+          </label>
+          <label class="deployment-type-option">
+            <input type="radio" name="deploymentType" value="package" />
+            <span>包部署</span>
+          </label>
+        </div>
+      </div>
+      <div class="run-block" id="runSourceBlock">
+        <label class="label" id="previewSourceLabel" for="previewBranch">选择分支</label>
         <div class="run-branch-row">
           <div class="branch-picker" id="previewBranchPicker">
             <button type="button" class="input branch-trigger" id="previewBranch" aria-haspopup="listbox" aria-expanded="false">
@@ -269,6 +282,18 @@
           <button type="button" class="icon-btn" id="btnRefreshPreviewBranches" title="刷新" aria-label="刷新">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.6 12A7.4 7.4 0 0 1 16.8 6.3M19.4 12A7.4 7.4 0 0 1 7.2 17.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.2 3.8v4.4h-4.4M7.8 20.2v-4.4h4.4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
+          <div class="branch-picker artifact-picker" id="previewArtifactPicker" hidden>
+            <button type="button" class="input branch-trigger" id="previewArtifact" aria-haspopup="listbox" aria-expanded="false">
+              <span id="previewArtifactValue">请选择镜像包</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 10l5 5 5-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="branch-menu artifact-menu" id="previewArtifactMenu" role="listbox" hidden>
+              <div class="artifact-search-wrap">
+                <input class="input artifact-search" id="previewArtifactSearch" type="search" placeholder="搜索镜像包" autocomplete="off" />
+              </div>
+              <div id="previewArtifactOptions"></div>
+            </div>
+          </div>
         </div>
         <p class="branch-status" id="previewBranchStatus" hidden></p>
       </div>

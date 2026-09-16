@@ -1780,6 +1780,10 @@ JOB_PUBLIC_FIELDS = (
     "service_id",
     "service_ids",
     "branch",
+    "deployment_type",
+    "artifact_job_id",
+    "package_name",
+    "package_validated",
     "status",
     "stage",
     "error",
@@ -1823,6 +1827,10 @@ JOB_COMPACT_FIELDS = (
     "service_id",
     "service_ids",
     "branch",
+    "deployment_type",
+    "artifact_job_id",
+    "package_name",
+    "package_validated",
     "status",
     "stage",
     "error",
@@ -1918,6 +1926,10 @@ PIPELINE_PREPARE_DEFS: tuple[tuple[str, str, str], ...] = (
 )
 
 PIPELINE_SUBTASK_DEFS: dict[str, tuple[tuple[str, str], ...]] = {
+    "package": (
+        ("archive", "检查归档文件"),
+        ("image", "校验镜像地址"),
+    ),
     "env": (
         ("docker", "Docker daemon"),
         ("disk", "磁盘空间检查"),
@@ -2009,7 +2021,6 @@ def _effective_pipeline_stage(job: dict[str, Any]) -> str:
 def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {"gamma_deploy": False, "gamma_test": False, "environment_id": "", "deployment_mode": "parallel"}
-    from gamma_e2e import options
     # Repository CID gamma (58df727) is temporarily disabled; keep the same
     # production path as :80 — browser E2E via gamma_real / ci-e2e.
     mode = str(raw.get("gamma_mode") or "browser-e2e").strip() or "browser-e2e"
@@ -2017,7 +2028,10 @@ def _normalize_optional_steps(raw: Any) -> dict[str, Any]:
         mode = "browser-e2e"
     if mode not in ("browser-e2e",):
         raise ValueError("Unknown Gamma test mode")
-    extra = options(raw) if (raw.get("gamma_test") and mode == "browser-e2e") or raw.get("environment_id") == "ci-e2e" else {}
+    extra = {}
+    if (raw.get("gamma_test") and mode == "browser-e2e") or raw.get("environment_id") == "ci-e2e":
+        from gamma_e2e import options
+        extra = options(raw)
     extra["gamma_mode"] = mode
     deployment_mode = str(raw.get("deployment_mode") or "parallel").strip().lower()
     if deployment_mode not in {"parallel", "inplace"}:
@@ -2088,6 +2102,39 @@ def _pipeline_steps_for_service(svc: dict[str, Any] | None) -> list[tuple[str, s
     if _service_skip_push(svc):
         steps = [item for item in steps if item[0] != "push"]
     return steps
+
+
+def _is_package_deployment(job: dict[str, Any] | None) -> bool:
+    return str((job or {}).get("deployment_type") or "code").strip().lower() == "package"
+
+
+def _package_prepare_lane(job: dict[str, Any]) -> list[dict[str, Any]]:
+    status = str(job.get("status") or "")
+    stage = _effective_pipeline_stage(job)
+    validated = bool(job.get("package_validated"))
+    if validated or stage == "release" or status == "ok":
+        state = "done"
+        detail = str(job.get("package_name") or "镜像包完整")
+    elif status == "failed" and stage != "release":
+        state = "failed"
+        detail = str(job.get("error") or "镜像包校验失败")[:120]
+    elif status in ("stopped",):
+        state = "skipped"
+        detail = "已停止"
+    elif status in ("running", "queued"):
+        state = "running"
+        detail = "正在检查归档文件和镜像地址…"
+    else:
+        state = "pending"
+        detail = "归档文件 / SWR 镜像"
+    return [{
+        "id": "package",
+        "label": "检查包完整性",
+        "hint": "归档文件 / SWR 镜像",
+        "status": state,
+        "detail": detail,
+        "subtasks": _subtask_rows("package", state),
+    }]
 
 
 def _job_needs_production_approval(job: dict[str, Any]) -> bool:
@@ -2788,7 +2835,10 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     for idx, service_id in enumerate(service_ids):
         svc = catalog.get(service_id)
         title = str((svc or {}).get("title") or service_id)
-        step_defs = _pipeline_steps_for_service(svc)
+        step_defs = [
+            ("release", "生产发布", "gamma"),
+            ("rollback", "一键回滚", "gamma"),
+        ] if _is_package_deployment(job) else _pipeline_steps_for_service(svc)
         if not (_gamma_selected(job, "deploy") or _gamma_selected(job, "test")):
             step_defs = [item for item in step_defs if item[0] != "gamma"]
         if not _release_selected(job):
@@ -2852,6 +2902,8 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
                 if stage in ("release", "done") or str(job.get("error") or "").startswith("生产发布"):
                     statuses["release"] = "failed"
                 elif stage == "gamma" and (_gamma_selected(job, "deploy") or _gamma_selected(job, "test")):
+                    statuses["release"] = "skipped"
+                elif _is_package_deployment(job) and stage != "release":
                     statuses["release"] = "skipped"
                 else:
                     statuses["release"] = "failed"
@@ -2921,7 +2973,7 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
     focus = next((item for item in services_out if item["service_id"] == focus_sid), None)
     focus_result = results_by_id.get(focus_sid or "")
     focus_svc = catalog.get(focus_sid or "")
-    prepare = _prepare_lane_for_job(job, service_ids, catalog)
+    prepare = _package_prepare_lane(job) if _is_package_deployment(job) else _prepare_lane_for_job(job, service_ids, catalog)
     steps = list(focus.get("steps") or []) if focus else []
     gates = []
     opts = _normalize_optional_steps(job.get("optional_steps"))
@@ -2968,6 +3020,8 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             ),
             "archive_dir": str(job.get("archive_dir") or ""),
             "service_count": len(service_ids),
+            "deployment_type": "package" if _is_package_deployment(job) else "code",
+            "package_name": str(job.get("package_name") or ""),
         },
         "prepare": prepare,
         "steps": steps,
@@ -3653,6 +3707,50 @@ def list_build_artifacts(
     }
 
 
+def resolve_deployable_artifact(service_id: str, job_id: str) -> tuple[dict[str, Any] | None, str]:
+    """Resolve one current artifact and verify it is safe to pass to CCE rollout."""
+    sid = str(service_id or "").strip()
+    source_job_id = str(job_id or "").strip()
+    if not sid or not source_job_id:
+        return None, "请选择镜像包"
+    path = artifacts_log_path()
+    try:
+        entries = _parse_artifact_entries(path.read_text(encoding="utf-8", errors="replace")) if path.is_file() else []
+    except OSError:
+        entries = []
+    item = next(
+        (
+            row for row in reversed(entries)
+            if str(row.get("service_id") or "") == sid
+            and str(row.get("job_id") or "") == source_job_id
+        ),
+        None,
+    )
+    if item is None:
+        return None, "所选镜像包不存在或不属于当前微服务，请刷新后重试"
+    annotated = annotate_artifact_entry(item)
+    archive = resolve_archive_file(str(item.get("archive") or ""))
+    if not annotated.get("available") or archive is None:
+        return None, "所选镜像包已过期，归档文件不存在"
+    try:
+        if archive.stat().st_size <= 0:
+            return None, "所选镜像包不完整，归档文件为空"
+    except OSError:
+        return None, "无法读取所选镜像包"
+    required = ("package_name", "image", "tag", "remote")
+    missing = [name for name in required if not str(item.get(name) or "").strip()]
+    if missing:
+        return None, "所选镜像包元数据不完整：" + ", ".join(missing)
+    remote = str(item.get("remote") or "").strip()
+    if remote == "archive-only":
+        return None, "该产物仅供归档下载，不能部署到 CCE"
+    try:
+        cce_rollout.validate_image_ref(remote)
+    except (ValueError, cce_rollout.CceRolloutError) as exc:
+        return None, f"镜像地址校验失败：{exc}"
+    return {**annotated, "archive": str(archive)}, ""
+
+
 def _history_created_at(meta: dict[str, Any], mtime: float = 0.0) -> str:
     created = str(meta.get("created_at") or "").strip()
     if created:
@@ -3981,6 +4079,10 @@ def persist_job_meta(job_id: str) -> None:
             "service_id",
             "service_ids",
             "branch",
+            "deployment_type",
+            "artifact_job_id",
+            "package_name",
+            "package_validated",
             "status",
             "stage",
             "error",
@@ -4074,6 +4176,23 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
             log_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             pass
+    deployment_type = str(meta.get("deployment_type") or "").strip().lower()
+    if deployment_type not in {"code", "package"}:
+        package_log_marker = any(
+            "deployment=package" in line
+            or "package deployment start" in line.lower()
+            or "package deploy " in line.lower()
+            for line in log_lines
+        )
+        deployment_type = "package" if (
+            str(meta.get("current") or "").endswith("@package") or package_log_marker
+        ) else "code"
+    results = meta.get("results") or []
+    first_result = results[0] if results and isinstance(results[0], dict) else {}
+    package_name = str(meta.get("package_name") or first_result.get("package_name") or "")
+    package_validated = bool(meta.get("package_validated")) or bool(
+        deployment_type == "package" and first_result.get("ok") and first_result.get("remote")
+    )
     return {
         "id": job_id,
         "client_id": meta.get("client_id") or "",
@@ -4083,12 +4202,16 @@ def load_job_from_disk(job_id: str) -> dict[str, Any] | None:
         "service_id": meta.get("service_id"),
         "service_ids": meta.get("service_ids") or _job_service_ids(meta),
         "branch": meta.get("branch"),
+        "deployment_type": deployment_type,
+        "artifact_job_id": meta.get("artifact_job_id") or "",
+        "package_name": package_name,
+        "package_validated": package_validated,
         "status": meta.get("status") or "unknown",
         "error": meta.get("error"),
         "remote": meta.get("remote"),
         "archive": meta.get("archive"),
         "archive_dir": meta.get("archive_dir"),
-        "results": meta.get("results") or [],
+        "results": results,
         "progress": meta.get("progress"),
         "current": meta.get("current"),
         "stage": meta.get("stage"),
@@ -7691,6 +7814,67 @@ def maybe_run_gamma_after_build(
     return True, ""
 
 
+def run_package_deploy_job(job_id: str, source_artifact: dict[str, Any]) -> None:
+    """Deploy a previously built artifact without cloning or rebuilding source code."""
+    _job_ctx.job_id = job_id
+    service_id = str(source_artifact.get("service_id") or "").strip()
+    source_job_id = str(source_artifact.get("job_id") or "").strip()
+    try:
+        set_job(job_id, stage="starting", current=f"{service_id}@package")
+        append_job_log(job_id, f"package deployment start service={service_id} source_job={source_job_id}")
+        with log_substep("package"):
+            append_job_log(job_id, "checking package archive and SWR image metadata")
+            artifact, error = resolve_deployable_artifact(service_id, source_job_id)
+            if error or artifact is None:
+                set_job(job_id, status="failed", stage="starting", error=error or "镜像包校验失败")
+                append_job_log(job_id, f"ERROR 镜像包校验失败: {error}")
+                return
+            result = {
+                "service_id": service_id,
+                "title": str(artifact.get("title") or service_id),
+                "branch": str(artifact.get("branch") or ""),
+                "commit_sha": str(artifact.get("commit_sha") or ""),
+                "image": str(artifact.get("image") or ""),
+                "tag": str(artifact.get("tag") or ""),
+                "remote": str(artifact.get("remote") or ""),
+                "archive": str(artifact.get("archive") or ""),
+                "package_name": str(artifact.get("package_name") or ""),
+                "download_url": str(artifact.get("download_url") or ""),
+                "created_at": str(artifact.get("created_at") or ""),
+                "ok": True,
+                "error": "",
+            }
+            set_job(
+                job_id,
+                package_validated=True,
+                package_name=result["package_name"],
+                branch=result["branch"],
+                commit_sha=result["commit_sha"],
+                remote=result["remote"],
+                archive=result["archive"],
+                results=[result],
+            )
+            append_job_log(job_id, f"OK 镜像包完整: {result['package_name']} image={result['remote']}")
+        ok, error = maybe_run_gamma_after_build(job_id, [result])
+        if not ok:
+            set_job(job_id, status="failed", stage="release", error=error, results=[result])
+            append_job_log(job_id, f"PACKAGE DEPLOY FAILED: {error}")
+            return
+        set_job(job_id, status="ok", stage="done", current="", results=[result])
+        append_job_log(job_id, "PACKAGE DEPLOY OK")
+    except JobStopped:
+        mark_job_stopped(job_id)
+    except Exception as exc:  # noqa: BLE001
+        if job_cancel_requested(job_id):
+            mark_job_stopped(job_id)
+        else:
+            set_job(job_id, status="failed", error=str(exc))
+            append_job_log(job_id, f"ERROR {exc}")
+    finally:
+        _job_ctx.job_id = None
+        unregister_live_job_marker(job_id)
+
+
 def run_push_job(
     job_id: str,
     items: list[dict[str, str]],
@@ -8760,6 +8944,10 @@ class Handler(SimpleHTTPRequestHandler):
 
         if path == "/api/push":
             login_command = (data.get("login_command") or "").strip()
+            deployment_type = str(data.get("deployment_type") or "code").strip().lower()
+            if deployment_type not in {"code", "package"}:
+                self._json(400, {"error": "不支持的部署类型"})
+                return
             raw_items = data.get("items")
             items: list[dict[str, str]] = []
             if isinstance(raw_items, list) and raw_items:
@@ -8805,6 +8993,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if not svc:
                     self._json(400, {"error": f"unknown service: {item['service_id']}"})
                     return
+                if deployment_type == "package":
+                    continue
                 default_branch = str(svc.get("default_branch") or "main")
                 cached = cached_branches(item["service_id"])
                 if cached and item["branch"] not in cached:
@@ -8836,10 +9026,19 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                     )
                     return
+            source_artifact: dict[str, Any] | None = None
+            if deployment_type == "package":
+                source_artifact, artifact_error = resolve_deployable_artifact(
+                    items[0]["service_id"], str(data.get("artifact_job_id") or "")
+                )
+                if artifact_error or source_artifact is None:
+                    self._json(400, {"error": artifact_error or "镜像包校验失败", "error_code": "artifact_invalid"})
+                    return
+                items[0]["branch"] = str(source_artifact.get("branch") or "")
             client_id = _normalize_client_id(data.get("client_id"))
             frozen_inputs = {}
             try:
-                if CFG.get('freeze_build_inputs'):
+                if str(data.get("deployment_type") or "code").strip().lower() == "code" and CFG.get('freeze_build_inputs'):
                     from frozen_builds import resolve as freeze_ref
                     for item in items:
                         svc = catalog[item['service_id']]
@@ -8851,6 +9050,13 @@ class Handler(SimpleHTTPRequestHandler):
                         frozen_inputs['public-service'] = freeze_ref(clone_url_for(CFG.get('public_service_github') or 'https://github.com/rollingfruit/public-service.git'),
                             CFG.get('public_service_branch') or 'main', run_cmd, git_args, git_env())
                 optional_steps = _normalize_optional_steps(data.get('optional_steps'))
+                if str(data.get("deployment_type") or "code").strip().lower() == "package":
+                    if not optional_steps.get("production_release"):
+                        raise ValueError("包部署必须执行生产发布")
+                    if optional_steps.get("gamma_deploy") or optional_steps.get("gamma_test"):
+                        raise ValueError("包部署不支持 gamma 步骤")
+                    if not optional_steps.get("release_environment_id"):
+                        raise ValueError("包部署必须选择发布环境")
                 if optional_steps.get('gamma_test') and optional_steps.get('gamma_mode') == 'browser-e2e' and optional_steps.get('environment_id') != 'ci-e2e':
                     from gamma_real import available
                     if not available(optional_steps.get('environment_id')):
@@ -8867,10 +9073,11 @@ class Handler(SimpleHTTPRequestHandler):
             except (ValueError, TypeError, OSError, KeyError) as exc:
                 self._json(400, {'error':'Gamma configuration invalid: '+str(exc)})
                 return
-            docker = docker_ready_for_push()
-            if not docker["ok"]:
-                self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
-                return
+            if deployment_type == "code":
+                docker = docker_ready_for_push()
+                if not docker["ok"]:
+                    self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
+                    return
             job_id = uuid.uuid4().hex[:12]
             log_file = LOG_DIR / f"job-{job_id}.log"
             ids = ",".join(it["service_id"] for it in items)
@@ -8892,6 +9099,10 @@ class Handler(SimpleHTTPRequestHandler):
                 "service_id": ids,
                 "service_ids": service_ids,
                 "branch": branches,
+                "deployment_type": deployment_type,
+                "artifact_job_id": str(data.get("artifact_job_id") or "") if deployment_type == "package" else "",
+                "package_name": str((source_artifact or {}).get("package_name") or ""),
+                "package_validated": False,
                 "template_id": template_id,
                 "template_name": template_name,
                 "status": "running",
@@ -8941,11 +9152,11 @@ class Handler(SimpleHTTPRequestHandler):
             persist_job_meta(job_id)
             append_job_log(
                 job_id,
-                f"job start service={ids} branch={branches} operator={user or '-'}",
+                f"job start service={ids} branch={branches} deployment={deployment_type} operator={user or '-'}",
             )
             threading.Thread(
-                target=run_push_job,
-                args=(job_id, items, login_command),
+                target=run_package_deploy_job if deployment_type == "package" else run_push_job,
+                args=(job_id, source_artifact) if deployment_type == "package" else (job_id, items, login_command),
                 daemon=True,
             ).start()
             self._json(
@@ -8957,6 +9168,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "count": len(items),
                     "items": items,
                     "branch": branches,
+                    "deployment_type": deployment_type,
                 },
             )
             return

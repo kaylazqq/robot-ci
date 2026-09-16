@@ -799,6 +799,57 @@ class JobPipelineTests(unittest.TestCase):
         self.assertIn("percent", pipeline["summary"])
         self.assertIn("artifacts", pipeline)
 
+    def test_package_deployment_pipeline_shows_prepare_release_and_rollback(self) -> None:
+        job = make_job("package-pipe", service_id="memory-service")
+        job.update({
+            "deployment_type": "package",
+            "stage": "release",
+            "package_validated": True,
+            "package_name": "memory-service_20260916.tar",
+            "optional_steps": {
+                "production_release": True,
+                "release_environment_id": "dev-package",
+                "deployment_mode": "parallel",
+            },
+            "results": [{
+                "service_id": "memory-service",
+                "ok": True,
+                "remote": "swr.example.com/public_ai/memory-service:20260916_abcd",
+                "package_name": "memory-service_20260916.tar",
+            }],
+        })
+        pipeline = server.build_job_pipeline(job)
+        self.assertEqual("package", pipeline["meta"]["deployment_type"])
+        self.assertEqual(["package"], [item["id"] for item in pipeline["prepare"]])
+        self.assertEqual(["release", "rollback"], [item["id"] for item in pipeline["steps"]])
+        self.assertEqual("skipped", pipeline["steps"][1]["status"])
+
+        job["rollback_requested"] = True
+        job["rollback_completed"] = True
+        rolled_back = server.build_job_pipeline(job)
+        rollback = next(item for item in rolled_back["steps"] if item["id"] == "rollback")
+        self.assertEqual("done", rollback["status"])
+
+    def test_package_deployment_fields_survive_payload_snapshot(self) -> None:
+        job = make_job("package-snapshot", service_id="memory-service")
+        job.update({
+            "deployment_type": "package",
+            "artifact_job_id": "source-job",
+            "package_name": "memory-service_20260916.tar",
+            "package_validated": True,
+            "optional_steps": {"production_release": True},
+        })
+        with server._jobs_lock:
+            snapshot = server.snapshot_job_for_payload(job, compact=True)
+        payload = server.job_payload(snapshot, compact=True)
+        self.assertEqual("package", payload["deployment_type"])
+        self.assertEqual("source-job", payload["artifact_job_id"])
+        self.assertEqual("memory-service_20260916.tar", payload["package_name"])
+        self.assertTrue(payload["package_validated"])
+        self.assertEqual("package", payload["pipeline"]["meta"]["deployment_type"])
+        self.assertEqual(["package"], [item["id"] for item in payload["pipeline"]["prepare"]])
+        self.assertEqual(["release", "rollback"], [item["id"] for item in payload["pipeline"]["steps"]])
+
 
 class SwrLoginProbeTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1309,6 +1360,43 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual(sixth, created["service_id"])
         self.assertIn(created["status"], ("running", "queued"))
 
+    def test_package_deploy_uses_existing_artifact_without_docker_check(self) -> None:
+        artifact = {
+            "job_id": "source-job",
+            "service_id": "memory-service",
+            "title": "memory-service",
+            "branch": "release",
+            "commit_sha": "abc123",
+            "image": "memory-service",
+            "tag": "20260916_abcd",
+            "remote": "swr.example.com/public_ai/memory-service:20260916_abcd",
+            "archive": "/tmp/memory.tar",
+            "package_name": "memory.tar",
+        }
+        payload = {
+            "service_id": "memory-service",
+            "deployment_type": "package",
+            "artifact_job_id": "source-job",
+            "optional_steps": {
+                "production_release": True,
+                "release_environment_id": "package-env",
+                "deployment_mode": "parallel",
+            },
+        }
+        with patch.object(server, "resolve_deployable_artifact", return_value=(artifact, "")), \
+                patch.object(server, "run_package_deploy_job") as runner, \
+                patch.object(server, "docker_ready_for_push") as docker:
+            with self._open("/api/push", data=json.dumps(payload).encode(), method="POST") as response:
+                created_payload = json.loads(response.read().decode("utf-8"))
+            time.sleep(0.05)
+        self.assertEqual("package", created_payload["deployment_type"])
+        docker.assert_not_called()
+        runner.assert_called_once()
+        with server._jobs_lock:
+            created = server._jobs[created_payload["job_id"]]
+        self.assertEqual("package", created["deployment_type"])
+        self.assertEqual("memory.tar", created["package_name"])
+
     def test_push_hits_mattermost_service_busy(self) -> None:
         job = make_job("mm-active", service_id="mattermost")
         self.assertIsNone(server.register_job_if_idle(job))
@@ -1525,6 +1613,29 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         self.assertEqual(1, filtered["total"])
         self.assertEqual("old-svc", filtered["artifacts"][0]["service_id"])
         self.assertEqual("old-svc", filtered["service_id"])
+
+    def test_resolve_deployable_artifact_checks_archive_and_image(self) -> None:
+        archive = self._stamp_dir("20260916000000", "memory.tar")
+        server.record_build_artifact({
+            "created_at": "2026-09-16 10:00:00",
+            "job_id": "artifact-job",
+            "service_id": "memory-service",
+            "title": "memory-service",
+            "branch": "release",
+            "commit_sha": "abc123",
+            "image": "memory-service",
+            "tag": "20260916_abcd",
+            "remote": "swr.example.com/public_ai/memory-service:20260916_abcd",
+            "archive": str(archive),
+            "package_name": "memory.tar",
+        })
+        artifact, error = server.resolve_deployable_artifact("memory-service", "artifact-job")
+        self.assertEqual("", error)
+        self.assertIsNotNone(artifact)
+        self.assertEqual("memory.tar", artifact["package_name"])
+        missing, wrong_service_error = server.resolve_deployable_artifact("agentlink", "artifact-job")
+        self.assertIsNone(missing)
+        self.assertIn("不属于当前微服务", wrong_service_error)
 
     def test_prune_expires_artifact_records(self) -> None:
         old = self._stamp_dir("20260801000000", "old.tar")
@@ -2164,6 +2275,89 @@ class ConcurrentPrepareTests(unittest.TestCase):
                 server.persist_job_meta(job["id"])
                 meta = json.loads((log_dir / f"job-{job['id']}.json").read_text(encoding="utf-8"))
                 self.assertEqual({"prepare": ["line"]}, meta.get("step_logs"))
+
+    def test_package_job_meta_round_trip_preserves_pipeline_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = server.Path(tmp)
+            with patch.object(server, "LOG_DIR", log_dir):
+                job = make_job("abcdef123456")
+                job.update({
+                    "deployment_type": "package",
+                    "artifact_job_id": "source-job",
+                    "package_name": "memory-service_20260916.tar",
+                    "package_validated": True,
+                })
+                with server._jobs_lock:
+                    server._jobs[job["id"]] = job
+                server.persist_job_meta(job["id"])
+                loaded = server.load_job_from_disk(job["id"])
+                self.assertIsNotNone(loaded)
+                self.assertEqual("package", loaded["deployment_type"])
+                self.assertEqual("source-job", loaded["artifact_job_id"])
+                self.assertEqual("memory-service_20260916.tar", loaded["package_name"])
+                self.assertTrue(loaded["package_validated"])
+                self.assertEqual("package", server.build_job_pipeline(loaded)["meta"]["deployment_type"])
+
+    def test_legacy_package_job_is_inferred_from_current_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = server.Path(tmp)
+            legacy = {
+                "id": "abcdef123456",
+                "service_id": "memory-service",
+                "service_ids": ["memory-service"],
+                "current": "memory-service@package",
+                "status": "running",
+                "stage": "release",
+                "optional_steps": {"production_release": True},
+                "results": [{
+                    "service_id": "memory-service",
+                    "ok": True,
+                    "remote": "swr.example.com/public_ai/memory-service:tag",
+                    "package_name": "memory-service_tag.tar",
+                }],
+            }
+            (log_dir / "job-abcdef123456.json").write_text(json.dumps(legacy), encoding="utf-8")
+            with patch.object(server, "LOG_DIR", log_dir):
+                loaded = server.load_job_from_disk("abcdef123456")
+            self.assertIsNotNone(loaded)
+            self.assertEqual("package", loaded["deployment_type"])
+            self.assertEqual("memory-service_tag.tar", loaded["package_name"])
+            self.assertTrue(loaded["package_validated"])
+            pipeline = server.build_job_pipeline(loaded)
+            self.assertEqual(["package"], [item["id"] for item in pipeline["prepare"]])
+            self.assertEqual(["release", "rollback"], [item["id"] for item in pipeline["steps"]])
+
+    def test_completed_legacy_package_job_is_inferred_from_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = server.Path(tmp)
+            legacy = {
+                "id": "abcdef123456",
+                "service_id": "memory-service",
+                "service_ids": ["memory-service"],
+                "current": "",
+                "status": "ok",
+                "stage": "done",
+                "optional_steps": {"production_release": True},
+                "results": [{
+                    "service_id": "memory-service",
+                    "ok": True,
+                    "remote": "swr.example.com/public_ai/memory-service:tag",
+                    "package_name": "memory-service_tag.tar",
+                }],
+            }
+            (log_dir / "job-abcdef123456.json").write_text(json.dumps(legacy), encoding="utf-8")
+            (log_dir / "job-abcdef123456.log").write_text(
+                "[16:01:51] job start service=memory-service branch=main deployment=package operator=user\n"
+                "[16:10:40] PACKAGE DEPLOY OK\n",
+                encoding="utf-8",
+            )
+            with patch.object(server, "LOG_DIR", log_dir):
+                loaded = server.load_job_from_disk("abcdef123456")
+            self.assertIsNotNone(loaded)
+            self.assertEqual("package", loaded["deployment_type"])
+            pipeline = server.build_job_pipeline(loaded)
+            self.assertEqual(["package"], [item["id"] for item in pipeline["prepare"]])
+            self.assertEqual(["release", "rollback"], [item["id"] for item in pipeline["steps"]])
 
     def test_ensure_swr_login_continues_when_probe_fails_but_local_auth_exists(self) -> None:
         job = make_job("swr-job")

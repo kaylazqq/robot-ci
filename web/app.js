@@ -30,12 +30,17 @@ let runPreviewActive = false;
 let runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
 let pipelineTemplates = [];
 let selectedTemplateId = "";
+let pipelineTemplateLoadGeneration = 0;
+let serviceJobLoadGeneration = 0;
 let runLayerMode = "run";
 let runLayerTemplateId = "";
 let cloneSourceId = "";
 let previewBranchPicker = null;
 let previewBranchLoadGeneration = 0;
 let previewBranchServiceId = "";
+let deploymentType = "code";
+let previewArtifactPicker = null;
+let previewArtifactLoadGeneration = 0;
 let svcMenuPage = 1;
 const SVC_PAGE_SIZE = 8;
 const branchLoads = {};
@@ -334,7 +339,7 @@ function normalizeBuildTab(next) {
   return isBuildListTab(next) ? next : "pipeline";
 }
 function allServicesFallbackTab(next) {
-  if (next === "artifacts" || next === "envs") return next;
+  if (next === "artifacts") return next;
   return "history";
 }
 
@@ -364,13 +369,17 @@ function applyServiceChrome() {
   });
   const pipeBtn = document.querySelector('.subtab[data-tab="pipeline"]');
   if (pipeBtn) pipeBtn.hidden = all;
+  const envBtn = document.querySelector('.subtab[data-tab="envs"]');
+  const permissionBtn = document.querySelector('.subtab[data-tab="permissions"]');
+  if (envBtn) envBtn.hidden = all;
+  if (permissionBtn) permissionBtn.hidden = all;
   if ($("pageBuild")) $("pageBuild").hidden = nav !== "build";
   if (!$("viewPipeline")) return;
   $("viewPipeline").hidden = tab !== "pipeline";
   if ($("viewHistory")) $("viewHistory").hidden = tab !== "history";
   if ($("viewArtifacts")) $("viewArtifacts").hidden = tab !== "artifacts";
-  if ($("viewEnvs")) $("viewEnvs").hidden = tab !== "envs";
-  if ($("viewPermissions")) $("viewPermissions").hidden = tab !== "permissions";
+  if ($("viewEnvs")) $("viewEnvs").hidden = all || tab !== "envs";
+  if ($("viewPermissions")) $("viewPermissions").hidden = all || tab !== "permissions";
   if ($("pipelineActions")) $("pipelineActions").hidden = all || tab !== "pipeline";
   if ($("jobMetaBar")) $("jobMetaBar").hidden = all || tab !== "pipeline";
   const createBtn = $("btnEnvCreate");
@@ -387,7 +396,7 @@ function jobIsLive(job) {
 
 function setTab(next) {
   if (!sessionLive) return;
-  if (isAllServices() && next !== "history" && next !== "artifacts" && next !== "envs") next = "history";
+  if (isAllServices() && next !== "history" && next !== "artifacts") next = "history";
   const nextTab = normalizeBuildTab(next);
   const changed = tab !== nextTab;
   tab = nextTab;
@@ -406,6 +415,7 @@ function setTab(next) {
     if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
     if (tab === "permissions") loadPermissions().catch(() => {});
     if (tab === "pipeline" && !isAllServices()) {
+      applyJob(null, { loading: true });
       loadPipelineTemplates()
         .catch(() => {})
         .then(() => {
@@ -689,6 +699,7 @@ function buildPipelineStages(pipeline, jobStatus, stopping) {
   return stages;
 }
 function isSelectablePreviewTask(stageId, taskId) {
+  if (deploymentType === "package") return false;
   return (stageId === "gamma" && (taskId === "deploy" || taskId === "test")) || (stageId === "release" && taskId === "deploy");
 }
 function previewTaskChecked(stageId, taskId) {
@@ -717,6 +728,16 @@ function togglePreviewTask(stageId, taskId) {
 }
 function previewPipelineData() {
   const task = (id, label) => ({ id, label, status: "pending" });
+  if (deploymentType === "package") {
+    return {
+      meta: { deployment_type: "package" },
+      prepare: [task("package", "检查包完整性")],
+      steps: [
+        { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
+        { id: "rollback", label: "一键回滚", status: "skipped", subtasks: [task("rollback", "一键回滚")] },
+      ],
+    };
+  }
   return {
     prepare: [task("env", "检查环境"), task("slot", "等待并发槽位"), task("adir", "归档目录")],
     steps: [
@@ -746,6 +767,142 @@ function setPreviewBranchStatus(text, cls) {
 }
 function renderRunPage() {
   renderJobPipeline("runJobPipeline", previewPipelineData(), "", null, { preview: true });
+}
+
+function createArtifactPicker() {
+  const root = $("previewArtifactPicker");
+  const trigger = $("previewArtifact");
+  const label = $("previewArtifactValue");
+  const menu = $("previewArtifactMenu");
+  const search = $("previewArtifactSearch");
+  const optionsRoot = $("previewArtifactOptions");
+  if (!root || !trigger || !label || !menu || !search || !optionsRoot) return null;
+  let items = [];
+  let value = "";
+  const close = () => {
+    menu.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+  };
+  const render = () => {
+    const term = search.value.trim().toLowerCase();
+    const visible = items.filter((item) => [item.package_name, item.tag, item.branch, item.commit_sha, item.created_at]
+      .some((part) => String(part || "").toLowerCase().includes(term)));
+    optionsRoot.replaceChildren();
+    if (!visible.length) {
+      const empty = document.createElement("div");
+      empty.className = "artifact-empty";
+      empty.textContent = items.length ? "没有匹配的镜像包" : "当前微服务暂无可部署镜像包";
+      optionsRoot.appendChild(empty);
+      return;
+    }
+    visible.forEach((item) => {
+      const option = document.createElement("button");
+      option.type = "button";
+      option.className = "branch-option" + (item.job_id === value ? " active" : "");
+      option.dataset.value = item.job_id;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", String(item.job_id === value));
+      const main = document.createElement("span");
+      main.className = "artifact-option-main";
+      main.textContent = item.package_name || ((item.image || "镜像") + ":" + (item.tag || ""));
+      const meta = document.createElement("span");
+      meta.className = "artifact-option-meta";
+      meta.textContent = [item.branch, item.created_at].filter(Boolean).join(" · ");
+      option.append(main, meta);
+      option.addEventListener("click", () => {
+        value = item.job_id;
+        label.textContent = main.textContent;
+        setPreviewHint("");
+        close();
+        trigger.focus();
+      });
+      optionsRoot.appendChild(option);
+    });
+  };
+  trigger.addEventListener("click", () => {
+    if (trigger.disabled) return;
+    const opening = menu.hidden;
+    menu.hidden = !opening;
+    trigger.setAttribute("aria-expanded", String(opening));
+    if (opening) {
+      search.value = "";
+      render();
+      setTimeout(() => search.focus(), 0);
+    }
+  });
+  search.addEventListener("input", render);
+  search.addEventListener("click", (event) => event.stopPropagation());
+  root.addEventListener("focusout", () => setTimeout(() => {
+    if (!root.contains(document.activeElement)) close();
+  }, 0));
+  return {
+    close,
+    setItems(next) {
+      items = Array.isArray(next) ? next : [];
+      value = items.some((item) => item.job_id === value) ? value : "";
+      label.textContent = value
+        ? ((items.find((item) => item.job_id === value) || {}).package_name || "请选择镜像包")
+        : "请选择镜像包";
+      trigger.disabled = !items.length;
+      render();
+    },
+    get value() { return value; },
+  };
+}
+
+function ensurePreviewArtifactPicker() {
+  if (!previewArtifactPicker) previewArtifactPicker = createArtifactPicker();
+  return previewArtifactPicker;
+}
+
+async function loadPreviewArtifacts() {
+  const svc = currentService();
+  const picker = ensurePreviewArtifactPicker();
+  if (!svc || !picker) return;
+  const generation = ++previewArtifactLoadGeneration;
+  setPreviewBranchStatus("正在加载镜像包…");
+  try {
+    const data = await api("/api/artifacts?service_id=" + encodeURIComponent(svc.id) + "&page=1&page_size=200");
+    if (generation !== previewArtifactLoadGeneration || deploymentType !== "package" || currentServiceId !== svc.id) return;
+    const items = (data.artifacts || []).filter((item) => item.available && item.remote && item.remote !== "archive-only");
+    picker.setItems(items);
+    setPreviewBranchStatus(items.length ? ("已加载 " + items.length + " 个可部署镜像包") : "当前微服务暂无可部署镜像包", items.length ? "ok" : "error");
+  } catch (error) {
+    if (generation !== previewArtifactLoadGeneration) return;
+    picker.setItems([]);
+    setPreviewBranchStatus(error.message || "加载镜像包失败", "error");
+  }
+}
+
+function setDeploymentType(next) {
+  deploymentType = next === "package" ? "package" : "code";
+  document.querySelectorAll('input[name="deploymentType"]').forEach((input) => { input.checked = input.value === deploymentType; });
+  const branchRoot = $("previewBranchPicker");
+  const artifactRoot = $("previewArtifactPicker");
+  const refresh = $("btnRefreshPreviewBranches");
+  const sourceLabel = $("previewSourceLabel");
+  const sourceBlock = $("runSourceBlock");
+  if (branchRoot) branchRoot.hidden = deploymentType !== "code";
+  if (artifactRoot) artifactRoot.hidden = deploymentType !== "package";
+  if (refresh) refresh.hidden = deploymentType !== "code";
+  if (sourceBlock) sourceBlock.classList.toggle("package-source", deploymentType === "package");
+  if (sourceLabel) {
+    sourceLabel.textContent = deploymentType === "package" ? "选择镜像包" : "选择分支";
+    sourceLabel.htmlFor = deploymentType === "package" ? "previewArtifact" : "previewBranch";
+  }
+  if (deploymentType === "package") {
+    runPreviewSelection.gammaDeploy = false;
+    runPreviewSelection.test = false;
+    runPreviewSelection.deploy = true;
+    loadPreviewArtifacts();
+  } else {
+    previewArtifactLoadGeneration += 1;
+    const tpl = findPipelineTemplate(runLayerTemplateId);
+    applyTemplateDefaults(tpl);
+    loadPreviewBranches(false);
+  }
+  setPreviewHint("");
+  renderRunPage();
 }
 function ensurePreviewBranchPicker() {
   const root = $("previewBranchPicker");
@@ -880,6 +1037,8 @@ function syncRunLayerChrome() {
   if (nameInput) nameInput.value = tpl ? (tpl.name || "") : "";
   const confirm = $("btnRunPreviewConfirm");
   if (confirm) confirm.textContent = runLayerMode === "edit" ? "保存" : "确认";
+  const typeBlock = $("deploymentTypeBlock");
+  if (typeBlock) typeBlock.hidden = runLayerMode === "edit";
 }
 function openRunWindow(templateId) {
   const svc = currentService();
@@ -914,6 +1073,7 @@ function openEditTemplate(templateId) {
 function enterRunPage(tpl) {
   runPreviewActive = true;
   applyTemplateDefaults(tpl);
+  deploymentType = "code";
   resetPreviewBranchMenuDom();
   const svc = currentService();
   previewBranchServiceId = (svc && svc.id) || "";
@@ -928,6 +1088,7 @@ function enterRunPage(tpl) {
     retryBtn.classList.remove("loading");
     retryBtn.disabled = false;
   }
+  setDeploymentType("code");
   setPreviewBranchStatus("");
   setPreviewHint("");
   syncRunLayerChrome();
@@ -940,16 +1101,17 @@ function enterRunPage(tpl) {
     }
     renderRunPage();
   }).catch((e) => setPreviewHint(e.message || "加载环境失败"));
-  loadPreviewBranches(false);
 }
 function cancelRunPreview() {
   previewBranchLoadGeneration += 1;
+  previewArtifactLoadGeneration += 1;
   if (!runPreviewActive && !runLayerOpen()) return;
   runPreviewActive = false;
   previewBranchServiceId = "";
   runLayerMode = "run";
   runLayerTemplateId = "";
   runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
+  deploymentType = "code";
   setPreviewHint("");
   closeRunPopup();
   applyServiceChrome();
@@ -970,6 +1132,15 @@ function confirmRunPreview() {
   }
   if (runPreviewSelection.deploy && (!runPreviewSelection.environmentId || !runPreviewSelection.deploymentMode)) {
     setPreviewHint("请为生产发布选择环境和部署方式");
+    return;
+  }
+  if (deploymentType === "package") {
+    const artifactJobId = (previewArtifactPicker && previewArtifactPicker.value) || "";
+    if (!artifactJobId) {
+      setPreviewHint("请选择镜像包");
+      return;
+    }
+    startRun("", artifactJobId);
     return;
   }
   const branch = (previewBranchPicker && previewBranchPicker.value) || "";
@@ -1049,24 +1220,24 @@ function renderPipelineTemplates() {
   updateActionButtons();
 }
 async function loadPipelineTemplates() {
+  const loadGeneration = ++pipelineTemplateLoadGeneration;
+  const serviceId = currentServiceId;
+  const viewGen = viewGeneration;
   if (isAllServices() || !currentServiceId) {
     pipelineTemplates = [];
     selectedTemplateId = "";
     renderPipelineTemplates();
     return;
   }
-  const [tplData, envData] = await Promise.all([
-    api("/api/pipeline-templates?service_id=" + encodeURIComponent(currentServiceId)),
-    api("/api/environments?service_id=" + encodeURIComponent(currentServiceId)),
-  ]);
+  const tplData = await api("/api/pipeline-templates?service_id=" + encodeURIComponent(serviceId));
+  if (loadGeneration !== pipelineTemplateLoadGeneration || !viewIsCurrent(viewGen, serviceId)) return false;
   pipelineTemplates = tplData.templates || [];
-  environments = envData.environments || [];
-  if (tab === "envs") renderEnvironments();
   if (!selectedTemplateId || !pipelineTemplates.some((item) => item.id === selectedTemplateId)) {
     const personal = defaultPersonalTemplate();
     selectedTemplateId = personal ? personal.id : "";
   }
   renderPipelineTemplates();
+  return true;
 }
 function cloneLayerOpen() {
   const layer = $("cloneLayer");
@@ -1501,7 +1672,7 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   const scroll = doc.createElement("div");
   scroll.className = "pl-scroll";
   const graph = doc.createElement("div");
-  graph.className = "pl-graph";
+  graph.className = "pl-graph" + (meta.deployment_type === "package" ? " is-package" : "");
   const isRailDone = (node) => Boolean(node && node.status === "done");
   const gates = preview || !Array.isArray(pipeline.gates) ? [] : pipeline.gates;
   const nodes = [];
@@ -1691,8 +1862,7 @@ async function refreshPipeline() {
   await withRefresh($("btnRefreshPipeline"), async () => {
     // Prefer pinned history jobs; otherwise reload the selected pipeline's latest.
     if (pinnedJobId) {
-      await openJob(pinnedJobId, { fromHistory: true });
-      await refreshServiceOccupancy();
+      await openJob(pinnedJobId);
       return;
     }
     await loadServiceJob();
@@ -1907,7 +2077,7 @@ function selectService(id) {
   if (isAllServices()) {
     stopPolling();
     applyJob(null);
-    if (tab === "pipeline") {
+    if (tab !== "history" && tab !== "artifacts") {
       setTab("history");
       return;
     }
@@ -2025,7 +2195,7 @@ function applyJob(job, { loading, force } = {}) {
     if (root) { root.hidden = true; root.replaceChildren(); }
     if (empty) {
       empty.hidden = false;
-      empty.textContent = loading ? "正在加载流水线…" : "当前分支无构建历史记录";
+      empty.textContent = loading ? "正在加载流水线…" : "当前流水线无构建历史记录";
     }
     return;
   }
@@ -2050,7 +2220,7 @@ function applyJob(job, { loading, force } = {}) {
   }
 }
 
-async function openJob(jobId, { fromHistory } = {}) {
+async function openJob(jobId, { fromHistory, serviceLoadGeneration } = {}) {
   if (!jobId || !sessionLive) return false;
   const gen = viewGeneration;
   const sidBefore = currentServiceId;
@@ -2058,6 +2228,7 @@ async function openJob(jobId, { fromHistory } = {}) {
   stopPolling();
   const job = await api("/api/jobs/" + jobId + "?compact=1");
   if (!sessionLive) return false;
+  if (serviceLoadGeneration != null && serviceLoadGeneration !== serviceJobLoadGeneration) return false;
   const sid = jobServiceIds(job)[0] || "";
   if (fromHistory) {
     if (sid && sid !== currentServiceId && services.some((item) => item.id === sid)) {
@@ -2123,8 +2294,10 @@ async function refreshServiceOccupancy() {
 }
 
 async function loadServiceJob() {
+  const loadGeneration = ++serviceJobLoadGeneration;
   const gen = viewGeneration;
   const sid = currentServiceId;
+  if (sessionLive && sid && sid !== ALL_SERVICES_ID) applyJob(null, { loading: true });
   // Wait for templates so personal pipeline id is known before filtering.
   if (!pipelineTemplates.length && sid && sid !== ALL_SERVICES_ID) {
     await loadPipelineTemplates().catch(() => {});
@@ -2136,24 +2309,17 @@ async function loadServiceJob() {
     applyJob(null);
     return;
   }
-  const btn = $("btnRefreshPipeline");
-  beginRefresh(btn);
-  const started = Date.now();
   applyJob(null, { loading: true });
-  const stillHere = () => viewIsCurrent(gen, sid) && (selectedTemplateId || "") === tid;
+  const stillHere = () => loadGeneration === serviceJobLoadGeneration && viewIsCurrent(gen, sid) && (selectedTemplateId || "") === tid;
   try {
     const qs = "service_id=" + encodeURIComponent(sid) +
       (tid ? "&template_id=" + encodeURIComponent(tid) : "");
-    const running = await api("/api/running-job?" + qs);
-    if (!stillHere()) return;
-    templateActiveJobId = (running && running.id) || "";
-    updateActionButtons();
-    if (running && running.id && await openJob(running.id)) return;
-    if (!stillHere()) return;
     const hist = await api("/api/jobs?" + qs + "&page=1&page_size=1");
     if (!stillHere()) return;
     const latest = hist.jobs && hist.jobs[0];
-    if (latest && latest.id && await openJob(latest.id)) return;
+    templateActiveJobId = jobIsLive(latest) ? latest.id : "";
+    updateActionButtons();
+    if (latest && latest.id && await openJob(latest.id, { serviceLoadGeneration: loadGeneration })) return;
     if (!stillHere()) return;
     applyJob(null);
   } catch (e) {
@@ -2165,10 +2331,6 @@ async function loadServiceJob() {
       empty.hidden = false;
       empty.textContent = "流水线加载失败，请稍后重试";
     }
-  } finally {
-    const wait = REFRESH_BUSY_MS - (Date.now() - started);
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    endRefresh(btn);
   }
 }
 
@@ -2427,15 +2589,15 @@ async function openRunDialog() {
   wrap.querySelector("#btnRunConfirm").addEventListener("click", () => startRun(branchPicker.value));
 }
 
-async function startRun(branch) {
+async function startRun(branch, artifactJobId) {
   const svc = currentService();
   if (!svc || submitting) return;
   const selectedBranch = String(branch || "").trim();
-  if (!selectedBranch) {
+  if (deploymentType === "code" && !selectedBranch) {
     alert("请选择分支后再运行");
     return;
   }
-  if (svc.requires_version && !DAEMON_VERSION_PATTERN.test(rememberedDaemonVersion() || svc.last_version || "")) {
+  if (deploymentType === "code" && svc.requires_version && !DAEMON_VERSION_PATTERN.test(rememberedDaemonVersion() || svc.last_version || "")) {
     closeModal();
     openParamsDialog("运行前请先配置 Daemon version");
     return;
@@ -2448,6 +2610,8 @@ async function startRun(branch) {
       body: JSON.stringify({
         service_id: svc.id,
         branch: selectedBranch,
+        deployment_type: deploymentType,
+        artifact_job_id: artifactJobId || "",
         version: rememberedDaemonVersion() || svc.last_version || "",
         login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
         template_id: (tpl && tpl.id) || selectedTemplateId || "",
@@ -3701,6 +3865,9 @@ function bindTplPicker() {
 bindTplPicker();
 bind("btnRunPreviewConfirm", () => confirmRunPreview());
 bind("btnRunPreviewCancel", () => cancelRunPreview());
+document.querySelectorAll('input[name="deploymentType"]').forEach((input) => {
+  input.addEventListener("change", () => { if (input.checked) setDeploymentType(input.value); });
+});
 bind("btnRefreshPreviewBranches", () => loadPreviewBranches(true));
 bind("btnStop", () => openStopDialog());
 bind("btnParams", () => openParamsDialog());
@@ -3803,10 +3970,7 @@ window.addEventListener("hashchange", async () => {
       return;
     }
     if (parsed.tab !== tab) setTab(parsed.tab);
-    if (tab === "pipeline") {
-      loadPipelineTemplates().catch(() => {});
-      await loadServiceJob();
-    }
+    if (tab === "pipeline") await loadServiceJob();
     else {
       stopPolling();
       refreshServiceOccupancy().catch(() => {});
@@ -3843,10 +4007,8 @@ async function bootApp(username) {
       refreshServiceOccupancy().catch(() => {});
     } else {
       setTab(parsed.tab);
-      if (tab === "pipeline") {
-        loadPipelineTemplates().catch(() => {});
-        await loadServiceJob();
-      } else refreshServiceOccupancy().catch(() => {});
+      if (tab === "pipeline") await loadServiceJob();
+      else refreshServiceOccupancy().catch(() => {});
     }
   } else {
     writeHash();
