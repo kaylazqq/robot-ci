@@ -892,19 +892,31 @@ def get_parallel_rollout(rollout_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def mark_parallel_rollout_old_deleted(rollout_id: str) -> None:
+def mark_parallel_rollout_old_deleted(rollout_id: str, *, complete_offline: bool = False) -> None:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     init_store()
     with _db_lock:
         conn = _connect_db()
         try:
-            conn.execute(
-                "UPDATE parallel_rollouts SET status = 'old_deleted', old_deleted_at = ? WHERE id = ?",
-                (now, str(rollout_id)),
-            )
+            if complete_offline:
+                offline = json.dumps(
+                    {"phase": "completed", "error": "", "updated_at": now},
+                    ensure_ascii=False,
+                )
+                conn.execute(
+                    "UPDATE parallel_rollouts SET status = 'old_deleted', old_deleted_at = ?, offline_operation_json = ? WHERE id = ?",
+                    (now, offline, str(rollout_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE parallel_rollouts SET status = 'old_deleted', old_deleted_at = ? WHERE id = ?",
+                    (now, str(rollout_id)),
+                )
             conn.commit()
         finally:
             conn.close()
+    if complete_offline:
+        invalidate_rollout_live_cache(rollout_id)
 
 
 def set_environment_active_workload(env_id: str, workload_name: str) -> None:
@@ -1033,6 +1045,8 @@ def parallel_rollout_live_state(
     state = {**record, "namespace": namespace, "old": old, "new": new,
              "recovery_phase": operation.get("phase", ""), "recovery_error": operation.get("error", ""),
              "offline_phase": offline_operation.get("phase", ""), "offline_error": offline_operation.get("error", ""),
+             "offline_updated_at": offline_operation.get("updated_at") or "",
+             "recovery_updated_at": operation.get("updated_at") or "",
              "operation_updated_at": offline_operation.get("updated_at") or operation.get("updated_at") or "",
              "can_rollback": not already_rolled_back and bool(record.get("old_manifest_json") or old_payload),
              "can_manage": str(record.get("status")) == "active" and not rollout_recovery.pending_operation(list_parallel_rollouts(str(record["environment_id"])))}
@@ -1093,7 +1107,8 @@ def _offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | Non
             # A restart may happen after CCE deleted the workload but before
             # the local operation was committed. Treat verified absence as a
             # successful idempotent retry.
-            mark_parallel_rollout_old_deleted(rollout_id)
+            _save_rollout_operation(rollout_id, "offline_operation_json", {"phase": "verifying", "error": ""})
+            mark_parallel_rollout_old_deleted(rollout_id, complete_offline=True)
             set_environment_active_workload(str(record["environment_id"]), str(record["candidate_workload"]))
             invalidate_rollout_live_cache(rollout_id)
             return parallel_rollout_live_state(rollout_id, use_cache=False)
@@ -1107,7 +1122,8 @@ def _offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | Non
         cce_rollout.delete_deployment(run_remote, namespace=namespace, deploy=str(record["source_workload"]))
     except cce_rollout.CceRolloutError as exc:
         return None, str(exc)
-    mark_parallel_rollout_old_deleted(rollout_id)
+    _save_rollout_operation(rollout_id, "offline_operation_json", {"phase": "verifying", "error": ""})
+    mark_parallel_rollout_old_deleted(rollout_id, complete_offline=True)
     set_environment_active_workload(str(record["environment_id"]), str(record["candidate_workload"]))
     invalidate_rollout_live_cache(rollout_id)
     return parallel_rollout_live_state(rollout_id, use_cache=False)
@@ -1181,13 +1197,19 @@ def start_parallel_rollout_rollback(rollout_id: str, plan_token: str = "") -> tu
     record = get_parallel_rollout(rollout_id)
     if not record:
         return None, "平滑发布记录不存在"
+    try:
+        # Persist restoring (with the full plan) before the background worker so
+        # the UI can poll intermediate phases instead of jumping to the final card.
+        plan = rollout_recovery.begin(sys.modules[__name__], rollout_id, plan_token)
+    except ValueError as exc:
+        return None, str(exc)
 
     def worker() -> None:
-        execute_parallel_rollout_rollback(rollout_id, plan_token)
+        execute_parallel_rollout_rollback(rollout_id, plan_token or str(plan.get("token") or ""))
         _finish_release_job_if_terminal(str(record.get("job_id") or ""))
 
     _launch_rollout_action("rollback-" + rollout_id, worker)
-    return {"phase": "restoring"}, ""
+    return {"phase": str(plan.get("phase") or "restoring")}, ""
 
 
 def resume_rollout_actions() -> None:

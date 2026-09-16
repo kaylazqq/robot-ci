@@ -366,6 +366,27 @@ class RecoveryTests(unittest.TestCase):
                 time.sleep(.02)
             self.assertEqual("completed", phase)
 
+    def test_rollback_begin_persists_restoring_before_worker(self):
+        phases = []
+        original = server.execute_parallel_rollout_rollback
+        def slow_execute(rollout_id, plan_token=""):
+            phases.append(json.loads(server.get_parallel_rollout(rollout_id)["rollback_operation_json"])["phase"])
+            return original(rollout_id, plan_token)
+        with patch.object(server, "execute_parallel_rollout_rollback", side_effect=slow_execute):
+            plan = rollout_recovery.preview(server, self.first["id"])
+            operation, error = server.start_parallel_rollout_rollback(self.first["id"], plan["token"])
+            self.assertFalse(error)
+            self.assertEqual("restoring", operation["phase"])
+            stored = json.loads(server.get_parallel_rollout(self.first["id"])["rollback_operation_json"])
+            self.assertEqual("restoring", stored["phase"])
+            self.assertEqual("v1", stored["target"])
+            for _ in range(50):
+                if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back":
+                    break
+                time.sleep(.02)
+            self.assertEqual(["restoring"], phases)
+            self.assertEqual("rolled_back", server.get_parallel_rollout(self.first["id"])["status"])
+
     def test_restart_resumes_persisted_offline_action(self):
         server._save_rollout_operation(self.second["id"], "offline_operation_json", {"phase": "offlining"})
         completed = threading.Event()

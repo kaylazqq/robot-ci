@@ -135,6 +135,23 @@ def preview(s, rollout_id):
         return {key: plan[key] for key in ("target", "delete", "affected", "token")}
 
 
+def begin(s, rollout_id, plan_token=""):
+    """Persist the rollback plan in restoring phase before the async worker runs."""
+    record = s.get_parallel_rollout(rollout_id)
+    if not record:
+        raise ValueError("平滑发布记录不存在")
+    with environment_lock(record["environment_id"]):
+        record = s.get_parallel_rollout(rollout_id)
+        plan = _plan(s, record)
+        if plan_token and plan_token != plan.get("token"):
+            raise ValueError("环境版本已变化，请重新预览并确认回滚")
+        if plan.get("phase") not in {"restoring", "cleaning"}:
+            plan = {**plan, "phase": "restoring", "error": ""}
+            _save(s, rollout_id, plan)
+            s.invalidate_rollout_live_cache(rollout_id)
+        return plan
+
+
 def _save(s, rollout_id, plan):
     plan = {**plan, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     with s._db_lock:

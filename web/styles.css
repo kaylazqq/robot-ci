@@ -1373,7 +1373,17 @@ body.clone-open { overflow: hidden; }
 .env-view-row > strong { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
 .env-view-nodes strong { display: grid; gap: 5px; }
 .env-view-nodes code { width: fit-content; padding: 2px 6px; border-radius: 5px; background: #eef3f8; color: #23364d; }
-.rollout-operation { margin: 10px 0; padding: 10px 12px; border-radius: 8px; display: flex; align-items: center; gap: 8px; background: #eef5ff; color: #234a78; }
+.rollout-operation {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #eef5ff;
+  color: #234a78;
+}
 .rollout-operation small { margin-left: auto; color: var(--muted); }
 .rollout-operation.is-failed { display: block; background: #fff0f0; color: #a12828; }
 .rollout-operation p { margin: 6px 0 0; }

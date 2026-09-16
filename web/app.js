@@ -3141,6 +3141,16 @@ function rolloutWorkloadHtml(rollout, side, item, allowScale) {
     '</div>';
 }
 
+function rolloutOperationPhase(row, mode) {
+  return mode === 'rollback' ? (row && row.recovery_phase) || '' : (row && row.offline_phase) || '';
+}
+
+function rolloutOperationUpdatedAt(row, mode) {
+  if (!row) return '';
+  if (mode === 'rollback') return row.recovery_updated_at || row.operation_updated_at || '';
+  return row.offline_updated_at || row.operation_updated_at || '';
+}
+
 function renderEnvRollouts(panel, rows, error, mode) {
   if (!panel) return;
   mode = mode || panel.dataset.compareMode || 'release';
@@ -3154,21 +3164,14 @@ function renderEnvRollouts(panel, rows, error, mode) {
       ? '<button type="button" class="btn ghost" disabled aria-disabled="true" title="本次发布已经回滚">一键回滚</button>'
       : rollbackBusy ? '<button type="button" class="btn ghost" disabled aria-disabled="true">回滚执行中…</button>'
       : row.can_rollback ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '';
-    const phase = mode === 'rollback' ? row.recovery_phase : row.offline_phase;
+    const phase = rolloutOperationPhase(row, mode);
     const phaseLabels = {offlining:'正在删除旧版本', verifying:'正在确认旧版本已删除', restoring:'正在恢复目标版本', cleaning:'目标版本已就绪，正在清理其他版本', completed: mode === 'rollback' ? '回滚完成' : '下线完成', failed: mode === 'rollback' ? '回滚失败' : '下线失败'};
     const active = ['offlining','verifying','restoring','cleaning'].includes(phase);
-    const operation = phase ? '<div class="rollout-operation ' + (phase === 'failed' ? 'is-failed' : active ? 'is-running' : 'is-done') + '" data-operation-active="' + (active ? '1' : '0') + '">' + (active ? '<span class="rollout-spinner" aria-hidden="true"></span>' : '') + '<strong>' + esc(phaseLabels[phase] || phase) + '</strong>' + (row.operation_updated_at ? '<small>最近更新：' + esc(row.operation_updated_at) + '</small>' : '') + (phase === 'failed' ? '<p>' + esc(mode === 'rollback' ? row.recovery_error : row.offline_error) + '</p>' : '') + '</div>' : '';
-    return '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'superseded' ? '已完成 · 已由历史回滚结束' : row.status === 'old_deleted' ? '旧版本已下线' : rolledBack ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.can_manage && !active ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + rollbackButton + '</div></div>' + operation + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release' && row.can_manage && !active) + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release' && row.can_manage && !active) + '</section>';
+    const updatedAt = rolloutOperationUpdatedAt(row, mode);
+    const operation = phase ? '<div class="rollout-operation ' + (phase === 'failed' ? 'is-failed' : active ? 'is-running' : 'is-done') + '" data-operation-active="' + (active ? '1' : '0') + '">' + (active ? '<span class="rollout-spinner" aria-hidden="true"></span>' : '') + '<strong>' + esc(phaseLabels[phase] || phase) + '</strong>' + (updatedAt ? '<small>最近更新：' + esc(updatedAt) + '</small>' : '') + (phase === 'failed' ? '<p>' + esc(mode === 'rollback' ? row.recovery_error : row.offline_error) + '</p>' : '') + '</div>' : '';
+    // Keep version comparison cards first; operation status sits below both workloads.
+    return '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'superseded' ? '已完成 · 已由历史回滚结束' : row.status === 'old_deleted' ? '旧版本已下线' : rolledBack ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.can_manage && !active ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + rollbackButton + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release' && row.can_manage && !active) + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release' && row.can_manage && !active) + operation + '</section>';
   }).join('');
-  panel.querySelectorAll('[data-rollout-id]').forEach((card) => {
-    const row = rows.find((item) => item.id === card.dataset.rolloutId);
-    if (row && ['restoring', 'cleaning', 'failed'].includes(row.recovery_phase)) {
-      const message = row.recovery_phase === 'failed'
-        ? '回滚未完成，可重新点击一键回滚重试：' + (row.recovery_error || '')
-        : '回滚进行中：' + (row.recovery_phase === 'restoring' ? '等待恢复版本就绪' : '清理其他版本');
-      card.insertAdjacentHTML('beforeend', '<p class="hint error">' + esc(message) + '</p>');
-    }
-  });
   panel.querySelectorAll('[data-rollout-scale]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const target = btn.getAttribute('data-rollout-scale');
     const input = card && card.querySelector('[data-rollout-replicas="' + target + '"]'); const replicas = input ? Number(input.value) : NaN;
@@ -3204,12 +3207,22 @@ function renderEnvRollouts(panel, rows, error, mode) {
   }));
 }
 
+function rolloutActionSettled(row, mode) {
+  if (!row) return true;
+  const phase = rolloutOperationPhase(row, mode);
+  if (phase === 'failed' || phase === 'completed') return true;
+  // Keep polling while an in-flight phase is still recorded, even if status flipped early.
+  if (['offlining', 'verifying', 'restoring', 'cleaning'].includes(phase)) return false;
+  if (mode === 'release') return row.status === 'old_deleted';
+  if (mode === 'rollback') return row.status === 'rolled_back';
+  return false;
+}
+
 async function pollEnvRolloutAction(rolloutId, panel, mode) {
   for (let attempt = 0; attempt < 300 && panel && panel.isConnected !== false; attempt += 1) {
     const rows = await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode, true);
     const row = (rows || []).find((item) => item.id === rolloutId);
-    const phase = row && (mode === 'rollback' ? row.recovery_phase : row.offline_phase);
-    if (!row || phase === 'failed' || phase === 'completed' || (mode === 'release' && row.status === 'old_deleted') || (mode === 'rollback' && row.status === 'rolled_back')) return;
+    if (rolloutActionSettled(row, mode)) return;
     await new Promise((resolve) => setTimeout(resolve, attempt < 10 ? 1000 : 2000));
   }
 }
