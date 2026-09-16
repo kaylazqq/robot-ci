@@ -3149,10 +3149,16 @@ function renderEnvRollouts(panel, rows, error, mode) {
   panel.innerHTML = rows.map((row) => {
     if (row.error) return '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>';
     const rolledBack = row.status === 'rolled_back';
+    const rollbackBusy = ['restoring', 'cleaning'].includes(row.recovery_phase);
     const rollbackButton = mode !== 'rollback' ? '' : rolledBack
       ? '<button type="button" class="btn ghost" disabled aria-disabled="true" title="本次发布已经回滚">一键回滚</button>'
+      : rollbackBusy ? '<button type="button" class="btn ghost" disabled aria-disabled="true">回滚执行中…</button>'
       : row.can_rollback ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '';
-    return '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'superseded' ? '已完成 · 已由历史回滚结束' : row.status === 'old_deleted' ? '旧版本已下线' : rolledBack ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.can_manage ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + rollbackButton + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release' && row.can_manage) + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release' && row.can_manage) + '</section>';
+    const phase = mode === 'rollback' ? row.recovery_phase : row.offline_phase;
+    const phaseLabels = {offlining:'正在删除旧版本', verifying:'正在确认旧版本已删除', restoring:'正在恢复目标版本', cleaning:'目标版本已就绪，正在清理其他版本', completed: mode === 'rollback' ? '回滚完成' : '下线完成', failed: mode === 'rollback' ? '回滚失败' : '下线失败'};
+    const active = ['offlining','verifying','restoring','cleaning'].includes(phase);
+    const operation = phase ? '<div class="rollout-operation ' + (phase === 'failed' ? 'is-failed' : active ? 'is-running' : 'is-done') + '" data-operation-active="' + (active ? '1' : '0') + '">' + (active ? '<span class="rollout-spinner" aria-hidden="true"></span>' : '') + '<strong>' + esc(phaseLabels[phase] || phase) + '</strong>' + (row.operation_updated_at ? '<small>最近更新：' + esc(row.operation_updated_at) + '</small>' : '') + (phase === 'failed' ? '<p>' + esc(mode === 'rollback' ? row.recovery_error : row.offline_error) + '</p>' : '') + '</div>' : '';
+    return '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'superseded' ? '已完成 · 已由历史回滚结束' : row.status === 'old_deleted' ? '旧版本已下线' : rolledBack ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.can_manage && !active ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + rollbackButton + '</div></div>' + operation + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release' && row.can_manage && !active) + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release' && row.can_manage && !active) + '</section>';
   }).join('');
   panel.querySelectorAll('[data-rollout-id]').forEach((card) => {
     const row = rows.find((item) => item.id === card.dataset.rolloutId);
@@ -3174,34 +3180,44 @@ function renderEnvRollouts(panel, rows, error, mode) {
   panel.querySelectorAll('[data-rollout-offline]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const name = card && card.querySelector('.is-old span');
     if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？', {title:'老版本下线', confirmLabel:'确认下线'})) return;
-    btn.disabled = true;
+    btn.disabled = true; btn.textContent = '正在提交下线…';
     try {
       await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' });
-      closeModal();
-      await openJob(currentJobId, { fromHistory: true });
+      await pollEnvRolloutAction(card.getAttribute('data-rollout-id'), panel, mode);
     }
     catch (e) { setEnvError(e.message); alert(e.message || '下线失败'); } finally { btn.disabled = false; }
   }));
   panel.querySelectorAll('[data-rollout-rollback]').forEach((btn) => btn.addEventListener('click', async () => {
     const card=btn.closest('[data-rollout-id]');
-    btn.disabled=true; try {
+    btn.disabled=true; btn.textContent='正在读取版本信息…'; try {
       const base='/api/parallel-rollouts/'+encodeURIComponent(card.dataset.rolloutId);
       const {plan}=await api(base+'/rollback-plan',{method:'POST',body:'{}'});
+      btn.textContent='一键回滚'; btn.disabled=false;
       const message='恢复版本「'+plan.target+'」，就绪后清理：'+(plan.delete.join('、') || '无')+'。'+(plan.affected.length ? '另有 '+plan.affected.length+' 条待下线发布将结束为已完成。' : '')+'确认继续？';
       if(!await askEnvConfirm(message, {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
+      btn.disabled=true; btn.textContent='正在提交回滚…';
       const data=await api(base+'/rollback',{method:'POST',body:JSON.stringify({plan_token:plan.token})});
-      if(data.approval_required){ closeModal(); await openJob(currentJobId, { fromHistory: true }); return; }
-      closeModal();
-      await openJob(currentJobId, { fromHistory: true });
+      if(data.approval_required){ btn.textContent='等待人工审批'; await openJob(currentJobId, { fromHistory: true }); return; }
+      await pollEnvRolloutAction(card.dataset.rolloutId, panel, mode);
     }
     catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
 }
 
-async function loadEnvRollouts(id, panel, mode) {
+async function pollEnvRolloutAction(rolloutId, panel, mode) {
+  for (let attempt = 0; attempt < 300 && panel && panel.isConnected !== false; attempt += 1) {
+    const rows = await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode, true);
+    const row = (rows || []).find((item) => item.id === rolloutId);
+    const phase = row && (mode === 'rollback' ? row.recovery_phase : row.offline_phase);
+    if (!row || phase === 'failed' || phase === 'completed' || (mode === 'release' && row.status === 'old_deleted') || (mode === 'rollback' && row.status === 'rolled_back')) return;
+    await new Promise((resolve) => setTimeout(resolve, attempt < 10 ? 1000 : 2000));
+  }
+}
+
+async function loadEnvRollouts(id, panel, mode, quiet) {
   if (!id || !panel) return;
   panel.hidden = false;
-  if (!panel.querySelector('.env-secret-hint') || !/加载中/.test(panel.textContent || '')) {
+  if (!quiet && (!panel.querySelector('.env-secret-hint') || !/加载中/.test(panel.textContent || ''))) {
     panel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
   }
   try {
@@ -3210,8 +3226,9 @@ async function loadEnvRollouts(id, panel, mode) {
     const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts' + qs);
     const rows = data.rollouts || [];
     renderEnvRollouts(panel, rows, '', mode);
+    return rows;
   }
-  catch (e) { renderEnvRollouts(panel, [], e.message, mode); }
+  catch (e) { renderEnvRollouts(panel, [], e.message, mode); return []; }
 }
 function bindEnvForm() {
   const list = $("envNodeList");

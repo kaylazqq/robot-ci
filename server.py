@@ -483,7 +483,7 @@ def _ensure_rollout_recovery_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE parallel_rollouts ADD COLUMN old_manifest_json TEXT NOT NULL DEFAULT ''")
     if "rolled_back_at" not in cols:
         conn.execute("ALTER TABLE parallel_rollouts ADD COLUMN rolled_back_at TEXT NOT NULL DEFAULT ''")
-    for name in ("rollback_operation_json", "superseded_by"):
+    for name in ("rollback_operation_json", "offline_operation_json", "superseded_by"):
         if name not in cols:
             conn.execute(f"ALTER TABLE parallel_rollouts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
@@ -1028,9 +1028,12 @@ def parallel_rollout_live_state(
             "source_workload": str(record.get("source_workload") or ""),
         }
     operation = json.loads(record.get("rollback_operation_json") or "{}")
+    offline_operation = json.loads(record.get("offline_operation_json") or "{}")
     already_rolled_back = str(record.get("status") or "") == "rolled_back"
     state = {**record, "namespace": namespace, "old": old, "new": new,
              "recovery_phase": operation.get("phase", ""), "recovery_error": operation.get("error", ""),
+             "offline_phase": offline_operation.get("phase", ""), "offline_error": offline_operation.get("error", ""),
+             "operation_updated_at": offline_operation.get("updated_at") or operation.get("updated_at") or "",
              "can_rollback": not already_rolled_back and bool(record.get("old_manifest_json") or old_payload),
              "can_manage": str(record.get("status")) == "active" and not rollout_recovery.pending_operation(list_parallel_rollouts(str(record["environment_id"])))}
     if rid:
@@ -1087,7 +1090,13 @@ def _offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | Non
             run_remote, namespace=namespace, deploy=str(record["source_workload"])
         )
         if old_payload is None:
-            return None, "旧版本负载不存在"
+            # A restart may happen after CCE deleted the workload but before
+            # the local operation was committed. Treat verified absence as a
+            # successful idempotent retry.
+            mark_parallel_rollout_old_deleted(rollout_id)
+            set_environment_active_workload(str(record["environment_id"]), str(record["candidate_workload"]))
+            invalidate_rollout_live_cache(rollout_id)
+            return parallel_rollout_live_state(rollout_id, use_cache=False)
         with _db_lock:
             conn = _connect_db()
             try:
@@ -1102,6 +1111,99 @@ def _offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | Non
     set_environment_active_workload(str(record["environment_id"]), str(record["candidate_workload"]))
     invalidate_rollout_live_cache(rollout_id)
     return parallel_rollout_live_state(rollout_id, use_cache=False)
+
+
+_rollout_action_threads: dict[str, threading.Thread] = {}
+_rollout_action_threads_lock = threading.Lock()
+
+
+def _save_rollout_operation(rollout_id: str, column: str, payload: Mapping[str, Any]) -> None:
+    if column not in {"offline_operation_json", "rollback_operation_json"}:
+        raise ValueError("invalid rollout operation column")
+    value = {**dict(payload), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(f"UPDATE parallel_rollouts SET {column}=? WHERE id=?", (json.dumps(value, ensure_ascii=False), rollout_id))
+            conn.commit()
+        finally:
+            conn.close()
+    invalidate_rollout_live_cache(rollout_id)
+
+
+def _finish_release_job_if_terminal(job_id: str) -> None:
+    job = ensure_action_job(job_id)
+    environment_id = str((job.get("optional_steps") or {}).get("release_environment_id") or "")
+    if not environment_id:
+        return
+    try:
+        records = [r for r in list_parallel_rollouts(environment_id) if r.get("job_id") == job_id]
+    except sqlite3.Error:
+        return
+    if records and all(str(r.get("status") or "") in {"old_deleted", "rolled_back", "superseded"} for r in records):
+        set_job(job_id, status="ok", stage="done", current="", error=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def _launch_rollout_action(key: str, target: Any) -> bool:
+    with _rollout_action_threads_lock:
+        current = _rollout_action_threads.get(key)
+        if current and current.is_alive():
+            return False
+        thread = threading.Thread(target=target, name="rollout-action-" + key, daemon=True)
+        _rollout_action_threads[key] = thread
+        thread.start()
+        return True
+
+
+def start_offline_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | None, str]:
+    record = get_parallel_rollout(rollout_id)
+    if not record:
+        return None, "平滑发布记录不存在"
+    operation = json.loads(record.get("offline_operation_json") or "{}")
+    if operation.get("phase") not in {"offlining", "verifying"}:
+        _save_rollout_operation(rollout_id, "offline_operation_json", {"phase": "offlining", "error": "", "started_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+    def worker() -> None:
+        item, error = offline_parallel_rollout_old(rollout_id)
+        if error or item is None:
+            _save_rollout_operation(rollout_id, "offline_operation_json", {"phase": "failed", "error": error})
+            append_job_step_log(str(record.get("job_id") or ""), "release", "offline", f"旧版本下线失败：{error}")
+            return
+        _save_rollout_operation(rollout_id, "offline_operation_json", {"phase": "completed", "error": ""})
+        append_job_step_log(str(record.get("job_id") or ""), "release", "offline", f"旧版本 {record.get('source_workload')} 已下线")
+        _finish_release_job_if_terminal(str(record.get("job_id") or ""))
+
+    _launch_rollout_action("offline-" + rollout_id, worker)
+    return {"phase": "offlining"}, ""
+
+
+def start_parallel_rollout_rollback(rollout_id: str, plan_token: str = "") -> tuple[dict[str, Any] | None, str]:
+    record = get_parallel_rollout(rollout_id)
+    if not record:
+        return None, "平滑发布记录不存在"
+
+    def worker() -> None:
+        execute_parallel_rollout_rollback(rollout_id, plan_token)
+        _finish_release_job_if_terminal(str(record.get("job_id") or ""))
+
+    _launch_rollout_action("rollback-" + rollout_id, worker)
+    return {"phase": "restoring"}, ""
+
+
+def resume_rollout_actions() -> None:
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM parallel_rollouts")]
+        finally:
+            conn.close()
+    for record in rows:
+        offline = json.loads(record.get("offline_operation_json") or "{}")
+        rollback = json.loads(record.get("rollback_operation_json") or "{}")
+        if offline.get("phase") in {"offlining", "verifying"}:
+            start_offline_parallel_rollout(str(record["id"]))
+        if rollback.get("phase") in {"restoring", "cleaning"}:
+            start_parallel_rollout_rollback(str(record["id"]), str(rollback.get("token") or ""))
 
 
 def rollback_parallel_rollout(rollout_id: str, plan_token: str = "") -> tuple[dict[str, Any] | None, str]:
@@ -8421,13 +8523,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(404, {"error": "平滑发布记录不存在"}); return
             job_id = str(record.get("job_id") or "")
             append_job_step_log(job_id, "release", "offline", f"开始下线旧版本 {record.get('source_workload')}")
-            item, err = offline_parallel_rollout_old(m_rollout_offline.group(1))
+            item, err = start_offline_parallel_rollout(m_rollout_offline.group(1))
             if err or item is None:
                 append_job_step_log(job_id, "release", "offline", f"旧版本下线失败：{err}")
                 self._json(400 if err != "平滑发布记录不存在" else 404, {"ok": False, "error": err})
                 return
-            append_job_step_log(job_id, "release", "offline", f"旧版本 {record.get('source_workload')} 已下线")
-            self._json(200, {"ok": True, "rollout": item})
+            self._json(202, {"ok": True, "operation_started": True, "operation": item})
             return
 
         m_rollout_plan = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/rollback-plan", path)
@@ -8471,10 +8572,10 @@ class Handler(SimpleHTTPRequestHandler):
                 append_job_step_log(job_id, "rollback", "log", "等待生产环境一键回滚人工确认")
                 self._json(200, {"ok": True, "approval_required": True})
                 return
-            item, err = execute_parallel_rollout_rollback(m_rollout_rollback.group(1), plan["token"])
+            item, err = start_parallel_rollout_rollback(m_rollout_rollback.group(1), plan["token"])
             if err or item is None:
                 self._json(400, {"error": err}); return
-            self._json(200, {"ok": True, "rollout": item}); return
+            self._json(202, {"ok": True, "operation_started": True, "operation": item}); return
 
         m_env_del = re.fullmatch(r"/api/environments/([^/]+)/delete", path)
         if m_env_del:
@@ -8626,11 +8727,11 @@ class Handler(SimpleHTTPRequestHandler):
             persist_job_meta(job_id)
             if gate_id == "rollback":
                 rollout_id = str(approval.get("rollout_id") or "")
-                item, err = execute_parallel_rollout_rollback(rollout_id, str(approval.get("plan_token") or ""))
+                item, err = start_parallel_rollout_rollback(rollout_id, str(approval.get("plan_token") or ""))
                 if err or item is None:
                     self._json(400, {"ok": False, "error": err})
                     return
-                self._json(200, {"ok": True, "approval": approval, "rollout": item})
+                self._json(202, {"ok": True, "approval": approval, "operation_started": True, "operation": item})
                 return
             self._json(200, {"ok": True, "approval": approval})
             return
@@ -8865,6 +8966,7 @@ def main() -> None:
     ensure_default_users()
     reaped = reap_orphaned_running_jobs()
     rollout_recovery.reconcile_completed(sys.modules[__name__])
+    resume_rollout_actions()
     if reaped:
         print(f"[swr-push-helper] marked {reaped} interrupted job(s) after restart", flush=True)
     backfilled = backfill_untagged_job_templates()

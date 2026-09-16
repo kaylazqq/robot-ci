@@ -3,6 +3,7 @@ import json
 import re
 import tempfile
 import threading
+import time
 import unittest
 from copy import deepcopy
 from http.server import ThreadingHTTPServer
@@ -272,6 +273,9 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual("waiting", server.load_job_from_disk("aaaaaaaa")["approval"]["status"])
                 server._jobs.pop("aaaaaaaa")
                 self.assertTrue(post("/api/jobs/aaaaaaaa/approval", {"action": "continue"})["ok"])
+                for _ in range(50):
+                    if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back": break
+                    time.sleep(.02)
                 self.assertEqual({"v1"}, set(self.live))
                 self.assertTrue(server.load_job_from_disk("aaaaaaaa")["rollback_completed"])
             finally:
@@ -296,6 +300,9 @@ class RecoveryTests(unittest.TestCase):
                 # does not require production permission.
                 second_base = "/api/parallel-rollouts/" + self.second["id"]
                 self.assertTrue(post(second_base + "/offline-old", {})["ok"])
+                for _ in range(50):
+                    if server.get_parallel_rollout(self.second["id"])["status"] == "old_deleted": break
+                    time.sleep(.02)
                 self.assertEqual("old_deleted", server.get_parallel_rollout(self.second["id"])["status"])
 
                 # Production rollback may be initiated by anyone, but still
@@ -330,8 +337,46 @@ class RecoveryTests(unittest.TestCase):
                 result = post(base + "/rollback", {"plan_token": plan["token"]})
                 self.assertTrue(result["ok"])
                 self.assertNotIn("approval_required", result)
+                for _ in range(50):
+                    if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back": break
+                    time.sleep(.02)
                 self.assertEqual({"v1"}, set(self.live))
             finally:
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join()
+
+    def test_offline_action_returns_immediately_and_persists_completion(self):
+        entered, release = threading.Event(), threading.Event()
+        def slow_offline(_rollout_id):
+            entered.set()
+            release.wait(5)
+            return {"status": "old_deleted"}, ""
+        with patch.object(server, "offline_parallel_rollout_old", side_effect=slow_offline):
+            operation, error = server.start_offline_parallel_rollout(self.second["id"])
+            self.assertFalse(error)
+            self.assertEqual("offlining", operation["phase"])
+            self.assertTrue(entered.wait(1))
+            stored = server.get_parallel_rollout(self.second["id"])
+            self.assertEqual("offlining", json.loads(stored["offline_operation_json"])["phase"])
+            release.set()
+            for _ in range(50):
+                phase = json.loads(server.get_parallel_rollout(self.second["id"])["offline_operation_json"])["phase"]
+                if phase == "completed": break
+                time.sleep(.02)
+            self.assertEqual("completed", phase)
+
+    def test_restart_resumes_persisted_offline_action(self):
+        server._save_rollout_operation(self.second["id"], "offline_operation_json", {"phase": "offlining"})
+        completed = threading.Event()
+        def resumed(_rollout_id):
+            completed.set()
+            return {"status": "old_deleted"}, ""
+        with patch.object(server, "offline_parallel_rollout_old", side_effect=resumed):
+            server.resume_rollout_actions()
+            self.assertTrue(completed.wait(1))
+            for _ in range(50):
+                phase = json.loads(server.get_parallel_rollout(self.second["id"])["offline_operation_json"])["phase"]
+                if phase == "completed": break
+                time.sleep(.02)
+            self.assertEqual("completed", phase)

@@ -136,6 +136,7 @@ def preview(s, rollout_id):
 
 
 def _save(s, rollout_id, plan):
+    plan = {**plan, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     with s._db_lock:
         conn = s._connect_db()
         try:
