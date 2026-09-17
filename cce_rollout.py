@@ -497,7 +497,7 @@ def parallel_deployment_name(source: str, release_id: str) -> str:
     token = match.group(1) if match else time.strftime("%Y%m%d%H%M")
     if not base or not token:
         raise CceRolloutError("无法生成新版本负载名称")
-    suffix = f"-v-{token}"
+    suffix = f"-v{token}"
     return (base[: 63 - len(suffix)].rstrip("-") + suffix)[:63]
 
 
@@ -639,7 +639,8 @@ def discover_related_deployments(
 ) -> list[dict[str, Any]]:
     """Approximate CCE Deployments related to a baseline workload name.
 
-    Matches parallel-release naming (``baseline-v-*``) and the
+    Matches current parallel-release naming (``baseline-v*``) and the legacy
+    form (``baseline-v-*``), plus the
     ``robot-ci.io/source-workload`` label. Exact baseline name is excluded —
     callers should already have tried that lookup.
     """
@@ -653,7 +654,7 @@ def discover_related_deployments(
             continue
         labels = ((item.get("metadata") or {}).get("labels") or {}) if isinstance(item.get("metadata"), Mapping) else {}
         source = str(labels.get(PARALLEL_SOURCE_LABEL) or "").strip()
-        if source == base or name.startswith(base + "-v-"):
+        if source == base or name.startswith(base + "-v"):
             related.append(item)
     related.sort(key=_deployment_name)
     return related
@@ -758,13 +759,16 @@ def create_parallel_deployment(
         if created is None or not _owns_parallel_attempt(created, manifest):
             raise CceRolloutError("新版本创建后未找到或负载归属已变化")
         uid = str(created.get("metadata", {}).get("uid") or "")
-        code, out, err = run_remote(
-            f"kubectl -n {shlex.quote(namespace)} rollout status deploy/{shlex.quote(name)} --timeout={shlex.quote(timeout)}",
-            rollout_timeout_seconds(timeout) + 60,
-        )
-        if code != 0:
-            raise CceRolloutError((err or out or f"exit {code}").strip())
-        ready = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+        if replicas > 0:
+            code, out, err = run_remote(
+                f"kubectl -n {shlex.quote(namespace)} rollout status deploy/{shlex.quote(name)} --timeout={shlex.quote(timeout)}",
+                rollout_timeout_seconds(timeout) + 60,
+            )
+            if code != 0:
+                raise CceRolloutError((err or out or f"exit {code}").strip())
+            ready = get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+        else:
+            ready = created
         if ready is None or not _owns_parallel_attempt(ready, manifest) or ready.get("metadata", {}).get("uid") != uid:
             raise CceRolloutError("新版本就绪检查后负载不存在或归属已变化")
         if replicas > 0 and int(ready.get("status", {}).get("readyReplicas") or 0) < replicas:
@@ -994,7 +998,7 @@ def deploy_job_results(
                     release_id=release_id,
                     image=image,
                     container=container,
-                    replicas=1,
+                    replicas=0,
                     timeout=rollout_timeout,
                     source_payload=source_payload,
                     log=write,
@@ -1006,10 +1010,10 @@ def deploy_job_results(
                 })
                 if on_parallel_created:
                     on_parallel_created(created)
-                write(
-                    f"新版本负载已就绪 deploy/{created['name']} "
-                    f"实例={created['desired_replicas']}"
-                )
+                if int(created.get("desired_replicas") or 0) > 0:
+                    write(f"新版本负载已就绪 deploy/{created['name']} 实例={created['desired_replicas']}")
+                else:
+                    write(f"新版本负载已创建 deploy/{created['name']} 实例=0，等待手动扩容")
                 continue
             write(f"kubectl set image deploy/{deploy} {container}={image}")
             code, out, err = set_image_and_rollout(

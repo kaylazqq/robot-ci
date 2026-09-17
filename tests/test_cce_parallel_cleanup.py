@@ -18,7 +18,7 @@ class ParallelCleanupTests(unittest.TestCase):
                                   "spec": {"containers": [{"name": "app", "image": "registry/gw:old"}]}}},
             "status": {"readyReplicas": 1},
         }
-        self.name = "governance-v-202609160937"
+        self.name = "governance-v202609160937"
         self.live = {"governance-old": copy.deepcopy(self.source)}
         self.calls = []
         self.logs = []
@@ -175,7 +175,7 @@ class ParallelCleanupTests(unittest.TestCase):
         self.assertEqual([], self.calls)
 
     def test_pipeline_records_no_release_on_failed_creation(self):
-        self.timeout = True
+        self.create_denied = True
         completed = []
         with patch.object(cce, "exec_via_nodes", side_effect=lambda command, **kw: self.remote(command, kw["timeout"])):
             ok, error = cce.deploy_job_results(
@@ -184,6 +184,6 @@ class ParallelCleanupTests(unittest.TestCase):
                 creds={"jump_password": "test", "node_password": "test"}, namespace="test", mode="parallel",
                 release_id="job-202609160937", on_parallel_created=completed.append, log=self.logs.append)
         self.assertFalse(ok)
-        self.assertIn("已清理", error)
+        self.assertIn("无残留", error)
         self.assertEqual([], completed)
         self.assertEqual({"governance-old"}, set(self.live))

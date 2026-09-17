@@ -244,10 +244,11 @@ function jobBelongsToSelectedTemplate(job) {
   const tid = selectedTemplateId || "";
   if (!tid || !job) return true;
   const jobTid = jobTemplateId(job);
-  // Legacy jobs without template_id stay visible only on the personal builtin pipeline.
-  if (!jobTid) {
-    const tpl = selectedPipelineTemplate();
-    return !!(tpl && tpl.kind === "personal" && tpl.builtin);
+  // The builtin personal pipeline has one database id per account, but represents
+  // the same logical pipeline. Its history must remain visible after switching users.
+  const tpl = selectedPipelineTemplate();
+  if (tpl && tpl.kind === "personal" && tpl.builtin) {
+    return !jobTid || String(job.template_name || "").trim() === String(tpl.name || "").trim();
   }
   return jobTid === tid;
 }
@@ -518,6 +519,7 @@ function renderJobMeta(job) {
 
 const PIPELINE_STATE_LABELS = {
   pending: "等待",
+  waiting: "等待中",
   queued: "排队中",
   running: "进行中",
   done: "成功",
@@ -675,9 +677,25 @@ function buildPipelineStages(pipeline, jobStatus, stopping) {
     });
   }
   (pipeline.steps || []).forEach((step) => {
-    if (step.id === "sync") return;
+    if (step.id === "sync" || step.id === "rollback") return;
     const tasks = visiblePipelineTasks(step);
     if (step.id === "gamma" && (step.status === "skipped" || !tasks.length)) return;
+    if (step.id === "release") {
+      const rolledUp = rollupStatus(tasks);
+      const releaseStatus = rolledUp === "queued" ? "waiting" : rolledUp;
+      stages.push({
+        id: "release",
+        logStep: "release",
+        label: step.label || "生产发布",
+        status: releaseStatus,
+        tasks: [decoratePipelineTask({
+          id: "deploy",
+          label: "部署新版本",
+          status: releaseStatus,
+        }, "release", "release")],
+      });
+      return;
+    }
     stages.push({
       id: step.id,
       logStep: step.id,
@@ -700,7 +718,8 @@ function buildPipelineStages(pipeline, jobStatus, stopping) {
 }
 function isSelectablePreviewTask(stageId, taskId) {
   if (deploymentType === "package") return false;
-  return (stageId === "gamma" && (taskId === "deploy" || taskId === "test")) || (stageId === "release" && taskId === "deploy");
+  return (stageId === "gamma" && (taskId === "deploy" || taskId === "test")) ||
+    (isProductionReleaseTemplate() && stageId === "release" && taskId === "deploy");
 }
 function previewTaskChecked(stageId, taskId) {
   if (stageId === "release") return !!runPreviewSelection.deploy;
@@ -733,23 +752,24 @@ function previewPipelineData() {
       meta: { deployment_type: "package" },
       prepare: [task("package", "检查包完整性")],
       steps: [
-        { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
-        { id: "rollback", label: "一键回滚", status: "skipped", subtasks: [task("rollback", "一键回滚")] },
+        { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "部署新版本")] },
       ],
     };
   }
+  const steps = [
+    { id: "sync", label: "拉代码", status: "pending", subtasks: [task("clone", "克隆仓库"), task("sha", "记录提交")] },
+    { id: "test", label: "测试执行", status: "pending", subtasks: [task("plan", "加载build.yaml"), task("runner", "启动测试"), task("ut-cases", "执行UT"), task("dt-cases", "执行DT")] },
+    { id: "build", label: "构建镜像", status: "pending", subtasks: [task("script", "执行构建脚本"), task("docker", "Docker构建"), task("verify", "产物校验")] },
+    { id: "push", label: "推送 SWR", status: "pending", subtasks: [task("tag", "标记镜像"), task("push", "推送镜像"), task("verify", "推送确认")] },
+    { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
+    { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
+  ];
+  if (isProductionReleaseTemplate()) {
+    steps.push({ id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] });
+  }
   return {
     prepare: [task("env", "检查环境"), task("slot", "等待并发槽位"), task("adir", "归档目录")],
-    steps: [
-      { id: "sync", label: "拉代码", status: "pending", subtasks: [task("clone", "克隆仓库"), task("sha", "记录提交")] },
-      { id: "test", label: "测试执行", status: "pending", subtasks: [task("plan", "加载build.yaml"), task("runner", "启动测试"), task("ut-cases", "执行UT"), task("dt-cases", "执行DT")] },
-      { id: "build", label: "构建镜像", status: "pending", subtasks: [task("script", "执行构建脚本"), task("docker", "Docker构建"), task("verify", "产物校验")] },
-      { id: "push", label: "推送 SWR", status: "pending", subtasks: [task("tag", "标记镜像"), task("push", "推送镜像"), task("verify", "推送确认")] },
-      { id: "archive", label: "本地归档", status: "pending", subtasks: [task("save", "归档镜像")] },
-      { id: "gamma", label: "gamma集成测试", status: "pending", subtasks: [task("deploy", "gamma部署"), task("test", "gamma测试")] },
-      { id: "release", label: "生产发布", status: "pending", subtasks: [task("deploy", "生产发布")] },
-      { id: "rollback", label: "一键回滚", status: "skipped", subtasks: [task("rollback", "一键回滚")] },
-    ],
+    steps,
   };
 }
 function setPreviewHint(text) {
@@ -875,7 +895,7 @@ async function loadPreviewArtifacts() {
 }
 
 function setDeploymentType(next) {
-  deploymentType = next === "package" ? "package" : "code";
+  deploymentType = next === "package" && isProductionReleaseTemplate() ? "package" : "code";
   document.querySelectorAll('input[name="deploymentType"]').forEach((input) => { input.checked = input.value === deploymentType; });
   const branchRoot = $("previewBranchPicker");
   const artifactRoot = $("previewArtifactPicker");
@@ -1011,6 +1031,10 @@ function findPipelineTemplate(id) {
 function selectedPipelineTemplate() {
   return findPipelineTemplate(selectedTemplateId);
 }
+function isProductionReleaseTemplate() {
+  const tpl = findPipelineTemplate(runLayerTemplateId) || selectedPipelineTemplate();
+  return !!(tpl && tpl.builtin && tpl.kind === "release");
+}
 function defaultPersonalTemplate() {
   return pipelineTemplates.find((item) => item.kind === "personal" && item.builtin) || pipelineTemplates[0] || null;
 }
@@ -1038,7 +1062,7 @@ function syncRunLayerChrome() {
   const confirm = $("btnRunPreviewConfirm");
   if (confirm) confirm.textContent = runLayerMode === "edit" ? "保存" : "确认";
   const typeBlock = $("deploymentTypeBlock");
-  if (typeBlock) typeBlock.hidden = runLayerMode === "edit";
+  if (typeBlock) typeBlock.hidden = runLayerMode === "edit" || !isProductionReleaseTemplate();
 }
 function openRunWindow(templateId) {
   const svc = currentService();
@@ -1229,9 +1253,13 @@ async function loadPipelineTemplates() {
     renderPipelineTemplates();
     return;
   }
-  const tplData = await api("/api/pipeline-templates?service_id=" + encodeURIComponent(serviceId));
+  const [tplData, permissionData] = await Promise.all([
+    api("/api/pipeline-templates?service_id=" + encodeURIComponent(serviceId)),
+    api("/api/permissions?service_id=" + encodeURIComponent(serviceId)).catch(() => null),
+  ]);
   if (loadGeneration !== pipelineTemplateLoadGeneration || !viewIsCurrent(viewGen, serviceId)) return false;
   pipelineTemplates = tplData.templates || [];
+  if (permissionData) servicePermissions = permissionData.permissions || [];
   if (!selectedTemplateId || !pipelineTemplates.some((item) => item.id === selectedTemplateId)) {
     const personal = defaultPersonalTemplate();
     selectedTemplateId = personal ? personal.id : "";
@@ -1376,7 +1404,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   left.className = "pl-rail left " + (incomingComplete ? "is-ok" : "is-wait");
   const right = doc.createElement("div");
   right.className = "pl-rail right " + (outgoingComplete ? "is-ok" : "is-wait");
-  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc, { continueIcon: status === "queued" }), right);
+  spine.append(left, createStatusIcon(status, "pl-stage-icon", doc, { continueIcon: status === "queued" || status === "waiting" }), right);
   col.appendChild(spine);
   const drop = doc.createElement("div");
   drop.className = "pl-drop";
@@ -1615,7 +1643,8 @@ function createApprovalGate(gate, incomingComplete, outgoingComplete, jobId, doc
   doc = doc || document;
   const status = gate.status || "pending";
   const col = doc.createElement("div");
-  col.className = "pl-gate is-" + status + (status === "queued" ? " is-actionable" : "");
+  const allowed = status === "queued" && canApproveProductionRelease();
+  col.className = "pl-gate is-" + status + (allowed ? " is-actionable" : status === "queued" ? " is-disabled" : "");
   const cap = doc.createElement("div");
   cap.className = "pl-caption";
   const title = doc.createElement("div");
@@ -1634,9 +1663,9 @@ function createApprovalGate(gate, incomingComplete, outgoingComplete, jobId, doc
   spine.append(left, createStatusIcon(status, "pl-stage-icon", doc, { continueIcon: true }), right);
   col.append(cap, spine);
   col.title = status === "queued"
-    ? "等待生产发布权限责任人确认，点击继续"
+    ? (allowed ? "等待生产发布权限责任人确认，点击继续" : "等待有生产发布权限的责任人确认")
     : (gate.operator ? "审批人：" + gate.operator + (gate.approved_at ? " · " + gate.approved_at : "") : "");
-  if (status === "queued") {
+  if (allowed) {
     col.tabIndex = 0;
     col.setAttribute("role", "button");
     const approve = async () => {
@@ -2334,6 +2363,24 @@ async function loadServiceJob() {
   }
 }
 
+async function openRoutedJobOrLatest(jobId) {
+  const routedId = String(jobId || "").trim();
+  if (!routedId) return loadServiceJob();
+  // Route restoration must be ordered: openJob validates against the selected
+  // template, so racing template loading can discard an otherwise valid result.
+  await loadPipelineTemplates().catch(() => {});
+  try {
+    if (await openJob(routedId, { fromHistory: true })) return true;
+  } catch (_) {
+    // A bookmarked job may have expired from retained history. Fall through to
+    // the latest job instead of leaving the shell in a permanent empty state.
+  }
+  if (pinnedJobId === routedId) pinnedJobId = "";
+  writeHash();
+  await loadServiceJob();
+  return false;
+}
+
 function startPolling(jobId) {
   stopPolling();
   if (!sessionLive) return;
@@ -2951,11 +2998,7 @@ async function openStepModal(stageId, taskId) {
   wrap.append(list, pane);
   openModal("步骤详情", wrap, { wide: true });
 
-  // Use job-stored rollout status only — never block the left step list on CCE.
-  const releaseState = String(((((currentJob || {}).gamma_rollouts || [])[0] || {}).status) || "");
-  if (stage.id === "release" && taskId === "offline" && !["old_deleted", "rolled_back", "superseded"].includes(releaseState)) taskId = "release-compare:results";
-  if (stage.id === "release" && taskId === "compare") taskId = "release-compare:results";
-  if (stage.id === "rollback") taskId = "rollback:results";
+  if (stage.id === "release") taskId = "release-deploy:results";
   let selectedTask = normalizeStepSelection(taskId, stage);
   if (parseCaseSelection(selectedTask)) logEl.hidden = true;
   const follow = newLogFollowState();
@@ -2984,16 +3027,18 @@ async function openStepModal(stageId, taskId) {
   const paintList = () => {
     list.replaceChildren();
     appendStepButton(list, stage.label || stage.id, stage.status, "", selectedTask === stage.id, () => {
-      selectedTask = stage.id === "rollback" ? "rollback:results" : stage.id;
+      selectedTask = stage.id === "release" ? "release-deploy:results" : stage.id;
       paintList();
       loadStep();
     });
-    if (stage.id === "rollback") {
-      appendStepButton(list, "版本对比", "", "sub", selectedTask === "rollback:results", () => {
-        selectedTask = "rollback:results"; paintList(); loadStep();
+    if (stage.id === "release") {
+      const deployTask = (stage.tasks || [])[0] || stage;
+      appendStepHeading(list, "部署新版本", deployTask.status, "sub");
+      appendStepButton(list, "版本对比", "", "sub nested", selectedTask === "release-deploy:results", () => {
+        selectedTask = "release-deploy:results"; paintList(); loadStep();
       });
-      appendStepButton(list, "日志详情", "", "sub", selectedTask === "rollback:log", () => {
-        selectedTask = "rollback:log"; paintList(); loadStep();
+      appendStepButton(list, "日志详情", "", "sub nested", selectedTask === "release-deploy:log", () => {
+        selectedTask = "release-deploy:log"; paintList(); loadStep();
       });
       return;
     }
@@ -3013,19 +3058,8 @@ async function openStepModal(stageId, taskId) {
         });
         return;
       }
-      if (stage.id === "release" && task.id === "compare") {
-        appendStepHeading(list, "版本对比", task.status, "sub");
-        appendStepButton(list, "版本对比", "", "sub nested", selectedTask === "release-compare:results", () => {
-          selectedTask = "release-compare:results"; paintList(); loadStep();
-        });
-        appendStepButton(list, "日志详情", "", "sub nested", selectedTask === "release-compare:log", () => {
-          selectedTask = "release-compare:log"; paintList(); loadStep();
-        });
-        return;
-      }
       appendStepButton(list, task.label || task.id, task.status, "sub", selectedTask === task.id, () => {
-        selectedTask = stage.id === "release" && task.id === "offline" && !["old_deleted", "rolled_back"].includes(releaseState)
-          ? "release-compare:results" : task.id;
+        selectedTask = task.id;
         paintList();
         loadStep();
       });
@@ -3034,8 +3068,8 @@ async function openStepModal(stageId, taskId) {
 
   const loadStep = async () => {
     pane.querySelectorAll(".step-rollouts").forEach((item) => item.remove());
-    if (selectedTask === "release-compare:results" || selectedTask === "rollback:results") {
-      await showReleaseComparison(selectedTask.startsWith("rollback") ? "rollback" : "release");
+    if (selectedTask === "release-deploy:results") {
+      await showReleaseComparison("release");
       return;
     }
     logEl.hidden = false;
@@ -3045,9 +3079,9 @@ async function openStepModal(stageId, taskId) {
     const selected = caseSel
       ? (stage.tasks || []).find((task) => task.id === (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId))
       : (stage.tasks || []).find((task) => task.id === selectedTask);
-    const specialLog = selectedTask === "release-compare:log" || selectedTask === "rollback:log";
-    const logStep = specialLog ? (selectedTask.startsWith("rollback") ? "rollback" : "release") : ((selected && selected.logStep) || stage.logStep || stage.id);
-    const sub = specialLog ? (selectedTask.startsWith("rollback") ? "log" : "compare") : caseSel ? (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId) : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
+    const specialLog = selectedTask === "release-deploy:log";
+    const logStep = specialLog ? "release" : ((selected && selected.logStep) || stage.logStep || stage.id);
+    const sub = specialLog ? "" : caseSel ? (caseSel.taskId === "gamma-test" ? "test" : caseSel.taskId) : (selectedTask && selectedTask !== stage.id ? selectedTask : "");
     try {
       const job = await api("/api/jobs/" + currentJobId + "?step=" + encodeURIComponent(logStep) + (sub ? "&sub=" + encodeURIComponent(sub) : "") + "&view=ui");
       const lines = Array.isArray(job.log) ? job.log : [];
@@ -3288,7 +3322,7 @@ function envCardHtml(env) {
   );
 }
 
-function rolloutWorkloadHtml(rollout, side, item, allowScale) {
+function rolloutWorkloadHtml(rollout, side, item, allowScale, actions) {
   const old = side === 'old';
   const exists = !!item.exists;
   const replicas = Number.isFinite(Number(item.desired_replicas)) ? Number(item.desired_replicas) : 0;
@@ -3299,20 +3333,36 @@ function rolloutWorkloadHtml(rollout, side, item, allowScale) {
     else image = '—';
   }
   return '<div class="env-rollout-workload ' + (old ? 'is-old' : 'is-new') + '">' +
-    '<strong>' + (old ? '旧版本负载' : '新版本负载') + '</strong><span>' + esc(item.name || '—') + '</span>' +
+    '<div class="env-rollout-workload-head"><strong>' + (old ? '旧版本负载' : '新版本负载') + '</strong>' +
+    '<div class="env-rollout-workload-actions">' + (actions || '') + '</div></div>' +
+    '<span>' + esc(item.name || '—') + '</span>' +
     '<small>镜像：' + esc(image) + '</small><small>实例：' + (exists ? replicas + '（Ready ' + Number(item.ready_replicas || 0) + '）' : '已不存在') + '</small>' +
     (exists && allowScale ? '<div class="env-rollout-scale"><input class="input" type="number" min="0" max="1000" value="' + replicas + '" data-rollout-replicas="' + side + '" /><button type="button" class="btn ghost" data-rollout-scale="' + side + '">设置实例数</button></div>' : '') +
     '</div>';
 }
 
 function rolloutOperationPhase(row, mode) {
-  return mode === 'rollback' ? (row && row.recovery_phase) || '' : (row && row.offline_phase) || '';
+  if (mode === 'rollback') return (row && row.recovery_phase) || '';
+  if (mode === 'scale') return (row && row.scale_phase) || '';
+  return (row && row.offline_phase) || '';
 }
 
 function rolloutOperationUpdatedAt(row, mode) {
   if (!row) return '';
   if (mode === 'rollback') return row.recovery_updated_at || row.operation_updated_at || '';
+  if (mode === 'scale') return row.scale_updated_at || row.operation_updated_at || '';
   return row.offline_updated_at || row.operation_updated_at || '';
+}
+
+function rolloutOperationMode(row) {
+  const candidates = [
+    {mode:'rollback', phase:row.recovery_phase, updated:row.recovery_updated_at || ''},
+    {mode:'release', phase:row.offline_phase, updated:row.offline_updated_at || ''},
+    {mode:'scale', phase:row.scale_phase, updated:row.scale_updated_at || ''}
+  ].filter((item) => item.phase);
+  const activePhases = ['offlining','verifying','restoring','cleaning','scaling'];
+  candidates.sort((a, b) => Number(activePhases.includes(b.phase)) - Number(activePhases.includes(a.phase)) || String(b.updated).localeCompare(String(a.updated)));
+  return candidates.length ? candidates[0].mode : 'release';
 }
 
 function renderEnvRollouts(panel, rows, error, mode) {
@@ -3324,24 +3374,35 @@ function renderEnvRollouts(panel, rows, error, mode) {
     if (row.error) return '<p class="hint error">' + esc(row.candidate_workload || row.id) + '：' + esc(row.error) + '</p>';
     const rolledBack = row.status === 'rolled_back';
     const rollbackBusy = ['restoring', 'cleaning'].includes(row.recovery_phase);
-    const rollbackButton = mode !== 'rollback' ? '' : rolledBack
-      ? '<button type="button" class="btn ghost" disabled aria-disabled="true" title="本次发布已经回滚">一键回滚</button>'
-      : rollbackBusy ? '<button type="button" class="btn ghost" disabled aria-disabled="true">回滚执行中…</button>'
-      : row.can_rollback ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '';
-    const phase = rolloutOperationPhase(row, mode);
-    const phaseLabels = {offlining:'正在删除旧版本', verifying:'正在确认旧版本已删除', restoring:'正在恢复目标版本', cleaning:'目标版本已就绪，正在清理其他版本', completed: mode === 'rollback' ? '回滚完成' : '下线完成', failed: mode === 'rollback' ? '回滚失败' : '下线失败'};
-    const active = ['offlining','verifying','restoring','cleaning'].includes(phase);
-    const updatedAt = rolloutOperationUpdatedAt(row, mode);
-    const operation = phase ? '<div class="rollout-operation ' + (phase === 'failed' ? 'is-failed' : active ? 'is-running' : 'is-done') + '" data-operation-active="' + (active ? '1' : '0') + '">' + (active ? '<span class="rollout-spinner" aria-hidden="true"></span>' : '') + '<strong>' + esc(phaseLabels[phase] || phase) + '</strong>' + (updatedAt ? '<small>最近更新：' + esc(updatedAt) + '</small>' : '') + (phase === 'failed' ? '<p>' + esc(mode === 'rollback' ? row.recovery_error : row.offline_error) + '</p>' : '') + '</div>' : '';
+    const oldMissing = !!(row.old && !row.old.exists);
+    const newReplicas = Number((row.new || {}).desired_replicas || 0);
+    const operationMode = rolloutOperationMode(row);
+    const phase = rolloutOperationPhase(row, operationMode);
+    const scaleSide = row.scale_target === 'old' ? '旧版本' : '新版本';
+    const phaseLabels = {offlining:'正在删除旧版本', verifying:'正在确认旧版本已删除', restoring:'正在恢复目标版本', cleaning:'目标版本已就绪，正在清理其他版本', scaling:'正在将' + scaleSide + '实例数调整为 ' + row.scale_replicas, completed: operationMode === 'rollback' ? '回滚完成' : operationMode === 'scale' ? '实例数调整完成' : '下线完成', failed: operationMode === 'rollback' ? '回滚失败' : operationMode === 'scale' ? '实例数调整失败' : '下线失败'};
+    const active = ['offlining','verifying','restoring','cleaning','scaling'].includes(phase);
+    const updatedAt = rolloutOperationUpdatedAt(row, operationMode);
+    const operationError = operationMode === 'rollback' ? row.recovery_error : operationMode === 'scale' ? row.scale_error : row.offline_error;
+    const operation = phase ? '<div class="rollout-operation ' + (phase === 'failed' ? 'is-failed' : active ? 'is-running' : 'is-done') + '" data-operation-active="' + (active ? '1' : '0') + '">' + (active ? '<span class="rollout-spinner" aria-hidden="true"></span>' : '') + '<strong>' + esc(phaseLabels[phase] || phase) + '</strong>' + (updatedAt ? '<small>最近更新：' + esc(updatedAt) + '</small>' : '') + (phase === 'failed' ? '<p>' + esc(operationError) + '</p>' : '') + '</div>' : '';
+    const offlineButton = row.old && row.old.exists && row.can_manage && !active
+      ? (newReplicas > 0
+        ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>'
+        : '<button type="button" class="btn ghost danger" disabled aria-disabled="true" title="请先将新版本负载实例数调整为大于 0">下线</button>')
+      : '';
+    const rollbackButton = oldMissing
+      ? (rollbackBusy
+        ? '<button type="button" class="btn ghost" disabled aria-disabled="true">回滚执行中…</button>'
+        : row.can_rollback ? '<button type="button" class="btn ghost" data-rollout-rollback>一键回滚</button>' : '')
+      : '';
     // Keep version comparison cards first; operation status sits below both workloads.
-    return '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'superseded' ? '已完成 · 已由历史回滚结束' : row.status === 'old_deleted' ? '旧版本已下线' : rolledBack ? '已回滚' : '等待老版本下线') + '</span>' + (mode === 'release' && row.old && row.old.exists && row.can_manage && !active ? '<button type="button" class="btn ghost danger" data-rollout-offline>下线</button>' : '') + rollbackButton + '</div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, mode === 'release' && row.can_manage && !active) + rolloutWorkloadHtml(row, 'new', row.new || {}, mode === 'release' && row.can_manage && !active) + operation + '</section>';
+    return '<section class="env-rollout" data-rollout-id="' + esc(row.id) + '"><div class="env-rollout-head"><strong>生产发布 ' + esc(row.created_at || '') + '</strong><div class="env-rollout-head-actions"><span>' + esc(row.status === 'superseded' ? '已完成 · 已由历史回滚结束' : row.status === 'old_deleted' ? '旧版本已下线' : rolledBack ? '已回滚' : '等待老版本下线') + '</span></div></div>' + rolloutWorkloadHtml(row, 'old', row.old || {}, row.can_manage && !active, offlineButton + rollbackButton) + rolloutWorkloadHtml(row, 'new', row.new || {}, row.can_manage && !active, '') + operation + '</section>';
   }).join('');
   panel.querySelectorAll('[data-rollout-scale]').forEach((btn) => btn.addEventListener('click', async () => {
     const card = btn.closest('[data-rollout-id]'); const target = btn.getAttribute('data-rollout-scale');
     const input = card && card.querySelector('[data-rollout-replicas="' + target + '"]'); const replicas = input ? Number(input.value) : NaN;
     if (!Number.isInteger(replicas) || replicas < 0 || replicas > 1000) { setEnvError('实例数必须是 0 到 1000 的整数'); return; }
     btn.disabled = true;
-    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/scale', { method: 'POST', body: JSON.stringify({ target, replicas }) }); await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode); }
+    try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/scale', { method: 'POST', body: JSON.stringify({ target, replicas }) }); await pollEnvRolloutAction(card.getAttribute('data-rollout-id'), panel, 'scale'); }
     catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
   }));
   panel.querySelectorAll('[data-rollout-offline]').forEach((btn) => btn.addEventListener('click', async () => {
@@ -3365,7 +3426,7 @@ function renderEnvRollouts(panel, rows, error, mode) {
       btn.disabled=true; btn.textContent='正在提交回滚…';
       const data=await api(base+'/rollback',{method:'POST',body:JSON.stringify({plan_token:plan.token})});
       if(data.approval_required){ btn.textContent='等待人工审批'; await openJob(currentJobId, { fromHistory: true }); return; }
-      await pollEnvRolloutAction(card.dataset.rolloutId, panel, mode);
+      await pollEnvRolloutAction(card.dataset.rolloutId, panel, 'rollback');
     }
     catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
@@ -3376,7 +3437,7 @@ function rolloutActionSettled(row, mode) {
   const phase = rolloutOperationPhase(row, mode);
   if (phase === 'failed' || phase === 'completed') return true;
   // Keep polling while an in-flight phase is still recorded, even if status flipped early.
-  if (['offlining', 'verifying', 'restoring', 'cleaning'].includes(phase)) return false;
+  if (['offlining', 'verifying', 'restoring', 'cleaning', 'scaling'].includes(phase)) return false;
   if (mode === 'release') return row.status === 'old_deleted';
   if (mode === 'rollback') return row.status === 'rolled_back';
   return false;
@@ -3580,6 +3641,9 @@ function permissionOwners(permissionId) {
 }
 function canManageEnvironments() {
   return permissionOwners('environment_manage').includes(currentUser);
+}
+function canApproveProductionRelease() {
+  return permissionOwners('production_release').includes(currentUser);
 }
 async function loadPermissions() {
   const root = $("permissionGrid"); if (!root || !currentServiceId || isAllServices()) return;
@@ -3965,8 +4029,7 @@ window.addEventListener("hashchange", async () => {
     if (parsed.job) {
       pinnedJobId = parsed.job;
       if (parsed.tab !== tab) setTab(parsed.tab);
-      loadPipelineTemplates().catch(() => {});
-      await openJob(parsed.job);
+      await openRoutedJobOrLatest(parsed.job);
       return;
     }
     if (parsed.tab !== tab) setTab(parsed.tab);
@@ -3983,7 +4046,7 @@ window.addEventListener("hashchange", async () => {
   if (parsed.job && parsed.job !== pinnedJobId) {
     pinnedJobId = parsed.job;
     if (parsed.tab !== tab) setTab(parsed.tab);
-    await openJob(parsed.job);
+    await openRoutedJobOrLatest(parsed.job);
     return;
   }
   if (parsed.tab !== tab) setTab(parsed.tab);
@@ -4002,8 +4065,7 @@ async function bootApp(username) {
     } else if (parsed.job) {
       pinnedJobId = parsed.job;
       setTab("pipeline");
-      loadPipelineTemplates().catch(() => {});
-      await openJob(parsed.job);
+      await openRoutedJobOrLatest(parsed.job);
       refreshServiceOccupancy().catch(() => {});
     } else {
       setTab(parsed.tab);

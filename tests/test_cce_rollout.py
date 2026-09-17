@@ -123,7 +123,7 @@ class CceRolloutHelperTests(unittest.TestCase):
             source, source_name="semantic-schedule", release_id="ab12cd34ef56",
             image="registry/schedule:new", container="container-1", replicas=1,
         )
-        self.assertRegex(manifest["metadata"]["name"], r"^semantic-schedule-v-20\d{10}$")
+        self.assertRegex(manifest["metadata"]["name"], r"^semantic-schedule-v20\d{10}$")
         labels = manifest["spec"]["template"]["metadata"]["labels"]
         self.assertEqual("schedule", labels["app"])
         self.assertEqual("ab12cd34ef56", labels[cce_rollout.PARALLEL_RELEASE_LABEL])
@@ -180,7 +180,7 @@ class CceRolloutHelperTests(unittest.TestCase):
             image="registry/service:new",
             container="app",
         )
-        self.assertEqual("service-v-202609151053", manifest["metadata"]["name"])
+        self.assertEqual("service-v202609151053", manifest["metadata"]["name"])
         self.assertEqual(
             "service-v-202609151000",
             manifest["metadata"]["labels"][cce_rollout.PARALLEL_SOURCE_LABEL],
@@ -268,7 +268,7 @@ class CceRolloutHelperTests(unittest.TestCase):
                 candidate["status"] = {"readyReplicas": 1, "availableReplicas": 1}
                 return 0, "created", ""
             if "get deploy" in command and "-o json" in command:
-                if "semantic-schedule-v-" in command:
+                if "semantic-schedule-v" in command:
                     if candidate is None:
                         return 1, "", "NotFound"
                     return 0, json.dumps(candidate), ""
@@ -283,7 +283,8 @@ class CceRolloutHelperTests(unittest.TestCase):
             mode="parallel", release_id="ab12cd34", on_parallel_created=created.append,
         )
         self.assertTrue(ok, err)
-        self.assertRegex(created[0]["name"], r"^semantic-schedule-v-20\d{10}$")
+        self.assertRegex(created[0]["name"], r"^semantic-schedule-v20\d{10}$")
+        self.assertEqual(0, created[0]["desired_replicas"])
         self.assertTrue(any("create -f" in command for command in commands))
         self.assertFalse(any("set image" in command for command in commands))
 

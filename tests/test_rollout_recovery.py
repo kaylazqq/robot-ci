@@ -120,6 +120,14 @@ class RecoveryTests(unittest.TestCase):
         self.assertNotIn("nodeName", restored_spec)
         self.assertEqual(pod_spec["affinity"], restored_spec["affinity"])
 
+    def test_old_workload_cannot_be_offlined_while_new_replicas_are_zero(self):
+        self.live["v3"]["spec"]["replicas"] = 0
+        self.live["v3"]["status"]["readyReplicas"] = 1
+        item, error = server.offline_parallel_rollout_old(self.second["id"])
+        self.assertIsNone(item)
+        self.assertEqual("新版本负载实例数为 0，不能下线旧版本", error)
+        self.assertIn("v2", self.live)
+
     def test_waiting_release_completed_and_reversible_history(self):
         # Legacy V2 record has not captured its source yet.
         with server._connect_db() as conn:
@@ -366,6 +374,28 @@ class RecoveryTests(unittest.TestCase):
                 time.sleep(.02)
             self.assertEqual("completed", phase)
 
+    def test_scale_action_returns_immediately_and_persists_completion(self):
+        entered, release = threading.Event(), threading.Event()
+        def slow_scale(_rollout_id, target, replicas):
+            self.assertEqual(("new", 3), (target, replicas))
+            entered.set()
+            release.wait(5)
+            return {"status": "active"}, ""
+        with patch.object(server, "scale_parallel_rollout", side_effect=slow_scale):
+            operation, error = server.start_scale_parallel_rollout(self.second["id"], "new", 3)
+            self.assertFalse(error)
+            self.assertEqual({"phase": "scaling", "target": "new", "replicas": 3}, operation)
+            self.assertTrue(entered.wait(1))
+            stored = json.loads(server.get_parallel_rollout(self.second["id"])["scale_operation_json"])
+            self.assertEqual("scaling", stored["phase"])
+            release.set()
+            for _ in range(50):
+                stored = json.loads(server.get_parallel_rollout(self.second["id"])["scale_operation_json"])
+                if stored["phase"] == "completed": break
+                time.sleep(.02)
+            self.assertEqual("completed", stored["phase"])
+            self.assertEqual(3, stored["replicas"])
+
     def test_rollback_begin_persists_restoring_before_worker(self):
         phases = []
         original = server.execute_parallel_rollout_rollback
@@ -398,6 +428,23 @@ class RecoveryTests(unittest.TestCase):
             self.assertTrue(completed.wait(1))
             for _ in range(50):
                 phase = json.loads(server.get_parallel_rollout(self.second["id"])["offline_operation_json"])["phase"]
+                if phase == "completed": break
+                time.sleep(.02)
+            self.assertEqual("completed", phase)
+
+    def test_restart_resumes_persisted_scale_action(self):
+        server._save_rollout_operation(self.second["id"], "scale_operation_json",
+                                       {"phase": "scaling", "target": "old", "replicas": 2})
+        completed = threading.Event()
+        def resumed(_rollout_id, target, replicas):
+            self.assertEqual(("old", 2), (target, replicas))
+            completed.set()
+            return {"status": "active"}, ""
+        with patch.object(server, "scale_parallel_rollout", side_effect=resumed):
+            server.resume_rollout_actions()
+            self.assertTrue(completed.wait(1))
+            for _ in range(50):
+                phase = json.loads(server.get_parallel_rollout(self.second["id"])["scale_operation_json"])["phase"]
                 if phase == "completed": break
                 time.sleep(.02)
             self.assertEqual("completed", phase)

@@ -450,8 +450,8 @@ def _ensure_environment_service_column(conn: sqlite3.Connection) -> None:
 
 def _baseline_workload_name(name: str) -> str:
     value = str(name or "").strip()
-    while re.search(r"-v-20\d{10}$", value):
-        value = re.sub(r"-v-20\d{10}$", "", value)
+    while re.search(r"-v-?20\d{10}$", value):
+        value = re.sub(r"-v-?20\d{10}$", "", value)
     return value
 
 
@@ -483,7 +483,7 @@ def _ensure_rollout_recovery_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE parallel_rollouts ADD COLUMN old_manifest_json TEXT NOT NULL DEFAULT ''")
     if "rolled_back_at" not in cols:
         conn.execute("ALTER TABLE parallel_rollouts ADD COLUMN rolled_back_at TEXT NOT NULL DEFAULT ''")
-    for name in ("rollback_operation_json", "offline_operation_json", "superseded_by"):
+    for name in ("rollback_operation_json", "offline_operation_json", "scale_operation_json", "superseded_by"):
         if name not in cols:
             conn.execute(f"ALTER TABLE parallel_rollouts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
@@ -1041,13 +1041,17 @@ def parallel_rollout_live_state(
         }
     operation = json.loads(record.get("rollback_operation_json") or "{}")
     offline_operation = json.loads(record.get("offline_operation_json") or "{}")
+    scale_operation = json.loads(record.get("scale_operation_json") or "{}")
     already_rolled_back = str(record.get("status") or "") == "rolled_back"
     state = {**record, "namespace": namespace, "old": old, "new": new,
              "recovery_phase": operation.get("phase", ""), "recovery_error": operation.get("error", ""),
              "offline_phase": offline_operation.get("phase", ""), "offline_error": offline_operation.get("error", ""),
              "offline_updated_at": offline_operation.get("updated_at") or "",
              "recovery_updated_at": operation.get("updated_at") or "",
-             "operation_updated_at": offline_operation.get("updated_at") or operation.get("updated_at") or "",
+             "scale_phase": scale_operation.get("phase", ""), "scale_error": scale_operation.get("error", ""),
+             "scale_target": scale_operation.get("target", ""), "scale_replicas": scale_operation.get("replicas"),
+             "scale_updated_at": scale_operation.get("updated_at") or "",
+             "operation_updated_at": max(filter(None, [offline_operation.get("updated_at"), operation.get("updated_at"), scale_operation.get("updated_at")]), default=""),
              "can_rollback": not already_rolled_back and bool(record.get("old_manifest_json") or old_payload),
              "can_manage": str(record.get("status")) == "active" and not rollout_recovery.pending_operation(list_parallel_rollouts(str(record["environment_id"])))}
     if rid:
@@ -1067,6 +1071,8 @@ def _scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tupl
         amount = int(replicas)
     except (TypeError, ValueError):
         return None, "实例数必须是整数"
+    if amount < 0 or amount > 1000:
+        return None, "实例数必须是 0 到 1000 的整数"
     record = get_parallel_rollout(rollout_id)
     if record is None:
         return None, "平滑发布记录不存在"
@@ -1097,6 +1103,9 @@ def _offline_parallel_rollout_old(rollout_id: str) -> tuple[dict[str, Any] | Non
         )
         if candidate is None:
             return None, "新版本负载不存在，不能下线旧版本"
+        candidate_spec = candidate.get("spec") if isinstance(candidate.get("spec"), Mapping) else {}
+        if int(candidate_spec.get("replicas") or 0) < 1:
+            return None, "新版本负载实例数为 0，不能下线旧版本"
         candidate_status = candidate.get("status") if isinstance(candidate.get("status"), Mapping) else {}
         if int(candidate_status.get("readyReplicas") or 0) < 1:
             return None, "新版本尚未就绪，不能下线旧版本"
@@ -1134,7 +1143,7 @@ _rollout_action_threads_lock = threading.Lock()
 
 
 def _save_rollout_operation(rollout_id: str, column: str, payload: Mapping[str, Any]) -> None:
-    if column not in {"offline_operation_json", "rollback_operation_json"}:
+    if column not in {"offline_operation_json", "rollback_operation_json", "scale_operation_json"}:
         raise ValueError("invalid rollout operation column")
     value = {**dict(payload), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     with _db_lock:
@@ -1193,6 +1202,37 @@ def start_offline_parallel_rollout(rollout_id: str) -> tuple[dict[str, Any] | No
     return {"phase": "offlining"}, ""
 
 
+def start_scale_parallel_rollout(rollout_id: str, target: str, replicas: Any) -> tuple[dict[str, Any] | None, str]:
+    if target not in {"old", "new"}:
+        return None, "只能调整新版本或旧版本实例数"
+    try:
+        amount = int(replicas)
+    except (TypeError, ValueError):
+        return None, "实例数必须是整数"
+    if amount < 0 or amount > 1000:
+        return None, "实例数必须是 0 到 1000 的整数"
+    record = get_parallel_rollout(rollout_id)
+    if not record:
+        return None, "平滑发布记录不存在"
+    payload = {"phase": "scaling", "error": "", "target": target, "replicas": amount,
+               "started_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    _save_rollout_operation(rollout_id, "scale_operation_json", payload)
+    append_job_step_log(str(record.get("job_id") or ""), "release", "compare",
+                        f"开始调整{'旧' if target == 'old' else '新'}版本实例数为 {amount}")
+
+    def worker() -> None:
+        item, error = scale_parallel_rollout(rollout_id, target, amount)
+        finished = {"phase": "failed" if error or item is None else "completed",
+                    "error": error if error or item is None else "", "target": target, "replicas": amount}
+        _save_rollout_operation(rollout_id, "scale_operation_json", finished)
+        label = "旧" if target == "old" else "新"
+        message = f"{label}版本实例数调整失败：{error}" if error or item is None else f"{label}版本实例数已调整为 {amount}"
+        append_job_step_log(str(record.get("job_id") or ""), "release", "compare", message)
+
+    _launch_rollout_action("scale-" + rollout_id, worker)
+    return {"phase": "scaling", "target": target, "replicas": amount}, ""
+
+
 def start_parallel_rollout_rollback(rollout_id: str, plan_token: str = "") -> tuple[dict[str, Any] | None, str]:
     record = get_parallel_rollout(rollout_id)
     if not record:
@@ -1222,10 +1262,13 @@ def resume_rollout_actions() -> None:
     for record in rows:
         offline = json.loads(record.get("offline_operation_json") or "{}")
         rollback = json.loads(record.get("rollback_operation_json") or "{}")
+        scale = json.loads(record.get("scale_operation_json") or "{}")
         if offline.get("phase") in {"offlining", "verifying"}:
             start_offline_parallel_rollout(str(record["id"]))
         if rollback.get("phase") in {"restoring", "cleaning"}:
             start_parallel_rollout_rollback(str(record["id"]), str(rollback.get("token") or ""))
+        if scale.get("phase") == "scaling":
+            start_scale_parallel_rollout(str(record["id"]), str(scale.get("target") or ""), scale.get("replicas"))
 
 
 def rollback_parallel_rollout(rollout_id: str, plan_token: str = "") -> tuple[dict[str, Any] | None, str]:
@@ -1263,6 +1306,64 @@ BUILTIN_PIPELINE_TEMPLATES = (
     {"kind": "personal", "name": "个人构建流水线", "gamma_deploy": 0, "gamma_test": 0, "production_release": 0},
     {"kind": "release", "name": "生产发布", "gamma_deploy": 1, "gamma_test": 1, "production_release": 1},
 )
+
+
+def _shared_builtin_template_id(service_id: str, kind: str) -> str:
+    """Stable id for one built-in pipeline shared by every account."""
+    raw = f"robot-ci:pipeline:{str(service_id).strip()}:{str(kind).strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _consolidate_pipeline_template_rows(conn: sqlite3.Connection) -> dict[str, str]:
+    """Collapse account-scoped built-ins into service-scoped rows.
+
+    Custom pipelines already have one unique id; clearing their creator field makes
+    them visible to every account without guessing which similarly named rows match.
+    """
+    mapping: dict[str, str] = {}
+    rows = conn.execute(
+        "SELECT * FROM pipeline_templates ORDER BY updated_at DESC, created_at ASC"
+    ).fetchall()
+    groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        if int(row["builtin"] or 0):
+            groups.setdefault((str(row["service_id"] or ""), str(row["kind"] or "")), []).append(row)
+    for (service_id, kind), members in groups.items():
+        if not service_id or kind not in {"personal", "release"}:
+            continue
+        canonical_id = _shared_builtin_template_id(service_id, kind)
+        source = next((row for row in members if str(row["id"]) == canonical_id), members[0])
+        spec = next(item for item in BUILTIN_PIPELINE_TEMPLATES if item["kind"] == kind)
+        shared_name = str(source["name"] or spec["name"])
+        if kind == "release" and shared_name == "生成发布":
+            shared_name = "生产发布"
+        existing = conn.execute("SELECT id, builtin FROM pipeline_templates WHERE id = ?", (canonical_id,)).fetchone()
+        if existing and not int(existing["builtin"] or 0):
+            raise RuntimeError(f"共享流水线 ID 冲突: {canonical_id}")
+        if not existing:
+            _insert_pipeline_template(conn, {
+                "id": canonical_id, "username": "", "service_id": service_id,
+                "name": shared_name, "kind": kind, "branch": str(source["branch"] or ""),
+                "gamma_deploy": int(source["gamma_deploy"] or 0), "gamma_test": int(source["gamma_test"] or 0),
+                "production_release": spec["production_release"],
+                "environment_id": str(source["environment_id"] or ""), "builtin": True,
+                "created_at": str(source["created_at"] or _now_stamp()), "updated_at": _now_stamp(),
+            })
+        conn.execute(
+            """UPDATE pipeline_templates SET username='', name=?, kind=?, gamma_deploy=?, gamma_test=?,
+               production_release=?, builtin=1, updated_at=? WHERE id=?""",
+            (shared_name, kind, int(source["gamma_deploy"] or 0), int(source["gamma_test"] or 0),
+             spec["production_release"], _now_stamp(), canonical_id),
+        )
+        for row in members:
+            old_id = str(row["id"])
+            mapping[old_id] = canonical_id
+            if old_id != canonical_id:
+                conn.execute("DELETE FROM pipeline_templates WHERE id = ?", (old_id,))
+    # All non-built-in pipelines are service-scoped too. Only the built-in release
+    # pipeline is allowed to expose production release/package deployment.
+    conn.execute("UPDATE pipeline_templates SET username='', production_release=0 WHERE builtin=0")
+    return mapping
 
 
 def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
@@ -1353,30 +1454,31 @@ def ensure_default_pipeline_templates(username: str, service_id: str) -> None:
         conn = _connect_db()
         try:
             _ensure_pipeline_templates_table(conn)
+            _consolidate_pipeline_template_rows(conn)
             conn.execute(
                 """
                 UPDATE pipeline_templates
                 SET name = '生产发布', updated_at = ?
-                WHERE username = ? AND service_id = ? AND kind = 'release'
+                WHERE service_id = ? AND kind = 'release'
                   AND builtin = 1 AND name = '生成发布'
                 """,
-                (now, user, sid),
+                (now, sid),
             )
             for spec in BUILTIN_PIPELINE_TEMPLATES:
                 row = conn.execute(
                     """
                     SELECT id FROM pipeline_templates
-                    WHERE username = ? AND service_id = ? AND kind = ? AND builtin = 1
+                    WHERE service_id = ? AND kind = ? AND builtin = 1
                     """,
-                    (user, sid, spec["kind"]),
+                    (sid, spec["kind"]),
                 ).fetchone()
                 if row:
                     continue
                 _insert_pipeline_template(
                     conn,
                     {
-                        "id": uuid.uuid4().hex[:12],
-                        "username": user,
+                        "id": _shared_builtin_template_id(sid, spec["kind"]),
+                        "username": "",
                         "service_id": sid,
                         "name": spec["name"],
                         "kind": spec["kind"],
@@ -1407,12 +1509,12 @@ def list_pipeline_templates(username: str, service_id: str) -> list[dict[str, An
             rows = conn.execute(
                 """
                 SELECT * FROM pipeline_templates
-                WHERE username = ? AND service_id = ?
+                WHERE service_id = ?
                 ORDER BY builtin DESC,
                     CASE kind WHEN 'personal' THEN 0 WHEN 'release' THEN 1 ELSE 2 END,
                     updated_at DESC
                 """,
-                (user, sid),
+                (sid,),
             ).fetchall()
         finally:
             conn.close()
@@ -1430,8 +1532,8 @@ def get_pipeline_template(username: str, template_id: str) -> dict[str, Any] | N
         try:
             _ensure_pipeline_templates_table(conn)
             row = conn.execute(
-                "SELECT * FROM pipeline_templates WHERE id = ? AND username = ?",
-                (tid, user),
+                "SELECT * FROM pipeline_templates WHERE id = ?",
+                (tid,),
             ).fetchone()
         finally:
             conn.close()
@@ -1464,6 +1566,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
     fields, err = _normalize_template_fields(data, require_name=True)
     if err or fields is None:
         return None, err
+    fields["production_release"] = bool(item["builtin"] and item["kind"] == "release")
     now = _now_stamp()
     init_store()
     with _db_lock:
@@ -1474,7 +1577,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                 UPDATE pipeline_templates SET
                     name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?, production_release = ?,
                     environment_id = ?, updated_at = ?
-                WHERE id = ? AND username = ?
+                WHERE id = ?
                 """,
                 (
                     fields["name"],
@@ -1485,7 +1588,6 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                     fields["environment_id"],
                     now,
                     item["id"],
-                    username,
                 ),
             )
             conn.commit()
@@ -1505,8 +1607,8 @@ def delete_pipeline_template(username: str, template_id: str) -> str:
         conn = _connect_db()
         try:
             conn.execute(
-                "DELETE FROM pipeline_templates WHERE id = ? AND username = ?",
-                (item["id"], username),
+                "DELETE FROM pipeline_templates WHERE id = ?",
+                (item["id"],),
             )
             conn.commit()
         finally:
@@ -1530,6 +1632,8 @@ def copy_pipeline_template(
         "name": raw_name or ((item["name"] or "流水线") + "_copy")[:60],
         "kind": "custom",
         "builtin": False,
+        "username": "",
+        "production_release": False,
         "created_at": now,
         "updated_at": now,
     }
@@ -3858,9 +3962,71 @@ def _job_matches_template_filter(meta: Mapping[str, Any] | None, template_id: st
     job_tid = _job_template_id(meta)
     if job_tid == tid:
         return True
-    if not job_tid and _template_is_personal_builtin(tid):
-        return True
+    if _template_is_personal_builtin(tid):
+        return not job_tid or _template_is_personal_builtin(job_tid)
     return False
+
+
+def migrate_pipeline_templates_to_service_scope() -> dict[str, int]:
+    """Unify account-scoped built-ins and rewrite persisted job references."""
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            mapping = _consolidate_pipeline_template_rows(conn)
+            conn.commit()
+        finally:
+            conn.close()
+    changed = 0
+    skipped = 0
+
+    def _canonical_id(meta: Mapping[str, Any]) -> str:
+        current = _job_template_id(meta)
+        if current in mapping:
+            return mapping[current]
+        sids = _job_service_ids(meta)
+        sid = sids[0] if sids else str(meta.get("service_id") or "").strip()
+        name = _job_template_name(meta)
+        if sid and name == "个人构建流水线":
+            return _shared_builtin_template_id(sid, "personal")
+        if sid and name in {"生产发布", "生成发布"}:
+            return _shared_builtin_template_id(sid, "release")
+        return current
+
+    def _patch(meta: dict[str, Any]) -> bool:
+        nonlocal changed, skipped
+        target = _canonical_id(meta)
+        if not target or target == _job_template_id(meta):
+            skipped += 1
+            return False
+        meta["template_id"] = target
+        if _job_template_name(meta) == "生成发布":
+            meta["template_name"] = "生产发布"
+        changed += 1
+        return True
+
+    changed_live_ids: list[str] = []
+    with _jobs_lock:
+        for job_id in list(_jobs):
+            if _patch(_jobs[job_id]):
+                changed_live_ids.append(job_id)
+    for job_id in changed_live_ids:
+        persist_job_meta(job_id)
+    for path in LOG_DIR.glob("job-*.json"):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            skipped += 1
+            continue
+        if not isinstance(meta, dict) or not _patch(meta):
+            continue
+        try:
+            path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with _history_disk_cache_lock:
+                _history_disk_cache.pop(str(path), None)
+        except OSError:
+            skipped += 1
+    return {"updated": changed, "skipped": skipped, "template_ids": len(set(mapping.values()))}
 
 
 def backfill_untagged_job_templates() -> dict[str, int]:
@@ -8710,16 +8876,13 @@ class Handler(SimpleHTTPRequestHandler):
             job_id = str(record.get("job_id") or "")
             target = str(data.get("target") or "")
             replicas = data.get("replicas")
-            append_job_step_log(job_id, "release", "compare", f"调整{'旧' if target == 'old' else '新'}版本实例数为 {replicas}")
-            item, err = scale_parallel_rollout(
+            item, err = start_scale_parallel_rollout(
                 m_rollout_scale.group(1), target, replicas
             )
             if err or item is None:
-                append_job_step_log(job_id, "release", "compare", f"调整实例数失败：{err}")
                 self._json(400 if err != "平滑发布记录不存在" else 404, {"ok": False, "error": err})
                 return
-            append_job_step_log(job_id, "release", "compare", "实例数调整完成")
-            self._json(200, {"ok": True, "rollout": item})
+            self._json(202, {"ok": True, "operation_started": True, "operation": item})
             return
 
         m_rollout_offline = re.fullmatch(r"/api/parallel-rollouts/([^/]+)/offline-old", path)
@@ -8988,6 +9151,15 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 return
             catalog = {svc["id"]: svc for svc in load_services()}
+            template_id = str(data.get("template_id") or "").strip()
+            template = get_pipeline_template(user, template_id) if template_id else personal_builtin_template(user, items[0]["service_id"])
+            if not template or str(template.get("service_id") or "") != items[0]["service_id"]:
+                self._json(400, {"error": "流水线不存在或不属于当前微服务", "error_code": "pipeline_invalid"})
+                return
+            release_pipeline = bool(template.get("builtin") and template.get("kind") == "release")
+            if deployment_type == "package" and not release_pipeline:
+                self._json(400, {"error": "只有生产发布流水线支持包部署", "error_code": "package_pipeline_required"})
+                return
             for item in items:
                 svc = catalog.get(item["service_id"])
                 if not svc:
@@ -9050,6 +9222,8 @@ class Handler(SimpleHTTPRequestHandler):
                         frozen_inputs['public-service'] = freeze_ref(clone_url_for(CFG.get('public_service_github') or 'https://github.com/rollingfruit/public-service.git'),
                             CFG.get('public_service_branch') or 'main', run_cmd, git_args, git_env())
                 optional_steps = _normalize_optional_steps(data.get('optional_steps'))
+                if optional_steps.get("production_release") and not release_pipeline:
+                    raise ValueError("只有生产发布流水线可以执行生产发布")
                 if str(data.get("deployment_type") or "code").strip().lower() == "package":
                     if not optional_steps.get("production_release"):
                         raise ValueError("包部署必须执行生产发布")
@@ -9083,12 +9257,8 @@ class Handler(SimpleHTTPRequestHandler):
             ids = ",".join(it["service_id"] for it in items)
             service_ids = [it["service_id"] for it in items]
             branches = ",".join(it["branch"] for it in items)
-            template_id = str(data.get("template_id") or "").strip()
-            template_name = str(data.get("template_name") or "").strip()
-            if template_id and not template_name and user:
-                tpl = get_pipeline_template(user, template_id)
-                if tpl:
-                    template_name = str(tpl.get("name") or "").strip()
+            template_id = str(template.get("id") or "")
+            template_name = str(template.get("name") or "").strip()
             new_job = {
                 'frozen_inputs': frozen_inputs,
                 "id": job_id,
@@ -9198,6 +9368,12 @@ def main() -> None:
     print(f"[swr-push-helper] ci_tmp={ci_tmp_root()}", flush=True)
     print(f"[swr-push-helper] allow_remote={allow_remote}", flush=True)
     ensure_default_users()
+    migrated = migrate_pipeline_templates_to_service_scope()
+    if migrated.get("updated"):
+        print(
+            f"[swr-push-helper] unified pipeline template ids: updated={migrated['updated']} shared={migrated['template_ids']}",
+            flush=True,
+        )
     reaped = reap_orphaned_running_jobs()
     rollout_recovery.reconcile_completed(sys.modules[__name__])
     resume_rollout_actions()

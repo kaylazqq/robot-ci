@@ -109,7 +109,7 @@ class PipelineTemplateApiTests(unittest.TestCase):
         self.assertEqual("custom", copied["kind"])
         self.assertFalse(copied["builtin"])
         self.assertTrue(copied["gamma_deploy"])
-        self.assertTrue(copied["production_release"])
+        self.assertFalse(copied["production_release"])
 
         with self.assertRaises(HTTPError) as denied:
             self._open(
@@ -132,10 +132,22 @@ class PipelineTemplateApiTests(unittest.TestCase):
         self.assertEqual(["我的日常构建", "生产发布"], names)
 
         other = self._login("c00985465", "c00985465")
-        other_names = [item["name"] for item in self._list(other)]
-        self.assertEqual(["个人构建流水线", "生产发布"], other_names)
+        other_templates = self._list(other)
+        other_names = [item["name"] for item in other_templates]
+        self.assertEqual(["我的日常构建", "生产发布"], other_names)
         other_ids = {item["id"] for item in self._list(other)}
-        self.assertNotIn(personal["id"], other_ids)
+        self.assertIn(personal["id"], other_ids)
+
+        other_personal = next(item for item in other_templates if item["kind"] == "personal")
+        self.assertEqual(personal["id"], other_personal["id"])
+        self.assertTrue(server._job_matches_template_filter(
+            {"template_id": personal["id"], "template_name": personal["name"]},
+            other_personal["id"],
+        ))
+        self.assertFalse(server._job_matches_template_filter(
+            {"template_id": release["id"], "template_name": release["name"]},
+            other_personal["id"],
+        ))
 
     def test_unknown_service_and_auth(self) -> None:
         with self.assertRaises(HTTPError) as denied:
@@ -146,6 +158,35 @@ class PipelineTemplateApiTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as missing:
             self._open("/api/pipeline-templates?service_id=not-a-service", cookie=cookie)
         self.assertEqual(404, missing.exception.code)
+
+    def test_account_scoped_builtin_ids_and_history_are_migrated(self) -> None:
+        service_id = "memory-service"
+        templates = self._list(self._login(), service_id)
+        canonical = next(item for item in templates if item["kind"] == "personal")
+        old_id = "oldpersonal1"
+        now = server._now_stamp()
+        with server._connect_db() as conn:
+            server._insert_pipeline_template(conn, {
+                **canonical, "id": old_id, "username": "other-user", "created_at": now, "updated_at": now,
+            })
+        log_dir = Path(self.tmp.name) / "logs"
+        log_dir.mkdir()
+        history = log_dir / "job-abcdef123456.json"
+        history.write_text(json.dumps({
+            "id": "abcdef123456", "service_id": service_id, "service_ids": [service_id],
+            "template_id": old_id, "template_name": "个人构建流水线",
+        }), encoding="utf-8")
+        with patch.object(server, "LOG_DIR", log_dir):
+            result = server.migrate_pipeline_templates_to_service_scope()
+        migrated = json.loads(history.read_text(encoding="utf-8"))
+        self.assertEqual(canonical["id"], migrated["template_id"])
+        self.assertGreaterEqual(result["updated"], 1)
+        with server._connect_db() as conn:
+            rows = conn.execute(
+                "SELECT id, username FROM pipeline_templates WHERE service_id=? AND kind='personal' AND builtin=1",
+                (service_id,),
+            ).fetchall()
+        self.assertEqual([(canonical["id"], "")], [(row["id"], row["username"]) for row in rows])
 
 
 if __name__ == "__main__":

@@ -1361,6 +1361,10 @@ class JobEndpointTests(unittest.TestCase):
         self.assertIn(created["status"], ("running", "queued"))
 
     def test_package_deploy_uses_existing_artifact_without_docker_check(self) -> None:
+        release_template = next(
+            item for item in server.list_pipeline_templates(server.DEFAULT_USERNAME, "memory-service")
+            if item["kind"] == "release" and item["builtin"]
+        )
         artifact = {
             "job_id": "source-job",
             "service_id": "memory-service",
@@ -1375,6 +1379,7 @@ class JobEndpointTests(unittest.TestCase):
         }
         payload = {
             "service_id": "memory-service",
+            "template_id": release_template["id"],
             "deployment_type": "package",
             "artifact_job_id": "source-job",
             "optional_steps": {
@@ -1396,6 +1401,22 @@ class JobEndpointTests(unittest.TestCase):
             created = server._jobs[created_payload["job_id"]]
         self.assertEqual("package", created["deployment_type"])
         self.assertEqual("memory.tar", created["package_name"])
+
+    def test_personal_pipeline_rejects_package_and_production_release(self) -> None:
+        personal = next(
+            item for item in server.list_pipeline_templates(server.DEFAULT_USERNAME, "memory-service")
+            if item["kind"] == "personal" and item["builtin"]
+        )
+        payload = {
+            "service_id": "memory-service", "template_id": personal["id"],
+            "deployment_type": "package", "artifact_job_id": "source-job",
+            "optional_steps": {"production_release": True, "release_environment_id": "package-env"},
+        }
+        with self.assertRaises(HTTPError) as denied:
+            self._open("/api/push", data=json.dumps(payload).encode(), method="POST")
+        self.assertEqual(400, denied.exception.code)
+        error = json.loads(denied.exception.read().decode("utf-8"))
+        self.assertEqual("package_pipeline_required", error["error_code"])
 
     def test_push_hits_mattermost_service_busy(self) -> None:
         job = make_job("mm-active", service_id="mattermost")
