@@ -677,7 +677,7 @@ function buildPipelineStages(pipeline, jobStatus, stopping) {
     });
   }
   (pipeline.steps || []).forEach((step) => {
-    if (step.id === "sync" || step.id === "rollback") return;
+    if (step.id === "sync" || (step.id === "rollback" && step.status === "skipped")) return;
     const tasks = visiblePipelineTasks(step);
     if (step.id === "gamma" && (step.status === "skipped" || !tasks.length)) return;
     if (step.id === "release") {
@@ -1674,6 +1674,7 @@ function createApprovalGate(gate, incomingComplete, outgoingComplete, jobId, doc
       try {
         await api("/api/jobs/" + encodeURIComponent(jobId) + "/approval", { method: "POST", body: JSON.stringify({ action: "continue" }) });
         await openJob(jobId);
+        if (gate.id === "rollback") await pollRollbackPipeline(jobId);
       } catch (e) { alert(e.message || "无权继续该人工卡点"); }
       finally { col.classList.remove("is-busy"); }
     };
@@ -1681,6 +1682,20 @@ function createApprovalGate(gate, incomingComplete, outgoingComplete, jobId, doc
     col.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); approve(); } });
   }
   return col;
+}
+
+function rollbackPipelineStatus(job) {
+  const steps = (((job || {}).pipeline || {}).steps || []);
+  const rollback = steps.find((step) => step.id === "rollback");
+  return (rollback && rollback.status) || "";
+}
+
+async function pollRollbackPipeline(jobId) {
+  for (let attempt = 0; attempt < 300 && sessionLive; attempt += 1) {
+    await openJob(jobId);
+    if (["done", "failed"].includes(rollbackPipelineStatus(currentJob))) return;
+    await new Promise((resolve) => setTimeout(resolve, attempt < 10 ? 1000 : 2000));
+  }
 }
 function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
   const root = $(containerId);
@@ -3425,8 +3440,11 @@ function renderEnvRollouts(panel, rows, error, mode) {
       if(!await askEnvConfirm(message, {title:'一键回滚', confirmLabel:'确认回滚', danger:false})) return;
       btn.disabled=true; btn.textContent='正在提交回滚…';
       const data=await api(base+'/rollback',{method:'POST',body:JSON.stringify({plan_token:plan.token})});
-      if(data.approval_required){ btn.textContent='等待人工审批'; await openJob(currentJobId, { fromHistory: true }); return; }
-      await pollEnvRolloutAction(card.dataset.rolloutId, panel, 'rollback');
+      const jobId=currentJobId;
+      closeModal();
+      await openJob(jobId, { fromHistory: true });
+      if(data.approval_required) return;
+      await pollRollbackPipeline(jobId);
     }
     catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));

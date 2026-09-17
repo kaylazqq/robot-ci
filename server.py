@@ -1243,10 +1243,13 @@ def start_parallel_rollout_rollback(rollout_id: str, plan_token: str = "") -> tu
         plan = rollout_recovery.begin(sys.modules[__name__], rollout_id, plan_token)
     except ValueError as exc:
         return None, str(exc)
+    job_id = str(record.get("job_id") or "")
+    if job_id:
+        set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
 
     def worker() -> None:
         execute_parallel_rollout_rollback(rollout_id, plan_token or str(plan.get("token") or ""))
-        _finish_release_job_if_terminal(str(record.get("job_id") or ""))
+        _finish_release_job_if_terminal(job_id)
 
     _launch_rollout_action("rollback-" + rollout_id, worker)
     return {"phase": str(plan.get("phase") or "restoring")}, ""

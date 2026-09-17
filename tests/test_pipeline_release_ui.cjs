@@ -39,6 +39,18 @@ const completed = context.buildPipelineStages({
 assert.equal(completed[0].status, 'done');
 assert.equal(completed[0].tasks[0].status, 'done');
 
+const withRollback = context.buildPipelineStages({
+  prepare: [],
+  steps: [
+    {id:'release', label:'生产发布', status:'done', subtasks:[{id:'deploy', status:'done'}]},
+    {id:'rollback', label:'一键回滚', status:'running', subtasks:[{id:'rollback', status:'running'}]},
+  ],
+}, 'ok');
+assert.equal(withRollback.length, 2);
+assert.equal(withRollback[1].id, 'rollback');
+assert.equal(withRollback[1].label, '一键回滚');
+assert.equal(withRollback[1].status, 'running');
+
 const previewStart = source.indexOf('function isSelectablePreviewTask(');
 const previewEnd = source.indexOf('function setPreviewHint(', previewStart);
 const previewContext = vm.createContext({isProductionReleaseTemplate: () => false});

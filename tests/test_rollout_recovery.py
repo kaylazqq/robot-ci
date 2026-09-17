@@ -282,10 +282,11 @@ class RecoveryTests(unittest.TestCase):
                 server._jobs.pop("aaaaaaaa")
                 self.assertTrue(post("/api/jobs/aaaaaaaa/approval", {"action": "continue"})["ok"])
                 for _ in range(50):
-                    if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back": break
+                    stored_job = server.load_job_from_disk("aaaaaaaa") or {}
+                    if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back" and stored_job.get("rollback_completed"): break
                     time.sleep(.02)
                 self.assertEqual({"v1"}, set(self.live))
-                self.assertTrue(server.load_job_from_disk("aaaaaaaa")["rollback_completed"])
+                self.assertTrue(stored_job["rollback_completed"])
             finally:
                 httpd.shutdown()
                 httpd.server_close()
@@ -318,6 +319,9 @@ class RecoveryTests(unittest.TestCase):
                 first_base = "/api/parallel-rollouts/" + self.first["id"]
                 plan = post(first_base + "/rollback-plan", {})["plan"]
                 self.assertTrue(post(first_base + "/rollback", {"plan_token": plan["token"]})["approval_required"])
+                waiting_pipeline = server.build_job_pipeline(server.ensure_action_job("aaaaaaaa"))
+                self.assertEqual("pending", next(step for step in waiting_pipeline["steps"] if step["id"] == "rollback")["status"])
+                self.assertEqual("queued", next(gate for gate in waiting_pipeline["gates"] if gate["id"] == "rollback")["status"])
                 with self.assertRaises(HTTPError) as denied:
                     post("/api/jobs/aaaaaaaa/approval", {"action": "continue"})
                 self.assertEqual(403, denied.exception.code)
@@ -349,6 +353,8 @@ class RecoveryTests(unittest.TestCase):
                     if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back": break
                     time.sleep(.02)
                 self.assertEqual({"v1"}, set(self.live))
+                finished_pipeline = server.build_job_pipeline(server.ensure_action_job("aaaaaaaa"))
+                self.assertEqual("done", next(step for step in finished_pipeline["steps"] if step["id"] == "rollback")["status"])
             finally:
                 httpd.shutdown()
                 httpd.server_close()
