@@ -1039,6 +1039,11 @@ def parallel_rollout_live_state(
             "release_id": "",
             "source_workload": str(record.get("source_workload") or ""),
         }
+    # Remote CCE reads can take seconds. Refresh the database row afterwards so
+    # a worker completion during those reads is not rendered as an older state.
+    latest_record = get_parallel_rollout(rid)
+    if latest_record is not None:
+        record = latest_record
     operation = json.loads(record.get("rollback_operation_json") or "{}")
     offline_operation = json.loads(record.get("offline_operation_json") or "{}")
     scale_operation = json.loads(record.get("scale_operation_json") or "{}")
@@ -1054,7 +1059,14 @@ def parallel_rollout_live_state(
              "operation_updated_at": max(filter(None, [offline_operation.get("updated_at"), operation.get("updated_at"), scale_operation.get("updated_at")]), default=""),
              "can_rollback": not already_rolled_back and bool(record.get("old_manifest_json") or old_payload),
              "can_manage": str(record.get("status")) == "active" and not rollout_recovery.pending_operation(list_parallel_rollouts(str(record["environment_id"])))}
-    if rid:
+    active_phases = {"offlining", "verifying", "restoring", "cleaning", "scaling"}
+    has_active_operation = any(
+        payload.get("phase") in active_phases
+        for payload in (operation, offline_operation, scale_operation)
+    )
+    # Active operations change asynchronously. Caching them can preserve a
+    # raced, stale state after the worker has already completed.
+    if rid and not has_active_operation:
         with _rollout_live_cache_lock:
             _rollout_live_cache[rid] = (time.time(), deepcopy(state), "")
     return state, ""
@@ -1169,6 +1181,15 @@ def _finish_release_job_if_terminal(job_id: str) -> None:
         set_job(job_id, status="ok", stage="done", current="", error=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
 
 
+def _mark_rollback_job_running(job_id: str) -> None:
+    job = ensure_action_job(job_id)
+    service_ids = _job_service_ids(job)
+    set_job(job_id, status="running", stage="rollback",
+            current=service_ids[0] if service_ids else str(job.get("service_id") or ""),
+            finished_at="", error=None, rollback_requested=True,
+            rollback_completed=False, rollback_failed=False)
+
+
 def _launch_rollout_action(key: str, target: Any) -> bool:
     with _rollout_action_threads_lock:
         current = _rollout_action_threads.get(key)
@@ -1245,7 +1266,7 @@ def start_parallel_rollout_rollback(rollout_id: str, plan_token: str = "") -> tu
         return None, str(exc)
     job_id = str(record.get("job_id") or "")
     if job_id:
-        set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
+        _mark_rollback_job_running(job_id)
 
     def worker() -> None:
         execute_parallel_rollout_rollback(rollout_id, plan_token or str(plan.get("token") or ""))
@@ -1292,7 +1313,7 @@ def execute_parallel_rollout_rollback(rollout_id: str, plan_token: str = "") -> 
     if err or item is None:
         if job_id:
             append_job_step_log(job_id, "rollback", "log", f"一键回滚失败：{err}")
-            set_job(job_id, rollback_failed=True)
+            set_job(job_id, status="failed", stage="done", current="", rollback_failed=True)
         return None, err
     if job_id:
         append_job_step_log(
@@ -8938,7 +8959,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "rollout_id": str(record.get("id") or ""),
                     "plan_token": plan["token"],
                 }
-                set_job(job_id, rollback_requested=True, rollback_completed=False, rollback_failed=False)
+                _mark_rollback_job_running(job_id)
                 _set_approval_gate(job_id, "rollback", approval)
                 set_job(job_id, approval=approval)
                 append_job_step_log(job_id, "rollback", "log", "等待生产环境一键回滚人工确认")

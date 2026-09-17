@@ -402,9 +402,27 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual("completed", stored["phase"])
             self.assertEqual(3, stored["replicas"])
 
+    def test_active_rollout_operation_is_not_cached(self):
+        server._save_rollout_operation(
+            self.second["id"], "offline_operation_json", {"phase": "offlining"}
+        )
+        state, error = server.parallel_rollout_live_state(self.second["id"], use_cache=False)
+        self.assertFalse(error)
+        self.assertEqual("offlining", state["offline_phase"])
+        self.assertNotIn(self.second["id"], server._rollout_live_cache)
+
+        server._save_rollout_operation(
+            self.second["id"], "offline_operation_json", {"phase": "completed"}
+        )
+        state, error = server.parallel_rollout_live_state(self.second["id"], use_cache=False)
+        self.assertFalse(error)
+        self.assertEqual("completed", state["offline_phase"])
+        self.assertIn(self.second["id"], server._rollout_live_cache)
+
     def test_rollback_begin_persists_restoring_before_worker(self):
         phases = []
         original = server.execute_parallel_rollout_rollback
+        server.set_job(self.first["job_id"], status="ok", stage="done", finished_at="2026-09-17 09:00:00")
         def slow_execute(rollout_id, plan_token=""):
             phases.append(json.loads(server.get_parallel_rollout(rollout_id)["rollback_operation_json"])["phase"])
             return original(rollout_id, plan_token)
@@ -413,6 +431,10 @@ class RecoveryTests(unittest.TestCase):
             operation, error = server.start_parallel_rollout_rollback(self.first["id"], plan["token"])
             self.assertFalse(error)
             self.assertEqual("restoring", operation["phase"])
+            started_job = server._job_copy(self.first["job_id"])
+            self.assertEqual("running", started_job["status"])
+            self.assertEqual("rollback", started_job["stage"])
+            self.assertEqual("", started_job["finished_at"])
             stored = json.loads(server.get_parallel_rollout(self.first["id"])["rollback_operation_json"])
             self.assertEqual("restoring", stored["phase"])
             self.assertEqual("v1", stored["target"])

@@ -51,6 +51,21 @@ assert.equal(withRollback[1].id, 'rollback');
 assert.equal(withRollback[1].label, '一键回滚');
 assert.equal(withRollback[1].status, 'running');
 
+const endHelperStart = source.indexOf('function pipelineEndComplete(');
+const endHelperEnd = source.indexOf('async function pollRollbackPipeline(', endHelperStart);
+const endContext = vm.createContext({});
+vm.runInContext(source.slice(endHelperStart, endHelperEnd) + ';this.pipelineEndComplete=pipelineEndComplete;', endContext);
+assert.equal(endContext.pipelineEndComplete('ok', [
+  {kind:'stage', data:{status:'done'}},
+  {kind:'stage', data:{status:'running'}},
+], false), false);
+assert.equal(endContext.pipelineEndComplete('ok', [
+  {kind:'stage', data:{status:'done'}},
+  {kind:'gate', data:{status:'done'}},
+  {kind:'stage', data:{status:'done'}},
+], false), true);
+assert.equal(endContext.pipelineEndComplete('ok', [{kind:'stage', data:{status:'done'}}], true), false);
+
 const previewStart = source.indexOf('function isSelectablePreviewTask(');
 const previewEnd = source.indexOf('function setPreviewHint(', previewStart);
 const previewContext = vm.createContext({isProductionReleaseTemplate: () => false});

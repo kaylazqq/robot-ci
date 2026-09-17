@@ -32,6 +32,7 @@ let pipelineTemplates = [];
 let selectedTemplateId = "";
 let pipelineTemplateLoadGeneration = 0;
 let serviceJobLoadGeneration = 0;
+let jobOpenGeneration = 0;
 let runLayerMode = "run";
 let runLayerTemplateId = "";
 let cloneSourceId = "";
@@ -1690,6 +1691,12 @@ function rollbackPipelineStatus(job) {
   return (rollback && rollback.status) || "";
 }
 
+function pipelineEndComplete(status, nodes, preview) {
+  return !preview && status === "ok" && nodes.length > 0 && nodes.every((node) =>
+    node.kind === "ellipsis" || Boolean(node.data && node.data.status === "done")
+  );
+}
+
 async function pollRollbackPipeline(jobId) {
   for (let attempt = 0; attempt < 300 && sessionLive; attempt += 1) {
     await openJob(jobId);
@@ -1751,7 +1758,7 @@ function renderJobPipeline(containerId, pipeline, jobStatus, onStep, opts) {
       ? createApprovalGate(stage, incomingComplete, outgoingComplete, meta.job_id || currentJobId, doc)
       : createStageColumn(stage, incomingComplete, outgoingComplete, onStep, preview, doc));
   });
-  graph.appendChild(createEndpoint("end", !preview && status === "ok" && stages.some((stage) => isRailDone(stage)), doc));
+  graph.appendChild(createEndpoint("end", pipelineEndComplete(status, nodes, preview), doc));
   scroll.appendChild(graph);
   root.appendChild(scroll);
 }
@@ -2266,12 +2273,15 @@ function applyJob(job, { loading, force } = {}) {
 
 async function openJob(jobId, { fromHistory, serviceLoadGeneration } = {}) {
   if (!jobId || !sessionLive) return false;
+  const openGeneration = ++jobOpenGeneration;
+  if (fromHistory) serviceJobLoadGeneration += 1;
   const gen = viewGeneration;
   const sidBefore = currentServiceId;
   const tidBefore = selectedTemplateId || "";
   stopPolling();
   const job = await api("/api/jobs/" + jobId + "?compact=1");
   if (!sessionLive) return false;
+  if (openGeneration !== jobOpenGeneration) return false;
   if (serviceLoadGeneration != null && serviceLoadGeneration !== serviceJobLoadGeneration) return false;
   const sid = jobServiceIds(job)[0] || "";
   if (fromHistory) {
@@ -3356,6 +3366,18 @@ function rolloutWorkloadHtml(rollout, side, item, allowScale, actions) {
     '</div>';
 }
 
+function showPendingRolloutOperation(card, label) {
+  if (!card) return;
+  let operation = card.querySelector('.rollout-operation');
+  if (!operation) {
+    operation = (card.ownerDocument || document).createElement('div');
+    card.appendChild(operation);
+  }
+  operation.className = 'rollout-operation is-running';
+  operation.dataset.operationActive = '1';
+  operation.innerHTML = '<span class="rollout-spinner" aria-hidden="true"></span><strong>' + esc(label) + '</strong>';
+}
+
 function rolloutOperationPhase(row, mode) {
   if (mode === 'rollback') return (row && row.recovery_phase) || '';
   if (mode === 'scale') return (row && row.scale_phase) || '';
@@ -3383,6 +3405,10 @@ function rolloutOperationMode(row) {
 function renderEnvRollouts(panel, rows, error, mode) {
   if (!panel) return;
   mode = mode || panel.dataset.compareMode || 'release';
+  if (panel._rolloutRefreshTimer) {
+    clearTimeout(panel._rolloutRefreshTimer);
+    panel._rolloutRefreshTimer = null;
+  }
   if (error) { panel.innerHTML = '<p class="hint error">' + esc(error) + '</p>'; return; }
   if (!rows || !rows.length) { panel.innerHTML = '<p class="env-secret-hint">暂无由 CI 创建的平滑发布负载。</p>'; return; }
   panel.innerHTML = rows.map((row) => {
@@ -3417,6 +3443,7 @@ function renderEnvRollouts(panel, rows, error, mode) {
     const input = card && card.querySelector('[data-rollout-replicas="' + target + '"]'); const replicas = input ? Number(input.value) : NaN;
     if (!Number.isInteger(replicas) || replicas < 0 || replicas > 1000) { setEnvError('实例数必须是 0 到 1000 的整数'); return; }
     btn.disabled = true;
+    showPendingRolloutOperation(card, '正在将' + (target === 'old' ? '旧版本' : '新版本') + '实例数调整为 ' + replicas);
     try { await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/scale', { method: 'POST', body: JSON.stringify({ target, replicas }) }); await pollEnvRolloutAction(card.getAttribute('data-rollout-id'), panel, 'scale'); }
     catch (e) { setEnvError(e.message); } finally { btn.disabled = false; }
   }));
@@ -3424,6 +3451,7 @@ function renderEnvRollouts(panel, rows, error, mode) {
     const card = btn.closest('[data-rollout-id]'); const name = card && card.querySelector('.is-old span');
     if (!await askEnvConfirm('确认下线旧版本「' + ((name && name.textContent) || '') + '」？', {title:'老版本下线', confirmLabel:'确认下线'})) return;
     btn.disabled = true; btn.textContent = '正在提交下线…';
+    showPendingRolloutOperation(card, '正在删除旧版本');
     try {
       await api('/api/parallel-rollouts/' + encodeURIComponent(card.getAttribute('data-rollout-id')) + '/offline-old', { method: 'POST', body: '{}' });
       await pollEnvRolloutAction(card.getAttribute('data-rollout-id'), panel, mode);
@@ -3448,6 +3476,19 @@ function renderEnvRollouts(panel, rows, error, mode) {
     }
     catch(e){ alert(e.message); } finally { btn.disabled=false; }
   }));
+  const hasActiveOperation = rows.some((row) =>
+    ['offlining', 'verifying', 'restoring', 'cleaning', 'scaling'].includes(
+      rolloutOperationPhase(row, rolloutOperationMode(row))
+    )
+  );
+  if (hasActiveOperation) {
+    panel._rolloutRefreshTimer = setTimeout(() => {
+      panel._rolloutRefreshTimer = null;
+      if (panel.isConnected !== false) {
+        loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode, true);
+      }
+    }, 1000);
+  }
 }
 
 function rolloutActionSettled(row, mode) {
@@ -3464,6 +3505,10 @@ function rolloutActionSettled(row, mode) {
 async function pollEnvRolloutAction(rolloutId, panel, mode) {
   for (let attempt = 0; attempt < 300 && panel && panel.isConnected !== false; attempt += 1) {
     const rows = await loadEnvRollouts(panel.getAttribute('data-env-rollout-list'), panel, mode, true);
+    if (!Array.isArray(rows)) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      continue;
+    }
     const row = (rows || []).find((item) => item.id === rolloutId);
     if (rolloutActionSettled(row, mode)) return;
     await new Promise((resolve) => setTimeout(resolve, attempt < 10 ? 1000 : 2000));
@@ -3472,6 +3517,8 @@ async function pollEnvRolloutAction(rolloutId, panel, mode) {
 
 async function loadEnvRollouts(id, panel, mode, quiet) {
   if (!id || !panel) return;
+  const requestGeneration = Number(panel.dataset.rolloutLoadGeneration || 0) + 1;
+  panel.dataset.rolloutLoadGeneration = String(requestGeneration);
   panel.hidden = false;
   if (!quiet && (!panel.querySelector('.env-secret-hint') || !/加载中/.test(panel.textContent || ''))) {
     panel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
@@ -3480,11 +3527,16 @@ async function loadEnvRollouts(id, panel, mode, quiet) {
     const jobId = panel.dataset.jobId || '';
     const qs = jobId ? ('?job_id=' + encodeURIComponent(jobId) + '&live=1') : '?live=1';
     const data = await api('/api/environments/' + encodeURIComponent(id) + '/rollouts' + qs);
+    if (Number(panel.dataset.rolloutLoadGeneration || 0) !== requestGeneration) return null;
     const rows = data.rollouts || [];
     renderEnvRollouts(panel, rows, '', mode);
     return rows;
   }
-  catch (e) { renderEnvRollouts(panel, [], e.message, mode); return []; }
+  catch (e) {
+    if (Number(panel.dataset.rolloutLoadGeneration || 0) !== requestGeneration) return null;
+    renderEnvRollouts(panel, [], e.message, mode);
+    return null;
+  }
 }
 function bindEnvForm() {
   const list = $("envNodeList");

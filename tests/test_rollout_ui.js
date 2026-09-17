@@ -5,7 +5,11 @@ const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8');
 const start = source.indexOf('function rolloutWorkloadHtml(');
 const end = source.indexOf('function bindEnvForm()', start);
-const context = vm.createContext({ esc: (s) => String(s ?? '') });
+const context = vm.createContext({
+  esc: (s) => String(s ?? ''),
+  setTimeout: () => 1,
+  clearTimeout: () => {},
+});
 vm.runInContext(source.slice(start, end), context);
 const panel = { dataset: {}, innerHTML: '', querySelectorAll: () => [] };
 const base = { id: 'release2', old: {exists:true}, new:{exists:true, desired_replicas:1}, can_rollback:true };
@@ -53,4 +57,18 @@ assert.equal(context.rolloutActionSettled({status:'active', recovery_phase:'clea
 assert.equal(context.rolloutActionSettled({status:'rolled_back', recovery_phase:'completed'}, 'rollback'), true);
 assert.equal(context.rolloutActionSettled({status:'active', scale_phase:'scaling'}, 'scale'), false);
 assert.equal(context.rolloutActionSettled({status:'active', scale_phase:'completed'}, 'scale'), true);
+const operationNode = { className:'', dataset:{}, innerHTML:'' };
+const operationCard = {
+  ownerDocument: {createElement: () => operationNode},
+  querySelector: () => null,
+  appendChild: (node) => { operationCard.operation = node; },
+};
+context.showPendingRolloutOperation(operationCard, '正在将新版本实例数调整为 3');
+assert.equal(operationCard.operation, operationNode);
+assert.equal(operationNode.className, 'rollout-operation is-running');
+assert.equal(operationNode.dataset.operationActive, '1');
+assert.match(operationNode.innerHTML, /正在将新版本实例数调整为 3/);
+assert.match(source, /rolloutLoadGeneration/);
+assert.match(source, /showPendingRolloutOperation\(card, '正在删除旧版本'\)/);
+assert.match(source, /panel\._rolloutRefreshTimer = setTimeout/);
 console.log('Rollback UI states: passed');
