@@ -956,7 +956,7 @@ async function loadPreviewBranches(force) {
     if (retryBtn) retryBtn.disabled = loading;
     // 默认分支始终可用；读取缓存不能让用户的运行入口失去响应。
     picker.setDisabled(false);
-    if (loading) setPreviewBranchStatus(force ? "正在从远程更新分支…" : "正在读取服务器缓存…");
+    if (loading) setPreviewBranchStatus(force ? "正在从远程更新分支…" : "正在加载可用分支…");
   };
   const applyCached = (data) => {
     if (!isCurrentLoad()) return;
@@ -967,9 +967,16 @@ async function loadPreviewBranches(force) {
     );
     const count = (data.branches || []).length;
     if (data.refresh_error) {
-      setPreviewBranchStatus("远程刷新失败，已使用服务器缓存（" + count + " 个分支）", "error");
+      setPreviewBranchStatus(
+        data.branch_source === "cache"
+          ? ("远程刷新失败，已使用服务器缓存（" + count + " 个分支）")
+          : "远程分支加载失败，当前仅可使用默认分支；点击刷新重试",
+        "error"
+      );
     } else if (force) {
       setPreviewBranchStatus("已更新 " + count + " 个分支", "ok");
+    } else if (data.branch_source === "remote") {
+      setPreviewBranchStatus("已加载 " + count + " 个远程分支", "ok");
     } else if (data.cached) {
       setPreviewBranchStatus("已读取服务器缓存（" + count + " 个分支）", "ok");
     } else {
@@ -2493,6 +2500,7 @@ function fetchServiceBranches(serviceId, force, priority) {
     selected_branch: data.selected_branch || "",
     default_branch: data.default_branch || "",
     cached: data.cached === true,
+    branch_source: data.branch_source || "",
     refresh_error: data.refresh_error || "",
   }));
   if (force) return request;
@@ -2633,12 +2641,21 @@ async function openRunDialog() {
       data.default_branch || fallbackBranch
     );
     const n = (data.branches || []).length;
-    statusEl.textContent = updated
-      ? ("已更新" + n + "个分支")
-      : data.cached
-        ? ("已读取服务器缓存 " + n + " 个分支")
-        : "服务器暂无分支缓存，当前使用默认分支；点击刷新加载";
-    statusEl.className = "branch-status ok";
+    if (data.refresh_error) {
+      statusEl.textContent = data.branch_source === "cache"
+        ? ("远程刷新失败，继续使用服务器缓存的 " + n + " 个分支")
+        : "远程分支加载失败，当前仅可使用默认分支；点击刷新重试";
+      statusEl.className = "branch-status error";
+    } else {
+      statusEl.textContent = updated
+        ? ("已更新" + n + "个分支")
+        : data.branch_source === "remote"
+          ? ("已加载 " + n + " 个远程分支")
+          : data.cached
+            ? ("已读取服务器缓存 " + n + " 个分支")
+            : "当前使用默认分支";
+      statusEl.className = "branch-status ok";
+    }
   };
   const loadBranches = async (force) => {
     setLoading(true);

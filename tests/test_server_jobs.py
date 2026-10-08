@@ -1249,7 +1249,7 @@ artifacts:
     def test_echoagent_components_share_one_pinned_source_revision(self, resolve) -> None:
         catalog = {svc["id"]: svc for svc in server.load_services()}
         items = [
-            {"service_id": service_id, "branch": "main"}
+            {"service_id": service_id, "branch": "feature/echo-branch-build"}
             for service_id in (
                 "echoagent-backend",
                 "echoagent-frontend",
@@ -1259,6 +1259,7 @@ artifacts:
         with patch.dict(server.CFG, {"freeze_build_inputs": False}):
             frozen = server.resolve_frozen_source_inputs(items, catalog, "code")
         self.assertEqual(1, resolve.call_count)
+        self.assertEqual("feature/echo-branch-build", resolve.call_args.args[1])
         self.assertEqual({item["service_id"] for item in items}, set(frozen))
         self.assertEqual({"a" * 40}, set(frozen.values()))
 
@@ -1566,15 +1567,31 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual("branch_not_cached", payload["error_code"])
         cached.assert_called_once_with("memory-service")
 
-    @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
-    def test_branch_lookup_uses_default_until_user_refreshes(self, lookup) -> None:
+    @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
+    def test_branch_lookup_populates_empty_cache_from_remote(self, lookup) -> None:
         with patch.object(server, "cached_branches", return_value=[]):
             with self._open("/api/services/memory-service/branches") as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            self.assertEqual(["main"], payload["branches"])
+            self.assertEqual(["main", "feature/latest"], payload["branches"])
             self.assertFalse(payload["cached"])
-            lookup.assert_not_called()
+            self.assertEqual("remote", payload["branch_source"])
+            lookup.assert_called_once_with(
+                "rollingfruit/CellMem", cache_key="memory-service"
+            )
 
+    @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
+    def test_initial_branch_lookup_falls_back_to_default(self, lookup) -> None:
+        with patch.object(server, "cached_branches", return_value=[]):
+            with self._open("/api/services/memory-service/branches") as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(["main"], payload["branches"])
+        self.assertFalse(payload["cached"])
+        self.assertEqual("default", payload["branch_source"])
+        self.assertIn("SSH timeout", payload["refresh_error"])
+        lookup.assert_called_once_with("rollingfruit/CellMem", cache_key="memory-service")
+
+    @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
+    def test_forced_branch_refresh_reports_failure_without_cache(self, lookup) -> None:
         with self.assertRaises(HTTPError) as raised:
             self._open("/api/services/memory-service/branches?refresh=1")
         self.assertEqual(503, raised.exception.code)
@@ -1582,6 +1599,17 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual("branch lookup failed", payload["error"])
         self.assertEqual("SSH timeout", payload["detail"])
         lookup.assert_called_once_with("rollingfruit/CellMem", force=True, cache_key="memory-service")
+
+    @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/echo"]))
+    def test_echoagent_branch_lookup_loads_remote_branches(self, lookup) -> None:
+        with patch.object(server, "cached_branches", return_value=[]):
+            with self._open("/api/services/echoagent-backend/branches") as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(["main", "feature/echo"], payload["branches"])
+        self.assertEqual("remote", payload["branch_source"])
+        lookup.assert_called_once_with(
+            "tech-innovation-group/EchoAgent", cache_key="echoagent-backend"
+        )
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
     def test_branch_retry_forces_backend_refresh(self, lookup) -> None:

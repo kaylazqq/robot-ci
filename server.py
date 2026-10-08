@@ -8665,19 +8665,27 @@ class Handler(SimpleHTTPRequestHandler):
                 cached_before_refresh = cached_branches(service_id)
                 ok, result = list_branches_api(repo, force=True, cache_key=service_id)
                 from_cache = False
+                branch_source = "remote"
                 refresh_error = ""
                 if not ok and cached_before_refresh:
                     result = cached_before_refresh
                     ok = True
                     from_cache = True
+                    branch_source = "cache"
                     refresh_error = "远程刷新失败，已保留服务器缓存"
             else:
                 result = cached_branches(service_id)
                 ok = True
                 from_cache = bool(result)
+                branch_source = "cache" if result else "remote"
                 refresh_error = ""
                 if not result:
-                    result = [default]
+                    ok, result = list_branches_api(repo, cache_key=service_id)
+                    if not ok:
+                        refresh_error = f"远程分支加载失败：{result}"
+                        result = [default]
+                        ok = True
+                        branch_source = "default"
             if not ok:
                 self._json(
                     503,
@@ -8701,6 +8709,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "default_branch": default,
                     "selected_branch": selected,
                     "cached": from_cache,
+                    "branch_source": branch_source,
                     "refresh_error": refresh_error or None,
                 },
             )

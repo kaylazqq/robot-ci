@@ -66,6 +66,8 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 每个微服务的分支选择框后提供独立刷新按钮。页面初始化最多并发加载 3 个仓库的分支，后端只缓存成功结果 60 秒；手动刷新会绕过前后端缓存并重新读取该仓库的最新分支。查询失败只在对应微服务行提示，失败结果不会缓存，也不会再把回退的 `main` 伪装成完整分支列表。GitHub API 备用查询支持分页。
 
+构建弹窗在服务尚无分支缓存时会立即读取远端分支，因此新接入的 EchoAgent Backend、Frontend、Router 首次打开即可选择分支。远端查询失败时仅保留默认分支并显示重试提示；选择的分支在任务提交时解析为不可变 commit。三个模块可以独立选择分支，同一批次引用同仓同分支时仍复用同一份 commit 锁定结果。
+
 ## 多人并发与页面刷新
 
 服务器最多同时跑 `max_concurrent_jobs` 个构建任务（默认 5）。**同一微服务也可以并发**（每个任务 clone 到 `<workspace_root>/<仓库名>--<job_id>`），但 **mattermost** 与 **kibana-service** 例外：全机各只允许 **1 个** 并发（`max_concurrent: 1`）。mattermost 与别人共用 `/opt/ai/build-cache/build.swap` 和约 3.6G 内存；kibana 在仓库 `build/package/build.sh` 里自建 swap 并需要约 8GB Node 堆。`public-service` 仍是共享旁路目录（加锁更新、不删除），供尚未完全自包含的构建脚本读取共享资源。达到全局或单服务并发上限时新请求返回 `409`。
