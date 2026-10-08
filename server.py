@@ -4818,6 +4818,55 @@ def load_services() -> list[dict[str, Any]]:
     return json.loads(SERVICES_PATH.read_text(encoding="utf-8"))
 
 
+def resolve_frozen_source_inputs(
+    items: list[dict[str, str]],
+    catalog: dict[str, dict[str, Any]],
+    deployment_type: str,
+) -> dict[str, str]:
+    """Resolve immutable commits for globally frozen or explicitly pinned services."""
+    frozen_inputs: dict[str, str] = {}
+    if deployment_type != "code":
+        return frozen_inputs
+
+    from frozen_builds import resolve as freeze_ref
+
+    resolved_sources: dict[tuple[str, str], str] = {}
+    for item in items:
+        svc = catalog[item["service_id"]]
+        if not (CFG.get("freeze_build_inputs") or svc.get("pin_source")):
+            continue
+        url = svc.get("github") or ("https://github.com/" + svc["repo"] + ".git")
+        source_key = (public_github_url(url), item["branch"])
+        if source_key not in resolved_sources:
+            resolved_sources[source_key] = freeze_ref(
+                clone_url_for(
+                    url,
+                    public_https=bool(svc.get("public_https")),
+                    prefer_token_https=bool(svc.get("prefer_token_https")),
+                ),
+                item["branch"],
+                run_cmd,
+                git_args,
+                git_env(),
+            )
+        frozen_inputs[item["service_id"]] = resolved_sources[source_key]
+
+    if CFG.get("freeze_build_inputs") and any(
+        not catalog[item["service_id"]].get("skip_public_service") for item in items
+    ):
+        frozen_inputs["public-service"] = freeze_ref(
+            clone_url_for(
+                CFG.get("public_service_github")
+                or "https://github.com/rollingfruit/public-service.git"
+            ),
+            CFG.get("public_service_branch") or "main",
+            run_cmd,
+            git_args,
+            git_env(),
+        )
+    return frozen_inputs
+
+
 def test_report_dir(job_id: str, service_id: str) -> Path:
     safe_service_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", service_id).strip("._") or "service"
     return LOG_DIR / "reports" / job_id / safe_service_id
@@ -5637,7 +5686,12 @@ def repo_full_name(svc: dict[str, Any]) -> str:
 
 
 def clone_dir_name(svc: dict[str, Any]) -> str:
-    name = repo_full_name(svc).rsplit("/", 1)[-1] or svc["id"]
+    # A repository can expose more than one independently buildable image.
+    # Keep those checkouts isolated inside a batch instead of making them
+    # overwrite the same <repo>--<job> workspace.
+    name = str(svc.get("workspace_name") or "").strip()
+    if not name:
+        name = repo_full_name(svc).rsplit("/", 1)[-1] or svc["id"]
     return re.sub(r"[^\w.\-]+", "_", name)
 
 
@@ -6513,9 +6567,10 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     wipe_workspace_dir(job_id, dest, label=f"workspace {svc.get('id') or dest.name}")
 
     frozen = (_job_copy(job_id) or {}).get('frozen_inputs', {})
-    if CFG.get('freeze_build_inputs'):
+    pinned_sha = str(frozen.get(svc["id"]) or "").strip()
+    if CFG.get('freeze_build_inputs') or pinned_sha:
         from frozen_builds import checkout
-        ok, detail = checkout(job_id, dest, clone_url, frozen.get(svc['id']), run_stream, run_cmd, git_args, genv)
+        ok, detail = checkout(job_id, dest, clone_url, pinned_sha, run_stream, run_cmd, git_args, genv)
         if not ok:
             return ok, detail
         run_cmd(git_args('-C', str(dest), 'remote', 'set-url', 'origin', public), timeout=30, env=genv)
@@ -6576,7 +6631,12 @@ def validate_cloned_repo_contract(dest: Path, svc: dict[str, Any]) -> tuple[bool
         return False, f"invalid .cid/build.yaml: {exc}"
     has_legacy = (dest / "deploy.sh").is_file() or (dest / "build-image.sh").is_file()
     has_package = (dest / "build" / "package" / "build.sh").is_file()
-    has_dockerfile = (dest / "Dockerfile").is_file()
+    dockerfile = str(svc.get("dockerfile") or "Dockerfile").strip()
+    dockerfile_parts = Path(dockerfile).parts
+    dockerfile_valid = bool(dockerfile) and not Path(dockerfile).is_absolute() and ".." not in dockerfile_parts
+    has_dockerfile = dockerfile_valid and (dest / dockerfile).is_file()
+    if svc.get("dockerfile_build") and not dockerfile_valid:
+        return False, f"invalid dockerfile path: {dockerfile!r}"
     if cid is None and not has_legacy and not has_package and not (
         svc.get("dockerfile_build") and has_dockerfile
     ):
@@ -6812,6 +6872,7 @@ def build_from_source(
     git_hash: str,
     version: str = "",
     archive_dir: Path | None = None,
+    commit_sha: str = "",
 ) -> tuple[bool, str]:
     src = repo_dir(svc, job_id)
     shell_src = host_path(src)
@@ -6878,11 +6939,43 @@ def build_from_source(
 
     image_tag = f"{time.strftime('%Y%m%d%H%M')}_{git_hash}"
     docker_args = ""
+    dockerfile = str(svc.get("dockerfile") or "Dockerfile").strip()
+    docker_context = str(svc.get("docker_context") or ".").strip()
+    docker_target = str(svc.get("docker_target") or "").strip()
     if svc.get("dockerfile_build"):
+        for label, value in (("dockerfile", dockerfile), ("docker_context", docker_context)):
+            path = Path(value)
+            if not value or path.is_absolute() or ".." in path.parts:
+                return False, f"invalid {label} path: {value!r}"
+        if docker_target and not re.fullmatch(r"[A-Za-z0-9_.-]+", docker_target):
+            return False, f"invalid docker target: {docker_target!r}"
+        if not (src / dockerfile).is_file():
+            return False, f"dockerfile not found: {dockerfile}"
+        if not (src / docker_context).is_dir():
+            return False, f"docker context not found: {docker_context}"
+        docker_args += f" --file {shlex.quote(dockerfile)}"
+        if docker_target:
+            docker_args += f" --target {shlex.quote(docker_target)}"
+        if svc.get("oci_build_metadata"):
+            revision = commit_sha if re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha or "") else git_hash
+            source_url = public_github_url(str(svc.get("github") or ""))
+            docker_args += f" --build-arg VCS_REF={shlex.quote(revision)}"
+            docker_args += f" --build-arg SOURCE_URL={shlex.quote(source_url)}"
+        static_build_args = svc.get("docker_build_args")
+        if static_build_args is not None and not isinstance(static_build_args, dict):
+            return False, "docker_build_args must be an object"
+        for key, value in (static_build_args or {}).items():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key)):
+                return False, f"invalid docker build arg: {key!r}"
+            docker_args += f" --build-arg {shlex.quote(str(key))}={shlex.quote(str(value))}"
         for key, value in svc_build_env.items():
             if key and value is not None:
                 docker_args += f" --build-arg {shlex.quote(str(key))}={shlex.quote(str(value))}"
-        append_job_log(job_id, f"dockerfile build local/{svc['image']}:{image_tag}")
+        append_job_log(
+            job_id,
+            f"dockerfile build file={dockerfile} target={docker_target or '(default)'} "
+            f"local/{svc['image']}:{image_tag}",
+        )
 
     if cid_build is not None:
         build_invocation = str(cid_build["command"])
@@ -6893,8 +6986,9 @@ def build_from_source(
             f"elif [[ -f ./build/deploy/deploy.sh ]]; then bash ./build/deploy/deploy.sh{deploy_args}; "
             f"elif [[ -f ./deploy.sh ]]; then bash ./deploy.sh{deploy_args}; "
             "elif [[ -f ./build-image.sh ]]; then bash ./build-image.sh; "
-            f"elif [[ -f ./Dockerfile ]]; then docker build{docker_args} "
-            f"-t local/{shlex.quote(str(svc['image']))}:{shlex.quote(image_tag)} .; "
+            f"elif [[ -f ./{shlex.quote(dockerfile)} ]]; then docker build{docker_args} "
+            f"-t local/{shlex.quote(str(svc['image']))}:{shlex.quote(image_tag)} "
+            f"{shlex.quote(docker_context)}; "
             "else echo 'ERROR: no build/package/build.sh'; exit 1; fi"
         )
         build_timeout = int(CFG.get("build_timeout_sec") or 7200)
@@ -7600,7 +7694,14 @@ def push_one_service(
     set_job(job_id, stage="building")
 
     # Always rebuild; never reuse a previous local image for the same git hash.
-    built, build_error = build_from_source(job_id, svc, git_hash, version, archive_dir)
+    built, build_error = build_from_source(
+        job_id,
+        svc,
+        git_hash,
+        version,
+        archive_dir,
+        commit_sha=commit_sha,
+    )
     if not built:
         result["error"] = build_error or "build failed"
         append_job_log(job_id, f"FAILED service={service_id} stage=building reason={result['error']}")
@@ -9232,19 +9333,12 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 items[0]["branch"] = str(source_artifact.get("branch") or "")
             client_id = _normalize_client_id(data.get("client_id"))
-            frozen_inputs = {}
             try:
-                if str(data.get("deployment_type") or "code").strip().lower() == "code" and CFG.get('freeze_build_inputs'):
-                    from frozen_builds import resolve as freeze_ref
-                    for item in items:
-                        svc = catalog[item['service_id']]
-                        url = svc.get('github') or ('https://github.com/' + svc['repo'] + '.git')
-                        frozen_inputs[item['service_id']] = freeze_ref(clone_url_for(url,
-                            public_https=bool(svc.get('public_https')), prefer_token_https=bool(svc.get('prefer_token_https'))),
-                            item['branch'], run_cmd, git_args, git_env())
-                    if any(not catalog[item['service_id']].get('skip_public_service') for item in items):
-                        frozen_inputs['public-service'] = freeze_ref(clone_url_for(CFG.get('public_service_github') or 'https://github.com/rollingfruit/public-service.git'),
-                            CFG.get('public_service_branch') or 'main', run_cmd, git_args, git_env())
+                frozen_inputs = resolve_frozen_source_inputs(items, catalog, deployment_type)
+            except (ValueError, TypeError, OSError, KeyError, RuntimeError) as exc:
+                self._json(400, {"error": "Source revision resolution failed: " + str(exc)})
+                return
+            try:
                 optional_steps = _normalize_optional_steps(data.get('optional_steps'))
                 if optional_steps.get("production_release") and not release_pipeline:
                     raise ValueError("只有生产发布流水线可以执行生产发布")

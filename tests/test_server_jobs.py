@@ -1177,6 +1177,91 @@ artifacts:
         self.assertNotIn("SKIP_WEBAPP_BUILD", env)
         self.assertNotIn("SKIP_SERVER_BUILD", env)
 
+    @patch.object(server, "run_stream", return_value=0)
+    def test_echoagent_frontend_uses_production_target_and_oci_metadata(self, run_stream) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = server.Path(tmp)
+            dockerfile = workspace / "deploy" / "production" / "Dockerfile"
+            dockerfile.parent.mkdir(parents=True)
+            dockerfile.write_text("FROM scratch AS frontend\n", encoding="utf-8")
+            svc = {
+                "id": "echoagent-frontend",
+                "image": "echoagent-frontend",
+                "repo": "tech-innovation-group/EchoAgent",
+                "github": "https://github.com/tech-innovation-group/EchoAgent.git",
+                "dockerfile_build": True,
+                "dockerfile": "deploy/production/Dockerfile",
+                "docker_target": "frontend",
+                "docker_context": ".",
+                "docker_build_args": {"DEVELOPE_MODE": "false"},
+                "oci_build_metadata": True,
+            }
+            with patch.object(server, "repo_dir", return_value=workspace):
+                ok, detail = server.build_from_source(
+                    "no-job",
+                    svc,
+                    "abcdef1",
+                    commit_sha="abcdef1234567890abcdef1234567890abcdef12",
+                )
+        self.assertTrue(ok, detail)
+        command = " ".join(run_stream.call_args.args[1])
+        self.assertIn("--file deploy/production/Dockerfile", command)
+        self.assertIn("--target frontend", command)
+        self.assertIn("--build-arg DEVELOPE_MODE=false", command)
+        self.assertIn("--build-arg VCS_REF=abcdef1234567890abcdef1234567890abcdef12", command)
+        self.assertIn("--build-arg SOURCE_URL=https://github.com/tech-innovation-group/EchoAgent.git", command)
+        self.assertIn("-t local/echoagent-frontend:", command)
+
+    def test_echoagent_services_have_isolated_workspaces(self) -> None:
+        services = {
+            svc["id"]: svc
+            for svc in server.load_services()
+            if str(svc.get("id") or "").startswith("echoagent-")
+        }
+        self.assertEqual(
+            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
+            set(services),
+        )
+        paths = {server.repo_dir(svc, "deadbeef") for svc in services.values()}
+        self.assertEqual(3, len(paths))
+        self.assertEqual(
+            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
+            {svc["image"] for svc in services.values()},
+        )
+
+    def test_echoagent_router_contract_accepts_nested_dockerfile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = server.Path(tmp)
+            dockerfile = workspace / "dev" / "router" / "Dockerfile"
+            dockerfile.parent.mkdir(parents=True)
+            dockerfile.write_text("FROM scratch AS router\n", encoding="utf-8")
+            ok, detail = server.validate_cloned_repo_contract(
+                workspace,
+                {
+                    "id": "echoagent-router",
+                    "dockerfile_build": True,
+                    "dockerfile": "dev/router/Dockerfile",
+                },
+            )
+        self.assertTrue(ok, detail)
+
+    @patch("frozen_builds.resolve", return_value="a" * 40)
+    def test_echoagent_components_share_one_pinned_source_revision(self, resolve) -> None:
+        catalog = {svc["id"]: svc for svc in server.load_services()}
+        items = [
+            {"service_id": service_id, "branch": "main"}
+            for service_id in (
+                "echoagent-backend",
+                "echoagent-frontend",
+                "echoagent-router",
+            )
+        ]
+        with patch.dict(server.CFG, {"freeze_build_inputs": False}):
+            frozen = server.resolve_frozen_source_inputs(items, catalog, "code")
+        self.assertEqual(1, resolve.call_count)
+        self.assertEqual({item["service_id"] for item in items}, set(frozen))
+        self.assertEqual({"a" * 40}, set(frozen.values()))
+
 
 class FleetRuntimeCacheTests(unittest.TestCase):
     @staticmethod
@@ -1457,6 +1542,14 @@ class JobEndpointTests(unittest.TestCase):
         self.assertIn("last_version", services["multica-server"])
         self.assertTrue(services["multica-fleet"]["archive_only"])
         self.assertEqual("censong574-spec/multica-fleet", services["multica-fleet"]["repo"])
+        self.assertEqual(
+            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
+            {service_id for service_id in services if service_id.startswith("echoagent-")},
+        )
+        self.assertEqual(
+            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
+            {services[service_id]["image"] for service_id in services if service_id.startswith("echoagent-")},
+        )
 
     @patch.object(server, "cached_branches", return_value=["main", "feature/a"])
     def test_push_rejects_branch_not_in_selected_service_cache(self, cached) -> None:

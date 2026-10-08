@@ -102,6 +102,10 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 ## 仓库级 `.cid/build.yaml`
 
+### EchoAgent 多镜像构建
+
+构建页面提供 `EchoAgent Backend`、`EchoAgent Frontend` 和 `EchoAgent Router` 三个可独立选择的构建项。三个构建项都从 `tech-innovation-group/EchoAgent` 的所选分支拉取源码；Backend、Frontend 使用生产 Dockerfile 的对应 target，Router 使用 `dev/router/Dockerfile` 的 `router` target，然后推送到当前配置的 SWR 组织。每个镜像使用独立工作目录，并在任务创建时锁定所选分支的源码提交；镜像标签仍由 robot-ci 统一生成，镜像内写入完整源码提交和公开源码地址的 OCI 标签。
+
 已整改的服务仓以 `.cid/build.yaml` 作为唯一构建契约。robot-ci 在拉取分支后读取该文件，并按 `scripts` 顺序执行启用的 UT、DT 和镜像构建步骤；测试报告格式及路径、构建超时、镜像名称和交付方式也来自该文件。
 
 - `dependencies`、`machine` 由固定构建机环境管理，禁止写入仓库 YAML。
