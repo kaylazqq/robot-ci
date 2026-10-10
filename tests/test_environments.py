@@ -77,6 +77,8 @@ class EnvironmentApiTests(unittest.TestCase):
             "region": "cn-southwest-2",
             "cluster_name": "AgentPlatform",
             "workload_name": "semantic-schedule",
+            "namespace": "echo-prod",
+            "kubeconfig_path": "/etc/robot-ci/kubeconfigs/dev2.yaml",
             "jump_host": "root@122.9.139.49",
             "jump_password": "jump-secret",
             "node_password": "node-secret",
@@ -93,6 +95,8 @@ class EnvironmentApiTests(unittest.TestCase):
         self.assertEqual("semantic-schedule", created["service_id"])
         self.assertEqual("贵阳一", created["region_label"])
         self.assertEqual(["172.31.8.33", "172.31.22.203"], created["nodes"])
+        self.assertEqual("echo-prod", created["namespace"])
+        self.assertEqual("/etc/robot-ci/kubeconfigs/dev2.yaml", created["kubeconfig_path"])
         self.assertNotIn("test_base_url", created)
         self.assertTrue(created["has_jump_password"])
         self.assertTrue(created["has_node_password"])

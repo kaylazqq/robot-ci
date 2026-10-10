@@ -277,6 +277,8 @@ def init_store() -> None:
                     region_label TEXT NOT NULL,
                     cluster_name TEXT NOT NULL,
                     workload_name TEXT NOT NULL,
+                    namespace TEXT NOT NULL DEFAULT 'default',
+                    kubeconfig_path TEXT NOT NULL DEFAULT '/root/.kube/config',
                     jump_host TEXT NOT NULL,
                     jump_password TEXT NOT NULL DEFAULT '',
                     node_password TEXT NOT NULL DEFAULT '',
@@ -311,6 +313,7 @@ def init_store() -> None:
             _ensure_environment_service_column(conn)
             _ensure_environment_workload_columns(conn)
             _ensure_environment_type_column(conn)
+            _ensure_environment_kubernetes_columns(conn)
             _ensure_rollout_recovery_columns(conn)
             _ensure_pipeline_templates_table(conn)
             conn.commit()
@@ -477,6 +480,16 @@ def _ensure_environment_type_column(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE environments SET environment_type='production' WHERE lower(name) LIKE '%prod%' OR lower(workload_name) LIKE '%prod%'")
 
 
+def _ensure_environment_kubernetes_columns(conn: sqlite3.Connection) -> None:
+    cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environments)")}
+    if "namespace" not in cols:
+        conn.execute("ALTER TABLE environments ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'")
+    if "kubeconfig_path" not in cols:
+        conn.execute(
+            "ALTER TABLE environments ADD COLUMN kubeconfig_path TEXT NOT NULL DEFAULT '/root/.kube/config'"
+        )
+
+
 def _ensure_rollout_recovery_columns(conn: sqlite3.Connection) -> None:
     cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(parallel_rollouts)")}
     if "old_manifest_json" not in cols:
@@ -555,6 +568,8 @@ def _environment_from_row(row: sqlite3.Row, *, include_secrets: bool = False) ->
         "cluster_name": str(row["cluster_name"]),
         "workload_name": str(row["workload_name"]),
         "active_workload_name": _row_text(row, "active_workload_name") or str(row["workload_name"]),
+        "namespace": _row_text(row, "namespace", "default") or "default",
+        "kubeconfig_path": _row_text(row, "kubeconfig_path", "/root/.kube/config") or "/root/.kube/config",
         "environment_type": _row_text(row, "environment_type", "dev"),
         "jump_host": str(row["jump_host"]),
         "nodes": [str(item) for item in nodes if str(item).strip()],
@@ -581,6 +596,8 @@ def _validate_environment_payload(
     region = str(data.get("region") or "").strip()
     cluster_name = str(data.get("cluster_name") or "").strip()
     workload_name = str(data.get("workload_name") or "").strip()
+    namespace = str(data.get("namespace") or "default").strip()
+    kubeconfig_path = str(data.get("kubeconfig_path") or "/root/.kube/config").strip()
     jump_host = str(data.get("jump_host") or "").strip()
     jump_password = _secret_text(data.get("jump_password"))
     node_password = _secret_text(data.get("node_password"))
@@ -600,6 +617,10 @@ def _validate_environment_payload(
         return None, "集群名称必填"
     if not workload_name:
         return None, "负载名称必填"
+    if len(namespace) > 63 or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", namespace):
+        return None, "Kubernetes Namespace 格式不正确"
+    if not kubeconfig_path.startswith("/") or any(ch in kubeconfig_path for ch in "\r\n\x00"):
+        return None, "kubeconfig 路径必须是目标节点上的绝对路径"
     if not jump_host:
         return None, "跳板机必填"
     if require_passwords and not jump_password:
@@ -614,6 +635,8 @@ def _validate_environment_payload(
         "cluster_name": cluster_name,
         "workload_name": workload_name,
         "active_workload_name": workload_name,
+        "namespace": namespace,
+        "kubeconfig_path": kubeconfig_path,
         "jump_host": jump_host,
         "jump_password": jump_password,
         "node_password": node_password,
@@ -676,9 +699,10 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
                 """
                 INSERT INTO environments (
                     id, name, service_id, region, region_label, cluster_name, workload_name, active_workload_name,
+                    namespace, kubeconfig_path,
                     jump_host, jump_password, node_password, nodes_json,
                     environment_type, created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
@@ -689,6 +713,8 @@ def create_environment(data: dict[str, Any], username: str = "") -> tuple[dict[s
                     item["cluster_name"],
                     item["workload_name"],
                     item["active_workload_name"],
+                    item["namespace"],
+                    item["kubeconfig_path"],
                     item["jump_host"],
                     item["jump_password"],
                     item["node_password"],
@@ -728,7 +754,7 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                 """
                 UPDATE environments SET
                     name = ?, region = ?, region_label = ?, cluster_name = ?,
-                    workload_name = ?, jump_host = ?, jump_password = ?,
+                    workload_name = ?, namespace = ?, kubeconfig_path = ?, jump_host = ?, jump_password = ?,
                     node_password = ?, nodes_json = ?, environment_type = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -738,6 +764,8 @@ def update_environment(env_id: str, data: dict[str, Any]) -> tuple[dict[str, Any
                     item["region_label"],
                     item["cluster_name"],
                     item["workload_name"],
+                    item["namespace"],
+                    item["kubeconfig_path"],
                     item["jump_host"],
                     item["jump_password"],
                     item["node_password"],
@@ -947,7 +975,7 @@ def _parallel_rollout_remote(record: Mapping[str, Any]) -> tuple[dict[str, Any],
         and cce_rollout.has_ssh_auth(creds)
     ):
         raise cce_rollout.CceRolloutError("环境未配置可用的跳板机、节点或 SSH 凭据")
-    namespace = str(CFG.get("cce_namespace") or "default").strip() or "default"
+    namespace = str(env.get("namespace") or CFG.get("cce_namespace") or "default").strip() or "default"
 
     def run_remote(command: str, timeout: int) -> tuple[int, str, str]:
         return cce_rollout.exec_via_nodes(
@@ -956,6 +984,7 @@ def _parallel_rollout_remote(record: Mapping[str, Any]) -> tuple[dict[str, Any],
             nodes=[str(row) for row in (env.get("nodes") or []) if str(row).strip()],
             creds=creds,
             timeout=timeout,
+            kubeconfig_path=str(env.get("kubeconfig_path") or "/root/.kube/config"),
         )
 
     return env, run_remote, namespace
@@ -8046,7 +8075,7 @@ def maybe_run_gamma_after_build(
                 cce_rollout.resolve_credentials(CFG, os.environ),
                 env,
             )
-            namespace = str(CFG.get("cce_namespace") or "default").strip() or "default"
+            namespace = str(env.get("namespace") or CFG.get("cce_namespace") or "default").strip() or "default"
             timeout = str(CFG.get("cce_rollout_timeout") or "180s").strip() or "180s"
             append_job_log(
                 job_id,

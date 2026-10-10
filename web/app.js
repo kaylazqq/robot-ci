@@ -3257,6 +3257,8 @@ function emptyEnvDraft() {
     region: "cn-southwest-2",
     cluster_name: "",
     workload_name: sid,
+    namespace: "default",
+    kubeconfig_path: "/root/.kube/config",
     jump_host: "",
     nodes: [""],
   };
@@ -3272,6 +3274,8 @@ function collectEnvForm() {
     region: ($("envRegion") && $("envRegion").value) || "cn-southwest-2",
     cluster_name: ($("envCluster") && $("envCluster").value || "").trim(),
     workload_name: ($("envWorkload") && $("envWorkload").value || "").trim(),
+    namespace: ($("envNamespace") && $("envNamespace").value || "").trim(),
+    kubeconfig_path: ($("envKubeconfigPath") && $("envKubeconfigPath").value || "").trim(),
     jump_host: ($("envJump") && $("envJump").value || "").trim(),
     jump_password: ($("envJumpPassword") && $("envJumpPassword").value) || "",
     node_password: ($("envNodePassword") && $("envNodePassword").value) || "",
@@ -3308,6 +3312,10 @@ function envFormHtml(env) {
     '<input id="envCluster" class="input" value="' + esc(data.cluster_name || "") + '" required />' +
     '<label class="label" for="envWorkload">负载名称</label>' +
     '<input id="envWorkload" class="input" value="' + esc(data.workload_name || "") + '" placeholder="CCE 集群中的微服务名称" required />' +
+    '<label class="label" for="envNamespace">Kubernetes Namespace</label>' +
+    '<input id="envNamespace" class="input" value="' + esc(data.namespace || "default") + '" placeholder="例如 echo-prod" required />' +
+    '<label class="label" for="envKubeconfigPath">节点 kubeconfig 路径</label>' +
+    '<input id="envKubeconfigPath" class="input" value="' + esc(data.kubeconfig_path || "/root/.kube/config") + '" placeholder="目标节点上的绝对路径" required />' +
     '<label class="label" for="envJump">跳板机</label>' +
     '<input id="envJump" class="input" value="' + esc(data.jump_host || "") + '" placeholder="用于 SSH 到 CCE 集群" required />' +
     '<label class="label" for="envJumpPassword">跳板机密码</label>' +
@@ -3334,6 +3342,7 @@ function envReadonlyHtml(env) {
     row('所属微服务', owned) + row('环境标签', env.environment_type || 'dev') +
     row('Region', env.region_label || env.region) + row('集群名称', env.cluster_name) +
     row('配置负载', env.workload_name) + row('当前活动负载', env.active_workload_name || env.workload_name) +
+    row('Kubernetes Namespace', env.namespace || 'default') + row('kubeconfig 路径', env.kubeconfig_path || '/root/.kube/config') +
     row('跳板机', env.jump_host) + row('跳板机密码', env.has_jump_password ? '已配置（不显示明文）' : '未配置') +
     '<div class="env-view-row env-view-nodes"><span>节点列表</span><strong>' +
       (nodes.length ? nodes.map((node) => '<code>' + esc(node) + '</code>').join('') : '—') + '</strong></div>' +
@@ -3359,6 +3368,7 @@ function envCardHtml(env) {
     '<div class="env-meta-row"><span class="env-meta-label">微服务:</span><strong class="env-meta-value">' + esc(serviceTitle(services.find((item) => item.id === env.service_id) || { id: env.service_id, title: env.service_id }) || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">Region:</span><strong class="env-meta-value">' + esc(env.region_label || env.region || "—") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">集群:</span><strong class="env-meta-value">' + esc(env.cluster_name || "—") + "</strong></div>" +
+    '<div class="env-meta-row"><span class="env-meta-label">Namespace:</span><strong class="env-meta-value">' + esc(env.namespace || "default") + "</strong></div>" +
     '<div class="env-meta-row"><span class="env-meta-label">负载:</span><strong class="env-meta-value">' + esc(env.workload_name || "—") + "</strong></div>" +
     '</div></article>'
   );

@@ -144,6 +144,8 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 
 环境管理卡片对所有已登录用户开放只读查看，展示环境标签、Region、集群、配置负载、当前活动负载、跳板机、节点及密码是否已配置；密码明文始终不返回。具有环境管理权限的责任人可以创建、编辑和删除环境，其他用户没有写操作入口，服务端仍对写请求校验权限。
 
+每个环境必须单独配置 Kubernetes Namespace 和目标节点上的 kubeconfig 绝对路径。发布命令始终显式使用该 kubeconfig，并在修改 Deployment 前检查文件可读及目标 Namespace 的 Deployment 列表权限；不要使用 CCE 节点内 kubelet/kube-proxy 的加密 kubeconfig。建议将 CCE 导出的私网 kubeconfig或最小权限 ServiceAccount kubeconfig放在 `/etc/robot-ci/kubeconfigs/<cluster>.yaml`，权限设为仅执行用户可读，并确保环境节点列表中的每个候选执行节点路径一致。
+
 例如 V1 → V2 已下线 V1，而 V2 → V3 正在等待下线 V2：回滚第一条记录后仅保留 V1，第二条流水线结束为已完成，发布标记为「已由历史回滚结束」，禁止继续下线及扩缩容。第二条记录的 V2 快照仍保留，可再次回滚到 V2。发布、下线、扩缩容、回滚在同一环境内串行执行；失败回滚保存恢复计划，可重试，未清理完成时不把受影响流水线标为完成。快照恢复 Deployment 配置，不回退数据库或外部配置内容。
 
 ## 安全提醒

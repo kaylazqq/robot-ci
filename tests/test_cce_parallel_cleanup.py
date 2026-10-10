@@ -177,7 +177,12 @@ class ParallelCleanupTests(unittest.TestCase):
     def test_pipeline_records_no_release_on_failed_creation(self):
         self.create_denied = True
         completed = []
-        with patch.object(cce, "exec_via_nodes", side_effect=lambda command, **kw: self.remote(command, kw["timeout"])):
+        def execute(command, **kwargs):  # noqa: ANN003
+            if "KUBECONFIG_NOT_READABLE" in command:
+                return 0, "", ""
+            return self.remote(command, kwargs["timeout"])
+
+        with patch.object(cce, "exec_via_nodes", side_effect=execute):
             ok, error = cce.deploy_job_results(
                 environment={"workload_name": "governance", "active_workload_name": "governance-old", "jump_host": "jump", "nodes": ["node"]},
                 results=[{"service_id": "agent-governance-gw", "ok": True, "remote": "registry/gw:new"}],

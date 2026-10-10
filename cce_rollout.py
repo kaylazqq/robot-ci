@@ -419,18 +419,23 @@ def exec_via_nodes(
     creds: Mapping[str, str],
     timeout: int,
     hop: Callable[..., tuple[int, str, str]] | None = None,
+    kubeconfig_path: str = "",
 ) -> tuple[int, str, str]:
     jump_user, jump_addr, jump_port = parse_ssh_target(jump_host)
     if not nodes:
         raise CceRolloutError("环境未配置 CCE 节点")
     errors: list[str] = []
     runner = hop or hop_exec
+    remote_command = command
+    path = str(kubeconfig_path or "").strip()
+    if path:
+        remote_command = f"export KUBECONFIG={shlex.quote(path)}; {command}"
     node_user_default = str(creds.get("node_user") or "root")
     for raw_node in nodes:
         node_user, node_addr, node_port = parse_ssh_target(raw_node, default_user=node_user_default)
         try:
             return runner(
-                command,
+                remote_command,
                 jump_user=jump_user,
                 jump_host=jump_addr,
                 jump_port=jump_port,
@@ -911,12 +916,15 @@ def deploy_job_results(
     base_workload = str(environment.get("workload_name") or workload).strip()
     env_name = str(environment.get("name") or workload or "environment")
     cluster = str(environment.get("cluster_name") or "").strip()
+    kubeconfig_path = str(environment.get("kubeconfig_path") or "/root/.kube/config").strip()
     if not jump_host:
         return False, "环境未配置跳板机"
     if not nodes:
         return False, "环境未配置 CCE 节点"
     if not workload:
         return False, "环境未配置负载名称"
+    if not kubeconfig_path.startswith("/"):
+        return False, "环境的 kubeconfig 路径必须是目标节点上的绝对路径"
     if not has_ssh_auth(creds):
         return False, (
             "未配置跳板机 SSH 凭据，请在 CI 的 config.json 设置 cce_ssh_password，"
@@ -966,7 +974,29 @@ def deploy_job_results(
             creds=creds,
             timeout=timeout,
             hop=hop,
+            kubeconfig_path=kubeconfig_path,
         )
+
+    path_arg = shlex.quote(kubeconfig_path)
+    ns_arg = shlex.quote(namespace)
+    code, out, err = run_remote(
+        f"test -r {path_arg} || {{ echo KUBECONFIG_NOT_READABLE >&2; exit 42; }}; "
+        f"kubectl --request-timeout=20s -n {ns_arg} get deploy -o name >/dev/null",
+        45,
+    )
+    if code != 0:
+        detail = (err or out or "").strip() or f"exit {code}"
+        lowered = detail.lower()
+        if "kubeconfig_not_readable" in lowered:
+            return False, (
+                f"目标节点无法读取 kubeconfig: {kubeconfig_path}；"
+                "请上传该集群的有效 kubeconfig 并设置仅运行用户可读"
+            )
+        if "localhost:8080" in lowered:
+            return False, f"kubeconfig 未生效，kubectl 仍在访问 localhost:8080: {kubeconfig_path}"
+        if "pem data" in lowered or "invalid key data" in lowered:
+            return False, f"kubeconfig 无效或包含 CCE 节点内部加密凭据: {kubeconfig_path}"
+        return False, f"Kubernetes 发布前检查失败(namespace={namespace}): {detail}"
 
     for service_id, deploy, image, preferred in planned:
         write(f"gamma部署 {service_id} → deploy/{deploy} image={image} mode={mode}")

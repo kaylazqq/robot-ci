@@ -378,6 +378,45 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("SSH", err)
 
+    def test_deploy_job_results_uses_environment_kubeconfig(self) -> None:
+        commands: list[str] = []
+
+        def hop(command, **_kwargs):  # noqa: ANN001
+            commands.append(command)
+            if "get deploy" in command and "-o json" in command:
+                return 0, json.dumps({"spec": {"template": {"spec": {"containers": [
+                    {"name": "container-1", "image": "registry/semantic-schedule:old"}
+                ]}}}}), ""
+            return 0, "ok", ""
+
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "workload_name": "semantic-schedule", "jump_host": "root@jump", "nodes": ["node"],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/dev2.yaml",
+            },
+            results=[{"service_id": "semantic-schedule", "ok": True, "remote": "registry/semantic-schedule:new"}],
+            creds={"jump_password": "x", "node_password": "x"}, hop=hop, namespace="echo-prod",
+        )
+        self.assertTrue(ok, err)
+        self.assertTrue(commands)
+        self.assertTrue(all(command.startswith("export KUBECONFIG=/etc/robot-ci/kubeconfigs/dev2.yaml;") for command in commands))
+        self.assertTrue(any("-n echo-prod get deploy" in command for command in commands))
+
+    def test_deploy_job_results_reports_unreadable_kubeconfig(self) -> None:
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "workload_name": "semantic-schedule", "jump_host": "root@jump", "nodes": ["node"],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/missing.yaml",
+            },
+            results=[{"service_id": "semantic-schedule", "ok": True, "remote": "registry/semantic-schedule:new"}],
+            creds={"jump_password": "x", "node_password": "x"},
+            hop=lambda *_args, **_kwargs: (42, "", "KUBECONFIG_NOT_READABLE"),
+            namespace="echo-prod",
+        )
+        self.assertFalse(ok)
+        self.assertIn("无法读取 kubeconfig", err)
+        self.assertIn("missing.yaml", err)
+
 
 class GammaAfterBuildTests(unittest.TestCase):
     def setUp(self) -> None:
