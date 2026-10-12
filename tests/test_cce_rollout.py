@@ -307,8 +307,39 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertTrue(ok, err)
         self.assertTrue(any("set image" in cmd for cmd in commands))
         self.assertTrue(any("rollout status" in cmd for cmd in commands))
+        self.assertTrue(any("patch deployment" in cmd and '"type":"Recreate"' in cmd for cmd in commands))
         self.assertTrue(any("container-1=" in cmd for cmd in commands))
         self.assertFalse(any("filebeat=" in cmd for cmd in commands))
+
+    def test_replacement_release_restarts_when_image_reference_is_unchanged(self) -> None:
+        commands: list[str] = []
+        image = "registry/echoagent-router:202610121637_52337da"
+
+        def direct(command, **_kwargs):  # noqa: ANN001
+            commands.append(command)
+            if "get deploy echoagent-router -o json" in command:
+                return 0, json.dumps({"spec": {"template": {"spec": {"containers": [
+                    {"name": "router", "image": image}
+                ]}}}}), ""
+            return 0, "rolled out", ""
+
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "workload_name": "echoagent-router",
+                "jump_host": "root@jump",
+                "nodes": [],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/prod.yaml",
+            },
+            results=[{"service_id": "echoagent-router", "ok": True, "remote": image}],
+            creds={"jump_password": "x"},
+            direct=direct,
+            mode="inplace",
+        )
+
+        self.assertTrue(ok, err)
+        release = next(command for command in commands if "set image" in command)
+        self.assertIn("patch deployment", release)
+        self.assertIn("rollout restart deployment/echoagent-router", release)
 
     def test_deploy_job_results_supports_direct_kubectl_on_jump_host(self) -> None:
         commands: list[str] = []

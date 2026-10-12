@@ -606,18 +606,33 @@ def set_image_and_rollout(
     image: str,
     timeout: str,
     kind: str = "deployment",
+    force_restart: bool = False,
 ) -> tuple[int, str, str]:
     if kind not in SUPPORTED_WORKLOAD_KINDS:
         raise CceRolloutError(f"不支持的工作负载类型: {kind}")
     ns = shlex.quote(namespace)
     name = shlex.quote(deploy)
     wait = shlex.quote(timeout)
-    set_cmd = (
-        f"kubectl -n {ns} set image {kind}/{name} {shlex.quote(container)}={shlex.quote(image)} && "
-        f"kubectl -n {ns} rollout status {kind}/{name} --timeout={wait} && "
-        f"kubectl -n {ns} get {kind} {name} -o wide && "
-        f"kubectl -n {ns} get pods -o wide | grep -i {shlex.quote(deploy)} | head -20"
+    commands: list[str] = []
+    if kind == "deployment":
+        recreate_patch = json.dumps(
+            {"spec": {"strategy": {"type": "Recreate", "rollingUpdate": None}}},
+            separators=(",", ":"),
+        )
+        commands.append(
+            f"kubectl -n {ns} patch deployment {name} --type=merge -p {shlex.quote(recreate_patch)}"
+        )
+    commands.append(
+        f"kubectl -n {ns} set image {kind}/{name} {shlex.quote(container)}={shlex.quote(image)}"
     )
+    if force_restart:
+        commands.append(f"kubectl -n {ns} rollout restart {kind}/{name}")
+    commands.extend([
+        f"kubectl -n {ns} rollout status {kind}/{name} --timeout={wait}",
+        f"kubectl -n {ns} get {kind} {name} -o wide",
+        f"kubectl -n {ns} get pods -o wide | grep -i {shlex.quote(deploy)} | head -20",
+    ])
+    set_cmd = " && ".join(commands)
     return run_remote(set_cmd, rollout_timeout_seconds(timeout) + 60)
 
 
@@ -1259,6 +1274,7 @@ def deploy_job_results(
                 image=image,
                 timeout=rollout_timeout,
                 kind=workload_kind,
+                force_restart=current == image,
             )
         except CceRolloutError as exc:
             return False, str(exc)
