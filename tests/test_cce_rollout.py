@@ -221,6 +221,45 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertEqual(2222, kwargs["jump_port"])
         self.assertNotIn("node_host", kwargs)
 
+    def test_list_jump_kubeconfigs_returns_only_safe_yaml_paths(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def direct(command, **kwargs):  # noqa: ANN001, ANN003
+            calls.append((command, kwargs))
+            return 0, (
+                "/etc/robot-ci/kubeconfigs/prod.yaml\x00"
+                "/etc/robot-ci/kubeconfigs/dev.yml\x00"
+                "/etc/robot-ci/kubeconfigs/nested/ignored.yaml\x00"
+                "/tmp/outside.yaml\x00"
+            ), ""
+
+        paths = cce_rollout.list_jump_kubeconfigs(
+            jump_host="ops@jump.example:2222",
+            creds={"jump_password": "secret"},
+            direct=direct,
+        )
+
+        self.assertEqual(
+            [
+                "/etc/robot-ci/kubeconfigs/dev.yml",
+                "/etc/robot-ci/kubeconfigs/prod.yaml",
+            ],
+            paths,
+        )
+        self.assertIn("-maxdepth 1", calls[0][0])
+        self.assertIn("-readable", calls[0][0])
+        self.assertEqual("ops", calls[0][1]["jump_user"])
+        self.assertEqual(2222, calls[0][1]["jump_port"])
+
+    def test_list_jump_kubeconfigs_reports_missing_directory(self) -> None:
+        with self.assertRaises(cce_rollout.CceRolloutError) as failed:
+            cce_rollout.list_jump_kubeconfigs(
+                jump_host="root@jump",
+                creds={"jump_password": "secret"},
+                direct=lambda *_args, **_kwargs: (44, "", "KUBECONFIG_DIR_NOT_FOUND"),
+            )
+        self.assertIn("不存在 kubeconfig 目录", str(failed.exception))
+
     def test_deploy_job_results_sets_image(self) -> None:
         commands: list[str] = []
 

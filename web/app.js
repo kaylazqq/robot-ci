@@ -3263,6 +3263,12 @@ function emptyEnvDraft() {
     nodes: [""],
   };
 }
+function kubeconfigSelectOptionsHtml(currentPath) {
+  const current = String(currentPath || "").trim();
+  return (current ? '<option value="' + esc(current) + '" selected>当前：' + esc(current) + '</option>' : '') +
+    '<option value="">读取跳板机上的配置文件…</option>' +
+    '<option value="__manual__">手工填写路径</option>';
+}
 function collectEnvForm() {
   const nodes = Array.from(document.querySelectorAll("[data-env-node]"))
     .map((el) => (el.value || "").trim())
@@ -3312,12 +3318,16 @@ function envFormHtml(env) {
     '<input id="envWorkload" class="input" value="' + esc(data.workload_name || "") + '" placeholder="CCE 集群中的微服务名称" required />' +
     '<label class="label" for="envNamespace">Kubernetes Namespace</label>' +
     '<input id="envNamespace" class="input" value="' + esc(data.namespace || "default") + '" placeholder="例如 echo-prod" required />' +
-    '<label class="label" for="envKubeconfigPath">kubectl 执行主机上的 kubeconfig 路径</label>' +
-    '<input id="envKubeconfigPath" class="input" value="' + esc(data.kubeconfig_path || "/root/.kube/config") + '" placeholder="跳板机或目标节点上的绝对路径" required />' +
     '<label class="label" for="envJump">跳板机</label>' +
     '<input id="envJump" class="input" value="' + esc(data.jump_host || "") + '" placeholder="用于 SSH 到 CCE 集群" required />' +
     '<label class="label" for="envJumpPassword">跳板机密码</label>' +
     '<input id="envJumpPassword" class="input" type="' + jumpPassType + '" value="" placeholder="' + esc(jumpPassPh) + '" autocomplete="new-password" spellcheck="false"' + (creating ? " required" : "") + " />" +
+    '<label class="label" for="envKubeconfigSelect">跳板机 kubeconfig</label>' +
+    '<div class="row env-kubeconfig-picker"><select id="envKubeconfigSelect" class="input">' + kubeconfigSelectOptionsHtml(data.kubeconfig_path) + '</select>' +
+    '<button type="button" class="btn ghost" id="btnEnvLoadKubeconfigs">读取配置文件</button></div>' +
+    '<small id="envKubeconfigHint" class="env-secret-hint">同一跳板机可选择多套 Kubernetes 配置；也可手工填写绝对路径。</small>' +
+    '<label class="label" for="envKubeconfigPath">kubeconfig 绝对路径</label>' +
+    '<input id="envKubeconfigPath" class="input" value="' + esc(data.kubeconfig_path || "/root/.kube/config") + '" placeholder="跳板机或目标节点上的绝对路径" required />' +
     '<div class="label">节点列表（可选）</div>' +
     '<div id="envNodeList">' + envNodeRowsHtml(data.nodes) + "</div>" +
     '<div class="row"><button type="button" class="btn ghost" id="btnEnvAddNode">' + envIconPlus() + " 添加节点</button></div>" +
@@ -3563,6 +3573,58 @@ async function loadEnvRollouts(id, panel, mode, quiet) {
     return null;
   }
 }
+async function loadEnvKubeconfigs() {
+  setEnvFormError("");
+  const button = $("btnEnvLoadKubeconfigs");
+  const hint = $("envKubeconfigHint");
+  const jumpHost = ($("envJump") && $("envJump").value || "").trim();
+  const jumpPassword = ($("envJumpPassword") && $("envJumpPassword").value) || "";
+  if (!jumpHost) {
+    setEnvFormError("请先填写跳板机");
+    return;
+  }
+  if (!envEditingId && !jumpPassword) {
+    setEnvFormError("请先填写跳板机密码");
+    return;
+  }
+  if (button) button.disabled = true;
+  if (hint) hint.textContent = "正在读取跳板机上的 kubeconfig…";
+  try {
+    const data = await api("/api/environments/kubeconfigs", {
+      method: "POST",
+      body: JSON.stringify({
+        environment_id: envEditingId || "",
+        service_id: currentServiceId && !isAllServices() ? currentServiceId : "",
+        jump_host: jumpHost,
+        jump_password: jumpPassword,
+      }),
+    });
+    const paths = Array.isArray(data.kubeconfigs) ? data.kubeconfigs : [];
+    const select = $("envKubeconfigSelect");
+    const pathInput = $("envKubeconfigPath");
+    const current = pathInput ? pathInput.value.trim() : "";
+    if (select) {
+      const options = paths.map((path) => '<option value="' + esc(path) + '">' + esc(path) + "</option>").join("");
+      const currentOption = current && !paths.includes(current)
+        ? '<option value="' + esc(current) + '">当前：' + esc(current) + "</option>"
+        : "";
+      select.innerHTML = currentOption + options + '<option value="__manual__">手工填写路径</option>';
+      if (current) select.value = current;
+      if (!select.value && paths.length) {
+        select.value = paths[0];
+        if (pathInput) pathInput.value = paths[0];
+      }
+    }
+    if (hint) hint.textContent = paths.length
+      ? "已读取 " + paths.length + " 份配置，请选择目标集群。"
+      : "该跳板机约定目录中没有可读的 .yaml/.yml 配置，可手工填写路径。";
+  } catch (error) {
+    if (hint) hint.textContent = "读取失败，可检查跳板机连接或改为手工填写路径。";
+    throw error;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
 function bindEnvForm() {
   const list = $("envNodeList");
   if (list) {
@@ -3592,6 +3654,20 @@ function bindEnvForm() {
       '<button type="button" class="btn ghost danger" data-env-remove-node>删除</button>';
     list.appendChild(row);
   });
+  const kubeconfigSelect = $("envKubeconfigSelect");
+  if (kubeconfigSelect) {
+    kubeconfigSelect.addEventListener("change", () => {
+      const path = $("envKubeconfigPath");
+      if (!path) return;
+      if (kubeconfigSelect.value === "__manual__") {
+        path.focus();
+        path.select();
+      } else if (kubeconfigSelect.value) {
+        path.value = kubeconfigSelect.value;
+      }
+    });
+  }
+  bind("btnEnvLoadKubeconfigs", () => loadEnvKubeconfigs().catch((e) => setEnvFormError(e.message)));
   bind("btnEnvSave", () => saveEnvironment().catch((e) => setEnvFormError(e.message)));
   bind("btnEnvCancel", () => closeEnvOverlay());
 }

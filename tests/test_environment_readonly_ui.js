@@ -55,4 +55,8 @@ assert.match(source, /if \(ev\.target\.closest\("button, input, select, a"\)\) r
 assert.match(source, /节点列表（可选）/);
 assert.match(source, /节点密码（可选）/);
 assert.doesNotMatch(source, /setEnvFormError\("节点密码必填"\)/);
+assert.match(source, /id="envKubeconfigSelect"/);
+assert.match(source, /id="btnEnvLoadKubeconfigs"/);
+assert.match(source, /\/api\/environments\/kubeconfigs/);
+assert.match(source, /同一跳板机可选择多套 Kubernetes 配置/);
 console.log('Environment read-only view states: passed');

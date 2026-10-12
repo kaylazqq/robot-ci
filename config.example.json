@@ -22,6 +22,7 @@
     "project_id": ""
   },
   "cce_namespace": "default",
+  "cce_kubeconfig_dir": "/etc/robot-ci/kubeconfigs",
   "cce_ssh_password": "",
   "cce_jump_password": "",
   "cce_node_password": "",

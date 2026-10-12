@@ -23,7 +23,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
@@ -792,6 +792,31 @@ def delete_environment(env_id: str) -> bool:
             return cur.rowcount > 0
         finally:
             conn.close()
+
+
+def discover_environment_kubeconfigs(
+    data: Mapping[str, Any],
+    *,
+    existing: Mapping[str, Any] | None = None,
+    direct: Callable[..., tuple[int, str, str]] | None = None,
+) -> list[str]:
+    jump_host = str(data.get("jump_host") or (existing or {}).get("jump_host") or "").strip()
+    if not jump_host:
+        raise cce_rollout.CceRolloutError("请先填写跳板机")
+    environment_auth = {
+        "jump_password": _secret_text(data.get("jump_password"))
+        or _secret_text((existing or {}).get("jump_password")),
+    }
+    creds = cce_rollout.overlay_environment_passwords(
+        cce_rollout.resolve_credentials(CFG, os.environ), environment_auth
+    )
+    directory = str(CFG.get("cce_kubeconfig_dir") or "/etc/robot-ci/kubeconfigs").strip()
+    return cce_rollout.list_jump_kubeconfigs(
+        jump_host=jump_host,
+        creds=creds,
+        directory=directory,
+        direct=direct,
+    )
 
 
 def list_service_permissions(service_id: str) -> list[dict[str, Any]]:
@@ -4618,6 +4643,14 @@ def load_config() -> dict[str, Any]:
     }
     cfg["cce_namespace"] = (
         str(cfg.get("cce_namespace") or os.environ.get("CCE_NAMESPACE") or "default").strip() or "default"
+    )
+    cfg["cce_kubeconfig_dir"] = (
+        str(
+            os.environ.get("CCE_KUBECONFIG_DIR")
+            or cfg.get("cce_kubeconfig_dir")
+            or "/etc/robot-ci/kubeconfigs"
+        ).strip()
+        or "/etc/robot-ci/kubeconfigs"
     )
     cfg["cce_ssh_password"] = (
         str(os.environ.get("CCE_SSH_PASSWORD") or cfg.get("cce_ssh_password") or "").strip()
@@ -9001,6 +9034,24 @@ class Handler(SimpleHTTPRequestHandler):
             save_config_value("github_token", (data.get("github_token") or "").strip())
             reload_cfg()
             self._json(200, {"ok": True, "github_token_configured": bool(CFG.get("github_token"))})
+            return
+
+        if path == "/api/environments/kubeconfigs":
+            environment_id = str(data.get("environment_id") or "").strip()
+            existing = get_environment(environment_id, include_secrets=True) if environment_id else None
+            if environment_id and existing is None:
+                self._json(404, {"ok": False, "error": "环境不存在"})
+                return
+            service_id = str((existing or {}).get("service_id") or data.get("service_id") or "").strip()
+            if not _has_service_permission(service_id, "environment_manage", user):
+                self._json(403, {"ok": False, "error": "没有环境管理权限"})
+                return
+            try:
+                paths = discover_environment_kubeconfigs(data, existing=existing)
+            except cce_rollout.CceRolloutError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+                return
+            self._json(200, {"ok": True, "kubeconfigs": paths})
             return
 
         if path == "/api/environments":

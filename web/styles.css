@@ -1441,6 +1441,9 @@ body.clone-open { overflow: hidden; }
 @keyframes rollout-spin { to { transform: rotate(360deg); } }
 .env-form-card .label { margin-top: 10px; }
 .env-form-card .label:first-child { margin-top: 0; }
+.env-kubeconfig-picker { flex-wrap: nowrap; align-items: center; }
+.env-kubeconfig-picker .input { flex: 1; min-width: 0; }
+.env-kubeconfig-picker .btn { flex: none; }
 .env-secret-hint {
   margin: 8px 0 0;
   font-size: 12px;

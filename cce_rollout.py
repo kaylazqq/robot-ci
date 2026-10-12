@@ -462,6 +462,57 @@ def jump_exec(
             pass
 
 
+def list_jump_kubeconfigs(
+    *,
+    jump_host: str,
+    creds: Mapping[str, str],
+    directory: str = "/etc/robot-ci/kubeconfigs",
+    direct: Callable[..., tuple[int, str, str]] | None = None,
+) -> list[str]:
+    """List readable YAML kubeconfigs from one fixed directory on a jump host."""
+    root = str(directory or "").strip().rstrip("/")
+    if not root.startswith("/") or any(ch in root for ch in "\r\n\x00"):
+        raise CceRolloutError("kubeconfig 目录必须是绝对路径")
+    if not has_jump_auth(creds):
+        raise CceRolloutError("未配置跳板机 SSH 凭据")
+    jump_user, jump_addr, jump_port = parse_ssh_target(jump_host)
+    runner = direct or jump_exec
+    root_arg = shlex.quote(root)
+    command = (
+        f"test -d {root_arg} || {{ echo KUBECONFIG_DIR_NOT_FOUND >&2; exit 44; }}; "
+        f"find {root_arg} -maxdepth 1 -type f -readable "
+        "\\( -name '*.yaml' -o -name '*.yml' \\) -print0"
+    )
+    code, out, err = runner(
+        command,
+        jump_user=jump_user,
+        jump_host=jump_addr,
+        jump_port=jump_port,
+        jump_password=str(creds.get("jump_password") or ""),
+        ssh_key=str(creds.get("ssh_key") or ""),
+        timeout=30,
+    )
+    if code != 0:
+        detail = (err or out or "").strip() or f"exit {code}"
+        if "KUBECONFIG_DIR_NOT_FOUND" in detail:
+            raise CceRolloutError(f"跳板机上不存在 kubeconfig 目录: {root}")
+        raise CceRolloutError(f"读取跳板机 kubeconfig 列表失败: {detail}")
+    prefix = root + "/"
+    paths: list[str] = []
+    for value in out.split("\x00"):
+        path = value.strip()
+        if not path or not path.startswith(prefix):
+            continue
+        relative = path[len(prefix):]
+        if not relative or "/" in relative or any(ord(ch) < 32 for ch in path):
+            continue
+        if path not in paths:
+            paths.append(path)
+        if len(paths) >= 100:
+            break
+    return sorted(paths)
+
+
 def exec_via_nodes(
     command: str,
     *,

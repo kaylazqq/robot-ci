@@ -223,6 +223,61 @@ class EnvironmentApiTests(unittest.TestCase):
         self.assertTrue(created["has_jump_password"])
         self.assertFalse(created["has_node_password"])
 
+    def test_kubeconfig_picker_lists_multiple_files_from_selected_jump_host(self) -> None:
+        cookie = self._login()
+        payload = {
+            "service_id": "semantic-schedule",
+            "jump_host": "ops@jump.example:2222",
+            "jump_password": "jump-secret",
+        }
+        expected = [
+            "/etc/robot-ci/kubeconfigs/dev.yaml",
+            "/etc/robot-ci/kubeconfigs/prod.yaml",
+        ]
+        with patch.object(server.cce_rollout, "list_jump_kubeconfigs", return_value=expected) as discover:
+            with self._open(
+                "/api/environments/kubeconfigs",
+                data=json.dumps(payload).encode(),
+                method="POST",
+                cookie=cookie,
+            ) as response:
+                result = json.loads(response.read().decode())
+
+        self.assertEqual(expected, result["kubeconfigs"])
+        kwargs = discover.call_args.kwargs
+        self.assertEqual("ops@jump.example:2222", kwargs["jump_host"])
+        self.assertEqual("jump-secret", kwargs["creds"]["jump_password"])
+        self.assertEqual("/etc/robot-ci/kubeconfigs", kwargs["directory"])
+        self.assertNotIn("jump-secret", json.dumps(result))
+
+    def test_kubeconfig_picker_reuses_saved_jump_password_when_editing(self) -> None:
+        env, err = server.create_environment({
+            "name": "saved",
+            "service_id": "semantic-schedule",
+            "region": "cn-southwest-2",
+            "cluster_name": "cluster",
+            "workload_name": "semantic-schedule",
+            "jump_host": "root@jump",
+            "jump_password": "saved-secret",
+            "nodes": [],
+        })
+        self.assertEqual("", err)
+        cookie = self._login()
+        with patch.object(server.cce_rollout, "list_jump_kubeconfigs", return_value=[]) as discover:
+            with self._open(
+                "/api/environments/kubeconfigs",
+                data=json.dumps({
+                    "environment_id": env["id"],
+                    "jump_host": "root@jump",
+                    "jump_password": "",
+                }).encode(),
+                method="POST",
+                cookie=cookie,
+            ) as response:
+                self.assertEqual([], json.loads(response.read().decode())["kubeconfigs"])
+
+        self.assertEqual("saved-secret", discover.call_args.kwargs["creds"]["jump_password"])
+
     def test_create_requires_known_service(self) -> None:
         cookie = self._login()
         base = {
