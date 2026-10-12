@@ -1141,9 +1141,21 @@ function openPushTargetEditor(target) {
     button.disabled = true;
     showError("");
     try {
+      const name = wrap.querySelector("#pushTargetName").value.trim();
+      if (!editing) {
+        await reloadPushTargets();
+        const existingTarget = pushTargets.find((item) => item.name === name);
+        if (existingTarget) {
+          closeModal();
+          runPreviewSelection.pushTargetId = existingTarget.id;
+          renderPushTargetBlock();
+          setPreviewHint("推送配置「" + existingTarget.name + "」已存在，已直接选用；同一配置可被多条流水线共享");
+          return;
+        }
+      }
       const payload = {
         service_id: currentServiceId,
-        name: wrap.querySelector("#pushTargetName").value.trim(),
+        name,
         namespace: wrap.querySelector("#pushTargetNamespace").value.trim(),
         login_command: wrap.querySelector("#pushTargetLoginCommand").value.trim(),
       };

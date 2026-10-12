@@ -1048,7 +1048,7 @@ def save_registry_target(data: Mapping[str, Any], actor: str, target_id: str = "
             finally:
                 conn.close()
     except sqlite3.IntegrityError:
-        return None, "同一微服务下推送目标名称不能重复"
+        return None, "同一微服务下已存在同名推送配置，请直接选择已有配置"
     saved = get_registry_target(item_id)
     return _public_registry_target(saved or {}), ""
 

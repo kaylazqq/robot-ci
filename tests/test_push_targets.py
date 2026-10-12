@@ -69,6 +69,18 @@ class PushTargetTests(unittest.TestCase):
         private = server.get_registry_target(target["id"], include_secret=True)
         self.assertEqual(password, private["password"])
 
+        duplicate, duplicate_error = server.save_registry_target(
+            {
+                "service_id": "echoagent-frontend",
+                "name": "第二账号",
+                "namespace": "another_org",
+                "login_command": f"docker login -u build-user -p {password} swr.example.com",
+            },
+            "l30042018",
+        )
+        self.assertIsNone(duplicate)
+        self.assertEqual("同一微服务下已存在同名推送配置，请直接选择已有配置", duplicate_error)
+
         template = next(
             item
             for item in server.list_pipeline_templates("l30042018", "echoagent-frontend")
