@@ -227,6 +227,14 @@ def has_jump_auth(creds: Mapping[str, str]) -> bool:
     return any(path.is_file() for path in default_key_candidates())
 
 
+def has_explicit_node_auth(creds: Mapping[str, str]) -> bool:
+    """Node hopping is opt-in; local default keys must not select it accidentally."""
+    if str(creds.get("node_password") or "").strip():
+        return True
+    key = str(creds.get("ssh_key") or "").strip()
+    return bool(key and Path(key).expanduser().is_file())
+
+
 def image_matches_workload(image: str, workload: str) -> bool:
     repo = image_ref_name(image).lower().replace("_", "-")
     name = str(workload or "").strip().lower().replace("_", "-")
@@ -1128,6 +1136,9 @@ def deploy_job_results(
     write = log or (lambda _line: None)
     jump_host = str(environment.get("jump_host") or "").strip()
     nodes = [str(item).strip() for item in (environment.get("nodes") or []) if str(item).strip()]
+    if nodes and not has_explicit_node_auth(creds):
+        write("环境配置了节点但未配置节点认证，忽略节点列表并在跳板机使用 kubeconfig")
+        nodes = []
     workload = str(environment.get("active_workload_name") or environment.get("workload_name") or "").strip()
     base_workload = str(environment.get("workload_name") or workload).strip()
     env_name = str(environment.get("name") or workload or "environment")

@@ -376,6 +376,46 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertTrue(any("kubectl执行位置=跳板机" in line for line in logs))
         self.assertTrue(all(command.startswith("export KUBECONFIG=/etc/robot-ci/kubeconfigs/prod.yaml;") for command in commands))
 
+    def test_deploy_ignores_stale_nodes_without_explicit_node_auth(self) -> None:
+        direct_commands: list[str] = []
+        hop_calls: list[str] = []
+
+        def direct(command, **_kwargs):  # noqa: ANN001
+            direct_commands.append(command)
+            if "get deploy echoagent-router -o json" in command:
+                return 0, json.dumps({"spec": {"template": {"spec": {"containers": [
+                    {"name": "router", "image": "registry/echoagent-router:old"}
+                ]}}}}), ""
+            return 0, "rolled out", ""
+
+        def hop(command, **_kwargs):  # noqa: ANN001
+            hop_calls.append(command)
+            return 1, "", "unexpected hop"
+
+        logs: list[str] = []
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "workload_name": "echoagent-router",
+                "jump_host": "root@jump",
+                "nodes": ["10.20.0.214"],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/prod.yaml",
+            },
+            results=[{
+                "service_id": "echoagent-router",
+                "ok": True,
+                "remote": "registry/echoagent-router:202610121700_abc1234",
+            }],
+            creds={"jump_password": "x"},
+            direct=direct,
+            hop=hop,
+            log=logs.append,
+        )
+
+        self.assertTrue(ok, err)
+        self.assertTrue(direct_commands)
+        self.assertFalse(hop_calls)
+        self.assertTrue(any("忽略节点列表" in line for line in logs))
+
     def test_statefulset_inplace_release_uses_statefulset_commands(self) -> None:
         commands: list[str] = []
         statefulset = {
