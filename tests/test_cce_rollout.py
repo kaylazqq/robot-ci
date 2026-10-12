@@ -345,6 +345,89 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertTrue(any("kubectl执行位置=跳板机" in line for line in logs))
         self.assertTrue(all(command.startswith("export KUBECONFIG=/etc/robot-ci/kubeconfigs/prod.yaml;") for command in commands))
 
+    def test_statefulset_inplace_release_uses_statefulset_commands(self) -> None:
+        commands: list[str] = []
+        statefulset = {
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "echoagent-backend"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "backend", "image": "registry/echoagent-backend:old"}
+            ]}}},
+        }
+
+        def direct(command, **_kwargs):  # noqa: ANN001
+            commands.append(command)
+            if "get deploy echoagent-backend -o json" in command:
+                return 1, "", 'deployments.apps "echoagent-backend" not found'
+            if "get statefulset echoagent-backend -o json" in command:
+                return 0, json.dumps(statefulset), ""
+            return 0, "statefulset rolling update complete", ""
+
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "name": "prod",
+                "workload_name": "echoagent-backend",
+                "jump_host": "root@jump",
+                "nodes": [],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/prod.yaml",
+            },
+            results=[{
+                "service_id": "echoagent-backend",
+                "ok": True,
+                "remote": "registry/echoagent-backend:202610121700_abc1234",
+            }],
+            creds={"jump_password": "x"},
+            direct=direct,
+            mode="inplace",
+        )
+
+        self.assertTrue(ok, err)
+        release = next(command for command in commands if "set image" in command)
+        self.assertIn("set image statefulset/echoagent-backend", release)
+        self.assertIn("rollout status statefulset/echoagent-backend", release)
+
+    def test_statefulset_parallel_release_is_rejected_before_mutation(self) -> None:
+        commands: list[str] = []
+        statefulset = {
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "echoagent-backend"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "backend", "image": "registry/echoagent-backend:old"}
+            ]}}},
+        }
+
+        def direct(command, **_kwargs):  # noqa: ANN001
+            commands.append(command)
+            if "get deploy echoagent-backend -o json" in command:
+                return 1, "", "not found"
+            if "get statefulset echoagent-backend -o json" in command:
+                return 0, json.dumps(statefulset), ""
+            return 0, "", ""
+
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "workload_name": "echoagent-backend",
+                "jump_host": "root@jump",
+                "nodes": [],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/prod.yaml",
+            },
+            results=[{
+                "service_id": "echoagent-backend",
+                "ok": True,
+                "remote": "registry/echoagent-backend:202610121700_abc1234",
+            }],
+            creds={"jump_password": "x"},
+            direct=direct,
+            mode="parallel",
+            release_id="job-202610121700",
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("StatefulSet echoagent-backend 不支持平滑升级，请选择替换升级", err)
+        self.assertFalse(any("set image" in command or "create -f" in command for command in commands))
+
     def test_deploy_job_results_parallel_creates_a_second_deployment(self) -> None:
         commands: list[str] = []
         source = {

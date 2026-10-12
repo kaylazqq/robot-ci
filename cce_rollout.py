@@ -564,21 +564,37 @@ def exec_via_nodes(
     raise CceRolloutError("所有节点 SSH 失败: " + " | ".join(errors))
 
 
-def inspect_containers(run_remote: RemoteFn, namespace: str, deploy: str) -> list[tuple[str, str]]:
+SUPPORTED_WORKLOAD_KINDS = ("deployment", "statefulset")
+
+
+def workload_display_name(kind: str) -> str:
+    return "StatefulSet" if kind == "statefulset" else "Deployment"
+
+
+def inspect_containers(
+    run_remote: RemoteFn,
+    namespace: str,
+    deploy: str,
+    *,
+    kind: str = "deployment",
+) -> list[tuple[str, str]]:
+    if kind not in SUPPORTED_WORKLOAD_KINDS:
+        raise CceRolloutError(f"不支持的工作负载类型: {kind}")
     ns = shlex.quote(namespace)
     name = shlex.quote(deploy)
-    code, out, err = run_remote(f"kubectl -n {ns} get deploy {name} -o json", 60)
+    display = workload_display_name(kind)
+    code, out, err = run_remote(f"kubectl -n {ns} get {kind} {name} -o json", 60)
     if code != 0:
         detail = (err or out or "").strip() or f"exit {code}"
-        raise CceRolloutError(f"读取 Deployment {deploy} 失败: {detail}")
+        raise CceRolloutError(f"读取 {display} {deploy} 失败: {detail}")
     try:
         payload = json.loads(out)
     except json.JSONDecodeError as exc:
-        raise CceRolloutError(f"Deployment {deploy} 返回的不是 JSON") from exc
+        raise CceRolloutError(f"{display} {deploy} 返回的不是 JSON") from exc
     rows = containers_from_deploy_json(payload)
     if rows:
         return rows
-    raise CceRolloutError(f"Deployment {deploy} 没有 containers")
+    raise CceRolloutError(f"{display} {deploy} 没有 containers")
 
 
 def set_image_and_rollout(
@@ -589,14 +605,17 @@ def set_image_and_rollout(
     container: str,
     image: str,
     timeout: str,
+    kind: str = "deployment",
 ) -> tuple[int, str, str]:
+    if kind not in SUPPORTED_WORKLOAD_KINDS:
+        raise CceRolloutError(f"不支持的工作负载类型: {kind}")
     ns = shlex.quote(namespace)
     name = shlex.quote(deploy)
     wait = shlex.quote(timeout)
     set_cmd = (
-        f"kubectl -n {ns} set image deploy/{name} {shlex.quote(container)}={shlex.quote(image)} && "
-        f"kubectl -n {ns} rollout status deploy/{name} --timeout={wait} && "
-        f"kubectl -n {ns} get deploy {name} -o wide && "
+        f"kubectl -n {ns} set image {kind}/{name} {shlex.quote(container)}={shlex.quote(image)} && "
+        f"kubectl -n {ns} rollout status {kind}/{name} --timeout={wait} && "
+        f"kubectl -n {ns} get {kind} {name} -o wide && "
         f"kubectl -n {ns} get pods -o wide | grep -i {shlex.quote(deploy)} | head -20"
     )
     return run_remote(set_cmd, rollout_timeout_seconds(timeout) + 60)
@@ -726,6 +745,36 @@ def get_deployment_payload(run_remote: RemoteFn, *, namespace: str, deploy: str)
     return payload
 
 
+def get_workload_payload(
+    run_remote: RemoteFn,
+    *,
+    namespace: str,
+    name: str,
+    kind: str,
+) -> dict[str, Any] | None:
+    if kind not in SUPPORTED_WORKLOAD_KINDS:
+        raise CceRolloutError(f"不支持的工作负载类型: {kind}")
+    if kind == "deployment":
+        return get_deployment_payload(run_remote, namespace=namespace, deploy=name)
+    code, out, err = run_remote(
+        f"kubectl -n {shlex.quote(namespace)} get {kind} {shlex.quote(name)} -o json", 60
+    )
+    display = workload_display_name(kind)
+    if code != 0:
+        text = (err or out or "").lower()
+        if "notfound" in text or "not found" in text:
+            return None
+        detail = (err or out or "").strip() or f"exit {code}"
+        raise CceRolloutError(f"读取 {display} {name} 失败: {detail}")
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise CceRolloutError(f"{display} {name} 返回的不是 JSON") from exc
+    if not isinstance(payload, dict):
+        raise CceRolloutError(f"{display} {name} 返回的不是对象")
+    return payload
+
+
 def list_namespace_deployments(run_remote: RemoteFn, *, namespace: str) -> list[dict[str, Any]]:
     code, out, err = run_remote(
         f"kubectl -n {shlex.quote(namespace)} get deploy -o json", 90
@@ -832,6 +881,45 @@ def resolve_source_deployment(
         f"源负载不存在（已查：{hint}），按基准名 {discover_base} 近似查询也无结果。"
         "请更新环境中的负载名称后重试"
     )
+
+
+def resolve_source_workload(
+    run_remote: RemoteFn,
+    *,
+    namespace: str,
+    active: str,
+    baseline: str,
+    log: Callable[[str], None] | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Resolve an exact Deployment/StatefulSet, retaining Deployment discovery fallback."""
+    write = log or (lambda _line: None)
+    active_name = str(active or "").strip()
+    baseline_name = str(baseline or "").strip()
+    tried: list[str] = []
+    for name in (active_name, baseline_name):
+        if not name or name in tried:
+            continue
+        tried.append(name)
+        for kind in SUPPORTED_WORKLOAD_KINDS:
+            payload = get_workload_payload(run_remote, namespace=namespace, name=name, kind=kind)
+            if payload is not None:
+                if active_name and name != active_name:
+                    write(f"活动负载 {active_name} 不存在，改用基准负载 {name}")
+                return kind, name, payload
+        if name == active_name and baseline_name and baseline_name != active_name:
+            write(f"活动负载 {active_name} 不存在，尝试基准负载 {baseline_name}")
+        else:
+            write(f"负载 {name} 不存在")
+
+    # Only Deployments support historical parallel-release discovery.
+    name, payload = resolve_source_deployment(
+        run_remote,
+        namespace=namespace,
+        active="",
+        baseline=baseline_name or active_name,
+        log=write,
+    )
+    return "deployment", name, payload
 
 
 def create_parallel_deployment(
@@ -1093,7 +1181,7 @@ def deploy_job_results(
     ns_arg = shlex.quote(namespace)
     code, out, err = run_remote(
         f"test -r {path_arg} || {{ echo KUBECONFIG_NOT_READABLE >&2; exit 42; }}; "
-        f"kubectl --request-timeout=20s -n {ns_arg} get deploy -o name >/dev/null",
+        f"kubectl --request-timeout=20s -n {ns_arg} get deployment,statefulset -o name >/dev/null",
         45,
     )
     if code != 0:
@@ -1111,26 +1199,31 @@ def deploy_job_results(
         return False, f"Kubernetes 发布前检查失败(namespace={namespace}): {detail}"
 
     for service_id, deploy, image, preferred in planned:
-        write(f"gamma部署 {service_id} → deploy/{deploy} image={image} mode={mode}")
+        write(f"gamma部署 {service_id} → workload/{deploy} image={image} mode={mode}")
         try:
-            source_name, source_payload = resolve_source_deployment(
+            workload_kind, source_name, source_payload = resolve_source_workload(
                 run_remote,
                 namespace=namespace,
                 active=deploy,
                 baseline=base_workload,
                 log=write,
             )
+            display = workload_display_name(workload_kind)
             if source_name != deploy:
-                write(f"实际源负载切换为 deploy/{source_name}")
+                write(f"实际源负载切换为 {workload_kind}/{source_name}")
                 deploy = source_name
             containers = containers_from_deploy_json(source_payload)
             if not containers:
-                raise CceRolloutError(f"Deployment {deploy} 没有 containers")
+                raise CceRolloutError(f"{display} {deploy} 没有 containers")
             container = pick_container(containers, image=image, preferred=preferred)
             current = next((img for name, img in containers if name == container), "")
             if current:
                 write(f"当前容器 {container}={current}")
             if mode == "parallel":
+                if workload_kind != "deployment":
+                    raise CceRolloutError(
+                        f"{display} {deploy} 不支持平滑升级，请选择替换升级"
+                    )
                 write(f"创建新版本 Deployment，旧版本 {deploy} 保持不变")
                 created = create_parallel_deployment(
                     run_remote,
@@ -1157,7 +1250,7 @@ def deploy_job_results(
                 else:
                     write(f"新版本负载已创建 deploy/{created['name']} 实例=0，等待手动扩容")
                 continue
-            write(f"kubectl set image deploy/{deploy} {container}={image}")
+            write(f"kubectl set image {workload_kind}/{deploy} {container}={image}")
             code, out, err = set_image_and_rollout(
                 run_remote,
                 namespace=namespace,
@@ -1165,6 +1258,7 @@ def deploy_job_results(
                 container=container,
                 image=image,
                 timeout=rollout_timeout,
+                kind=workload_kind,
             )
         except CceRolloutError as exc:
             return False, str(exc)
@@ -1174,5 +1268,5 @@ def deploy_job_results(
                 write(line)
         if code != 0:
             return False, f"kubectl 升级 {deploy} 失败 (exit {code})"
-        write(f"gamma部署完成 {service_id} deploy/{deploy} container={container}")
+        write(f"gamma部署完成 {service_id} {workload_kind}/{deploy} container={container}")
     return True, ""
