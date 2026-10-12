@@ -14,4 +14,9 @@ assert.match(pickerSource, /id: 'inplace'/);
 assert.doesNotMatch(pickerSource, /id: 'inplace'[^\n]*disabled:\s*true/);
 assert.match(pickerSource, /runPreviewSelection\.deploymentMode = choice\.id/);
 
-console.log('Release mode picker options: passed');
+assert.match(source, /deploymentMode: \(tpl && tpl\.deployment_mode\) \|\| "parallel"/);
+assert.match(source, /deployment_mode: runPreviewSelection\.deploymentMode \|\| "parallel"/);
+assert.match(source, /runLayerMode === "edit"[\s\S]*createReleaseModePicker/);
+assert.match(source, /createConfiguredRunSummary\(doc, stage\.id\)/);
+
+console.log('Pipeline-configured release options: passed');

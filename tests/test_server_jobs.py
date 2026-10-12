@@ -1451,6 +1451,18 @@ class JobEndpointTests(unittest.TestCase):
             item for item in server.list_pipeline_templates(server.DEFAULT_USERNAME, "memory-service")
             if item["kind"] == "release" and item["builtin"]
         )
+        release_template, error = server.update_pipeline_template(
+            server.DEFAULT_USERNAME,
+            release_template["id"],
+            {
+                **release_template,
+                "gamma_deploy": False,
+                "gamma_test": False,
+                "release_environment_id": "package-env",
+                "deployment_mode": "inplace",
+            },
+        )
+        self.assertEqual("", error)
         artifact = {
             "job_id": "source-job",
             "service_id": "memory-service",
@@ -1470,7 +1482,7 @@ class JobEndpointTests(unittest.TestCase):
             "artifact_job_id": "source-job",
             "optional_steps": {
                 "production_release": True,
-                "release_environment_id": "package-env",
+                "release_environment_id": "ignored-runtime-env",
                 "deployment_mode": "parallel",
             },
         }
@@ -1487,6 +1499,8 @@ class JobEndpointTests(unittest.TestCase):
             created = server._jobs[created_payload["job_id"]]
         self.assertEqual("package", created["deployment_type"])
         self.assertEqual("memory.tar", created["package_name"])
+        self.assertEqual("package-env", created["optional_steps"]["release_environment_id"])
+        self.assertEqual("inplace", created["optional_steps"]["deployment_mode"])
 
     def test_personal_pipeline_rejects_package_and_production_release(self) -> None:
         personal = next(

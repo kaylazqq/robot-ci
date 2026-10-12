@@ -1058,7 +1058,7 @@ function applyTemplateDefaults(tpl) {
     test: !!(tpl && tpl.gamma_test),
     environmentId: (tpl && (hasReleaseEnvironment ? tpl.release_environment_id : tpl.environment_id)) || "",
     gammaEnvironmentId: (tpl && (hasGammaEnvironment ? tpl.gamma_environment_id : tpl.environment_id)) || "",
-    deploymentMode: "",
+    deploymentMode: (tpl && tpl.deployment_mode) || "parallel",
     pushTargetId: (tpl && tpl.push_target_id) || "",
   };
 }
@@ -1295,7 +1295,7 @@ function confirmRunPreview() {
     return;
   }
   if (runPreviewSelection.deploy && (!runPreviewSelection.environmentId || !runPreviewSelection.deploymentMode)) {
-    setPreviewHint("请为生产发布选择环境和部署方式");
+    setPreviewHint("流水线未配置生产发布环境或部署方式，请先编辑流水线");
     return;
   }
   if (deploymentType === "package") {
@@ -1333,6 +1333,7 @@ async function saveEditedTemplate() {
       environment_id: runPreviewSelection.environmentId || "",
       release_environment_id: runPreviewSelection.environmentId || "",
       gamma_environment_id: runPreviewSelection.gammaEnvironmentId || "",
+      deployment_mode: runPreviewSelection.deploymentMode || "parallel",
       push_target_id: runPreviewSelection.pushTargetId || "",
     }),
   });
@@ -1562,7 +1563,10 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
   const tree = doc.createElement("div");
   tree.className = "pl-tree";
   if (preview && stage.id === "release" && runPreviewSelection.deploy) {
-    [createGammaEnvPicker(doc, stage.id), createReleaseModePicker(doc)].forEach((picker) => {
+    const releaseOptions = runLayerMode === "edit"
+      ? [createGammaEnvPicker(doc, stage.id), createReleaseModePicker(doc)]
+      : [createConfiguredRunSummary(doc, stage.id)];
+    releaseOptions.forEach((picker) => {
       const optionsRow = doc.createElement("div");
       optionsRow.className = "pl-task pl-env-row pl-release-options";
       optionsRow.appendChild(doc.createElement("span"));
@@ -1575,7 +1579,7 @@ function createStageColumn(stage, incomingComplete, outgoingComplete, onStep, pr
     envRow.className = "pl-task pl-env-row";
     envRow.appendChild(doc.createElement("span"));
     envRow.appendChild(createStatusIcon("pending", "pl-task-icon", doc));
-    envRow.appendChild(createGammaEnvPicker(doc, stage.id));
+    envRow.appendChild(runLayerMode === "edit" ? createGammaEnvPicker(doc, stage.id) : createConfiguredRunSummary(doc, stage.id));
     tree.appendChild(envRow);
   }
   (stage.tasks || []).forEach((task) => {
@@ -1634,6 +1638,19 @@ function selectedEnvName(kind) {
   const id = kind === "gamma" ? runPreviewSelection.gammaEnvironmentId : runPreviewSelection.environmentId;
   const env = environments.find((item) => item.id === id);
   return env ? (env.name || "未命名环境") : "";
+}
+function createConfiguredRunSummary(doc, kind) {
+  doc = doc || document;
+  const summary = doc.createElement("div");
+  summary.className = "pl-env-pick pl-config-summary";
+  const environmentName = selectedEnvName(kind) || "未配置环境";
+  if (kind === "release") {
+    const modeName = runPreviewSelection.deploymentMode === "inplace" ? "替换升级" : "平滑升级";
+    summary.textContent = environmentName + " · " + modeName;
+  } else {
+    summary.textContent = environmentName;
+  }
+  return summary;
 }
 function createGammaEnvPicker(doc, kind) {
   doc = doc || document;

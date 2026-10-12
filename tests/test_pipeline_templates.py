@@ -78,6 +78,7 @@ class PipelineTemplateApiTests(unittest.TestCase):
         self.assertTrue(release["gamma_deploy"])
         self.assertTrue(release["gamma_test"])
         self.assertTrue(release["production_release"])
+        self.assertEqual("parallel", release["deployment_mode"])
 
         with self._open(
             "/api/pipeline-templates/" + personal["id"],
@@ -121,6 +122,7 @@ class PipelineTemplateApiTests(unittest.TestCase):
                     "production_release": True,
                     "release_environment_id": "prod-colink",
                     "gamma_environment_id": "",
+                    "deployment_mode": "inplace",
                 }
             ).encode(),
             method="POST",
@@ -130,6 +132,7 @@ class PipelineTemplateApiTests(unittest.TestCase):
         self.assertTrue(copied["production_release"])
         self.assertEqual("prod-colink", copied["release_environment_id"])
         self.assertEqual("", copied["gamma_environment_id"])
+        self.assertEqual("inplace", copied["deployment_mode"])
 
         personal_copy, error = server.copy_pipeline_template(
             server.DEFAULT_USERNAME, personal["id"], "普通自定义流水线"

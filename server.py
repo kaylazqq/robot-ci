@@ -1678,14 +1678,16 @@ def _consolidate_pipeline_template_rows(conn: sqlite3.Connection) -> dict[str, s
                 "release_environment_id": release_environment_id,
                 "gamma_environment_id": gamma_environment_id,
                 "push_target_id": _row_text(source, "push_target_id"), "builtin": True,
+                "deployment_mode": _row_text(source, "deployment_mode") or "parallel",
                 "created_at": str(source["created_at"] or _now_stamp()), "updated_at": _now_stamp(),
             })
         conn.execute(
             """UPDATE pipeline_templates SET username='', name=?, kind=?, gamma_deploy=?, gamma_test=?,
                production_release=?, release_environment_id=?, gamma_environment_id=?,
-               builtin=1, updated_at=? WHERE id=?""",
+               deployment_mode=?, builtin=1, updated_at=? WHERE id=?""",
             (shared_name, kind, int(source["gamma_deploy"] or 0), int(source["gamma_test"] or 0),
              spec["production_release"], release_environment_id, gamma_environment_id,
+             _row_text(source, "deployment_mode") or "parallel",
              _now_stamp(), canonical_id),
         )
         for row in members:
@@ -1714,6 +1716,7 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
             environment_id TEXT NOT NULL DEFAULT '',
             release_environment_id TEXT NOT NULL DEFAULT '',
             gamma_environment_id TEXT NOT NULL DEFAULT '',
+            deployment_mode TEXT NOT NULL DEFAULT 'parallel',
             builtin INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -1738,6 +1741,8 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
             """UPDATE pipeline_templates SET gamma_environment_id=environment_id
                WHERE (gamma_deploy=1 OR gamma_test=1) AND environment_id<>''"""
         )
+    if "deployment_mode" not in cols:
+        conn.execute("ALTER TABLE pipeline_templates ADD COLUMN deployment_mode TEXT NOT NULL DEFAULT 'parallel'")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pipeline_templates_user_svc "
         "ON pipeline_templates (username, service_id)"
@@ -1761,6 +1766,7 @@ def _pipeline_template_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "environment_id": release_environment_id or gamma_environment_id or legacy_environment_id,
         "release_environment_id": release_environment_id,
         "gamma_environment_id": gamma_environment_id,
+        "deployment_mode": _row_text(row, "deployment_mode").strip() or "parallel",
         "push_target_id": _row_text(row, "push_target_id").strip(),
         "builtin": bool(row["builtin"]),
         "created_at": str(row["created_at"] or ""),
@@ -1779,8 +1785,8 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
             id, username, service_id, name, kind, branch,
             gamma_deploy, gamma_test, production_release, environment_id,
             release_environment_id, gamma_environment_id, push_target_id,
-            builtin, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            deployment_mode, builtin, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"],
@@ -1796,6 +1802,7 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
             str(item.get("release_environment_id") or ""),
             str(item.get("gamma_environment_id") or ""),
             str(item.get("push_target_id") or ""),
+            str(item.get("deployment_mode") or "parallel"),
             1 if item["builtin"] else 0,
             item["created_at"],
             item["updated_at"],
@@ -1850,6 +1857,7 @@ def ensure_default_pipeline_templates(username: str, service_id: str) -> None:
                         "release_environment_id": "",
                         "gamma_environment_id": "",
                         "push_target_id": "",
+                        "deployment_mode": "parallel",
                         "builtin": True,
                         "created_at": now,
                         "updated_at": now,
@@ -1923,6 +1931,9 @@ def _normalize_template_fields(data: dict[str, Any], *, require_name: bool = Fal
         if "gamma_environment_id" in (data or {})
         else legacy_environment_id
     ).strip()
+    deployment_mode = str((data or {}).get("deployment_mode") or "parallel").strip().lower()
+    if deployment_mode not in {"parallel", "inplace"}:
+        return None, "部署方式仅支持平滑升级或替换升级"
     return {
         "name": name,
         "branch": branch,
@@ -1932,6 +1943,7 @@ def _normalize_template_fields(data: dict[str, Any], *, require_name: bool = Fal
         "environment_id": release_environment_id or gamma_environment_id,
         "release_environment_id": release_environment_id,
         "gamma_environment_id": gamma_environment_id,
+        "deployment_mode": deployment_mode,
         "push_target_id": str((data or {}).get("push_target_id") or "").strip(),
     }, ""
 
@@ -1958,7 +1970,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                 UPDATE pipeline_templates SET
                     name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?, production_release = ?,
                     environment_id = ?, release_environment_id = ?, gamma_environment_id = ?,
-                    push_target_id = ?, updated_at = ?
+                    push_target_id = ?, deployment_mode = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -1971,6 +1983,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                     fields["release_environment_id"],
                     fields["gamma_environment_id"],
                     fields["push_target_id"],
+                    fields["deployment_mode"],
                     now,
                     item["id"],
                 ),
@@ -9922,7 +9935,17 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(400, {"error": "Source revision resolution failed: " + str(exc)})
                 return
             try:
-                optional_steps = _normalize_optional_steps(data.get('optional_steps'))
+                requested_steps = dict(data.get('optional_steps') or {})
+                requested_steps.update({
+                    "gamma_deploy": bool(template.get("gamma_deploy")),
+                    "production_release": bool(template.get("production_release")),
+                    "gamma_test": bool(template.get("gamma_test")),
+                    "environment_id": str(template.get("release_environment_id") or template.get("environment_id") or ""),
+                    "release_environment_id": str(template.get("release_environment_id") or ""),
+                    "gamma_environment_id": str(template.get("gamma_environment_id") or ""),
+                    "deployment_mode": str(template.get("deployment_mode") or "parallel"),
+                })
+                optional_steps = _normalize_optional_steps(requested_steps)
                 if optional_steps.get("production_release") and not release_pipeline:
                     raise ValueError("只有生产发布流水线可以执行生产发布")
                 if str(data.get("deployment_type") or "code").strip().lower() == "package":
