@@ -1666,6 +1666,8 @@ def _consolidate_pipeline_template_rows(conn: sqlite3.Connection) -> dict[str, s
         existing = conn.execute("SELECT id, builtin FROM pipeline_templates WHERE id = ?", (canonical_id,)).fetchone()
         if existing and not int(existing["builtin"] or 0):
             raise RuntimeError(f"共享流水线 ID 冲突: {canonical_id}")
+        release_environment_id = _row_text(source, "release_environment_id")
+        gamma_environment_id = _row_text(source, "gamma_environment_id")
         if not existing:
             _insert_pipeline_template(conn, {
                 "id": canonical_id, "username": "", "service_id": service_id,
@@ -1673,23 +1675,27 @@ def _consolidate_pipeline_template_rows(conn: sqlite3.Connection) -> dict[str, s
                 "gamma_deploy": int(source["gamma_deploy"] or 0), "gamma_test": int(source["gamma_test"] or 0),
                 "production_release": spec["production_release"],
                 "environment_id": str(source["environment_id"] or ""),
+                "release_environment_id": release_environment_id,
+                "gamma_environment_id": gamma_environment_id,
                 "push_target_id": _row_text(source, "push_target_id"), "builtin": True,
                 "created_at": str(source["created_at"] or _now_stamp()), "updated_at": _now_stamp(),
             })
         conn.execute(
             """UPDATE pipeline_templates SET username='', name=?, kind=?, gamma_deploy=?, gamma_test=?,
-               production_release=?, builtin=1, updated_at=? WHERE id=?""",
+               production_release=?, release_environment_id=?, gamma_environment_id=?,
+               builtin=1, updated_at=? WHERE id=?""",
             (shared_name, kind, int(source["gamma_deploy"] or 0), int(source["gamma_test"] or 0),
-             spec["production_release"], _now_stamp(), canonical_id),
+             spec["production_release"], release_environment_id, gamma_environment_id,
+             _now_stamp(), canonical_id),
         )
         for row in members:
             old_id = str(row["id"])
             mapping[old_id] = canonical_id
             if old_id != canonical_id:
                 conn.execute("DELETE FROM pipeline_templates WHERE id = ?", (old_id,))
-    # All non-built-in pipelines are service-scoped too. Only the built-in release
-    # pipeline is allowed to expose production release/package deployment.
-    conn.execute("UPDATE pipeline_templates SET username='', production_release=0 WHERE builtin=0")
+    # Custom pipelines are service-scoped too. A clone of a release pipeline keeps
+    # kind=release and therefore remains release-capable.
+    conn.execute("UPDATE pipeline_templates SET username='' WHERE builtin=0")
     return mapping
 
 
@@ -1706,6 +1712,8 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
             gamma_deploy INTEGER NOT NULL DEFAULT 0,
             gamma_test INTEGER NOT NULL DEFAULT 0,
             environment_id TEXT NOT NULL DEFAULT '',
+            release_environment_id TEXT NOT NULL DEFAULT '',
+            gamma_environment_id TEXT NOT NULL DEFAULT '',
             builtin INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -1718,6 +1726,18 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
         conn.execute("UPDATE pipeline_templates SET production_release=1 WHERE kind='release' AND builtin=1")
     if "push_target_id" not in cols:
         conn.execute("ALTER TABLE pipeline_templates ADD COLUMN push_target_id TEXT NOT NULL DEFAULT ''")
+    if "release_environment_id" not in cols:
+        conn.execute("ALTER TABLE pipeline_templates ADD COLUMN release_environment_id TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """UPDATE pipeline_templates SET release_environment_id=environment_id
+               WHERE production_release=1 AND environment_id<>''"""
+        )
+    if "gamma_environment_id" not in cols:
+        conn.execute("ALTER TABLE pipeline_templates ADD COLUMN gamma_environment_id TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            """UPDATE pipeline_templates SET gamma_environment_id=environment_id
+               WHERE (gamma_deploy=1 OR gamma_test=1) AND environment_id<>''"""
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pipeline_templates_user_svc "
         "ON pipeline_templates (username, service_id)"
@@ -1725,6 +1745,9 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
 
 
 def _pipeline_template_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    release_environment_id = _row_text(row, "release_environment_id").strip()
+    gamma_environment_id = _row_text(row, "gamma_environment_id").strip()
+    legacy_environment_id = str(row["environment_id"] or "").strip()
     return {
         "id": str(row["id"]),
         "username": str(row["username"] or ""),
@@ -1735,7 +1758,9 @@ def _pipeline_template_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "gamma_deploy": bool(row["gamma_deploy"]),
         "gamma_test": bool(row["gamma_test"]),
         "production_release": bool(row["production_release"]),
-        "environment_id": str(row["environment_id"] or "").strip(),
+        "environment_id": release_environment_id or gamma_environment_id or legacy_environment_id,
+        "release_environment_id": release_environment_id,
+        "gamma_environment_id": gamma_environment_id,
         "push_target_id": _row_text(row, "push_target_id").strip(),
         "builtin": bool(row["builtin"]),
         "created_at": str(row["created_at"] or ""),
@@ -1752,9 +1777,10 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
         """
         INSERT INTO pipeline_templates (
             id, username, service_id, name, kind, branch,
-            gamma_deploy, gamma_test, production_release, environment_id, push_target_id,
+            gamma_deploy, gamma_test, production_release, environment_id,
+            release_environment_id, gamma_environment_id, push_target_id,
             builtin, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"],
@@ -1767,6 +1793,8 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
             1 if item["gamma_test"] else 0,
             1 if item.get("production_release") else 0,
             item["environment_id"],
+            str(item.get("release_environment_id") or ""),
+            str(item.get("gamma_environment_id") or ""),
             str(item.get("push_target_id") or ""),
             1 if item["builtin"] else 0,
             item["created_at"],
@@ -1819,6 +1847,8 @@ def ensure_default_pipeline_templates(username: str, service_id: str) -> None:
                         "gamma_test": spec["gamma_test"],
                         "production_release": spec["production_release"],
                         "environment_id": "",
+                        "release_environment_id": "",
+                        "gamma_environment_id": "",
                         "push_target_id": "",
                         "builtin": True,
                         "created_at": now,
@@ -1882,13 +1912,26 @@ def _normalize_template_fields(data: dict[str, Any], *, require_name: bool = Fal
     branch = str((data or {}).get("branch") or "").strip()
     if branch and not re.match(r"^[\w./\-]+$", branch):
         return None, "分支无效"
+    legacy_environment_id = str((data or {}).get("environment_id") or "").strip()
+    release_environment_id = str(
+        (data or {}).get("release_environment_id")
+        if "release_environment_id" in (data or {})
+        else legacy_environment_id
+    ).strip()
+    gamma_environment_id = str(
+        (data or {}).get("gamma_environment_id")
+        if "gamma_environment_id" in (data or {})
+        else legacy_environment_id
+    ).strip()
     return {
         "name": name,
         "branch": branch,
         "gamma_deploy": bool((data or {}).get("gamma_deploy")),
         "gamma_test": bool((data or {}).get("gamma_test")),
         "production_release": bool((data or {}).get("production_release")),
-        "environment_id": str((data or {}).get("environment_id") or "").strip(),
+        "environment_id": release_environment_id or gamma_environment_id,
+        "release_environment_id": release_environment_id,
+        "gamma_environment_id": gamma_environment_id,
         "push_target_id": str((data or {}).get("push_target_id") or "").strip(),
     }, ""
 
@@ -1904,7 +1947,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
         target = get_registry_target(fields["push_target_id"])
         if target is None or str(target.get("service_id") or "") != str(item.get("service_id") or ""):
             return None, "推送目标不存在或不属于当前微服务"
-    fields["production_release"] = bool(item["builtin"] and item["kind"] == "release")
+    fields["production_release"] = bool(item["kind"] == "release" and fields["production_release"])
     now = _now_stamp()
     init_store()
     with _db_lock:
@@ -1914,7 +1957,8 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                 """
                 UPDATE pipeline_templates SET
                     name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?, production_release = ?,
-                    environment_id = ?, push_target_id = ?, updated_at = ?
+                    environment_id = ?, release_environment_id = ?, gamma_environment_id = ?,
+                    push_target_id = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -1924,6 +1968,8 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                     1 if fields["gamma_test"] else 0,
                     1 if fields["production_release"] else 0,
                     fields["environment_id"],
+                    fields["release_environment_id"],
+                    fields["gamma_environment_id"],
                     fields["push_target_id"],
                     now,
                     item["id"],
@@ -1969,10 +2015,10 @@ def copy_pipeline_template(
         **item,
         "id": uuid.uuid4().hex[:12],
         "name": raw_name or ((item["name"] or "流水线") + "_copy")[:60],
-        "kind": "custom",
+        "kind": "release" if item["kind"] == "release" else "custom",
         "builtin": False,
         "username": "",
-        "production_release": False,
+        "production_release": bool(item["kind"] == "release" and item["production_release"]),
         "created_at": now,
         "updated_at": now,
     }
@@ -9818,7 +9864,7 @@ class Handler(SimpleHTTPRequestHandler):
             elif deployment_type != "code":
                 push_target_id = ""
                 push_target_summary = {}
-            release_pipeline = bool(template.get("builtin") and template.get("kind") == "release")
+            release_pipeline = bool(template.get("kind") == "release")
             if deployment_type == "package" and not release_pipeline:
                 self._json(400, {"error": "只有生产发布流水线支持包部署", "error_code": "package_pipeline_required"})
                 return

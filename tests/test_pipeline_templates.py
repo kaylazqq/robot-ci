@@ -106,10 +106,44 @@ class PipelineTemplateApiTests(unittest.TestCase):
         ) as response:
             copied = json.loads(response.read().decode("utf-8"))["template"]
         self.assertEqual("生产发布 克隆", copied["name"])
-        self.assertEqual("custom", copied["kind"])
+        self.assertEqual("release", copied["kind"])
         self.assertFalse(copied["builtin"])
         self.assertTrue(copied["gamma_deploy"])
-        self.assertFalse(copied["production_release"])
+        self.assertTrue(copied["production_release"])
+
+        with self._open(
+            "/api/pipeline-templates/" + copied["id"],
+            data=json.dumps(
+                {
+                    **copied,
+                    "gamma_deploy": False,
+                    "gamma_test": False,
+                    "production_release": True,
+                    "release_environment_id": "prod-colink",
+                    "gamma_environment_id": "",
+                }
+            ).encode(),
+            method="POST",
+            cookie=cookie,
+        ) as response:
+            copied = json.loads(response.read().decode("utf-8"))["template"]
+        self.assertTrue(copied["production_release"])
+        self.assertEqual("prod-colink", copied["release_environment_id"])
+        self.assertEqual("", copied["gamma_environment_id"])
+
+        personal_copy, error = server.copy_pipeline_template(
+            server.DEFAULT_USERNAME, personal["id"], "普通自定义流水线"
+        )
+        self.assertEqual("", error)
+        personal_copy, error = server.update_pipeline_template(
+            server.DEFAULT_USERNAME,
+            personal_copy["id"],
+            {**personal_copy, "production_release": True},
+        )
+        self.assertEqual("", error)
+        self.assertEqual("custom", personal_copy["kind"])
+        self.assertFalse(personal_copy["production_release"])
+        self.assertEqual("", server.delete_pipeline_template(server.DEFAULT_USERNAME, personal_copy["id"]))
 
         with self.assertRaises(HTTPError) as denied:
             self._open(
@@ -165,10 +199,14 @@ class PipelineTemplateApiTests(unittest.TestCase):
         canonical = next(item for item in templates if item["kind"] == "personal")
         old_id = "oldpersonal1"
         now = server._now_stamp()
-        with server._connect_db() as conn:
+        conn = server._connect_db()
+        try:
             server._insert_pipeline_template(conn, {
                 **canonical, "id": old_id, "username": "other-user", "created_at": now, "updated_at": now,
             })
+            conn.commit()
+        finally:
+            conn.close()
         log_dir = Path(self.tmp.name) / "logs"
         log_dir.mkdir()
         history = log_dir / "job-abcdef123456.json"
@@ -181,11 +219,14 @@ class PipelineTemplateApiTests(unittest.TestCase):
         migrated = json.loads(history.read_text(encoding="utf-8"))
         self.assertEqual(canonical["id"], migrated["template_id"])
         self.assertGreaterEqual(result["updated"], 1)
-        with server._connect_db() as conn:
+        conn = server._connect_db()
+        try:
             rows = conn.execute(
                 "SELECT id, username FROM pipeline_templates WHERE service_id=? AND kind='personal' AND builtin=1",
                 (service_id,),
             ).fetchall()
+        finally:
+            conn.close()
         self.assertEqual([(canonical["id"], "")], [(row["id"], row["username"]) for row in rows])
 
 

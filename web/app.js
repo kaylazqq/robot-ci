@@ -1044,18 +1044,20 @@ function selectedPipelineTemplate() {
 }
 function isProductionReleaseTemplate() {
   const tpl = findPipelineTemplate(runLayerTemplateId) || selectedPipelineTemplate();
-  return !!(tpl && tpl.builtin && tpl.kind === "release");
+  return !!(tpl && tpl.kind === "release");
 }
 function defaultPersonalTemplate() {
   return pipelineTemplates.find((item) => item.kind === "personal" && item.builtin) || pipelineTemplates[0] || null;
 }
 function applyTemplateDefaults(tpl) {
+  const hasReleaseEnvironment = !!(tpl && Object.prototype.hasOwnProperty.call(tpl, "release_environment_id"));
+  const hasGammaEnvironment = !!(tpl && Object.prototype.hasOwnProperty.call(tpl, "gamma_environment_id"));
   runPreviewSelection = {
     gammaDeploy: !!(tpl && tpl.gamma_deploy),
     deploy: !!(tpl && tpl.production_release),
     test: !!(tpl && tpl.gamma_test),
-    environmentId: (tpl && tpl.environment_id) || "",
-    gammaEnvironmentId: (tpl && tpl.environment_id) || "",
+    environmentId: (tpl && (hasReleaseEnvironment ? tpl.release_environment_id : tpl.environment_id)) || "",
+    gammaEnvironmentId: (tpl && (hasGammaEnvironment ? tpl.gamma_environment_id : tpl.environment_id)) || "",
     deploymentMode: "",
     pushTargetId: (tpl && tpl.push_target_id) || "",
   };
@@ -1242,8 +1244,12 @@ function enterRunPage(tpl) {
   updateActionButtons();
   loadEnvironments().then(() => {
     if (!runPreviewActive) return;
-    if (tpl && tpl.environment_id && !environments.some((item) => item.id === tpl.environment_id)) {
+    if (runPreviewSelection.environmentId && !environments.some((item) => item.id === runPreviewSelection.environmentId)) {
       runPreviewSelection.environmentId = "";
+    }
+    if (runPreviewSelection.gammaEnvironmentId && runPreviewSelection.gammaEnvironmentId !== "ci-e2e" &&
+        !environments.some((item) => item.id === runPreviewSelection.gammaEnvironmentId)) {
+      runPreviewSelection.gammaEnvironmentId = "";
     }
     renderRunPage();
   }).catch((e) => setPreviewHint(e.message || "加载环境失败"));
