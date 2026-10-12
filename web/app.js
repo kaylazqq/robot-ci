@@ -3993,6 +3993,13 @@ async function loadPermissions() {
   servicePermissions = data.permissions || [];
   const accounts = data.accounts || [];
   currentUserIsSuperAdmin = !!data.is_super_admin;
+  const sourceData = currentUserIsSuperAdmin ? await api('/api/source-provider') : null;
+  const sourceProvider = sourceData && sourceData.source_provider || 'gitcode';
+  const sourceStatuses = sourceData && sourceData.providers || [];
+  const sourceStatusText = sourceStatuses.map((item) =>
+    (item.provider === 'gitcode' ? 'GitCode' : 'GitHub') + '：' +
+    (item.configured ? 'SSH 已配置' : 'SSH 未配置')
+  ).join('；');
   const specs = [
     { permission_id: 'production_release', permission: '生产发布权限' },
     { permission_id: 'environment_manage', permission: '环境管理权限' },
@@ -4000,12 +4007,38 @@ async function loadPermissions() {
   const byId = {};
   servicePermissions.forEach((row) => { byId[row.permission_id] = row; });
   root.innerHTML = (currentUserIsSuperAdmin
-    ? '<section class="permission-account-admin"><strong>账号管理</strong><span class="env-secret-hint">新建账号后可加入下方流水线权限白名单。</span>' +
+    ? '<section class="permission-account-admin"><strong>代码源管理</strong><span class="env-secret-hint">切换前会验证目标平台的全部 EchoAgent 仓库；正在运行的任务不受影响。</span>' +
+      '<div class="row"><select id="sourceProviderSelect" class="input"><option value="gitcode">GitCode（默认）</option><option value="github">GitHub</option></select>' +
+      '<button type="button" class="btn ghost" id="btnSwitchSourceProvider">测试连接并切换</button></div>' +
+      '<span id="sourceProviderStatus" class="env-secret-hint">当前：' + esc(sourceProvider === 'gitcode' ? 'GitCode' : 'GitHub') + '；' + esc(sourceStatusText) + '</span></section>' +
+      '<section class="permission-account-admin"><strong>账号管理</strong><span class="env-secret-hint">新建账号后可加入下方流水线权限白名单。</span>' +
       '<div class="row"><input id="permissionNewAccount" class="input" placeholder="账号" autocomplete="off" />' +
       '<input id="permissionNewPassword" class="input" type="password" placeholder="初始密码（至少 8 位）" autocomplete="new-password" />' +
       '<button type="button" class="btn ghost" id="btnPermissionCreateAccount">创建账号</button></div></section>'
     : '') + '<table class="art-table permission-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody></tbody></table>';
   if (currentUserIsSuperAdmin) {
+    const providerSelect = root.querySelector('#sourceProviderSelect');
+    providerSelect.value = sourceProvider;
+    const switchButton = root.querySelector('#btnSwitchSourceProvider');
+    switchButton.addEventListener('click', async () => {
+      const target = providerSelect.value;
+      const status = root.querySelector('#sourceProviderStatus');
+      switchButton.disabled = true;
+      status.textContent = '正在验证 ' + (target === 'gitcode' ? 'GitCode' : 'GitHub') + ' 仓库连接…';
+      try {
+        const result = await api('/api/source-provider', {
+          method: 'POST', body: JSON.stringify({source_provider: target}),
+        });
+        status.textContent = '已切换到 ' + (result.source_provider === 'gitcode' ? 'GitCode' : 'GitHub');
+        await refreshServices();
+        await loadPermissions();
+      } catch (e) {
+        status.textContent = e.message || '代码源切换失败';
+        status.className = 'hint error';
+      } finally {
+        switchButton.disabled = false;
+      }
+    });
     const create = root.querySelector('#btnPermissionCreateAccount');
     create.addEventListener('click', async () => {
       const username = root.querySelector('#permissionNewAccount').value.trim();

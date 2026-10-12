@@ -137,6 +137,8 @@ HISTORY_DEFAULT_PAGE_SIZE = 10
 HISTORY_MAX_ENTRIES = 500
 HISTORY_TRIM_TO = 250
 BRANCH_REFRESH_TIMEOUT_SEC = 20
+SOURCE_PROVIDERS = ("gitcode", "github")
+DEFAULT_SOURCE_PROVIDER = "gitcode"
 DISK_USAGE_PRUNE_RATIO = 0.80
 BUILDKIT_CACHE_MAX_AGE = "168h"
 BUILDKIT_CACHE_KEEP_STORAGE = "50GB"
@@ -4952,6 +4954,21 @@ def load_config() -> dict[str, Any]:
         cfg["github_use_ssh"] = bool(cfg.get("github_use_ssh"))
     else:
         cfg["github_use_ssh"] = bool(ssh_key)
+    source_provider = str(
+        os.environ.get("ROBOT_CI_SOURCE_PROVIDER")
+        or cfg.get("source_provider")
+        or DEFAULT_SOURCE_PROVIDER
+    ).strip().lower()
+    cfg["source_provider"] = (
+        source_provider if source_provider in SOURCE_PROVIDERS else DEFAULT_SOURCE_PROVIDER
+    )
+    gitcode_ssh_key = str(
+        cfg.get("gitcode_ssh_key")
+        or os.environ.get("ROBOT_CI_GITCODE_SSH_KEY")
+        or "/etc/robot-ci/ssh/gitcode_hw_colink_ed25519"
+    ).strip()
+    cfg["gitcode_ssh_key"] = gitcode_ssh_key
+    cfg["gitcode_use_ssh"] = bool(cfg.get("gitcode_use_ssh", True))
     cfg["helper_root"] = str(ROOT)
 
     # Optional: archive image tar locally for nginx static download.
@@ -5234,8 +5251,37 @@ def reload_cfg() -> None:
 apply_ci_tmp_env()
 
 
-def load_services() -> list[dict[str, Any]]:
-    return json.loads(SERVICES_PATH.read_text(encoding="utf-8"))
+def active_source_provider() -> str:
+    provider = str(CFG.get("source_provider") or DEFAULT_SOURCE_PROVIDER).strip().lower()
+    return provider if provider in SOURCE_PROVIDERS else DEFAULT_SOURCE_PROVIDER
+
+
+def resolve_service_source(
+    svc: dict[str, Any], provider: str | None = None
+) -> dict[str, Any]:
+    """Apply an optional provider-specific source/build override to one service."""
+    resolved = deepcopy(svc)
+    sources = svc.get("sources") if isinstance(svc.get("sources"), dict) else {}
+    selected = str(provider or active_source_provider()).strip().lower()
+    override = sources.get(selected) if isinstance(sources.get(selected), dict) else None
+    if override:
+        resolved.update(deepcopy(override))
+        resolved["source_provider"] = selected
+    else:
+        resolved["source_provider"] = "github"
+    return resolved
+
+
+def load_services(provider: str | None = None) -> list[dict[str, Any]]:
+    raw = json.loads(SERVICES_PATH.read_text(encoding="utf-8"))
+    return [resolve_service_source(item, provider) for item in raw]
+
+
+def service_branch_cache_key(svc: dict[str, Any]) -> str:
+    service_id = str(svc.get("id") or "")
+    if isinstance(svc.get("sources"), dict):
+        return f"{svc.get('source_provider') or active_source_provider()}:{service_id}"
+    return service_id
 
 
 def resolve_frozen_source_inputs(
@@ -5255,8 +5301,8 @@ def resolve_frozen_source_inputs(
         svc = catalog[item["service_id"]]
         if not (CFG.get("freeze_build_inputs") or svc.get("pin_source")):
             continue
-        url = svc.get("github") or ("https://github.com/" + svc["repo"] + ".git")
-        source_key = (public_github_url(url), item["branch"])
+        url = service_git_url(svc)
+        source_key = (public_git_url(url), item["branch"])
         if source_key not in resolved_sources:
             resolved_sources[source_key] = freeze_ref(
                 clone_url_for(
@@ -5267,7 +5313,7 @@ def resolve_frozen_source_inputs(
                 item["branch"],
                 run_cmd,
                 git_args,
-                git_env(),
+                git_env(url),
             )
         frozen_inputs[item["service_id"]] = resolved_sources[source_key]
 
@@ -6028,15 +6074,23 @@ def git_bin() -> str:
     return shutil.which("git") or "git"
 
 
-def git_env() -> dict[str, str]:
-    """Non-interactive git env; attach SSH key for GitHub when configured."""
+def git_provider_for_url(url: str) -> str:
+    lowered = str(url or "").lower()
+    if "gitcode.com" in lowered:
+        return "gitcode"
+    return "github"
+
+
+def git_env(url: str = "") -> dict[str, str]:
+    """Non-interactive git env with a provider-scoped SSH identity."""
     env = os.environ.copy()
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "never"
     env["GIT_ASKPASS"] = ""
     env["SSH_ASKPASS"] = ""
     env["GCM_PRESERVE_CREDENTIALS"] = "true"
-    key = (CFG.get("github_ssh_key") or "").strip()
+    provider = git_provider_for_url(url)
+    key = str(CFG.get(f"{provider}_ssh_key") or "").strip()
     if key and Path(key).is_file():
         # BatchMode=yes → never prompt for passphrase / host confirmation hang
         env["GIT_SSH_COMMAND"] = (
@@ -6058,29 +6112,36 @@ def git_args(*args: str) -> list[str]:
     ]
 
 
-def to_github_ssh_url(url: str) -> str:
-    """https://github.com/org/repo.git -> git@github.com:org/repo.git"""
+def to_git_ssh_url(url: str) -> str:
+    """Convert a supported HTTPS repository URL to its SSH equivalent."""
     if url.startswith("git@"):
         return url
-    pub = public_github_url(url)
-    m = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", pub)
+    pub = public_git_url(url)
+    m = re.search(r"(github\.com|gitcode\.com)/([^/]+)/([^/]+?)(?:\.git)?/?$", pub)
     if not m:
         return url
-    return f"git@github.com:{m.group(1)}/{m.group(2)}.git"
+    return f"git@{m.group(1)}:{m.group(2)}/{m.group(3)}.git"
+
+
+def to_github_ssh_url(url: str) -> str:
+    """Backward-compatible alias retained for callers and tests."""
+    return to_git_ssh_url(url)
 
 
 def clone_url_for(
     url: str, *, public_https: bool = False, prefer_token_https: bool = False
 ) -> str:
+    provider = git_provider_for_url(url)
+    public = public_git_url(url)
     if public_https:
-        return public_github_url(url)
+        return public
     if prefer_token_https and gh_token():
-        return auth_github_url(public_github_url(url))
-    if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
-        return to_github_ssh_url(url)
-    if gh_token():
-        return auth_github_url(public_github_url(url))
-    return public_github_url(url)
+        return auth_github_url(public)
+    if CFG.get(f"{provider}_use_ssh") and (CFG.get(f"{provider}_ssh_key") or ""):
+        return to_git_ssh_url(url)
+    if provider == "github" and gh_token():
+        return auth_github_url(public)
+    return public
 
 
 def gh_token() -> str:
@@ -6118,7 +6179,13 @@ def auth_github_url(url: str) -> str:
     return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
 
 
-def public_github_url(url: str) -> str:
+def public_git_url(url: str) -> str:
+    if str(url or "").startswith("git@"):
+        match = re.match(r"git@([^:]+):(.+)$", str(url or ""))
+        if match:
+            path = match.group(2)
+            return f"https://{match.group(1)}/{path if path.endswith('.git') else path + '.git'}"
+        return str(url or "")
     parsed = urlparse(url or "")
     if not parsed.hostname:
         return url or ""
@@ -6126,12 +6193,62 @@ def public_github_url(url: str) -> str:
     return urlunparse((parsed.scheme or "https", netloc, parsed.path, "", "", ""))
 
 
+def public_github_url(url: str) -> str:
+    """Backward-compatible generic credential stripping helper."""
+    return public_git_url(url)
+
+
+def service_git_url(svc: dict[str, Any]) -> str:
+    url = str(svc.get("git_url") or svc.get("github") or "").strip()
+    if url:
+        return url
+    repo = str(svc.get("repo") or "").strip()
+    return f"https://github.com/{repo}.git" if repo else ""
+
+
 def repo_full_name(svc: dict[str, Any]) -> str:
     if svc.get("repo"):
         return svc["repo"]
-    gh = public_github_url(svc.get("github") or "")
-    m = re.search(r"github\.com/([^/]+/[^/]+?)(?:\.git)?$", gh)
+    public = public_git_url(service_git_url(svc))
+    m = re.search(r"(?:github|gitcode)\.com/([^/]+/[^/]+?)(?:\.git)?$", public)
     return m.group(1) if m else ""
+
+
+def source_provider_status(provider: str, *, check_remote: bool = False) -> dict[str, Any]:
+    selected = str(provider or "").strip().lower()
+    if selected not in SOURCE_PROVIDERS:
+        return {"provider": selected, "configured": False, "ok": False, "error": "不支持的代码源"}
+    services = [svc for svc in load_services(selected) if isinstance(svc.get("sources"), dict)]
+    urls = sorted({service_git_url(svc) for svc in services if service_git_url(svc)})
+    key = str(CFG.get(f"{selected}_ssh_key") or "").strip()
+    configured = bool(urls and key and Path(key).is_file())
+    result: dict[str, Any] = {
+        "provider": selected,
+        "configured": configured,
+        "ok": configured,
+        "repositories": len(urls),
+    }
+    if not configured:
+        result["error"] = "SSH 私钥未配置或文件不存在"
+        return result
+    if not check_remote:
+        return result
+    for url in urls:
+        clone_url = clone_url_for(url)
+        code, out = run_cmd(
+            git_args("ls-remote", "--heads", clone_url),
+            timeout=BRANCH_REFRESH_TIMEOUT_SEC,
+            env=git_env(clone_url),
+        )
+        if code != 0:
+            result["ok"] = False
+            result["error"] = (
+                f"仓库连接失败：{public_git_url(url)}；"
+                + re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1***@", out)[-300:]
+            )
+            return result
+    result["ok"] = True
+    return result
 
 
 def clone_dir_name(svc: dict[str, Any]) -> str:
@@ -6882,7 +6999,11 @@ def cached_branches(service_id: str) -> list[str]:
 
 
 def list_branches_api(
-    repo: str, force: bool = False, *, cache_key: str = ""
+    repo: str,
+    force: bool = False,
+    *,
+    cache_key: str = "",
+    url: str = "",
 ) -> tuple[bool, list[str] | str]:
     if not repo:
         return False, "missing repo"
@@ -6900,10 +7021,17 @@ def list_branches_api(
     def remaining_timeout(limit: float) -> float:
         return max(1.0, min(limit, deadline - time.monotonic()))
 
-    # 1) SSH ls-remote (preferred on shared server)
-    if CFG.get("github_use_ssh") and (CFG.get("github_ssh_key") or ""):
-        ssh_url = f"git@github.com:{repo}.git"
-        code, out = run_cmd(git_args("ls-remote", "--heads", ssh_url), timeout=remaining_timeout(12), env=git_env())
+    source_url = str(url or f"https://github.com/{repo}.git").strip()
+    clone_url = clone_url_for(source_url)
+    provider = git_provider_for_url(source_url)
+
+    # 1) Provider-neutral ls-remote (preferred on shared server)
+    if clone_url:
+        code, out = run_cmd(
+            git_args("ls-remote", "--heads", clone_url),
+            timeout=remaining_timeout(12),
+            env=git_env(clone_url),
+        )
         if code == 0:
             names = []
             for line in out.splitlines():
@@ -6913,15 +7041,15 @@ def list_branches_api(
             names = _cache_branches(cache_id, names)
             if names:
                 return True, names
-            ssh_err = "git ls-remote returned no branch refs"
+            remote_err = "git ls-remote returned no branch refs"
         else:
-            ssh_err = re.sub(r"x-access-token:[^@\s]+@", "***@", out)[-500:]
+            remote_err = re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1***@", out)[-500:]
     else:
-        ssh_err = "ssh not configured"
+        remote_err = "repository URL not configured"
 
-    # 2) GitHub API with token
+    # 2) GitHub API with token (GitCode already used its SSH URL above)
     token = gh_token()
-    if token:
+    if provider == "github" and token:
         try:
             names: list[str] = []
             for page in range(1, 11):
@@ -6941,14 +7069,14 @@ def list_branches_api(
             names = _cache_branches(cache_id, names)
             if names:
                 return True, names
-            return False, f"SSH: {ssh_err}; GitHub API returned no branches"
+            return False, f"Git remote: {remote_err}; GitHub API returned no branches"
         except Exception as e:  # noqa: BLE001
-            return False, f"SSH: {ssh_err}; GitHub API: {e}"
+            return False, f"Git remote: {remote_err}; GitHub API: {e}"
 
     return (
         False,
-        "需要 GitHub SSH 密钥或 Token。"
-        f" SSH: {ssh_err}",
+        f"需要有效的 {provider} 仓库凭证。"
+        f" Git remote: {remote_err}",
     )
 
 
@@ -6965,16 +7093,14 @@ def wipe_workspace_dir(job_id: str, dest: Path, label: str = "workspace") -> Non
 
 
 def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]:
-    url = (svc.get("github") or "").strip()
-    if not url and svc.get("repo"):
-        url = f"https://github.com/{svc['repo']}.git"
+    url = service_git_url(svc)
     if not url:
-        return False, "missing github url"
+        return False, "missing git repository url"
     if not re.match(r"^[\w./\-]+$", branch or ""):
         return False, f"invalid branch: {branch!r}"
 
     dest = repo_dir(svc, job_id)
-    public = public_github_url(url)
+    public = public_git_url(url)
     public_https = bool(svc.get("public_https"))
     prefer_token_https = bool(svc.get("prefer_token_https"))
     clone_url = clone_url_for(
@@ -6984,18 +7110,17 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     )
     if (
         clone_url.startswith("https://")
-        and "github.com" in clone_url
-        and not gh_token()
+        and not (git_provider_for_url(url) == "github" and gh_token())
         and not public_https
         and not prefer_token_https
     ):
         return (
             False,
-            "私有仓需要配置 GitHub SSH 密钥（推荐）或 Token",
+            f"私有仓需要配置 {git_provider_for_url(url)} SSH 密钥",
         )
-    genv = git_env()
+    genv = git_env(clone_url)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    append_job_log(job_id, f"github={public}")
+    append_job_log(job_id, f"git_repository={public}")
     append_job_log(job_id, f"clone_via={'ssh' if clone_url.startswith('git@') else 'https'}")
     append_job_log(job_id, f"branch={branch}")
     append_job_log(job_id, f"workspace={dest}")
@@ -8664,7 +8789,13 @@ def run_push_job(
     docker_config_dir: Path | None = None
     push_target: dict[str, Any] | None = None
     try:
-        catalog = {s["id"]: s for s in load_services()}
+        job_source_provider = str(
+            (_job_copy(job_id) or {}).get("source_provider") or active_source_provider()
+        )
+        catalog = {
+            s["id"]: resolve_service_source(s, job_source_provider)
+            for s in load_services()
+        }
         resolved: list[tuple[dict[str, Any], str, str]] = []
         for item in items:
             sid = (item.get("service_id") or "").strip()
@@ -9040,6 +9171,14 @@ class Handler(SimpleHTTPRequestHandler):
             })
             return
 
+        if path == "/api/source-provider":
+            self._json(200, {
+                "source_provider": active_source_provider(),
+                "providers": [source_provider_status(item) for item in SOURCE_PROVIDERS],
+                "is_super_admin": is_super_admin(user),
+            })
+            return
+
         m_rollouts = re.fullmatch(r"/api/environments/([^/]+)/rollouts", path)
         if m_rollouts:
             job_id = str((query.get("job_id") or [""])[0]).strip()
@@ -9075,7 +9214,8 @@ class Handler(SimpleHTTPRequestHandler):
                 {
                     "ok": True,
                     "agent": "swr-push-helper",
-                    "mode": "local-github",
+                    "mode": "local-git",
+                    "source_provider": active_source_provider(),
                     "docker": docker_status_cached(),
                     "login_cached": logged,
                     "registry": CFG["swr_registry"],
@@ -9089,6 +9229,11 @@ class Handler(SimpleHTTPRequestHandler):
                         and Path(CFG.get("github_ssh_key") or "").is_file()
                     ),
                     "github_use_ssh": bool(CFG.get("github_use_ssh")),
+                    "gitcode_ssh_configured": bool(
+                        CFG.get("gitcode_use_ssh")
+                        and (CFG.get("gitcode_ssh_key") or "")
+                        and Path(CFG.get("gitcode_ssh_key") or "").is_file()
+                    ),
                     "allow_remote": bool(CFG.get("allow_remote")),
                     "archive_enabled": bool(CFG.get("archive_enabled")),
                     "archive_root": (CFG.get("archive_root") or "").strip(),
@@ -9106,7 +9251,9 @@ class Handler(SimpleHTTPRequestHandler):
                         "title": svc["title"],
                         "image": svc.get("image"),
                         "repo": repo_full_name(svc),
-                        "github": public_github_url(svc.get("github") or (f"https://github.com/{repo_full_name(svc)}.git")),
+                        "github": public_git_url(service_git_url(svc)),
+                        "git_url": public_git_url(service_git_url(svc)),
+                        "source_provider": svc.get("source_provider") or "github",
                         "default_branch": svc.get("default_branch") or "main",
                         "cloned": (repo_dir(svc) / ".git").is_dir(),
                         "requires_version": bool(svc.get("requires_version")),
@@ -9181,11 +9328,16 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             repo = repo_full_name(svc)
             service_id = str(svc.get("id") or "")
+            provider = str(svc.get("source_provider") or "github")
+            cache_key = service_branch_cache_key(svc)
+            branch_kwargs: dict[str, Any] = {"cache_key": cache_key}
+            if isinstance(svc.get("sources"), dict):
+                branch_kwargs["url"] = service_git_url(svc)
             force_refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
             default = svc.get("default_branch") or "main"
             if force_refresh:
-                cached_before_refresh = cached_branches(service_id)
-                ok, result = list_branches_api(repo, force=True, cache_key=service_id)
+                cached_before_refresh = cached_branches(cache_key)
+                ok, result = list_branches_api(repo, force=True, **branch_kwargs)
                 from_cache = False
                 branch_source = "remote"
                 refresh_error = ""
@@ -9196,13 +9348,13 @@ class Handler(SimpleHTTPRequestHandler):
                     branch_source = "cache"
                     refresh_error = "远程刷新失败，已保留服务器缓存"
             else:
-                result = cached_branches(service_id)
+                result = cached_branches(cache_key)
                 ok = True
                 from_cache = bool(result)
                 branch_source = "cache" if result else "remote"
                 refresh_error = ""
                 if not result:
-                    ok, result = list_branches_api(repo, cache_key=service_id)
+                    ok, result = list_branches_api(repo, **branch_kwargs)
                     if not ok:
                         refresh_error = f"远程分支加载失败：{result}"
                         result = [default]
@@ -9228,6 +9380,7 @@ class Handler(SimpleHTTPRequestHandler):
                 {
                     "branches": branches,
                     "service_id": service_id,
+                    "source_provider": provider,
                     "default_branch": default,
                     "selected_branch": selected,
                     "cached": from_cache,
@@ -9439,6 +9592,34 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(200, {
                 "ok": True,
                 "accounts": [item["username"] for item in _load_users()],
+            })
+            return
+
+        if path == "/api/source-provider":
+            if not is_super_admin(user):
+                self._json(403, {"ok": False, "error": "只有超级管理员可以切换代码源"})
+                return
+            provider = str(data.get("source_provider") or "").strip().lower()
+            if provider not in SOURCE_PROVIDERS:
+                self._json(400, {"ok": False, "error": "不支持的代码源"})
+                return
+            if str(os.environ.get("ROBOT_CI_SOURCE_PROVIDER") or "").strip():
+                self._json(409, {"ok": False, "error": "代码源已被启动环境变量锁定，不能在页面切换"})
+                return
+            status = source_provider_status(provider, check_remote=True)
+            if not status.get("ok"):
+                self._json(400, {"ok": False, "error": status.get("error") or "代码源连接失败", "status": status})
+                return
+            before = active_source_provider()
+            save_config_value("source_provider", provider)
+            reload_cfg()
+            with _branch_cache_lock:
+                _branch_cache.clear()
+            print(f"[source-provider] actor={user} before={before} after={provider}", flush=True)
+            self._json(200, {
+                "ok": True,
+                "source_provider": active_source_provider(),
+                "status": source_provider_status(provider),
             })
             return
 
@@ -9905,6 +10086,7 @@ class Handler(SimpleHTTPRequestHandler):
                 )
                 return
             catalog = {svc["id"]: svc for svc in load_services()}
+            source_provider = active_source_provider()
             template_id = str(data.get("template_id") or "").strip()
             template = get_pipeline_template(user, template_id) if template_id else personal_builtin_template(user, items[0]["service_id"])
             if not template or str(template.get("service_id") or "") != items[0]["service_id"]:
@@ -9946,7 +10128,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if deployment_type == "package":
                     continue
                 default_branch = str(svc.get("default_branch") or "main")
-                cached = cached_branches(item["service_id"])
+                cached = cached_branches(service_branch_cache_key(svc))
                 if cached and item["branch"] not in cached:
                     self._json(
                         400,
@@ -10042,6 +10224,7 @@ class Handler(SimpleHTTPRequestHandler):
             template_name = str(template.get("name") or "").strip()
             new_job = {
                 'frozen_inputs': frozen_inputs,
+                "source_provider": source_provider,
                 "id": job_id,
                 "client_id": client_id,
                 "operator": user,

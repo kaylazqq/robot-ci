@@ -962,6 +962,55 @@ class BranchLookupTests(unittest.TestCase):
         self.assertEqual(2, urlopen.call_count)
 
 
+class SourceProviderTests(unittest.TestCase):
+    def test_echo_services_default_to_gitcode_and_can_resolve_github(self) -> None:
+        with patch.dict(server.CFG, {"source_provider": "gitcode"}):
+            gitcode = {item["id"]: item for item in server.load_services()}
+        github = {item["id"]: item for item in server.load_services("github")}
+
+        self.assertEqual("hw-colink/EchoAgent", gitcode["echoagent-backend"]["repo"])
+        self.assertEqual("hw-colink/EchoAgent", gitcode["echoagent-frontend"]["repo"])
+        self.assertEqual("hw-colink/EchoRouter", gitcode["echoagent-router"]["repo"])
+        self.assertEqual("tech-innovation-group/EchoAgent", github["echoagent-router"]["repo"])
+
+    def test_gitcode_clone_uses_provider_scoped_ssh_key(self) -> None:
+        with tempfile.NamedTemporaryFile() as key, patch.dict(
+            server.CFG,
+            {
+                "gitcode_use_ssh": True,
+                "gitcode_ssh_key": key.name,
+                "github_use_ssh": False,
+                "github_ssh_key": "",
+            },
+        ):
+            url = server.clone_url_for("https://gitcode.com/hw-colink/EchoAgent.git")
+            env = server.git_env(url)
+
+        self.assertEqual("git@gitcode.com:hw-colink/EchoAgent.git", url)
+        self.assertIn(key.name, env["GIT_SSH_COMMAND"])
+
+    @patch.object(
+        server,
+        "run_cmd",
+        return_value=(0, "a refs/heads/main\nb refs/heads/feature/gitcode\n"),
+    )
+    def test_gitcode_branch_lookup_uses_repository_url(self, run_cmd) -> None:
+        with tempfile.NamedTemporaryFile() as key, patch.dict(
+            server.CFG,
+            {"gitcode_use_ssh": True, "gitcode_ssh_key": key.name},
+        ):
+            ok, branches = server.list_branches_api(
+                "hw-colink/EchoAgent",
+                force=True,
+                cache_key="gitcode:echoagent-backend",
+                url="git@gitcode.com:hw-colink/EchoAgent.git",
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(["feature/gitcode", "main"], branches)
+        self.assertIn("git@gitcode.com:hw-colink/EchoAgent.git", run_cmd.call_args.args[0])
+
+
 class BuildCommandTests(unittest.TestCase):
     def test_host_package_discovery_supports_cid_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1258,7 +1307,7 @@ artifacts:
         ]
         with patch.dict(server.CFG, {"freeze_build_inputs": False}):
             frozen = server.resolve_frozen_source_inputs(items, catalog, "code")
-        self.assertEqual(1, resolve.call_count)
+        self.assertEqual(2, resolve.call_count)
         self.assertEqual("feature/echo-branch-build", resolve.call_args.args[1])
         self.assertEqual({item["service_id"] for item in items}, set(frozen))
         self.assertEqual({"a" * 40}, set(frozen.values()))
@@ -1622,7 +1671,9 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual(["main", "feature/echo"], payload["branches"])
         self.assertEqual("remote", payload["branch_source"])
         lookup.assert_called_once_with(
-            "tech-innovation-group/EchoAgent", cache_key="echoagent-backend"
+            "hw-colink/EchoAgent",
+            cache_key="gitcode:echoagent-backend",
+            url="git@gitcode.com:hw-colink/EchoAgent.git",
         )
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))

@@ -153,6 +153,37 @@ class AuthApiTests(unittest.TestCase):
             )
         self.assertEqual(403, denied.exception.code)
 
+    def test_only_super_admin_can_switch_source_provider(self) -> None:
+        regular_cookie = self._login("l00855954", "l00855954")
+        with self.assertRaises(HTTPError) as denied:
+            self._open(
+                "/api/source-provider",
+                data=json.dumps({"source_provider": "github"}).encode(),
+                method="POST",
+                cookie=regular_cookie,
+            )
+        self.assertEqual(403, denied.exception.code)
+
+        admin_cookie = self._login()
+        status = {"provider": "github", "configured": True, "ok": True, "repositories": 2}
+        with patch.dict(server.CFG, {"source_provider": "gitcode"}), patch.object(
+            server, "source_provider_status", return_value=status
+        ), patch.object(
+            server,
+            "save_config_value",
+            side_effect=lambda key, value: server.CFG.__setitem__(key, value),
+        ) as save_config, patch.object(server, "reload_cfg"):
+            with self._open(
+                "/api/source-provider",
+                data=json.dumps({"source_provider": "github"}).encode(),
+                method="POST",
+                cookie=admin_cookie,
+            ) as response:
+                payload = json.load(response)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("github", payload["source_provider"])
+        save_config.assert_called_once_with("source_provider", "github")
+
     def test_super_admin_can_replace_pipeline_permission_owners(self) -> None:
         service_id = "echoagent-backend"
         permissions = server.list_service_permissions(service_id)
