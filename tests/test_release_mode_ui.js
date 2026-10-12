@@ -18,5 +18,9 @@ assert.match(source, /deploymentMode: \(tpl && tpl\.deployment_mode\) \|\| "para
 assert.match(source, /deployment_mode: runPreviewSelection\.deploymentMode \|\| "parallel"/);
 assert.match(source, /runLayerMode === "edit"[\s\S]*createReleaseModePicker/);
 assert.match(source, /createConfiguredRunSummary\(doc, stage\.id\)/);
+assert.match(source, /stage\.status === "failed" \? "release-deploy:log" : "release-deploy:results"/);
+assert.match(source, /deploymentMode === "inplace"/);
+assert.match(source, /替换升级失败/);
+assert.match(source, /不会创建平滑发布的新旧双负载记录/);
 
 console.log('Pipeline-configured release options: passed');

@@ -462,7 +462,13 @@ def jump_exec(
         code = int(stdout.channel.recv_exit_status())
         return code, out, err
     except Exception as exc:
-        raise CceRolloutError(f"SSH 跳板机 {jump_host} 失败: {exc}") from exc
+        detail = str(exc).strip() or type(exc).__name__
+        if "timed out" in detail.lower() or isinstance(exc, TimeoutError):
+            detail += (
+                f"; CI 打包机到跳板机 {jump_host}:{int(jump_port or 22)} 网络不通，"
+                "请在云安全组/ACL 放行 CI 打包机出口 IP 访问该 SSH 端口"
+            )
+        raise CceRolloutError(f"SSH 跳板机 {jump_host} 失败: {detail}") from exc
     finally:
         try:
             jump.close()

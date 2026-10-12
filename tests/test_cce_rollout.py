@@ -32,6 +32,35 @@ def _job(job_id: str, service_id: str = "memory-service") -> dict:
 
 
 class CceRolloutHelperTests(unittest.TestCase):
+    def test_jump_timeout_reports_cloud_network_action(self) -> None:
+        class FakeClient:
+            def set_missing_host_key_policy(self, _policy) -> None:
+                pass
+
+            def connect(self, *_args, **_kwargs) -> None:
+                raise TimeoutError("timed out")
+
+            def close(self) -> None:
+                pass
+
+        fake_paramiko = types.SimpleNamespace(
+            SSHClient=lambda: FakeClient(),
+            AutoAddPolicy=lambda: object(),
+        )
+        with patch.object(cce_rollout, "_import_paramiko", return_value=fake_paramiko):
+            with self.assertRaises(cce_rollout.CceRolloutError) as failed:
+                cce_rollout.jump_exec(
+                    "kubectl get deploy",
+                    jump_user="root",
+                    jump_host="jump.example",
+                    jump_port=2222,
+                    jump_password="secret",
+                )
+        message = str(failed.exception)
+        self.assertIn("jump.example:2222", message)
+        self.assertIn("CI 打包机出口 IP", message)
+        self.assertIn("云安全组/ACL", message)
+
     def test_parse_ssh_target(self) -> None:
         self.assertEqual(("root", "122.9.139.49", 22), cce_rollout.parse_ssh_target("root@122.9.139.49"))
         self.assertEqual(("root", "122.9.139.49", 22), cce_rollout.parse_ssh_target("122.9.139.49"))

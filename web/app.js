@@ -3197,7 +3197,9 @@ async function openStepModal(stageId, taskId) {
   wrap.append(list, pane);
   openModal("步骤详情", wrap, { wide: true });
 
-  if (stage.id === "release") taskId = "release-deploy:results";
+  if (stage.id === "release") {
+    taskId = stage.status === "failed" ? "release-deploy:log" : "release-deploy:results";
+  }
   let selectedTask = normalizeStepSelection(taskId, stage);
   if (parseCaseSelection(selectedTask)) logEl.hidden = true;
   const follow = newLogFollowState();
@@ -3216,6 +3218,16 @@ async function openStepModal(stageId, taskId) {
     rolloutPanel.dataset.compareMode = mode;
     rolloutPanel.innerHTML = '<p class="env-secret-hint">加载中…</p>';
     pane.appendChild(rolloutPanel);
+    const deploymentMode = String((((currentJob || {}).optional_steps || {}).deployment_mode) || "parallel");
+    if (deploymentMode === "inplace") {
+      const failed = String((currentJob || {}).status || "") === "failed";
+      const detail = String((currentJob || {}).error || "").trim();
+      rolloutPanel.innerHTML = failed
+        ? '<p class="hint error">替换升级失败：' + esc(detail || '请查看日志详情') + '</p>' +
+          '<p class="env-secret-hint">替换升级直接更新原工作负载，不会创建平滑发布的新旧双负载记录。</p>'
+        : '<p class="env-secret-hint">本次使用替换升级，镜像直接更新到原工作负载，不生成平滑发布的新旧双负载记录。</p>';
+      return;
+    }
     if (!envId) {
       rolloutPanel.innerHTML = '<p class="hint error">未找到发布环境，无法加载版本对比。</p>';
       return;
