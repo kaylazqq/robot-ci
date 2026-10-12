@@ -86,6 +86,7 @@ DEFAULT_USERNAMES = (
     "z00987657",
 )
 DEFAULT_USERS = tuple((name, name) for name in DEFAULT_USERNAMES)
+ACCOUNT_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{2,63}$")
 AUTH_PUBLIC_GET = {"/api/auth/me", "/api/health"}
 AUTH_PUBLIC_POST = {"/api/auth/login"}
 ENV_REGIONS = ({"id": "cn-southwest-2", "label": "贵阳一"},)
@@ -1111,7 +1112,7 @@ def update_service_permission(service_id: str, permission_id: str, owners: Any, 
         return None, "未知权限"
     permissions = list_service_permissions(service_id)
     current = next((item["owners"] for item in permissions if item["permission_id"] == permission_id), [])
-    if current and actor not in current:
+    if current and actor not in current and not is_super_admin(actor):
         return None, "只有当前权限责任人可以修改"
     clean = sorted({str(item).strip() for item in (owners or []) if str(item).strip()})
     if not clean:
@@ -1131,6 +1132,39 @@ def update_service_permission(service_id: str, permission_id: str, owners: Any, 
         finally:
             conn.close()
     return list_service_permissions(service_id), ""
+
+
+def super_admin_usernames() -> set[str]:
+    raw = str(os.environ.get("ROBOT_CI_SUPER_ADMINS") or DEFAULT_USERNAME)
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def is_super_admin(username: str) -> bool:
+    return str(username or "").strip() in super_admin_usernames()
+
+
+def create_account(username: str, password: str) -> str:
+    name = str(username or "").strip()
+    secret = str(password or "")
+    if not ACCOUNT_USERNAME_RE.fullmatch(name):
+        return "账号必须以字母开头，长度为 3-64，只能包含字母、数字、点、下划线和横线"
+    if len(secret) < 8:
+        return "初始密码至少 8 位"
+    salt, digest = _hash_password(secret)
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            if conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+                return "账号已存在"
+            conn.execute(
+                "INSERT INTO users(username,salt,password_hash) VALUES(?,?,?)",
+                (name, salt, digest),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return ""
 
 
 def create_parallel_rollout_record(
@@ -8970,7 +9004,11 @@ class Handler(SimpleHTTPRequestHandler):
         if user is None:
             return
         if path == "/api/auth/me":
-            self._json(200, {"user": user or None, "username": user or None})
+            self._json(200, {
+                "user": user or None,
+                "username": user or None,
+                "is_super_admin": bool(user and is_super_admin(user)),
+            })
             return
         if path == "/api/login/status":
             # Instant: no docker info / no SWR network round-trip.
@@ -8998,6 +9036,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(200, {
                 "permissions": list_service_permissions(service_id) if service_id else [],
                 "accounts": [item["username"] for item in _load_users()],
+                "is_super_admin": is_super_admin(user),
             })
             return
 
@@ -9380,9 +9419,27 @@ class Handler(SimpleHTTPRequestHandler):
             token = create_session(username)
             self._json(
                 200,
-                {"ok": True, "username": username, "user": username},
+                {"ok": True, "username": username, "user": username,
+                 "is_super_admin": is_super_admin(username)},
                 extra_headers={"Set-Cookie": self._session_cookie_headers(token)},
             )
+            return
+
+        if path == "/api/accounts":
+            if not is_super_admin(user):
+                self._json(403, {"error": "只有超级管理员可以创建账号"})
+                return
+            err = create_account(
+                str(data.get("username") or ""),
+                str(data.get("password") or ""),
+            )
+            if err:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {
+                "ok": True,
+                "accounts": [item["username"] for item in _load_users()],
+            })
             return
 
         if path == "/api/auth/logout":

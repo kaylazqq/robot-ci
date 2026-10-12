@@ -1688,3 +1688,14 @@ body.env-overlay-open { overflow: hidden; }
 .gamma-result-link a { color: var(--primary, #008899); text-decoration: underline; overflow-wrap: anywhere; }
 .log a { color: #83d9ff; text-decoration: underline; text-underline-offset: 3px; }
 .log a:hover, .log a:focus-visible { color: #fff; }
+.permission-account-admin {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid var(--line, #dfe5ec);
+  border-radius: 10px;
+  background: #f8fafc;
+}
+.permission-account-admin .row { align-items: center; flex-wrap: wrap; }
+.permission-account-admin .input { width: min(280px, 100%); }

@@ -6,6 +6,7 @@ const ALL_SERVICES_ID = "all";
 const LOG_FOLLOW_SLOP_PX = 48;
 
 let currentUser = "";
+let currentUserIsSuperAdmin = false;
 let nav = "build";
 let tab = "pipeline";
 let services = [];
@@ -295,9 +296,10 @@ function showLogin(message) {
   }
 }
 
-function enterApp(username) {
+function enterApp(username, isSuperAdmin) {
   sessionLive = true;
   currentUser = username;
+  currentUserIsSuperAdmin = !!isSuperAdmin;
   if ($("loginGate")) $("loginGate").hidden = true;
   if ($("appShell")) $("appShell").hidden = false;
   if ($("userNameLabel")) $("userNameLabel").textContent = username;
@@ -3990,18 +3992,49 @@ async function loadPermissions() {
   const data = await api('/api/permissions?service_id=' + encodeURIComponent(currentServiceId));
   servicePermissions = data.permissions || [];
   const accounts = data.accounts || [];
+  currentUserIsSuperAdmin = !!data.is_super_admin;
   const specs = [
     { permission_id: 'production_release', permission: '生产发布权限' },
     { permission_id: 'environment_manage', permission: '环境管理权限' },
   ];
   const byId = {};
   servicePermissions.forEach((row) => { byId[row.permission_id] = row; });
-  root.innerHTML = '<table class="art-table permission-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody></tbody></table>';
+  root.innerHTML = (currentUserIsSuperAdmin
+    ? '<section class="permission-account-admin"><strong>账号管理</strong><span class="env-secret-hint">新建账号后可加入下方流水线权限白名单。</span>' +
+      '<div class="row"><input id="permissionNewAccount" class="input" placeholder="账号" autocomplete="off" />' +
+      '<input id="permissionNewPassword" class="input" type="password" placeholder="初始密码（至少 8 位）" autocomplete="new-password" />' +
+      '<button type="button" class="btn ghost" id="btnPermissionCreateAccount">创建账号</button></div></section>'
+    : '') + '<table class="art-table permission-table"><thead><tr><th>权限</th><th>责任人</th></tr></thead><tbody></tbody></table>';
+  if (currentUserIsSuperAdmin) {
+    const create = root.querySelector('#btnPermissionCreateAccount');
+    create.addEventListener('click', async () => {
+      const username = root.querySelector('#permissionNewAccount').value.trim();
+      const password = root.querySelector('#permissionNewPassword').value;
+      const err = $('permissionError');
+      err.hidden = true;
+      err.textContent = '';
+      if (!username || password.length < 8) {
+        err.hidden = false;
+        err.textContent = '请输入合法账号和至少 8 位的初始密码';
+        return;
+      }
+      create.disabled = true;
+      try {
+        await api('/api/accounts', {method:'POST', body:JSON.stringify({username, password})});
+        await loadPermissions();
+      } catch (e) {
+        err.hidden = false;
+        err.textContent = e.message;
+      } finally {
+        create.disabled = false;
+      }
+    });
+  }
   const tbody = root.querySelector('tbody');
   specs.forEach((spec) => {
     const row = byId[spec.permission_id] || spec;
     const initialOwners = [...(row.owners || [])];
-    const editable = initialOwners.includes(currentUser);
+    const editable = currentUserIsSuperAdmin || initialOwners.includes(currentUser);
     const tr = document.createElement('tr');
     const nameTd = document.createElement('td');
     nameTd.innerHTML = '<strong>' + esc(row.permission || spec.permission) + '</strong>';
@@ -4211,7 +4244,7 @@ $("loginForm").addEventListener("submit", async (ev) => {
       method: "POST",
       body: JSON.stringify({ username: $("authUser").value.trim(), password: $("authPass").value }),
     });
-    if (!returnToPipeline()) await bootApp(data.username);
+    if (!returnToPipeline()) await bootApp(data.username, data.is_super_admin);
   } catch (e) {
     $("loginError").hidden = false;
     $("loginError").textContent = e.message || "登录失败";
@@ -4398,9 +4431,9 @@ window.addEventListener("hashchange", async () => {
   if (parsed.tab !== tab) setTab(parsed.tab);
 });
 
-async function bootApp(username) {
+async function bootApp(username, isSuperAdmin) {
   const parsed = readHash();
-  enterApp(username);
+  enterApp(username, isSuperAdmin);
   if (parsed.service) currentServiceId = parsed.service;
   await Promise.all([refreshHealth(), refreshServices()]);
   setNav(parsed.nav, true);
@@ -4426,7 +4459,7 @@ async function bootApp(username) {
 (async function boot() {
   try {
     const me = await api("/api/auth/me");
-    if (me.user) { if (!returnToPipeline()) await bootApp(me.user); }
+    if (me.user) { if (!returnToPipeline()) await bootApp(me.user, me.is_super_admin); }
     else showLogin();
   } catch (_) {
     showLogin();

@@ -129,6 +129,56 @@ class AuthApiTests(unittest.TestCase):
             payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual("l00855954", payload["username"])
 
+    def test_super_admin_can_create_account_and_new_account_can_login(self) -> None:
+        cookie = self._login()
+        with self._open(
+            "/api/accounts",
+            data=json.dumps({"username": "new.operator", "password": "initial-pass-1"}).encode(),
+            method="POST",
+            cookie=cookie,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertIn("new.operator", payload["accounts"])
+        self.assertEqual("new.operator", server.authenticate_user("new.operator", "initial-pass-1"))
+
+    def test_non_super_admin_cannot_create_account(self) -> None:
+        cookie = self._login("l00855954", "l00855954")
+        with self.assertRaises(HTTPError) as denied:
+            self._open(
+                "/api/accounts",
+                data=json.dumps({"username": "blocked.user", "password": "initial-pass-1"}).encode(),
+                method="POST",
+                cookie=cookie,
+            )
+        self.assertEqual(403, denied.exception.code)
+
+    def test_super_admin_can_replace_pipeline_permission_owners(self) -> None:
+        service_id = "echoagent-backend"
+        permissions = server.list_service_permissions(service_id)
+        permission_id = permissions[0]["permission_id"]
+        with server._db_lock:
+            conn = server._connect_db()
+            try:
+                conn.execute(
+                    "DELETE FROM service_permissions WHERE service_id=? AND permission=?",
+                    (service_id, permission_id),
+                )
+                conn.execute(
+                    "INSERT INTO service_permissions(service_id,permission,username) VALUES(?,?,?)",
+                    (service_id, permission_id, "l00855954"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        updated, error = server.update_service_permission(
+            service_id, permission_id, ["z00616552"], server.DEFAULT_USERNAME
+        )
+        self.assertEqual("", error)
+        self.assertEqual(["z00616552"], next(
+            row["owners"] for row in updated if row["permission_id"] == permission_id
+        ))
+
     def test_preset_roster_accounts_are_seeded(self) -> None:
         self.assertIn("c50065452", server.DEFAULT_USERNAMES)
         self.assertIn("z00987657", server.DEFAULT_USERNAMES)
