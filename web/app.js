@@ -1719,7 +1719,7 @@ function createGammaEnvPicker(doc, kind) {
 function createReleaseModePicker(doc) {
   doc = doc || document;
   const win = doc.defaultView || window;
-  const choices = [{ id: 'parallel', name: '平滑升级' }, { id: 'inplace', name: '替换升级', disabled: true }];
+  const choices = [{ id: 'parallel', name: '平滑升级' }, { id: 'inplace', name: '替换升级' }];
   const wrap = doc.createElement('div'); wrap.className = 'pl-env-pick release-mode-pick';
   const picker = doc.createElement('div'); picker.className = 'pl-env-picker';
   const trigger = doc.createElement('button'); trigger.type = 'button';

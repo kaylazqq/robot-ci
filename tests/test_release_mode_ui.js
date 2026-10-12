@@ -1,0 +1,17 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+
+const source = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8');
+const start = source.indexOf('function createReleaseModePicker(');
+const end = source.indexOf('function createEndpoint(', start);
+
+assert.ok(start >= 0 && end > start, 'release mode picker should exist');
+const pickerSource = source.slice(start, end);
+
+assert.match(pickerSource, /id: 'parallel'/);
+assert.match(pickerSource, /id: 'inplace'/);
+assert.doesNotMatch(pickerSource, /id: 'inplace'[^\n]*disabled:\s*true/);
+assert.match(pickerSource, /runPreviewSelection\.deploymentMode = choice\.id/);
+
+console.log('Release mode picker options: passed');
