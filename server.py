@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -26,6 +27,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+from cryptography.fernet import Fernet, InvalidToken
 
 try:
     import fcntl
@@ -47,6 +50,7 @@ TEST_RUNNER_PATH = ROOT / "test_runner.py"
 LAST_DAEMON_VERSION_PATH = LOG_DIR / "last-daemon-version.json"
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "robot-ci.db"
+REGISTRY_SECRET_KEY_PATH = DATA_DIR / "registry-target.key"
 USERS_PATH = ROOT / "users.json"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_COOKIE = "robot_ci_session"
@@ -89,6 +93,7 @@ ENV_REGION_IDS = {item["id"] for item in ENV_REGIONS}
 _sessions: dict[str, dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 _db_lock = threading.Lock()
+_registry_key_lock = threading.Lock()
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -307,6 +312,21 @@ def init_store() -> None:
                     username TEXT NOT NULL,
                     PRIMARY KEY (service_id, permission, username)
                 );
+                CREATE TABLE IF NOT EXISTS registry_targets (
+                    id TEXT PRIMARY KEY,
+                    service_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    registry TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    password_cipher TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(service_id, name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_registry_targets_service
+                    ON registry_targets(service_id, updated_at DESC);
                 """
             )
             _ensure_environment_secret_columns(conn)
@@ -817,6 +837,237 @@ def discover_environment_kubeconfigs(
         directory=directory,
         direct=direct,
     )
+
+
+def parse_docker_login_command(command: str) -> tuple[str, str, str]:
+    """Parse one docker login command without ever invoking a shell."""
+    try:
+        parts = shlex.split(str(command or "").strip(), posix=True)
+    except ValueError as exc:
+        raise ValueError(f"docker login 命令格式错误: {exc}") from exc
+    if len(parts) < 3 or Path(parts[0]).name.lower() not in {"docker", "docker.exe"} or parts[1].lower() != "login":
+        raise ValueError("仅支持标准 docker login 命令")
+    username = ""
+    password = ""
+    registries: list[str] = []
+    index = 2
+    while index < len(parts):
+        token = parts[index]
+        if token in {"-u", "--username", "-p", "--password"}:
+            if index + 1 >= len(parts):
+                raise ValueError(f"docker login 参数缺少值: {token}")
+            value = parts[index + 1]
+            if token in {"-u", "--username"}:
+                username = value
+            else:
+                password = value
+            index += 2
+            continue
+        if token.startswith("--username="):
+            username = token.split("=", 1)[1]
+        elif token.startswith("--password="):
+            password = token.split("=", 1)[1]
+        elif token == "--password-stdin":
+            raise ValueError("请粘贴包含 -p/--password 的临时 docker login 命令")
+        elif token.startswith("-"):
+            raise ValueError(f"不支持的 docker login 参数: {token}")
+        else:
+            registries.append(token)
+        index += 1
+    if not username or not password or len(registries) != 1:
+        raise ValueError("docker login 命令必须包含用户名、密码和唯一 Registry")
+    registry = registries[0].strip().rstrip("/")
+    if not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]{1,5})?", registry):
+        raise ValueError("Registry 必须是主机名或主机名:端口，不能包含路径")
+    return username, password, registry.lower()
+
+
+def _registry_fernet() -> Fernet:
+    configured = str(os.environ.get("ROBOT_CI_REGISTRY_SECRET_KEY") or "").strip()
+    if configured:
+        try:
+            return Fernet(configured.encode("ascii"))
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("ROBOT_CI_REGISTRY_SECRET_KEY 格式无效") from exc
+    path = REGISTRY_SECRET_KEY_PATH
+    with _registry_key_lock:
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            key = Fernet.generate_key()
+            try:
+                with path.open("xb") as handle:
+                    handle.write(key + b"\n")
+            except FileExistsError:
+                pass
+        try:
+            os.chmod(path, 0o600)
+            key = path.read_bytes().strip()
+            return Fernet(key)
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("无法读取镜像推送凭证加密密钥") from exc
+
+
+def _encrypt_registry_password(password: str) -> str:
+    return _registry_fernet().encrypt(str(password).encode("utf-8")).decode("ascii")
+
+
+def _decrypt_registry_password(ciphertext: str) -> str:
+    try:
+        return _registry_fernet().decrypt(str(ciphertext).encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError, UnicodeError) as exc:
+        raise RuntimeError("镜像推送凭证无法解密，请重新配置 docker login") from exc
+
+
+def _public_registry_target(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(item.get("id") or ""),
+        "service_id": str(item.get("service_id") or ""),
+        "name": str(item.get("name") or ""),
+        "registry": str(item.get("registry") or ""),
+        "namespace": str(item.get("namespace") or ""),
+        "has_credential": bool(item.get("password_cipher") or item.get("has_credential")),
+        "created_by": str(item.get("created_by") or ""),
+        "created_at": str(item.get("created_at") or ""),
+        "updated_at": str(item.get("updated_at") or ""),
+        "legacy": bool(item.get("legacy")),
+    }
+
+
+def default_registry_target(service_id: str) -> dict[str, Any]:
+    return {
+        "id": "",
+        "service_id": str(service_id or ""),
+        "name": "默认 SWR",
+        "registry": str(CFG.get("swr_registry") or "").strip(),
+        "namespace": str(CFG.get("swr_org") or "").strip(),
+        "has_credential": docker_config_has_swr_auth(),
+        "legacy": True,
+    }
+
+
+def _registry_target_from_row(row: sqlite3.Row, *, include_secret: bool = False) -> dict[str, Any]:
+    item = {key: str(row[key] or "") for key in row.keys()}
+    if include_secret:
+        item["password"] = _decrypt_registry_password(item.pop("password_cipher"))
+    return item
+
+
+def list_registry_targets(service_id: str) -> list[dict[str, Any]]:
+    sid = str(service_id or "").strip()
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM registry_targets WHERE service_id=? ORDER BY name, updated_at DESC",
+                (sid,),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [_public_registry_target(default_registry_target(sid))] + [
+        _public_registry_target(_registry_target_from_row(row)) for row in rows
+    ]
+
+
+def get_registry_target(target_id: str, *, include_secret: bool = False) -> dict[str, Any] | None:
+    tid = str(target_id or "").strip()
+    if not tid:
+        return None
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute("SELECT * FROM registry_targets WHERE id=?", (tid,)).fetchone()
+        finally:
+            conn.close()
+    return _registry_target_from_row(row, include_secret=include_secret) if row else None
+
+
+def _normalize_registry_target(data: Mapping[str, Any], existing: Mapping[str, Any] | None = None) -> tuple[dict[str, str] | None, str]:
+    name = str(data.get("name") or (existing or {}).get("name") or "").strip()
+    namespace = str(data.get("namespace") or (existing or {}).get("namespace") or "").strip().strip("/")
+    service_id = str(data.get("service_id") or (existing or {}).get("service_id") or "").strip()
+    command = str(data.get("login_command") or "").strip()
+    if not name or len(name) > 60:
+        return None, "推送目标名称必填且不能超过 60 个字符"
+    if service_id not in _known_service_ids():
+        return None, "未知微服务"
+    if not namespace or not re.fullmatch(r"[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?", namespace):
+        return None, "组织/Namespace 格式不正确"
+    if command:
+        try:
+            username, password, registry = parse_docker_login_command(command)
+        except ValueError as exc:
+            return None, str(exc)
+        password_cipher = _encrypt_registry_password(password)
+    elif existing:
+        username = str(existing.get("username") or "")
+        registry = str(existing.get("registry") or "")
+        password_cipher = str(existing.get("password_cipher") or "")
+    else:
+        return None, "新建推送目标必须填写 docker login 命令"
+    return {
+        "name": name,
+        "namespace": namespace,
+        "service_id": service_id,
+        "username": username,
+        "registry": registry,
+        "password_cipher": password_cipher,
+    }, ""
+
+
+def save_registry_target(data: Mapping[str, Any], actor: str, target_id: str = "") -> tuple[dict[str, Any] | None, str]:
+    existing = get_registry_target(target_id) if target_id else None
+    if target_id and existing is None:
+        return None, "推送目标不存在"
+    fields, err = _normalize_registry_target(data, existing)
+    if err or fields is None:
+        return None, err
+    now = _now_stamp()
+    item_id = str(target_id or uuid.uuid4().hex[:12])
+    try:
+        with _db_lock:
+            conn = _connect_db()
+            try:
+                if existing:
+                    conn.execute(
+                        """UPDATE registry_targets SET name=?, registry=?, namespace=?, username=?,
+                           password_cipher=?, updated_at=? WHERE id=?""",
+                        (fields["name"], fields["registry"], fields["namespace"], fields["username"],
+                         fields["password_cipher"], now, item_id),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO registry_targets
+                           (id,service_id,name,registry,namespace,username,password_cipher,created_by,created_at,updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (item_id, fields["service_id"], fields["name"], fields["registry"], fields["namespace"],
+                         fields["username"], fields["password_cipher"], actor, now, now),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+    except sqlite3.IntegrityError:
+        return None, "同一微服务下推送目标名称不能重复"
+    saved = get_registry_target(item_id)
+    return _public_registry_target(saved or {}), ""
+
+
+def delete_registry_target(target_id: str) -> str:
+    target = get_registry_target(target_id)
+    if target is None:
+        return "推送目标不存在"
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            used = conn.execute("SELECT 1 FROM pipeline_templates WHERE push_target_id=? LIMIT 1", (target_id,)).fetchone()
+            if used:
+                return "推送目标仍被流水线使用，不能删除"
+            conn.execute("DELETE FROM registry_targets WHERE id=?", (target_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    return ""
 
 
 def list_service_permissions(service_id: str) -> list[dict[str, Any]]:
@@ -1421,7 +1672,8 @@ def _consolidate_pipeline_template_rows(conn: sqlite3.Connection) -> dict[str, s
                 "name": shared_name, "kind": kind, "branch": str(source["branch"] or ""),
                 "gamma_deploy": int(source["gamma_deploy"] or 0), "gamma_test": int(source["gamma_test"] or 0),
                 "production_release": spec["production_release"],
-                "environment_id": str(source["environment_id"] or ""), "builtin": True,
+                "environment_id": str(source["environment_id"] or ""),
+                "push_target_id": _row_text(source, "push_target_id"), "builtin": True,
                 "created_at": str(source["created_at"] or _now_stamp()), "updated_at": _now_stamp(),
             })
         conn.execute(
@@ -1464,6 +1716,8 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
     if "production_release" not in cols:
         conn.execute("ALTER TABLE pipeline_templates ADD COLUMN production_release INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE pipeline_templates SET production_release=1 WHERE kind='release' AND builtin=1")
+    if "push_target_id" not in cols:
+        conn.execute("ALTER TABLE pipeline_templates ADD COLUMN push_target_id TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pipeline_templates_user_svc "
         "ON pipeline_templates (username, service_id)"
@@ -1482,6 +1736,7 @@ def _pipeline_template_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "gamma_test": bool(row["gamma_test"]),
         "production_release": bool(row["production_release"]),
         "environment_id": str(row["environment_id"] or "").strip(),
+        "push_target_id": _row_text(row, "push_target_id").strip(),
         "builtin": bool(row["builtin"]),
         "created_at": str(row["created_at"] or ""),
         "updated_at": str(row["updated_at"] or ""),
@@ -1497,8 +1752,9 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
         """
         INSERT INTO pipeline_templates (
             id, username, service_id, name, kind, branch,
-            gamma_deploy, gamma_test, production_release, environment_id, builtin, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            gamma_deploy, gamma_test, production_release, environment_id, push_target_id,
+            builtin, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"],
@@ -1511,6 +1767,7 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
             1 if item["gamma_test"] else 0,
             1 if item.get("production_release") else 0,
             item["environment_id"],
+            str(item.get("push_target_id") or ""),
             1 if item["builtin"] else 0,
             item["created_at"],
             item["updated_at"],
@@ -1562,6 +1819,7 @@ def ensure_default_pipeline_templates(username: str, service_id: str) -> None:
                         "gamma_test": spec["gamma_test"],
                         "production_release": spec["production_release"],
                         "environment_id": "",
+                        "push_target_id": "",
                         "builtin": True,
                         "created_at": now,
                         "updated_at": now,
@@ -1631,6 +1889,7 @@ def _normalize_template_fields(data: dict[str, Any], *, require_name: bool = Fal
         "gamma_test": bool((data or {}).get("gamma_test")),
         "production_release": bool((data or {}).get("production_release")),
         "environment_id": str((data or {}).get("environment_id") or "").strip(),
+        "push_target_id": str((data or {}).get("push_target_id") or "").strip(),
     }, ""
 
 
@@ -1641,6 +1900,10 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
     fields, err = _normalize_template_fields(data, require_name=True)
     if err or fields is None:
         return None, err
+    if fields["push_target_id"]:
+        target = get_registry_target(fields["push_target_id"])
+        if target is None or str(target.get("service_id") or "") != str(item.get("service_id") or ""):
+            return None, "推送目标不存在或不属于当前微服务"
     fields["production_release"] = bool(item["builtin"] and item["kind"] == "release")
     now = _now_stamp()
     init_store()
@@ -1651,7 +1914,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                 """
                 UPDATE pipeline_templates SET
                     name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?, production_release = ?,
-                    environment_id = ?, updated_at = ?
+                    environment_id = ?, push_target_id = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -1661,6 +1924,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                     1 if fields["gamma_test"] else 0,
                     1 if fields["production_release"] else 0,
                     fields["environment_id"],
+                    fields["push_target_id"],
                     now,
                     item["id"],
                 ),
@@ -1995,6 +2259,8 @@ JOB_PUBLIC_FIELDS = (
     "rollback_failed",
     "template_id",
     "template_name",
+    "push_target_id",
+    "push_target",
 )
 
 JOB_COMPACT_FIELDS = (
@@ -2040,6 +2306,8 @@ JOB_COMPACT_FIELDS = (
     "rollback_failed",
     "template_id",
     "template_name",
+    "push_target_id",
+    "push_target",
 )
 
 
@@ -5310,7 +5578,12 @@ def run_cmd(
         detach_job_proc(job_id, proc)
 
 
-def run_cmd_stdin(args: list[str], stdin_text: str, timeout: int | None = 120) -> tuple[int, str]:
+def run_cmd_stdin(
+    args: list[str],
+    stdin_text: str,
+    timeout: int | None = 120,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     try:
         p = subprocess.run(
             args,
@@ -5320,6 +5593,7 @@ def run_cmd_stdin(args: list[str], stdin_text: str, timeout: int | None = 120) -
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
         )
         out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
         return p.returncode, out.strip()
@@ -5327,10 +5601,33 @@ def run_cmd_stdin(args: list[str], stdin_text: str, timeout: int | None = 120) -
         return 1, str(e)
 
 
-def docker_cmd(*docker_args: str, timeout: int | None = 600) -> tuple[int, str]:
+def _docker_config_args(config_dir: Path | str | None) -> list[str]:
+    if not config_dir:
+        return []
+    path = Path(config_dir)
+    rendered = win_to_wsl(path) if use_wsl() else str(path)
+    return ["--config", rendered]
+
+
+def docker_cmd(
+    *docker_args: str,
+    timeout: int | None = 600,
+    config_dir: Path | str | None = None,
+) -> tuple[int, str]:
+    args = [*_docker_config_args(config_dir), *docker_args]
     if use_wsl():
-        return run_cmd(wsl_prefix() + ["docker", *docker_args], timeout=timeout)
-    return run_cmd(["docker", *docker_args], timeout=timeout)
+        return run_cmd(wsl_prefix() + ["docker", *args], timeout=timeout)
+    return run_cmd(["docker", *args], timeout=timeout)
+
+
+def docker_login_credentials(
+    *, username: str, password: str, registry: str, config_dir: Path | str
+) -> tuple[bool, str]:
+    args = ["docker", *_docker_config_args(config_dir), "login", "-u", username, "--password-stdin", registry]
+    if use_wsl():
+        args = wsl_prefix() + args
+    code, out = run_cmd_stdin(args, password, timeout=120)
+    return code == 0 and "succeeded" in (out or "").lower(), out
 
 
 def win_to_wsl(path: Path) -> str:
@@ -6232,18 +6529,14 @@ def schedule_docker_probe() -> None:
 
 def do_login(command: str) -> tuple[bool, str]:
     global _login_ok, _login_probe_cache
-    cmd = command.strip()
-    if not cmd:
-        return False, "empty login command"
-    m = re.search(r"docker\s+login\s+-u\s+(\S+)\s+-p\s+(\S+)\s+(\S+)", cmd, re.I)
-    if m:
-        user, password, registry = m.group(1), m.group(2), m.group(3)
-        login_args = ["docker", "login", "-u", user, "--password-stdin", registry]
-        if use_wsl():
-            login_args = wsl_prefix() + login_args
-        code, out = run_cmd_stdin(login_args, password, timeout=120)
-    else:
-        code, out = run_cmd(bash_lc(cmd), timeout=120)
+    try:
+        user, password, registry = parse_docker_login_command(command)
+    except ValueError as exc:
+        return False, str(exc)
+    login_args = ["docker", "login", "-u", user, "--password-stdin", registry]
+    if use_wsl():
+        login_args = wsl_prefix() + login_args
+    code, out = run_cmd_stdin(login_args, password, timeout=120)
     ok = code == 0 and "succeeded" in out.lower()
     with _login_lock:
         _login_ok = ok
@@ -7633,18 +7926,58 @@ def ensure_swr_login(job_id: str, login_command: str = "") -> bool:
         return False
 
 
+def ensure_registry_target_login(
+    job_id: str,
+    target: Mapping[str, Any],
+    config_dir: Path | str,
+) -> bool:
+    registry = str(target.get("registry") or "").strip()
+    namespace = str(target.get("namespace") or "").strip()
+    name = str(target.get("name") or registry).strip()
+    username = str(target.get("username") or "")
+    password = str(target.get("password") or "")
+    with log_substep("env"):
+        append_job_log(job_id, f"镜像推送目标: {name} ({registry}/{namespace})")
+        ok, output = docker_login_credentials(
+            username=username,
+            password=password,
+            registry=registry,
+            config_dir=config_dir,
+        )
+        safe_output = "\n".join(
+            line for line in (output or "").splitlines() if password not in line and username not in line
+        )
+        if safe_output:
+            append_job_log(job_id, safe_output[-800:])
+        if not ok:
+            set_job(job_id, status="failed", error="镜像推送目标登录失败")
+            return False
+        probe = f"{registry}/{namespace}/robot-ci-auth-probe-does-not-exist"
+        code, detail = docker_cmd("manifest", "inspect", probe, timeout=20, config_dir=config_dir)
+        verified, snippet = _swr_probe_ok(code, detail)
+        if not verified:
+            set_job(job_id, status="failed", error="镜像推送目标凭证校验失败")
+            append_job_log(job_id, "ERROR Registry 凭证校验失败: " + snippet)
+            return False
+        append_job_log(job_id, "镜像推送目标登录验证成功")
+        return True
+
+
 def push_one_service(
     job_id: str,
     svc: dict[str, Any],
     branch: str,
     archive_dir: Path | None,
     version: str = "",
+    push_target: Mapping[str, Any] | None = None,
+    docker_config_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Build/push/archive one service. Does not set final job status."""
     service_id = svc["id"]
     branch = (branch or svc.get("default_branch") or "main").strip()
     image = svc["image"]
-    registry, org = CFG["swr_registry"], CFG["swr_org"]
+    registry = str((push_target or {}).get("registry") or CFG["swr_registry"])
+    org = str((push_target or {}).get("namespace") or CFG["swr_org"])
     result: dict[str, Any] = {
         "service_id": service_id,
         "title": svc.get("title") or service_id,
@@ -7877,7 +8210,7 @@ def push_one_service(
     remote = f"{registry}/{org}/{image}:{tag}"
     with log_substep("tag"):
         append_job_log(job_id, f"docker tag {local_ref} -> {remote}")
-        code, out = docker_cmd("tag", local_ref, remote, timeout=60)
+        code, out = docker_cmd("tag", local_ref, remote, timeout=60, config_dir=docker_config_dir)
         if code != 0:
             append_job_log(job_id, out)
             result["error"] = "docker tag failed"
@@ -7888,7 +8221,7 @@ def push_one_service(
     with log_substep("push"):
         for attempt in range(1, push_attempts + 1):
             append_job_log(job_id, f"docker push {remote} (try {attempt}/{push_attempts})")
-            code, out = docker_cmd("push", remote, timeout=3600)
+            code, out = docker_cmd("push", remote, timeout=3600, config_dir=docker_config_dir)
             for line in (out or "").splitlines()[-40:]:
                 append_job_log(job_id, line)
             if code == 0:
@@ -7927,7 +8260,8 @@ def push_one_service(
         )
         if auth_failed:
             result["error_code"] = "swr_auth_failed"
-            mark_swr_login_invalid()
+            if not push_target:
+                mark_swr_login_invalid()
             append_job_log(
                 job_id,
                 "ERROR: SWR 鉴权失败。请重新复制华为云临时登录指令到页面后再推送；并确认组织 public_ai 有推送权限",
@@ -8229,9 +8563,13 @@ def run_push_job(
     job_id: str,
     items: list[dict[str, str]],
     login_command: str = "",
+    push_target_id: str = "",
 ) -> None:
     """Push one or more services; batch jobs share one archive timestamp directory."""
     _job_ctx.job_id = job_id
+    docker_config_tmp: tempfile.TemporaryDirectory[str] | None = None
+    docker_config_dir: Path | None = None
+    push_target: dict[str, Any] | None = None
     try:
         catalog = {s["id"]: s for s in load_services()}
         resolved: list[tuple[dict[str, Any], str, str]] = []
@@ -8270,7 +8608,22 @@ def run_push_job(
         register_live_job_marker(job_id, service_ids)
 
         needs_swr = any(not svc.get("archive_only") for svc, _, _ in resolved)
-        if needs_swr and not ensure_swr_login(job_id, login_command):
+        if needs_swr and push_target_id:
+            push_target = get_registry_target(push_target_id, include_secret=True)
+            service_ids_for_target = {str(svc.get("id") or "") for svc, _, _ in resolved}
+            if push_target is None or str(push_target.get("service_id") or "") not in service_ids_for_target:
+                set_job(job_id, status="failed", error="推送目标不存在或不属于当前微服务")
+                append_job_log(job_id, "ERROR 推送目标不存在或不属于当前微服务")
+                return
+            ci_tmp_root().mkdir(parents=True, exist_ok=True)
+            docker_config_tmp = tempfile.TemporaryDirectory(
+                prefix=f"robot-ci-docker-{job_id}-",
+                dir=str(ci_tmp_root()),
+            )
+            docker_config_dir = Path(docker_config_tmp.name)
+            if not ensure_registry_target_login(job_id, push_target, docker_config_dir):
+                return
+        elif needs_swr and not ensure_swr_login(job_id, login_command):
             return
         if not needs_swr:
             append_job_log(job_id, "SWR login skipped: all selected services are archive-only")
@@ -8318,7 +8671,15 @@ def run_push_job(
                 set_job(job_id, stage="syncing", current=f"{svc['id']}@{br}", progress=f"{idx}/{total}")
                 # Refresh marker mtime while long compiles run.
                 register_live_job_marker(job_id, service_ids)
-                result = push_one_service(job_id, svc, br, archive_dir, version)
+                result = push_one_service(
+                    job_id,
+                    svc,
+                    br,
+                    archive_dir,
+                    version,
+                    push_target=push_target,
+                    docker_config_dir=docker_config_dir,
+                )
                 results.append(result)
                 set_job(job_id, results=results)
                 if result.get("error_code") == "swr_auth_failed":
@@ -8415,6 +8776,8 @@ def run_push_job(
             set_job(job_id, status="failed", error=str(e))
             append_job_log(job_id, f"ERROR {e}")
     finally:
+        if docker_config_tmp is not None:
+            docker_config_tmp.cleanup()
         release_build_slot(job_id)
         _job_ctx.job_id = None
         reclaim_ci_disk(job_id)
@@ -8428,12 +8791,14 @@ def push_service(
     service_id: str,
     branch: str,
     login_command: str = "",
+    push_target_id: str = "",
 ) -> None:
     """Back-compat wrapper for a single service push."""
     run_push_job(
         job_id,
         [{"service_id": service_id, "branch": branch}],
         login_command=login_command,
+        push_target_id=push_target_id,
     )
 
 
@@ -8792,6 +9157,22 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
 
+        if path == "/api/push-targets":
+            service_id = str((query.get("service_id") or [""])[0]).strip()
+            if service_id not in {str(item.get("id") or "") for item in load_services()}:
+                self._json(404, {"ok": False, "error": "未知微服务"})
+                return
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "service_id": service_id,
+                    "can_manage": _has_service_permission(service_id, "environment_manage", user),
+                    "targets": list_registry_targets(service_id),
+                },
+            )
+            return
+
         if path == "/api/jobs":
             def _query_int(name: str, default: int) -> int:
                 try:
@@ -8981,6 +9362,52 @@ class Handler(SimpleHTTPRequestHandler):
                     "service_ids": service_ids,
                 },
             )
+            return
+
+        if path == "/api/push-targets":
+            service_id = str(data.get("service_id") or "").strip()
+            if not _has_service_permission(service_id, "environment_manage", user):
+                self._json(403, {"ok": False, "error": "没有环境管理权限"})
+                return
+            item, err = save_registry_target(data, user)
+            if err or item is None:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "target": item})
+            return
+
+        m_target_delete = re.fullmatch(r"/api/push-targets/([^/]+)/delete", path)
+        if m_target_delete:
+            target = get_registry_target(m_target_delete.group(1))
+            if target is None:
+                self._json(404, {"ok": False, "error": "推送目标不存在"})
+                return
+            service_id = str(target.get("service_id") or "")
+            if not _has_service_permission(service_id, "environment_manage", user):
+                self._json(403, {"ok": False, "error": "没有环境管理权限"})
+                return
+            err = delete_registry_target(str(target.get("id") or ""))
+            if err:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True})
+            return
+
+        m_target = re.fullmatch(r"/api/push-targets/([^/]+)", path)
+        if m_target:
+            target = get_registry_target(m_target.group(1))
+            if target is None:
+                self._json(404, {"ok": False, "error": "推送目标不存在"})
+                return
+            service_id = str(target.get("service_id") or "")
+            if not _has_service_permission(service_id, "environment_manage", user):
+                self._json(403, {"ok": False, "error": "没有环境管理权限"})
+                return
+            item, err = save_registry_target({**dict(data), "service_id": service_id}, user, str(target.get("id") or ""))
+            if err or item is None:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "target": item})
             return
 
         m_tpl_copy = re.fullmatch(r"/api/pipeline-templates/([^/]+)/copy", path)
@@ -9367,6 +9794,30 @@ class Handler(SimpleHTTPRequestHandler):
             if not template or str(template.get("service_id") or "") != items[0]["service_id"]:
                 self._json(400, {"error": "流水线不存在或不属于当前微服务", "error_code": "pipeline_invalid"})
                 return
+            push_target_id = str(
+                data.get("push_target_id")
+                if "push_target_id" in data
+                else template.get("push_target_id") or ""
+            ).strip()
+            push_target_summary = default_registry_target(items[0]["service_id"])
+            if deployment_type == "code" and push_target_id:
+                selected_push_target = get_registry_target(push_target_id)
+                if (
+                    selected_push_target is None
+                    or str(selected_push_target.get("service_id") or "") != items[0]["service_id"]
+                ):
+                    self._json(
+                        400,
+                        {
+                            "error": "推送目标不存在或不属于当前微服务",
+                            "error_code": "push_target_invalid",
+                        },
+                    )
+                    return
+                push_target_summary = selected_push_target
+            elif deployment_type != "code":
+                push_target_id = ""
+                push_target_summary = {}
             release_pipeline = bool(template.get("builtin") and template.get("kind") == "release")
             if deployment_type == "package" and not release_pipeline:
                 self._json(400, {"error": "只有生产发布流水线支持包部署", "error_code": "package_pipeline_required"})
@@ -9479,6 +9930,8 @@ class Handler(SimpleHTTPRequestHandler):
                 "package_validated": False,
                 "template_id": template_id,
                 "template_name": template_name,
+                "push_target_id": push_target_id,
+                "push_target": push_target_summary,
                 "status": "running",
                 "stage": "starting",
                 "error": None,
@@ -9530,7 +9983,9 @@ class Handler(SimpleHTTPRequestHandler):
             )
             threading.Thread(
                 target=run_package_deploy_job if deployment_type == "package" else run_push_job,
-                args=(job_id, source_artifact) if deployment_type == "package" else (job_id, items, login_command),
+                args=(job_id, source_artifact)
+                if deployment_type == "package"
+                else (job_id, items, login_command, push_target_id),
                 daemon=True,
             ).start()
             self._json(
@@ -9543,6 +9998,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "items": items,
                     "branch": branches,
                     "deployment_type": deployment_type,
+                    "push_target_id": push_target_id,
+                    "push_target": push_target_summary,
                 },
             )
             return

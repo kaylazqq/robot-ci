@@ -1096,6 +1096,21 @@ body.run-open { overflow: hidden; }
 }
 .run-tpl-caption[hidden] { display: none !important; }
 #runTemplateNameBlock .input { max-width: 420px; }
+.push-target-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 760px;
+}
+.push-target-row select { min-width: 280px; max-width: 420px; }
+.push-target-form .label { margin-top: 14px; }
+.push-target-form .label:first-child { margin-top: 0; }
+.push-target-form textarea { width: 100%; min-height: 112px; }
+.push-target-form-actions { margin-top: 18px; }
+@media (max-width: 760px) {
+  .push-target-row { align-items: stretch; flex-direction: column; }
+  .push-target-row select { min-width: 0; max-width: none; width: 100%; }
+}
 .clone-overlay {
   position: fixed;
   inset: 0;

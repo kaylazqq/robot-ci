@@ -21,7 +21,7 @@ bash deploy-linux.sh
 ```
 
 4. 浏览器打开 `http://服务器IP/`
-5. 别人只需粘贴**自己的 SWR 临时登录指令**；拉私有 GitHub 代码用服务器上的 Token，无需再登 GitHub
+5. 在流水线的「推送镜像配置」中选择目标；具有环境管理权限的用户可粘贴对应账号的 **SWR 临时登录指令**新增配置。拉私有 GitHub 代码仍使用服务器 Token，无需再登 GitHub
 
 之后升级**只改代码，不换目录**：
 
@@ -40,6 +40,12 @@ bash /opt/swr-push-helper/scripts/apply-release.sh /tmp/robot-ci.tar.gz
 工具会在拉取服务代码后执行 `test-plans.json` 中受控的 UT/DT 测试，并在任务日志和页面显示总用例、通过、失败和错误数及失败用例摘要。第一阶段测试不阻断镜像构建或 SWR 推送；数据库、Redis、Temporal 等外部依赖测试不在测试计划中执行。
 
 批量构建时，每个所选微服务都按“拉取代码 → 执行该服务 UT/DT → 构建 → 推送 → 归档”的顺序独立执行。页面按微服务显示独立的测试结果卡片和分页表格，单个服务测试失败不会阻止该服务或后续服务继续构建。SWR 登录检测会向仓库发起真实 manifest 探测；仅明确确认登录有效时才开始需要推送的任务，鉴权失败后立即停止后续 SWR 操作。
+
+### 多账号镜像推送
+
+每个微服务可以维护多条「推送镜像配置」。配置包含名称、Registry、组织/Namespace 和登录凭证；Registry、用户名及密码从标准 `docker login -u ... -p ... <registry>` 命令中解析，原始命令不会保存或执行。密码由服务器专用 Fernet 密钥加密后写入运行时数据库，API 和页面不回显用户名或密码。每个构建任务使用独立的临时 Docker `--config`，因此不同华为云账号的并发任务不会覆盖彼此登录状态。
+
+流水线模板保存推送配置 ID，运行时仍可临时改选。空 ID 表示兼容原有服务器全局 SWR 登录；新环境应创建命名配置。推送目标管理暂时复用该微服务的「环境管理权限」。默认加密密钥位于 `data/registry-target.key`（权限 `0600`），也可通过 `ROBOT_CI_REGISTRY_SECRET_KEY` 注入 Fernet key；数据库与密钥必须一起备份，否则已保存凭证无法解密，需要重新配置。
 
 `multica-server` 构建前必须在页面填写 Daemon 版本，格式为 `vMAJOR.MINOR.PATCH`，例如 `v1.2.3`。前后端使用同一规则校验；工具不修改微服务配置文件，而是通过 `DAEMON_RELEASE_VERSION` 调用仓库 `.cid/build.yaml` 声明的 `build/package/build.sh build-cce`，由微服务构建脚本把对应版本写入镜像内的 release manifest。最近一次成功提交构建的合法版本会保存在服务器 `logs/last-daemon-version.json` 并对所有浏览器回填；浏览器本地值只作为服务器状态不可用时的兜底。
 
@@ -169,7 +175,7 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 - `SWR_GITHUB_TOKEN` 或 `GITHUB_TOKEN`：拉取私有 GitHub 仓库时使用。
 - `SWR_GITHUB_SSH_KEY`：使用 SSH 拉取时的私钥路径，可替代 GitHub Token。
 - `SWR_ARCHIVE_ROOT`、`SWR_ARCHIVE_ENABLED`、`SWR_ARCHIVE_REQUIRED`：控制镜像归档。
-- SWR 登录使用页面提交的华为云临时 `docker login` 命令；凭据只进入构建机的 Docker credential store，不写入仓库或镜像。
+- SWR 登录使用所选「推送镜像配置」；凭据加密存于运行时数据库，并只写入该任务的临时 Docker 配置，不写入仓库、镜像或任务日志。
 - `CCE_GIT_HASH`、`CCE_SKIP_EXPORT`、`CCE_UPLOAD` 等由 robot-ci 注入，不应作为容器运行变量。
 
 robot-ci 在启动构建进程前会移除 `GM_*`、模型供应商、数据库、S3、Mattermost、MemoryService 和 Multica 等运行变量，防止宿主机上已有的运行凭据意外成为构建输入。GM Agent 的 Dockerfile 不接收运行时 secret build arguments。

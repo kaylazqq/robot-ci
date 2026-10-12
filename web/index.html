@@ -297,6 +297,15 @@
         </div>
         <p class="branch-status" id="previewBranchStatus" hidden></p>
       </div>
+      <div class="run-block" id="pushTargetBlock">
+        <label class="label" for="pushTargetSelect">推送镜像配置</label>
+        <div class="push-target-row">
+          <select id="pushTargetSelect" class="input" aria-label="推送镜像配置"></select>
+          <button type="button" class="btn ghost" id="btnPushTargetEdit">编辑当前</button>
+          <button type="button" class="btn ghost" id="btnPushTargetCreate">新增配置</button>
+        </div>
+        <p class="env-secret-hint" id="pushTargetDetail"></p>
+      </div>
       <div class="run-block run-block-tasks">
         <label class="label">选择任务</label>
         <section class="job-pipeline" id="runJobPipeline" aria-label="选择任务"></section>

@@ -27,8 +27,10 @@ let servicePermissions = [];
 let envDraftOpen = false;
 let envEditingId = "";
 let runPreviewActive = false;
-let runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
+let runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "", pushTargetId: "" };
 let pipelineTemplates = [];
+let pushTargets = [];
+let pushTargetsCanManage = false;
 let selectedTemplateId = "";
 let pipelineTemplateLoadGeneration = 0;
 let serviceJobLoadGeneration = 0;
@@ -923,6 +925,7 @@ function setDeploymentType(next) {
     loadPreviewBranches(false);
   }
   setPreviewHint("");
+  renderPushTargetBlock();
   renderRunPage();
 }
 function ensurePreviewBranchPicker() {
@@ -1054,7 +1057,117 @@ function applyTemplateDefaults(tpl) {
     environmentId: (tpl && tpl.environment_id) || "",
     gammaEnvironmentId: (tpl && tpl.environment_id) || "",
     deploymentMode: "",
+    pushTargetId: (tpl && tpl.push_target_id) || "",
   };
+}
+
+function selectedPushTarget() {
+  return pushTargets.find((item) => item.id === (runPreviewSelection.pushTargetId || "")) || pushTargets[0] || null;
+}
+
+function renderPushTargetBlock() {
+  const block = $("pushTargetBlock");
+  const select = $("pushTargetSelect");
+  const detail = $("pushTargetDetail");
+  const edit = $("btnPushTargetEdit");
+  const create = $("btnPushTargetCreate");
+  if (!block || !select) return;
+  block.hidden = deploymentType !== "code";
+  const wanted = runPreviewSelection.pushTargetId || "";
+  if (!pushTargets.some((item) => item.id === wanted)) runPreviewSelection.pushTargetId = "";
+  select.innerHTML = pushTargets.map((item) => (
+    '<option value="' + esc(item.id || "") + '">' + esc(item.name || "未命名推送配置") + '</option>'
+  )).join("");
+  select.value = runPreviewSelection.pushTargetId || "";
+  select.disabled = !pushTargets.length || deploymentType !== "code";
+  const target = selectedPushTarget();
+  if (detail) {
+    detail.textContent = target
+      ? [target.registry, target.namespace].filter(Boolean).join("/") + (target.legacy ? "（使用服务器全局登录）" : "")
+      : "暂无可用推送配置";
+  }
+  if (edit) {
+    edit.hidden = !target || !target.id;
+    edit.disabled = !pushTargetsCanManage;
+    edit.title = pushTargetsCanManage ? "" : "没有环境管理权限";
+  }
+  if (create) {
+    create.disabled = !pushTargetsCanManage;
+    create.title = pushTargetsCanManage ? "" : "没有环境管理权限";
+  }
+}
+
+async function reloadPushTargets(preferredId) {
+  if (!currentServiceId || isAllServices()) return;
+  const data = await api("/api/push-targets?service_id=" + encodeURIComponent(currentServiceId));
+  pushTargets = data.targets || [];
+  pushTargetsCanManage = !!data.can_manage;
+  if (preferredId !== undefined) runPreviewSelection.pushTargetId = preferredId || "";
+  renderPushTargetBlock();
+}
+
+function openPushTargetEditor(target) {
+  if (!pushTargetsCanManage) {
+    setPreviewHint("没有环境管理权限");
+    return;
+  }
+  const editing = !!(target && target.id);
+  const wrap = document.createElement("div");
+  wrap.className = "push-target-form";
+  wrap.innerHTML =
+    '<label class="label" for="pushTargetName">配置名称</label>' +
+    '<input id="pushTargetName" class="input" maxlength="60" value="' + esc((target && target.name) || "") + '" placeholder="例如：生产账号 SWR" />' +
+    '<label class="label" for="pushTargetNamespace">组织 / Namespace</label>' +
+    '<input id="pushTargetNamespace" class="input" value="' + esc((target && target.namespace) || "") + '" placeholder="例如：public_ai" />' +
+    '<label class="label" for="pushTargetLoginCommand">docker login 命令' + (editing ? "（留空表示不修改）" : "") + '</label>' +
+    '<textarea id="pushTargetLoginCommand" class="input" rows="5" autocomplete="off" spellcheck="false" placeholder="docker login -u ... -p ... swr.example.com"></textarea>' +
+    '<p class="env-secret-hint">系统只解析 Registry、用户名和密码；不会执行其他 Shell 命令。密码加密保存且不会回显。</p>' +
+    '<p class="hint error" id="pushTargetFormError" hidden></p>' +
+    '<div class="row push-target-form-actions">' +
+      '<button type="button" class="btn primary" id="btnPushTargetSave">保存</button>' +
+      (editing ? '<button type="button" class="btn danger" id="btnPushTargetDelete">删除</button>' : "") +
+      '<button type="button" class="btn ghost" data-close-modal>取消</button>' +
+    '</div>';
+  openModal(editing ? "编辑镜像推送配置" : "新增镜像推送配置", wrap, { narrow: true });
+  const showError = (message) => {
+    const el = wrap.querySelector("#pushTargetFormError");
+    el.hidden = !message;
+    el.textContent = message || "";
+  };
+  wrap.querySelector("#btnPushTargetSave").addEventListener("click", async () => {
+    const button = wrap.querySelector("#btnPushTargetSave");
+    button.disabled = true;
+    showError("");
+    try {
+      const payload = {
+        service_id: currentServiceId,
+        name: wrap.querySelector("#pushTargetName").value.trim(),
+        namespace: wrap.querySelector("#pushTargetNamespace").value.trim(),
+        login_command: wrap.querySelector("#pushTargetLoginCommand").value.trim(),
+      };
+      const path = editing ? "/api/push-targets/" + encodeURIComponent(target.id) : "/api/push-targets";
+      const data = await api(path, { method: "POST", body: JSON.stringify(payload) });
+      closeModal();
+      await reloadPushTargets((data.target && data.target.id) || "");
+    } catch (error) {
+      showError(error.message || "保存失败");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  const remove = wrap.querySelector("#btnPushTargetDelete");
+  if (remove) remove.addEventListener("click", async () => {
+    if (!window.confirm("确认删除推送配置「" + target.name + "」？")) return;
+    remove.disabled = true;
+    try {
+      await api("/api/push-targets/" + encodeURIComponent(target.id) + "/delete", { method: "POST", body: "{}" });
+      closeModal();
+      await reloadPushTargets("");
+    } catch (error) {
+      showError(error.message || "删除失败");
+      remove.disabled = false;
+    }
+  });
 }
 function syncRunLayerChrome() {
   const tpl = findPipelineTemplate(runLayerTemplateId);
@@ -1071,6 +1184,7 @@ function syncRunLayerChrome() {
   if (confirm) confirm.textContent = runLayerMode === "edit" ? "保存" : "确认";
   const typeBlock = $("deploymentTypeBlock");
   if (typeBlock) typeBlock.hidden = runLayerMode === "edit" || !isProductionReleaseTemplate();
+  renderPushTargetBlock();
 }
 function openRunWindow(templateId) {
   const svc = currentService();
@@ -1142,7 +1256,7 @@ function cancelRunPreview() {
   previewBranchServiceId = "";
   runLayerMode = "run";
   runLayerTemplateId = "";
-  runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "" };
+  runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "", pushTargetId: "" };
   deploymentType = "code";
   setPreviewHint("");
   closeRunPopup();
@@ -1201,6 +1315,7 @@ async function saveEditedTemplate() {
       environment_id: runPreviewSelection.environmentId || "",
       release_environment_id: runPreviewSelection.environmentId || "",
       gamma_environment_id: runPreviewSelection.gammaEnvironmentId || "",
+      push_target_id: runPreviewSelection.pushTargetId || "",
     }),
   });
   if (data.template) {
@@ -1257,22 +1372,28 @@ async function loadPipelineTemplates() {
   const viewGen = viewGeneration;
   if (isAllServices() || !currentServiceId) {
     pipelineTemplates = [];
+    pushTargets = [];
+    pushTargetsCanManage = false;
     selectedTemplateId = "";
     renderPipelineTemplates();
     return;
   }
-  const [tplData, permissionData] = await Promise.all([
+  const [tplData, permissionData, pushTargetData] = await Promise.all([
     api("/api/pipeline-templates?service_id=" + encodeURIComponent(serviceId)),
     api("/api/permissions?service_id=" + encodeURIComponent(serviceId)).catch(() => null),
+    api("/api/push-targets?service_id=" + encodeURIComponent(serviceId)).catch(() => ({ targets: [], can_manage: false })),
   ]);
   if (loadGeneration !== pipelineTemplateLoadGeneration || !viewIsCurrent(viewGen, serviceId)) return false;
   pipelineTemplates = tplData.templates || [];
+  pushTargets = pushTargetData.targets || [];
+  pushTargetsCanManage = !!pushTargetData.can_manage;
   if (permissionData) servicePermissions = permissionData.permissions || [];
   if (!selectedTemplateId || !pipelineTemplates.some((item) => item.id === selectedTemplateId)) {
     const personal = defaultPersonalTemplate();
     selectedTemplateId = personal ? personal.id : "";
   }
   renderPipelineTemplates();
+  renderPushTargetBlock();
   return true;
 }
 function cloneLayerOpen() {
@@ -2702,7 +2823,8 @@ async function startRun(branch, artifactJobId) {
         deployment_type: deploymentType,
         artifact_job_id: artifactJobId || "",
         version: rememberedDaemonVersion() || svc.last_version || "",
-        login_command: ($("loginCmd") && $("loginCmd").value || "").trim(),
+        login_command: runPreviewSelection.pushTargetId ? "" : (($("loginCmd") && $("loginCmd").value || "").trim()),
+        push_target_id: runPreviewSelection.pushTargetId || "",
         template_id: (tpl && tpl.id) || selectedTemplateId || "",
         template_name: (tpl && tpl.name) || "",
         optional_steps: {
@@ -4100,6 +4222,16 @@ document.querySelectorAll('input[name="deploymentType"]').forEach((input) => {
   input.addEventListener("change", () => { if (input.checked) setDeploymentType(input.value); });
 });
 bind("btnRefreshPreviewBranches", () => loadPreviewBranches(true));
+const pushTargetSelect = $("pushTargetSelect");
+if (pushTargetSelect) pushTargetSelect.addEventListener("change", () => {
+  runPreviewSelection.pushTargetId = pushTargetSelect.value || "";
+  renderPushTargetBlock();
+});
+bind("btnPushTargetCreate", () => openPushTargetEditor(null));
+bind("btnPushTargetEdit", () => {
+  const target = selectedPushTarget();
+  if (target && target.id) openPushTargetEditor(target);
+});
 bind("btnStop", () => openStopDialog());
 bind("btnParams", () => openParamsDialog());
 bind("btnRefreshPipeline", () => refreshPipeline().catch(() => {}));
