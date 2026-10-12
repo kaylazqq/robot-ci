@@ -625,8 +625,6 @@ def _validate_environment_payload(
         return None, "跳板机必填"
     if require_passwords and not jump_password:
         return None, "跳板机密码必填"
-    if require_passwords and not node_password:
-        return None, "节点密码必填"
     return {
         "name": name,
         "service_id": service_id,
@@ -971,10 +969,9 @@ def _parallel_rollout_remote(record: Mapping[str, Any]) -> tuple[dict[str, Any],
     )
     if not (
         str(env.get("jump_host") or "").strip()
-        and [str(row) for row in (env.get("nodes") or []) if str(row).strip()]
-        and cce_rollout.has_ssh_auth(creds)
+        and cce_rollout.has_jump_auth(creds)
     ):
-        raise cce_rollout.CceRolloutError("环境未配置可用的跳板机、节点或 SSH 凭据")
+        raise cce_rollout.CceRolloutError("环境未配置可用的跳板机或 SSH 凭据")
     namespace = str(env.get("namespace") or CFG.get("cce_namespace") or "default").strip() or "default"
 
     def run_remote(command: str, timeout: int) -> tuple[int, str, str]:

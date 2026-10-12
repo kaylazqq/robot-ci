@@ -3298,9 +3298,7 @@ function envFormHtml(env) {
   const nodePassType = data.has_node_password ? "password" : "text";
   const jumpPassPh = data.has_jump_password ? "已保存，留空不修改" : "跳板机 SSH 密码";
   const nodePassPh = data.has_node_password ? "已保存，留空不修改" : "CCE 节点 SSH 密码";
-  const secretHint = data.has_jump_password && data.has_node_password
-    ? "已保存的密码不会回显。要更换时重新输入，留空则保持不变。"
-    : "仅首次填写时明文可见，保存后任何人都不会再看到密码。";
+  const secretHint = "跳板机密码必填。节点列表留空时直接在跳板机执行 kubectl；配置节点时节点密码仍可留空并使用 SSH Key。保存后的密码不会回显。";
   const owned = serviceTitle(services.find((item) => item.id === data.service_id) || { id: data.service_id, title: data.service_id });
   return (
     '<div class="env-form-card">' +
@@ -3314,17 +3312,17 @@ function envFormHtml(env) {
     '<input id="envWorkload" class="input" value="' + esc(data.workload_name || "") + '" placeholder="CCE 集群中的微服务名称" required />' +
     '<label class="label" for="envNamespace">Kubernetes Namespace</label>' +
     '<input id="envNamespace" class="input" value="' + esc(data.namespace || "default") + '" placeholder="例如 echo-prod" required />' +
-    '<label class="label" for="envKubeconfigPath">节点 kubeconfig 路径</label>' +
-    '<input id="envKubeconfigPath" class="input" value="' + esc(data.kubeconfig_path || "/root/.kube/config") + '" placeholder="目标节点上的绝对路径" required />' +
+    '<label class="label" for="envKubeconfigPath">kubectl 执行主机上的 kubeconfig 路径</label>' +
+    '<input id="envKubeconfigPath" class="input" value="' + esc(data.kubeconfig_path || "/root/.kube/config") + '" placeholder="跳板机或目标节点上的绝对路径" required />' +
     '<label class="label" for="envJump">跳板机</label>' +
     '<input id="envJump" class="input" value="' + esc(data.jump_host || "") + '" placeholder="用于 SSH 到 CCE 集群" required />' +
     '<label class="label" for="envJumpPassword">跳板机密码</label>' +
     '<input id="envJumpPassword" class="input" type="' + jumpPassType + '" value="" placeholder="' + esc(jumpPassPh) + '" autocomplete="new-password" spellcheck="false"' + (creating ? " required" : "") + " />" +
-    '<div class="label">节点列表</div>' +
+    '<div class="label">节点列表（可选）</div>' +
     '<div id="envNodeList">' + envNodeRowsHtml(data.nodes) + "</div>" +
     '<div class="row"><button type="button" class="btn ghost" id="btnEnvAddNode">' + envIconPlus() + " 添加节点</button></div>" +
-    '<label class="label" for="envNodePassword">节点密码</label>' +
-    '<input id="envNodePassword" class="input" type="' + nodePassType + '" value="" placeholder="' + esc(nodePassPh) + '" autocomplete="new-password" spellcheck="false"' + (creating ? " required" : "") + " />" +
+    '<label class="label" for="envNodePassword">节点密码（可选）</label>' +
+    '<input id="envNodePassword" class="input" type="' + nodePassType + '" value="" placeholder="' + esc(nodePassPh) + '" autocomplete="new-password" spellcheck="false" />' +
     '<p class="env-secret-hint">' + secretHint + "</p>" +
     '<label class="label" for="envName">环境名称</label>' +
     '<input id="envName" class="input" value="' + esc(data.name || "") + '" required />' +
@@ -3882,10 +3880,6 @@ async function saveEnvironment() {
     }
     if (!payload.jump_password) {
       setEnvFormError("跳板机密码必填");
-      return;
-    }
-    if (!payload.node_password) {
-      setEnvFormError("节点密码必填");
       return;
     }
   }

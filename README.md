@@ -140,11 +140,11 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 
 老版本下线和一键回滚采用持久化异步操作：接口提交后立即返回，页面原地显示删除、恢复、等待就绪、清理、完成或失败阶段并轮询更新。未完成操作会在服务重启后恢复，避免长 HTTP 请求无反馈或重启后流水线永久停在等待状态。
 
-平滑发布复制源 Deployment 的节点池亲和性、节点选择器和容忍配置，但会移除固定 `nodeName`，由 Kubernetes 在符合节点池约束且有容量的节点上调度新版本。环境管理中的节点列表仅用于 SSH/kubectl 执行入口，不限制节点池内未列出的节点参与调度。
+平滑发布复制源 Deployment 的节点池亲和性、节点选择器和容忍配置，但会移除固定 `nodeName`，由 Kubernetes 在符合节点池约束且有容量的节点上调度新版本。环境管理中的节点列表仅用于 SSH/kubectl 执行入口，不限制节点池内未列出的节点参与调度。节点列表留空时，CI 直接 SSH 到跳板机执行 kubectl；配置节点后才使用“跳板机 → 节点”的二次 SSH 兼容模式。节点密码始终可选，可由 SSH Key/Agent 认证替代。
 
 环境管理卡片对所有已登录用户开放只读查看，展示环境标签、Region、集群、配置负载、当前活动负载、跳板机、节点及密码是否已配置；密码明文始终不返回。具有环境管理权限的责任人可以创建、编辑和删除环境，其他用户没有写操作入口，服务端仍对写请求校验权限。
 
-每个环境必须单独配置 Kubernetes Namespace 和目标节点上的 kubeconfig 绝对路径。发布命令始终显式使用该 kubeconfig，并在修改 Deployment 前检查文件可读及目标 Namespace 的 Deployment 列表权限；不要使用 CCE 节点内 kubelet/kube-proxy 的加密 kubeconfig。建议将 CCE 导出的私网 kubeconfig或最小权限 ServiceAccount kubeconfig放在 `/etc/robot-ci/kubeconfigs/<cluster>.yaml`，权限设为仅执行用户可读，并确保环境节点列表中的每个候选执行节点路径一致。
+每个环境必须单独配置 Kubernetes Namespace 和 kubectl 执行主机上的 kubeconfig 绝对路径。发布命令始终显式使用该 kubeconfig，并在修改 Deployment 前检查文件可读及目标 Namespace 的 Deployment 列表权限；不要使用 CCE 节点内 kubelet/kube-proxy 的加密 kubeconfig。推荐将 CCE 导出的私网 kubeconfig 或最小权限 ServiceAccount kubeconfig 放在跳板机的 `/etc/robot-ci/kubeconfigs/<cluster>.yaml`，权限设为仅执行用户可读，并把节点列表留空。只有保留二次 SSH 兼容模式时，才需要确保每个候选节点都有相同路径的 kubeconfig。
 
 例如 V1 → V2 已下线 V1，而 V2 → V3 正在等待下线 V2：回滚第一条记录后仅保留 V1，第二条流水线结束为已完成，发布标记为「已由历史回滚结束」，禁止继续下线及扩缩容。第二条记录的 V2 快照仍保留，可再次回滚到 V2。发布、下线、扩缩容、回滚在同一环境内串行执行；失败回滚保存恢复计划，可重试，未清理完成时不把受影响流水线标为完成。快照恢复 Deployment 配置，不回退数据库或外部配置内容。
 

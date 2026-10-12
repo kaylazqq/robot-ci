@@ -175,7 +175,7 @@ class EnvironmentApiTests(unittest.TestCase):
             )
         self.assertEqual(400, failed.exception.code)
 
-    def test_create_requires_passwords_and_never_echoes_them(self) -> None:
+    def test_create_requires_jump_password(self) -> None:
         cookie = self._login()
         with self.assertRaises(HTTPError) as failed:
             self._open(
@@ -196,6 +196,32 @@ class EnvironmentApiTests(unittest.TestCase):
             )
         self.assertEqual(400, failed.exception.code)
         self.assertIn("密码", json.loads(failed.exception.read().decode())["error"])
+
+    def test_create_allows_direct_jump_mode_without_nodes_or_node_password(self) -> None:
+        cookie = self._login()
+        payload = {
+            "name": "direct-jump",
+            "service_id": "semantic-schedule",
+            "region": "cn-southwest-2",
+            "cluster_name": "cluster",
+            "workload_name": "semantic-schedule",
+            "namespace": "echo-prod",
+            "kubeconfig_path": "/etc/robot-ci/kubeconfigs/prod.yaml",
+            "jump_host": "root@jump",
+            "jump_password": "jump-secret",
+            "nodes": [],
+        }
+        with self._open(
+            "/api/environments",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            cookie=cookie,
+        ) as response:
+            created = json.loads(response.read().decode())["environment"]
+
+        self.assertEqual([], created["nodes"])
+        self.assertTrue(created["has_jump_password"])
+        self.assertFalse(created["has_node_password"])
 
     def test_create_requires_known_service(self) -> None:
         cookie = self._login()

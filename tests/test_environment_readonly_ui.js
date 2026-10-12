@@ -52,4 +52,7 @@ assert.doesNotMatch(editableCard, /data-env-delete="env1"[^>]*disabled/);
 assert.match(source, /grid\.querySelectorAll\("\[data-env-id\]"\)/);
 assert.match(source, /if \(ev\.key !== "Enter" && ev\.key !== " "\)/);
 assert.match(source, /if \(ev\.target\.closest\("button, input, select, a"\)\) return/);
+assert.match(source, /节点列表（可选）/);
+assert.match(source, /节点密码（可选）/);
+assert.doesNotMatch(source, /setEnvFormError\("节点密码必填"\)/);
 console.log('Environment read-only view states: passed');

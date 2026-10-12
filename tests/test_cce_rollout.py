@@ -195,6 +195,32 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertEqual("from-env", creds["jump_password"])
         self.assertEqual("from-cfg", creds["node_password"])
 
+    def test_exec_via_nodes_runs_directly_on_jump_when_nodes_are_empty(self) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def direct(command, **kwargs):  # noqa: ANN001, ANN003
+            calls.append((command, kwargs))
+            return 0, "ok", ""
+
+        result = cce_rollout.exec_via_nodes(
+            "kubectl get deploy",
+            jump_host="ci@jump.example:2222",
+            nodes=[],
+            creds={"jump_password": "jump-secret"},
+            timeout=45,
+            direct=direct,
+            kubeconfig_path="/etc/robot-ci/kubeconfigs/prod.yaml",
+        )
+
+        self.assertEqual((0, "ok", ""), result)
+        self.assertEqual(1, len(calls))
+        command, kwargs = calls[0]
+        self.assertTrue(command.startswith("export KUBECONFIG=/etc/robot-ci/kubeconfigs/prod.yaml;"))
+        self.assertEqual("ci", kwargs["jump_user"])
+        self.assertEqual("jump.example", kwargs["jump_host"])
+        self.assertEqual(2222, kwargs["jump_port"])
+        self.assertNotIn("node_host", kwargs)
+
     def test_deploy_job_results_sets_image(self) -> None:
         commands: list[str] = []
 
@@ -244,6 +270,41 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertTrue(any("rollout status" in cmd for cmd in commands))
         self.assertTrue(any("container-1=" in cmd for cmd in commands))
         self.assertFalse(any("filebeat=" in cmd for cmd in commands))
+
+    def test_deploy_job_results_supports_direct_kubectl_on_jump_host(self) -> None:
+        commands: list[str] = []
+
+        def direct(command, **_kwargs):  # noqa: ANN001
+            commands.append(command)
+            if "get deploy" in command and "-o json" in command:
+                return 0, json.dumps({"spec": {"template": {"spec": {"containers": [
+                    {"name": "frontend", "image": "registry/echoagent-frontend:old"}
+                ]}}}}), ""
+            return 0, "rolled out", ""
+
+        logs: list[str] = []
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "name": "prod",
+                "workload_name": "echoagent-frontend",
+                "jump_host": "root@jump",
+                "nodes": [],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/prod.yaml",
+            },
+            results=[{
+                "service_id": "echoagent-frontend",
+                "ok": True,
+                "remote": "registry/echoagent-frontend:202610120930_abc1234",
+            }],
+            creds={"jump_password": "x"},
+            direct=direct,
+            log=logs.append,
+        )
+
+        self.assertTrue(ok, err)
+        self.assertTrue(any("set image" in command for command in commands))
+        self.assertTrue(any("kubectl执行位置=跳板机" in line for line in logs))
+        self.assertTrue(all(command.startswith("export KUBECONFIG=/etc/robot-ci/kubeconfigs/prod.yaml;") for command in commands))
 
     def test_deploy_job_results_parallel_creates_a_second_deployment(self) -> None:
         commands: list[str] = []

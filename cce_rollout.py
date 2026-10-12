@@ -1,4 +1,4 @@
-"""SSH jump → CCE worker → in-place or parallel Deployment rollout.
+"""SSH to a jump host, optionally hop to a CCE worker, then roll out a Deployment.
 
 Used by gamma deploy after a successful SWR push. Credentials come from
 config / process env / an optional secrets file — never from git.
@@ -218,6 +218,15 @@ def has_ssh_auth(creds: Mapping[str, str]) -> bool:
     return any(path.is_file() for path in default_key_candidates())
 
 
+def has_jump_auth(creds: Mapping[str, str]) -> bool:
+    if str(creds.get("jump_password") or "").strip():
+        return True
+    key = str(creds.get("ssh_key") or "").strip()
+    if key and Path(key).expanduser().is_file():
+        return True
+    return any(path.is_file() for path in default_key_candidates())
+
+
 def image_matches_workload(image: str, workload: str) -> bool:
     repo = image_ref_name(image).lower().replace("_", "-")
     name = str(workload or "").strip().lower().replace("_", "-")
@@ -411,6 +420,48 @@ def hop_exec(
             pass
 
 
+def jump_exec(
+    command: str,
+    *,
+    jump_user: str,
+    jump_host: str,
+    jump_port: int = 22,
+    jump_password: str = "",
+    ssh_key: str = "",
+    timeout: int = 120,
+) -> tuple[int, str, str]:
+    """Run a command directly on the jump host without a worker-node SSH hop."""
+    paramiko = _import_paramiko()
+    jump = paramiko.SSHClient()
+    jump.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kw: dict[str, Any] = {
+        "timeout": 20,
+        "banner_timeout": 20,
+        "auth_timeout": 20,
+        "allow_agent": True,
+        "look_for_keys": True,
+    }
+    key = str(ssh_key or "").strip()
+    if key:
+        connect_kw["key_filename"] = str(Path(key).expanduser())
+    if jump_password:
+        connect_kw["password"] = jump_password
+    try:
+        jump.connect(jump_host, port=int(jump_port or 22), username=jump_user, **connect_kw)
+        _stdin, stdout, stderr = jump.exec_command(command, timeout=max(30, int(timeout or 120)))
+        out = stdout.read().decode("utf-8", "replace")
+        err = stderr.read().decode("utf-8", "replace")
+        code = int(stdout.channel.recv_exit_status())
+        return code, out, err
+    except Exception as exc:
+        raise CceRolloutError(f"SSH 跳板机 {jump_host} 失败: {exc}") from exc
+    finally:
+        try:
+            jump.close()
+        except Exception:
+            pass
+
+
 def exec_via_nodes(
     command: str,
     *,
@@ -419,17 +470,27 @@ def exec_via_nodes(
     creds: Mapping[str, str],
     timeout: int,
     hop: Callable[..., tuple[int, str, str]] | None = None,
+    direct: Callable[..., tuple[int, str, str]] | None = None,
     kubeconfig_path: str = "",
 ) -> tuple[int, str, str]:
     jump_user, jump_addr, jump_port = parse_ssh_target(jump_host)
-    if not nodes:
-        raise CceRolloutError("环境未配置 CCE 节点")
-    errors: list[str] = []
-    runner = hop or hop_exec
     remote_command = command
     path = str(kubeconfig_path or "").strip()
     if path:
         remote_command = f"export KUBECONFIG={shlex.quote(path)}; {command}"
+    if not nodes:
+        runner = direct or jump_exec
+        return runner(
+            remote_command,
+            jump_user=jump_user,
+            jump_host=jump_addr,
+            jump_port=jump_port,
+            jump_password=str(creds.get("jump_password") or ""),
+            ssh_key=str(creds.get("ssh_key") or ""),
+            timeout=timeout,
+        )
+    errors: list[str] = []
+    runner = hop or hop_exec
     node_user_default = str(creds.get("node_user") or "root")
     for raw_node in nodes:
         node_user, node_addr, node_port = parse_ssh_target(raw_node, default_user=node_user_default)
@@ -904,6 +965,7 @@ def deploy_job_results(
     namespace: str = "default",
     rollout_timeout: str = "180s",
     hop: Callable[..., tuple[int, str, str]] | None = None,
+    direct: Callable[..., tuple[int, str, str]] | None = None,
     log: Callable[[str], None] | None = None,
     mode: str = "inplace",
     release_id: str = "",
@@ -919,13 +981,11 @@ def deploy_job_results(
     kubeconfig_path = str(environment.get("kubeconfig_path") or "/root/.kube/config").strip()
     if not jump_host:
         return False, "环境未配置跳板机"
-    if not nodes:
-        return False, "环境未配置 CCE 节点"
     if not workload:
         return False, "环境未配置负载名称"
     if not kubeconfig_path.startswith("/"):
         return False, "环境的 kubeconfig 路径必须是目标节点上的绝对路径"
-    if not has_ssh_auth(creds):
+    if not has_jump_auth(creds):
         return False, (
             "未配置跳板机 SSH 凭据，请在 CI 的 config.json 设置 cce_ssh_password，"
             "或设置环境变量 CCE_SSH_PASSWORD / CCE_JUMP_PASSWORD"
@@ -963,7 +1023,7 @@ def deploy_job_results(
 
     write(
         f"gamma部署 环境={env_name} 集群={cluster or '-'} 跳板={jump_host} "
-        f"节点={','.join(nodes)} 负载={workload}"
+        f"kubectl执行位置={'节点=' + ','.join(nodes) if nodes else '跳板机'} 负载={workload}"
     )
 
     def run_remote(command: str, timeout: int) -> tuple[int, str, str]:
@@ -974,6 +1034,7 @@ def deploy_job_results(
             creds=creds,
             timeout=timeout,
             hop=hop,
+            direct=direct,
             kubeconfig_path=kubeconfig_path,
         )
 
