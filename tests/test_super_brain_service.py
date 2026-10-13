@@ -23,7 +23,6 @@ class SuperBrainServiceTests(unittest.TestCase):
         self.assertEqual("main", item["default_branch"])
         self.assertEqual("super-brain", item["image"])
         self.assertEqual("super-brain_", item["tar_prefix"])
-        self.assertEqual(["python"], item["base_image_targets"])
         self.assertFalse(any(service["id"] == "log-agent" for service in services))
 
         self.assertEqual("super-brain-pytest", plans["services"]["super-brain"])
@@ -82,9 +81,7 @@ artifacts:
             self.assertIsNotNone(cid)
             with patch.object(server, "repo_dir", return_value=repo), patch.object(
                 server, "host_path", side_effect=lambda path: str(path)
-            ), patch.object(server, "public_service_dir", return_value=Path("/tmp/public-service")), patch.object(
-                server, "append_job_log"
-            ), patch.object(
+            ), patch.object(server, "append_job_log"), patch.object(
                 server, "run_stream", return_value=0
             ) as run_stream, patch.object(
                 server.time, "strftime", return_value="202609101800"

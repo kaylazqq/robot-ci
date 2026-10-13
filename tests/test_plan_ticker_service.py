@@ -23,7 +23,6 @@ class PlanTickerServiceTests(unittest.TestCase):
         self.assertEqual("main", item["default_branch"])
         self.assertEqual("plan-ticker", item["image"])
         self.assertEqual("plan-ticker_", item["tar_prefix"])
-        self.assertEqual(["ubuntu"], item["base_image_targets"])
 
         # Fallback plan remains for old branches without .cid; CID UT is preferred.
         self.assertEqual("plan-ticker-go", plans["services"]["plan-ticker"])
@@ -81,9 +80,7 @@ artifacts:
             self.assertIsNotNone(cid)
             with patch.object(server, "repo_dir", return_value=repo), patch.object(
                 server, "host_path", side_effect=lambda path: str(path)
-            ), patch.object(server, "public_service_dir", return_value=Path("/tmp/public-service")), patch.object(
-                server, "append_job_log"
-            ), patch.object(
+            ), patch.object(server, "append_job_log"), patch.object(
                 server, "run_stream", return_value=0
             ) as run_stream, patch.object(
                 server.time, "strftime", return_value="202609091800"

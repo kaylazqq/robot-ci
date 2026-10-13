@@ -29,10 +29,13 @@ fi
 "$PYTHON_BIN" - <<'PY'
 import json
 from pathlib import Path
-plans = json.loads(Path("test-plans.json").read_text(encoding="utf-8"))
-profile = plans.get("services", {}).get("config-service")
-print("config-service profile:", profile)
-assert profile == "config-service-go", "config-service not registered in test-plans.json"
+services = json.loads(Path("services.json").read_text(encoding="utf-8"))
+ids = {item["id"] for item in services}
+print("services:", ", ".join(sorted(ids)))
+assert "org-admin" in ids, "org-admin not registered in services.json"
+assert "link-ops" in ids, "link-ops not registered in services.json"
+assert all("base_image_targets" not in item for item in services)
+assert all("skip_public_service" not in item for item in services)
 PY
 
 if systemctl is-active --quiet swr-push-helper.service 2>/dev/null; then

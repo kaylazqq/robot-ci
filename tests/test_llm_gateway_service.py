@@ -21,7 +21,6 @@ class LlmGatewayServiceTests(unittest.TestCase):
         self.assertEqual("llm-gateway", item["image"])
         self.assertEqual("llm-gateway_", item["tar_prefix"])
         self.assertNotIn("dockerfile_build", item)
-        self.assertTrue(item["skip_public_service"])
 
     def test_test_plan_runs_repo_pytest(self) -> None:
         # Fallback plan remains for old branches without .cid; CID UT is preferred.
@@ -35,7 +34,6 @@ class LlmGatewayServiceTests(unittest.TestCase):
         svc = {
             "id": "llm-gateway",
             "image": "llm-gateway",
-            "skip_public_service": True,
         }
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -82,9 +80,9 @@ artifacts:
             self.assertIsNotNone(cid)
             with patch.object(server, "repo_dir", return_value=repo), patch.object(
                 server, "host_path", side_effect=lambda path: str(path)
-            ), patch.object(server, "public_service_dir", return_value=Path("/tmp/public-service")), patch.object(
-                server, "append_job_log"
-            ), patch.object(server, "run_stream", return_value=0) as run_stream, patch.object(
+            ), patch.object(server, "append_job_log"), patch.object(
+                server, "run_stream", return_value=0
+            ) as run_stream, patch.object(
                 server.time, "strftime", return_value="202609021800"
             ):
                 ok, detail = server.build_from_source("job", svc, "abc1234")

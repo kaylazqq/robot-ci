@@ -119,9 +119,6 @@ _daemon_version_lock = threading.Lock()
 _branch_cache: dict[str, tuple[float, list[str]]] = {}
 _branch_cache_lock = threading.Lock()
 _artifacts_lock = threading.Lock()
-_public_service_lock = threading.Lock()
-_public_service_ready_at = 0.0
-PUBLIC_SERVICE_REUSE_SEC = 120
 _history_disk_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
 _history_disk_cache_lock = threading.Lock()
 _fleet_cache_lock = threading.Lock()
@@ -143,7 +140,7 @@ BUILDKIT_CACHE_KEEP_STORAGE = "50GB"
 CI_TMP_DEFAULT = "/home/ci"
 BUILD_CACHE_DEFAULT = "/opt/ai/build-cache"
 BUILD_SWAP_NAME = "build.swap"
-WORKSPACE_KEEP_NAMES = ("public-service", ".robot-ci-cache")
+WORKSPACE_KEEP_NAMES = (".robot-ci-cache",)
 LIVE_JOB_MARKERS_DIRNAME = "live-jobs"
 LIVE_JOB_MARKER_MAX_AGE_SEC = 6 * 3600
 HOST_SERVICE_LOCK_NAMES = ("mattermost",)
@@ -3024,9 +3021,6 @@ def _prepare_lane_for_job(
             if any(token in error for token in ("SWR", "swr", "login", "鉴权", "docker login", "docker unavailable")):
                 st = "failed"
                 detail = "环境检查失败"
-            elif "public-service" in error:
-                st = "failed"
-                detail = "依赖仓库同步失败"
             elif job_status == "failed" and active in (None, "prepare") and not _job_progressed_past_prepare(job):
                 st = "failed"
                 detail = (error[:80] if error else "前置准备失败")
@@ -5271,19 +5265,6 @@ def resolve_frozen_source_inputs(
             )
         frozen_inputs[item["service_id"]] = resolved_sources[source_key]
 
-    if CFG.get("freeze_build_inputs") and any(
-        not catalog[item["service_id"]].get("skip_public_service") for item in items
-    ):
-        frozen_inputs["public-service"] = freeze_ref(
-            clone_url_for(
-                CFG.get("public_service_github")
-                or "https://github.com/rollingfruit/public-service.git"
-            ),
-            CFG.get("public_service_branch") or "main",
-            run_cmd,
-            git_args,
-            git_env(),
-        )
     return frozen_inputs
 
 
@@ -6150,10 +6131,7 @@ def job_workspace_suffix(job_id: str | None) -> str:
 
 
 def repo_dir(svc: dict[str, Any], job_id: str | None = None) -> Path:
-    """Per-job checkout: <workspace_root>/<repo>--<job_id>.
-
-    Sibling of shared public-service so deploy.sh `../public-service` still works.
-    """
+    """Per-job checkout: <workspace_root>/<repo>--<job_id>."""
     root = Path(CFG["workspace_root"])
     name = clone_dir_name(svc)
     suffix = job_workspace_suffix(job_id)
@@ -6351,7 +6329,7 @@ def gc_idle_clone_dirs(job_id: str, svc: dict[str, Any]) -> None:
 
 
 def gc_all_idle_clone_dirs(job_id: str) -> None:
-    """Drop every finished checkout. Keep public-service, fleet cache, running jobs."""
+    """Drop every finished checkout. Keep fleet cache and running jobs."""
     root = Path(CFG.get("workspace_root") or "")
     if not root.is_dir():
         return
@@ -7089,199 +7067,6 @@ def validate_cloned_repo_contract(dest: Path, svc: dict[str, Any]) -> tuple[bool
     return True, ""
 
 
-def public_service_dir() -> Path:
-    """Sibling of per-service clone dirs: <workspace_root>/public-service."""
-    job_id = current_job_id()
-    if CFG.get('freeze_build_inputs') and job_id:
-        return Path(CFG['workspace_root']) / 'frozen-inputs' / job_id / 'public-service'
-    return Path(CFG["workspace_root"]) / "public-service"
-
-
-def ensure_public_service(job_id: str) -> tuple[bool, str]:
-    """
-    Some legacy branches source shared helpers from the sibling public-service.
-    Helper clones only the service repo, so keep a shared public-service checkout
-    next to it (does not modify service source trees).
-
-    Concurrent jobs share this checkout: update in place under a lock, never wipe
-    an existing tree (wiping would break other in-flight builds).
-    """
-    global _public_service_ready_at
-    with log_substep("env"), _public_service_lock:
-        dest = public_service_dir()
-        branch = (CFG.get("public_service_branch") or "main").strip() or "main"
-        url = (CFG.get("public_service_github") or "https://github.com/rollingfruit/public-service.git").strip()
-        public = public_github_url(url)
-        clone_url = clone_url_for(url)
-        genv = git_env()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if CFG.get('freeze_build_inputs'):
-            from frozen_builds import checkout
-            sha = (_job_copy(job_id) or {}).get('frozen_inputs', {}).get('public-service')
-            if dest.exists():
-                code, actual = run_cmd(git_args('-C', str(dest), 'rev-parse', 'HEAD'), env=genv, timeout=30)
-                return (True, str(dest)) if not code and actual.strip() == sha else (False, 'Frozen shared dependency changed')
-            return checkout(job_id, dest, clone_url, sha, run_stream, run_cmd, git_args, genv)
-        rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
-        now = time.time()
-        append_job_log(job_id, f"ensure shared public-service → {dest} @ {branch}")
-
-        if (dest / ".git").is_dir() and rrd.is_file() and now - _public_service_ready_at < PUBLIC_SERVICE_REUSE_SEC:
-            code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
-            append_job_log(
-                job_id,
-                f"public-service recently updated; reuse HEAD={head if code == 0 else '?'} @ {branch}",
-            )
-            return True, str(dest)
-
-        if (dest / ".git").is_dir():
-            append_job_log(job_id, "public-service exists; fetch/update (no wipe, safe for concurrency)")
-            run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", clone_url), timeout=30, env=genv)
-            code = run_stream(
-                job_id,
-                git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
-                timeout=600,
-                env=genv,
-            )
-            if code != 0:
-                if rrd.is_file():
-                    append_job_log(job_id, "WARN git fetch public-service failed; reusing existing checkout")
-                    _public_service_ready_at = now
-                    return True, str(dest)
-                return False, "git fetch public-service failed"
-            code, old_head = run_cmd(git_args("-C", str(dest), "rev-parse", "HEAD"), timeout=30, env=genv)
-            code_fh, new_head = run_cmd(git_args("-C", str(dest), "rev-parse", "FETCH_HEAD"), timeout=30, env=genv)
-            if code == 0 and code_fh == 0 and (old_head or "").strip() == (new_head or "").strip():
-                append_job_log(job_id, "public-service already at FETCH_HEAD; skip checkout")
-            else:
-                code = run_stream(
-                    job_id,
-                    git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
-                    timeout=120,
-                    env=genv,
-                )
-                if code != 0:
-                    if rrd.is_file():
-                        append_job_log(
-                            job_id,
-                            f"WARN checkout public-service {branch} failed; reusing existing checkout",
-                        )
-                        _public_service_ready_at = now
-                        return True, str(dest)
-                    return False, f"checkout public-service {branch} failed"
-        else:
-            append_job_log(job_id, "git clone public-service…")
-            code = run_stream(
-                job_id,
-                git_args("clone", "--depth", "1", "--branch", branch, clone_url, str(dest)),
-                timeout=1800,
-                env=genv,
-            )
-            if code != 0:
-                wipe_workspace_dir(job_id, dest, label="failed public-service clone")
-                code = run_stream(
-                    job_id,
-                    git_args("clone", "--depth", "1", clone_url, str(dest)),
-                    timeout=1800,
-                    env=genv,
-                )
-                if code != 0:
-                    return False, "git clone public-service failed"
-                run_stream(
-                    job_id,
-                    git_args("-C", str(dest), "fetch", "--depth", "1", "origin", branch),
-                    timeout=600,
-                    env=genv,
-                )
-                code = run_stream(
-                    job_id,
-                    git_args("-C", str(dest), "checkout", "-B", branch, "FETCH_HEAD"),
-                    timeout=120,
-                    env=genv,
-                )
-                if code != 0:
-                    return False, f"checkout public-service {branch} failed"
-
-        run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
-        if not rrd.is_file():
-            rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
-        if not rrd.is_file():
-            return False, f"missing {rrd}"
-        code, head = run_cmd(git_args("-C", str(dest), "rev-parse", "--short=7", "HEAD"), timeout=30, env=genv)
-        append_job_log(job_id, f"public-service HEAD={head if code == 0 else '?'} @ {branch}")
-        _public_service_ready_at = time.time()
-        return True, str(dest)
-
-
-def ensure_versioned_base_images(
-    job_id: str,
-    targets: list[str] | tuple[str, ...] | None = None,
-) -> tuple[bool, str]:
-    """Verify only the shared bases required by the selected services."""
-    script = public_service_dir() / "scripts" / "build-versioned-base-images.sh"
-    if not script.is_file():
-        return False, f"missing shared base-image builder: {script}"
-    selected = normalize_base_image_targets(targets)
-    if not selected:
-        append_job_log(job_id, "base images: no shared targets required; skip")
-        return True, ""
-    target_args = " ".join(shlex.quote(item) for item in selected)
-    append_job_log(
-        job_id,
-        f"base images: verifying targets [{', '.join(selected)}] (HIT/MISS follows)",
-    )
-    # Serialize across jobs so concurrent Python/OpenResty cold builds cannot race
-    # on the same local/ai-* tags (e.g. agentlink vs semantic-gateway).
-    with _public_service_lock:
-        code = run_stream(
-            job_id,
-            bash_lc(f"bash {shlex.quote(host_path(script))} {target_args}"),
-            timeout=3600,
-        )
-    if code != 0:
-        return False, "shared base-image verification/build failed"
-    append_job_log(job_id, f"base images: contract verified for [{', '.join(selected)}]")
-    return True, ""
-
-
-KNOWN_BASE_IMAGE_TARGETS = ("ubuntu", "openresty", "observability", "python")
-
-
-def normalize_base_image_targets(raw: Any) -> list[str]:
-    """Keep script-supported targets in stable order; drop unknowns/duplicates."""
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        values = [part.strip().lower() for part in raw.replace(",", " ").split() if part.strip()]
-    elif isinstance(raw, (list, tuple, set)):
-        values = [str(part).strip().lower() for part in raw if str(part).strip()]
-    else:
-        return []
-    ordered: list[str] = []
-    for target in KNOWN_BASE_IMAGE_TARGETS:
-        if target in values and target not in ordered:
-            ordered.append(target)
-    return ordered
-
-
-def base_image_targets_for_service(svc: dict[str, Any] | None) -> list[str]:
-    """Map one service to the public-service base targets it needs."""
-    if not svc or svc.get("skip_public_service"):
-        return []
-    if "base_image_targets" in svc:
-        return normalize_base_image_targets(svc.get("base_image_targets"))
-    return ["ubuntu"]
-
-
-def base_image_targets_for_services(services: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> list[str]:
-    selected: list[str] = []
-    for svc in services:
-        for target in base_image_targets_for_service(svc):
-            if target not in selected:
-                selected.append(target)
-    return normalize_base_image_targets(selected)
-
-
 def find_local_image_by_git_hash(image: str, git_hash: str) -> tuple[str | None, str | None]:
     """Pick newest local/<image>:*_<git_hash> after a fresh build (tag is YYYYMMDDHHMM_<hash>)."""
     if not image or not git_hash or git_hash.startswith("0000"):
@@ -7321,7 +7106,6 @@ def build_from_source(
 ) -> tuple[bool, str]:
     src = repo_dir(svc, job_id)
     shell_src = host_path(src)
-    ps_dir = host_path(public_service_dir())
     where = "WSL" if use_wsl() else "host"
     append_job_log(job_id, f"build on {where}: {src}")
 
@@ -7444,7 +7228,7 @@ def build_from_source(
         "find . -maxdepth 5 -type f -name '*.sh' -exec sed -i 's/\\r$//' {} + 2>/dev/null || true; "
         "unset SKIP_PACKAGE MATTERMOST_FORCE_BUILD SKIP_WEBAPP_BUILD SKIP_SERVER_BUILD FORCE_WEBAPP_BUILD FORCE_REBUILD; "
         f"export {build_env_exports}CCE_UPLOAD=0 DEPLOY_NO_PAUSE=1 SKIP_IMAGE_ARCHIVE=1 EXPORT_ARCHIVE=0 "
-        f"CCE_GIT_HASH='{git_hash}' PUBLIC_SERVICE_DIR='{ps_dir}' {extra_env}; "
+        f"CCE_GIT_HASH='{git_hash}' {extra_env}; "
         f"{build_invocation}"
     )
     output_tail: list[str] = []
@@ -8720,21 +8504,6 @@ def run_push_job(
             return
         if not needs_swr:
             append_job_log(job_id, "SWR login skipped: all selected services are archive-only")
-
-        if any(not svc.get("skip_public_service") for svc, _, _ in resolved):
-            ok_ps, detail_ps = ensure_public_service(job_id)
-            if not ok_ps:
-                set_job(job_id, status="failed", error=detail_ps)
-                append_job_log(job_id, f"ERROR {detail_ps}")
-                return
-            base_targets = base_image_targets_for_services([svc for svc, _, _ in resolved])
-            ok_bases, detail_bases = ensure_versioned_base_images(job_id, base_targets)
-            if not ok_bases:
-                set_job(job_id, status="failed", error=detail_bases)
-                append_job_log(job_id, f"ERROR {detail_bases}")
-                return
-        else:
-            append_job_log(job_id, "shared public-service skipped: not required by selected services")
 
         archive_dir: Path | None = None
         bundle_required = any(svc.get("bundle_archive") for svc, _, _ in resolved)

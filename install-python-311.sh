@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Install shared Python 3.11.15 for mattermost packaging (public-service contract).
+# Install shared Python 3.11.15 for mattermost packaging on the CI host.
 set -euo pipefail
 
 PY_VER=3.11.15
 ARCHIVE="Python-${PY_VER}.tgz"
-PS_DEPS=/var/lib/swr-workspaces/public-service/deps
 AI_INSTALLERS=/opt/ai/installers
-PS_ROOT=/var/lib/swr-workspaces/public-service
+PREFIX=/opt/ai/python-${PY_VER}
+BUILD_ROOT=/home/ci/python-build
 
-mkdir -p "$PS_DEPS" "$AI_INSTALLERS"
+mkdir -p "$AI_INSTALLERS" /opt/ai "$BUILD_ROOT"
 
 echo "==> build deps for compiling Python"
 if command -v dnf >/dev/null 2>&1; then
@@ -19,18 +19,17 @@ elif command -v yum >/dev/null 2>&1; then
     readline-devel ncurses-devel zlib-devel libuuid-devel make gcc gcc-c++ tar gzip xz
 fi
 
-if [[ ! -s "$PS_DEPS/$ARCHIVE" ]]; then
+if [[ ! -s "$AI_INSTALLERS/$ARCHIVE" ]]; then
   echo "==> download $ARCHIVE"
-  curl -fL --retry 3 -o "$PS_DEPS/$ARCHIVE" \
+  curl -fL --retry 3 -o "$AI_INSTALLERS/$ARCHIVE" \
     "https://mirrors.huaweicloud.com/python/${PY_VER}/${ARCHIVE}" \
-    || curl -fL --retry 3 -o "$PS_DEPS/$ARCHIVE" \
+    || curl -fL --retry 3 -o "$AI_INSTALLERS/$ARCHIVE" \
     "https://www.python.org/ftp/python/${PY_VER}/${ARCHIVE}"
 fi
-cp -f "$PS_DEPS/$ARCHIVE" "$AI_INSTALLERS/$ARCHIVE"
-ls -lh "$PS_DEPS/$ARCHIVE"
+ls -lh "$AI_INSTALLERS/$ARCHIVE"
 
-if [[ -x /opt/ai/python-${PY_VER}/bin/python3.11 ]]; then
-  /opt/ai/python-${PY_VER}/bin/python3.11 - <<PY
+if [[ -x "${PREFIX}/bin/python3.11" ]]; then
+  "${PREFIX}/bin/python3.11" - <<PY
 import sys
 print(sys.version)
 raise SystemExit(0 if sys.version_info[:3] == (3, 11, 15) else 1)
@@ -39,10 +38,15 @@ PY
   exit 0
 fi
 
-echo "==> ensure-python.sh (compile may take several minutes)"
-export PUBLIC_SERVICE_ROOT="$PS_ROOT"
-export AI_ROOT=/opt/ai
-bash "$PS_ROOT/scripts/ensure-python.sh"
+echo "==> compile Python ${PY_VER} (may take several minutes)"
+rm -rf "${BUILD_ROOT}/Python-${PY_VER}"
+tar -C "$BUILD_ROOT" -xzf "$AI_INSTALLERS/$ARCHIVE"
+cd "${BUILD_ROOT}/Python-${PY_VER}"
+./configure --prefix="$PREFIX" --enable-optimizations --with-ensurepip=install
+make -j"$(nproc)"
+make altinstall
+ln -sfn "${PREFIX}/bin/python3.11" /usr/local/bin/python3.11
+ln -sfn "${PREFIX}/bin/pip3.11" /usr/local/bin/pip3.11 2>/dev/null || true
 
-/opt/ai/python-${PY_VER}/bin/python3.11 -V
+"${PREFIX}/bin/python3.11" -V
 echo "==> Python host prep OK"

@@ -20,10 +20,10 @@ and Worker must support `/internal/gamma` before deploying this bridge.
 
 Set `freeze_build_inputs: true` in the existing private Robot CI configuration
 after validating the deployment. The switch is off for compatibility until then.
-New submissions resolve the selected branches and shared public-service branch
-to full SHAs. Fetch or SHA verification failures stop the build; they do not fall
-back to the default branch. Checkouts are separated by build ID under
-`workspace_root/frozen-inputs/` and frozen inputs are persisted in job metadata.
+New submissions resolve the selected branches to full SHAs. Fetch or SHA
+verification failures stop the build; they do not fall back to the default
+branch. Checkouts are separated by build ID under `workspace_root/frozen-inputs/`
+and frozen inputs are persisted in job metadata.
 
 Existing running builds must finish before enabling this switch. Versioned source
 directories and pinned handoffs require ownership-aware retention; do not apply

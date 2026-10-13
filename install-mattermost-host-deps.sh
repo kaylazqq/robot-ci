@@ -8,7 +8,6 @@ GO_ARCHIVE_SHA256=1153d3d50e0ac764b447adfe05c2bcf08e889d42a02e0fe0259bd47f6733ad
 NODE_VERSION=24.11.1
 GO_ARCHIVE="go${GO_VERSION}.linux-amd64.tar.gz"
 NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.xz"
-PS_DEPS=/var/lib/swr-workspaces/public-service/deps
 MM_INSTALLERS=/var/lib/swr-workspaces/mattermost/deploy/installers
 AI_INSTALLERS=/opt/ai/installers
 
@@ -19,23 +18,22 @@ elif command -v yum >/dev/null 2>&1; then
   yum install -y make gcc gcc-c++ rsync curl tar gzip xz which git
 fi
 
-mkdir -p "$PS_DEPS" "$AI_INSTALLERS" /usr/local
+mkdir -p "$AI_INSTALLERS" /usr/local
 
 echo "==> Go ${GO_VERSION}"
 if [[ ! -x /usr/local/go/bin/go ]] || ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION}"; then
-  if [[ ! -s "$PS_DEPS/$GO_ARCHIVE" ]]; then
+  if [[ ! -s "$AI_INSTALLERS/$GO_ARCHIVE" ]]; then
     echo "download $GO_ARCHIVE"
-    curl -fL --retry 3 -o "$PS_DEPS/$GO_ARCHIVE" \
+    curl -fL --retry 3 -o "$AI_INSTALLERS/$GO_ARCHIVE" \
       "https://mirrors.aliyun.com/golang/${GO_ARCHIVE}" \
-      || curl -fL --retry 3 -o "$PS_DEPS/$GO_ARCHIVE" \
+      || curl -fL --retry 3 -o "$AI_INSTALLERS/$GO_ARCHIVE" \
       "https://mirrors.huaweicloud.com/golang/${GO_ARCHIVE}" \
-      || curl -fL --retry 3 -o "$PS_DEPS/$GO_ARCHIVE" \
+      || curl -fL --retry 3 -o "$AI_INSTALLERS/$GO_ARCHIVE" \
       "https://go.dev/dl/${GO_ARCHIVE}"
   fi
-  echo "${GO_ARCHIVE_SHA256}  $PS_DEPS/$GO_ARCHIVE" | sha256sum -c -
-  cp -f "$PS_DEPS/$GO_ARCHIVE" "$AI_INSTALLERS/$GO_ARCHIVE"
+  echo "${GO_ARCHIVE_SHA256}  $AI_INSTALLERS/$GO_ARCHIVE" | sha256sum -c -
   rm -rf /usr/local/go
-  tar -C /usr/local -xzf "$PS_DEPS/$GO_ARCHIVE"
+  tar -C /usr/local -xzf "$AI_INSTALLERS/$GO_ARCHIVE"
 fi
 ln -sfn /usr/local/go/bin/go /usr/local/bin/go
 ln -sfn /usr/local/go/bin/gofmt /usr/local/bin/gofmt

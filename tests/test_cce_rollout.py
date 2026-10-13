@@ -952,44 +952,39 @@ class GammaAfterBuildTests(unittest.TestCase):
                     with patch.object(server, "register_live_job_marker"):
                         with patch.object(server, "unregister_live_job_marker"):
                             with patch.object(server, "ensure_swr_login", return_value=True):
-                                with patch.object(server, "ensure_public_service", return_value=(True, "")):
+                                with patch.object(
+                                    server, "make_archive_dir", return_value=Path(tmp)
+                                ):
                                     with patch.object(
-                                        server, "ensure_versioned_base_images", return_value=(True, "")
+                                        server,
+                                        "host_service_compile_lock",
+                                        return_value=nullcontext(),
                                     ):
-                                        with patch.object(server, "base_image_targets_for_services", return_value=[]):
+                                        with patch.object(
+                                            server, "push_one_service", return_value=result
+                                        ):
                                             with patch.object(
-                                                server, "make_archive_dir", return_value=Path(tmp)
-                                            ):
-                                                with patch.object(
-                                                    server,
-                                                    "host_service_compile_lock",
-                                                    return_value=nullcontext(),
-                                                ):
+                                                server,
+                                                "maybe_run_gamma_after_build",
+                                                return_value=(False, "kubectl failed"),
+                                            ) as gamma:
+                                                with patch.object(server, "reclaim_ci_disk"):
                                                     with patch.object(
-                                                        server, "push_one_service", return_value=result
+                                                        server, "release_build_slot"
                                                     ):
-                                                        with patch.object(
-                                                            server,
-                                                            "maybe_run_gamma_after_build",
-                                                            return_value=(False, "kubectl failed"),
-                                                        ) as gamma:
-                                                            with patch.object(server, "reclaim_ci_disk"):
-                                                                with patch.object(
-                                                                    server, "release_build_slot"
-                                                                ):
-                                                                    with patch.object(server, "append_job_log"):
-                                                                        with patch.object(
-                                                                            server, "persist_job_meta"
-                                                                        ):
-                                                                            server.run_push_job(
-                                                                                "gamma-hook",
-                                                                                [
-                                                                                    {
-                                                                                        "service_id": "memory-service",
-                                                                                        "branch": "main",
-                                                                                    }
-                                                                                ],
-                                                                            )
+                                                        with patch.object(server, "append_job_log"):
+                                                            with patch.object(
+                                                                server, "persist_job_meta"
+                                                            ):
+                                                                server.run_push_job(
+                                                                    "gamma-hook",
+                                                                    [
+                                                                        {
+                                                                            "service_id": "memory-service",
+                                                                            "branch": "main",
+                                                                        }
+                                                                    ],
+                                                                )
         gamma.assert_called_once()
         with server._jobs_lock:
             stored = server._jobs["gamma-hook"]
