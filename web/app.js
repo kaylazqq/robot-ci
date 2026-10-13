@@ -3530,6 +3530,110 @@ function envReadonlyHtml(env) {
     '<p class="env-secret-hint">只读查看不包含跳板机密码和节点密码明文。</p>' +
     '<div class="row env-form-actions"><button type="button" class="btn primary" id="btnEnvViewClose">关闭</button></div></div>';
 }
+function envDetailShell(env, basicHtml) {
+  const existing = !!(env && env.id);
+  return '<div class="env-detail-tabs" role="tablist">' +
+    '<button type="button" class="env-detail-tab active" data-env-detail-tab="basic" role="tab" aria-selected="true">基础信息</button>' +
+    '<button type="button" class="env-detail-tab" data-env-detail-tab="runtime" role="tab" aria-selected="false"' + (existing ? '' : ' disabled title="保存环境后可配置"') + '>运行配置</button>' +
+    '</div>' +
+    '<div data-env-detail-pane="basic">' + basicHtml + '</div>' +
+    '<div data-env-detail-pane="runtime" data-env-runtime-id="' + esc(existing ? env.id : '') + '" hidden>' +
+      '<p class="env-secret-hint">配置只保存在 CI；下次生产发布时才应用到目标工作负载。请勿在此填写密码、Token 或密钥。</p>' +
+      '<div data-env-runtime-content><p class="env-secret-hint">点击“运行配置”加载变量。</p></div>' +
+    '</div>';
+}
+function renderRuntimeConfigPane(pane, data) {
+  if (!pane) return;
+  const root = pane.querySelector('[data-env-runtime-content]');
+  if (!root) return;
+  const rows = Array.isArray(data && data.variables) ? data.variables : [];
+  const deletedNames = Array.isArray(data && data.deleted_names) ? data.deleted_names : [];
+  const sync = data && data.sync;
+  const editable = canManageEnvironments();
+  const body = rows.length ? rows.map((item) => (
+    '<tr><td><code>' + esc(item.name) + '</code></td><td class="runtime-value"><code>' + esc(item.value) + '</code></td>' +
+    '<td>' + (item.source === 'cluster' ? '真实环境' : '手工') + '</td><td>' + esc(item.updated_by || item.created_by || '—') + '</td><td>' + esc(item.updated_at || item.created_at || '—') + '</td>' +
+    '<td><button type="button" class="btn ghost danger" data-runtime-delete="' + esc(item.name) + '"' + (editable ? '' : ' disabled') + '>删除</button></td></tr>'
+  )).join('') : '<tr><td colspan="6" class="runtime-empty">暂无运行变量</td></tr>';
+  const syncText = sync ? ('上次同步：' + esc(sync.synced_at || '—') + '，' + esc(sync.workload_kind || '') + '/' + esc(sync.workload_name || '') + ' · 容器 ' + esc(sync.container_name || '—') + '；跳过 Secret/不支持引用 ' + ((sync.skipped_value_from_names || []).length) + ' 项、敏感变量 ' + ((sync.skipped_sensitive_names || []).length) + ' 项') : '尚未从真实环境同步';
+  const deletedText = deletedNames.length ? '<div class="runtime-pending-delete">下次发布将删除：' + deletedNames.map((name) => '<code>' + esc(name) + '</code>').join('、') + '</div>' : '';
+  root.innerHTML = '<div class="runtime-config-toolbar"><div><div class="runtime-config-meta">当前版本 <code>' + esc((data && data.revision) || '—') + '</code> · 共 ' + rows.length + ' 项</div><div class="env-secret-hint">' + syncText + '</div></div>' +
+    (editable ? '<button type="button" class="btn" data-runtime-sync>同步真实环境</button>' : '') + '</div>' + deletedText +
+    '<div class="art-table-wrap"><table class="art-table runtime-config-table"><thead><tr><th>变量名</th><th>变量值</th><th>来源</th><th>操作人</th><th>更新时间</th><th></th></tr></thead><tbody>' + body + '</tbody></table></div>' +
+    (editable ? '<div class="runtime-config-add"><input class="input" data-runtime-name maxlength="128" placeholder="变量名，例如 AGENT_MCP_PUBLIC_URL" />' +
+      '<input class="input" data-runtime-value maxlength="16384" placeholder="变量值" />' +
+      '<button type="button" class="btn primary" data-runtime-save>新增或更新</button></div>' : '');
+  const envId = pane.getAttribute('data-env-runtime-id') || '';
+  const syncButton = root.querySelector('[data-runtime-sync]');
+  if (syncButton) syncButton.addEventListener('click', async () => {
+    if (!await askEnvConfirm('确认从目标工作负载读取普通环境变量和非敏感 ConfigMap 配置并合并吗？Secret 引用不会读取。', {title:'同步真实环境', confirmLabel:'确认同步'})) return;
+    syncButton.disabled = true;
+    try {
+      const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/sync', {method:'POST', body:'{}'});
+      setEnvFormError('');
+      renderRuntimeConfigPane(pane, result);
+    } catch (error) {
+      setEnvFormError(error.message);
+      syncButton.disabled = false;
+    }
+  });
+  root.querySelectorAll('[data-runtime-delete]').forEach((button) => button.addEventListener('click', async () => {
+    const name = button.getAttribute('data-runtime-delete') || '';
+    if (!await askEnvConfirm('确认删除运行变量“' + name + '”吗？删除只影响 CI 配置，下次生产发布时生效。', {title:'删除运行变量', confirmLabel:'确认删除'})) return;
+    button.disabled = true;
+    try {
+      const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/variables/' + encodeURIComponent(name) + '/delete', {method:'POST', body:'{}'});
+      renderRuntimeConfigPane(pane, result);
+    } catch (error) {
+      setEnvFormError(error.message);
+      button.disabled = false;
+    }
+  }));
+  const save = root.querySelector('[data-runtime-save]');
+  if (save) save.addEventListener('click', async () => {
+    const nameInput = root.querySelector('[data-runtime-name]');
+    const valueInput = root.querySelector('[data-runtime-value]');
+    const name = (nameInput && nameInput.value || '').trim();
+    const value = valueInput ? valueInput.value : '';
+    if (!name) { setEnvFormError('请输入变量名'); return; }
+    save.disabled = true;
+    try {
+      const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/variables', {method:'POST', body:JSON.stringify({name, value})});
+      setEnvFormError('');
+      renderRuntimeConfigPane(pane, result);
+    } catch (error) {
+      setEnvFormError(error.message);
+      save.disabled = false;
+    }
+  });
+}
+async function loadRuntimeConfigPane(pane) {
+  const envId = pane && pane.getAttribute('data-env-runtime-id');
+  const root = pane && pane.querySelector('[data-env-runtime-content]');
+  if (!envId || !root) return;
+  root.innerHTML = '<p class="env-secret-hint">正在加载运行配置…</p>';
+  try {
+    const data = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config');
+    renderRuntimeConfigPane(pane, data);
+  } catch (error) {
+    root.innerHTML = '<p class="hint error">' + esc(error.message) + '</p>';
+  }
+}
+function bindEnvDetailTabs(env) {
+  const body = $('envOverlayBody');
+  if (!body) return;
+  body.querySelectorAll('[data-env-detail-tab]').forEach((button) => button.addEventListener('click', () => {
+    if (button.disabled) return;
+    const name = button.getAttribute('data-env-detail-tab');
+    body.querySelectorAll('[data-env-detail-tab]').forEach((item) => {
+      const active = item === button;
+      item.classList.toggle('active', active);
+      item.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    body.querySelectorAll('[data-env-detail-pane]').forEach((pane) => { pane.hidden = pane.getAttribute('data-env-detail-pane') !== name; });
+    if (name === 'runtime') loadRuntimeConfigPane(body.querySelector('[data-env-detail-pane="runtime"]'));
+  }));
+}
 function envCardHtml(env) {
   const locked = !canManageEnvironments();
   const editTitle = locked ? "没有环境管理权限" : "编辑";
@@ -3872,8 +3976,10 @@ function openEnvOverlay(env) {
   title.textContent = envEditingId ? "编辑环境" : "创建环境";
   setEnvError("");
   setEnvFormError("");
-  body.innerHTML = envFormHtml(env || emptyEnvDraft());
+  const data = env || emptyEnvDraft();
+  body.innerHTML = envDetailShell(data, envFormHtml(data));
   bindEnvForm();
+  bindEnvDetailTabs(data);
   overlay.hidden = false;
   syncEnvOverlayLock();
   if ($("envRegion")) $("envRegion").focus();
@@ -3888,7 +3994,8 @@ function openEnvViewOverlay(env) {
   title.textContent = "查看环境 · " + (env.name || "未命名环境");
   setEnvError("");
   setEnvFormError("");
-  body.innerHTML = envReadonlyHtml(env);
+  body.innerHTML = envDetailShell(env, envReadonlyHtml(env));
+  bindEnvDetailTabs(env);
   bind("btnEnvViewClose", () => closeEnvOverlay());
   overlay.hidden = false;
   syncEnvOverlayLock();

@@ -14,7 +14,7 @@ import shlex
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import quote
 
 # CI service_id -> (Deployment, business container)
@@ -650,6 +650,145 @@ def set_image_and_rollout(
     return run_remote(set_cmd, rollout_timeout_seconds(timeout) + 60)
 
 
+RUNTIME_ENV_KEYS_ANNOTATION = "robot-ci.io/runtime-env-keys"
+RUNTIME_CONFIG_REVISION_ANNOTATION = "robot-ci.io/runtime-config-revision"
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?:PASSWORD|PASSWD|TOKEN|SECRET|PRIVATE_KEY|API_KEY|ACCESS_KEY|CREDENTIAL|COOKIE)", re.IGNORECASE
+)
+
+
+def _normalized_runtime_variables(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, Mapping):
+        return {}
+    variables: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise CceRolloutError(f"运行配置包含非法变量名: {name or '(空)'}")
+        variables[name] = str(value if value is not None else "")
+    return dict(sorted(variables.items()))
+
+
+def apply_runtime_variables_to_pod_template(
+    template: dict[str, Any],
+    *,
+    container: str,
+    variables: Mapping[str, Any],
+    revision: str,
+    deleted_names: Iterable[str] = (),
+) -> None:
+    """Replace only environment variables previously managed by robot-ci."""
+    normalized = _normalized_runtime_variables(variables)
+    metadata = template.setdefault("metadata", {})
+    annotations = metadata.setdefault("annotations", {})
+    previous = {
+        item.strip()
+        for item in str(annotations.get(RUNTIME_ENV_KEYS_ANNOTATION) or "").split(",")
+        if item.strip()
+    }
+    deleted = {
+        str(item or "").strip()
+        for item in deleted_names
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(item or "").strip())
+    }
+    managed = previous | set(normalized) | deleted
+    pod_spec = template.setdefault("spec", {})
+    containers = pod_spec.get("containers") if isinstance(pod_spec.get("containers"), list) else []
+    target = next(
+        (item for item in containers if isinstance(item, dict) and item.get("name") == container),
+        None,
+    )
+    if target is None:
+        raise CceRolloutError(f"容器 {container} 不存在，无法应用运行配置")
+    current = target.get("env") if isinstance(target.get("env"), list) else []
+    target["env"] = [
+        copy.deepcopy(item)
+        for item in current
+        if isinstance(item, Mapping) and str(item.get("name") or "") not in managed
+    ] + [{"name": name, "value": value} for name, value in normalized.items()]
+    annotations[RUNTIME_ENV_KEYS_ANNOTATION] = ",".join(normalized)
+    annotations[RUNTIME_CONFIG_REVISION_ANNOTATION] = str(revision or "")
+
+
+def set_image_runtime_env_and_rollout(
+    run_remote: RemoteFn,
+    *,
+    namespace: str,
+    deploy: str,
+    container: str,
+    image: str,
+    timeout: str,
+    kind: str,
+    source_payload: Mapping[str, Any],
+    variables: Mapping[str, Any],
+    revision: str,
+    deleted_names: Iterable[str] = (),
+    force_restart: bool = False,
+) -> tuple[int, str, str]:
+    if kind not in SUPPORTED_WORKLOAD_KINDS:
+        raise CceRolloutError(f"不支持的工作负载类型: {kind}")
+    payload = copy.deepcopy(dict(source_payload))
+    spec = payload.get("spec") if isinstance(payload.get("spec"), dict) else {}
+    template = spec.get("template") if isinstance(spec.get("template"), dict) else {}
+    apply_runtime_variables_to_pod_template(
+        template,
+        container=container,
+        variables=variables,
+        revision=revision,
+        deleted_names=deleted_names,
+    )
+    pod_spec = template.get("spec") if isinstance(template.get("spec"), dict) else {}
+    containers = pod_spec.get("containers") if isinstance(pod_spec.get("containers"), list) else []
+    target_index = next(
+        (index for index, item in enumerate(containers) if isinstance(item, dict) and item.get("name") == container),
+        -1,
+    )
+    if target_index < 0:
+        raise CceRolloutError(f"容器 {container} 不存在，无法更新镜像")
+    target = containers[target_index]
+    target["image"] = image
+    patch = [
+        {
+            "op": "replace",
+            "path": f"/spec/template/spec/containers/{target_index}/image",
+            "value": image,
+        },
+        {
+            "op": "add",
+            "path": f"/spec/template/spec/containers/{target_index}/env",
+            "value": target.get("env") or [],
+        },
+        {
+            "op": "add",
+            "path": "/spec/template/metadata/annotations",
+            "value": template.get("metadata", {}).get("annotations", {}),
+        },
+    ]
+    encoded = base64.b64encode(json.dumps(patch, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode("ascii")
+    ns = shlex.quote(namespace)
+    name = shlex.quote(deploy)
+    wait = shlex.quote(timeout)
+    commands: list[str] = []
+    if kind == "deployment":
+        recreate_patch = json.dumps(
+            {"spec": {"strategy": {"type": "Recreate", "rollingUpdate": None}}},
+            separators=(",", ":"),
+        )
+        commands.append(f"kubectl -n {ns} patch deployment {name} --type=merge -p {shlex.quote(recreate_patch)}")
+    commands.append(
+        f"printf %s {shlex.quote(encoded)} | base64 -d | "
+        f"kubectl -n {ns} patch {kind} {name} --type=json --patch-file=/dev/stdin"
+    )
+    if force_restart:
+        commands.append(f"kubectl -n {ns} rollout restart {kind}/{name}")
+    commands.extend([
+        f"kubectl -n {ns} rollout status {kind}/{name} --timeout={wait}",
+        f"kubectl -n {ns} get {kind} {name} -o wide",
+        f"kubectl -n {ns} get pods -o wide | grep -i {shlex.quote(deploy)} | head -20",
+    ])
+    return run_remote(" && ".join(commands), rollout_timeout_seconds(timeout) + 60)
+
+
 PARALLEL_RELEASE_LABEL = "robot-ci.io/release"
 PARALLEL_SOURCE_LABEL = "robot-ci.io/source-workload"
 PARALLEL_ATTEMPT_ANNOTATION = "robot-ci.io/create-attempt"
@@ -675,6 +814,9 @@ def deployment_manifest_for_parallel_release(
     image: str,
     container: str,
     replicas: int = 1,
+    runtime_variables: Mapping[str, Any] | None = None,
+    runtime_config_revision: str = "",
+    runtime_deleted_names: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Clone a Deployment safely, adding a selector unique to this release.
 
@@ -698,6 +840,14 @@ def deployment_manifest_for_parallel_release(
     for row in containers:
         if isinstance(row, dict) and row.get("name") == container:
             row["image"] = image
+    if runtime_variables is not None:
+        apply_runtime_variables_to_pod_template(
+            template,
+            container=container,
+            variables=runtime_variables,
+            revision=runtime_config_revision,
+            deleted_names=runtime_deleted_names,
+        )
 
     name = parallel_deployment_name(base_name or source_name, release_id)
     release = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(release_id)).strip("-_.")[:63]
@@ -951,6 +1101,144 @@ def resolve_source_workload(
     return "deployment", name, payload
 
 
+def read_workload_runtime_environment(
+    *,
+    environment: Mapping[str, Any],
+    creds: Mapping[str, str],
+    hop: Callable[..., tuple[int, str, str]] | None = None,
+    direct: Callable[..., tuple[int, str, str]] | None = None,
+) -> dict[str, Any]:
+    """Read literal container env values without resolving Secret/ConfigMap references."""
+    jump_host = str(environment.get("jump_host") or "").strip()
+    workload = str(environment.get("active_workload_name") or environment.get("workload_name") or "").strip()
+    baseline = str(environment.get("workload_name") or workload).strip()
+    namespace = str(environment.get("namespace") or "default").strip() or "default"
+    kubeconfig_path = str(environment.get("kubeconfig_path") or "/root/.kube/config").strip()
+    nodes = [str(item).strip() for item in (environment.get("nodes") or []) if str(item).strip()]
+    if nodes and not has_explicit_node_auth(creds):
+        nodes = []
+    if not jump_host or not workload:
+        raise CceRolloutError("环境缺少跳板机或负载名称，无法同步运行配置")
+    if not kubeconfig_path.startswith("/"):
+        raise CceRolloutError("环境的 kubeconfig 路径必须是绝对路径")
+    if not has_jump_auth(creds):
+        raise CceRolloutError("未配置跳板机 SSH 凭据，无法同步运行配置")
+
+    def run_remote(command: str, timeout: int = 120) -> tuple[int, str, str]:
+        return exec_via_nodes(
+            command,
+            jump_host=jump_host,
+            nodes=nodes,
+            creds=creds,
+            timeout=timeout,
+            hop=hop,
+            direct=direct,
+            kubeconfig_path=kubeconfig_path,
+        )
+
+    kind, source_name, payload = resolve_source_workload(
+        run_remote, namespace=namespace, active=workload, baseline=baseline
+    )
+    containers = containers_from_deploy_json(payload)
+    _deploy, preferred = resolve_deploy_target(
+        str(environment.get("service_id") or ""), "", workload
+    )
+    container_name = pick_container(containers, image="", preferred=preferred)
+    pod_containers = (
+        payload.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    )
+    target = next(
+        (item for item in pod_containers if isinstance(item, Mapping) and item.get("name") == container_name),
+        None,
+    )
+    if target is None:
+        raise CceRolloutError(f"负载 {source_name} 中未找到容器 {container_name}")
+    variables: dict[str, str] = {}
+    skipped: list[str] = []
+    skipped_sensitive: list[str] = []
+    configmaps: dict[str, Mapping[str, Any]] = {}
+
+    def configmap_data(name: str, *, optional: bool = False) -> Mapping[str, Any]:
+        cm_name = str(name or "").strip()
+        if not cm_name:
+            return {}
+        if cm_name not in configmaps:
+            command = (
+                f"kubectl -n {shlex.quote(namespace)} get configmap {shlex.quote(cm_name)} -o json"
+            )
+            code, out, err = run_remote(command, 60)
+            if code != 0:
+                if optional:
+                    configmaps[cm_name] = {}
+                else:
+                    detail = (err or out or "").strip() or f"exit {code}"
+                    raise CceRolloutError(f"读取 ConfigMap {cm_name} 失败: {detail}")
+            else:
+                try:
+                    parsed = json.loads(out)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CceRolloutError(f"ConfigMap {cm_name} 返回格式无效") from exc
+                configmaps[cm_name] = (
+                    parsed.get("data")
+                    if isinstance(parsed, Mapping) and isinstance(parsed.get("data"), Mapping)
+                    else {}
+                )
+        return configmaps[cm_name]
+
+    for source in target.get("envFrom") or []:
+        if not isinstance(source, Mapping):
+            continue
+        prefix = str(source.get("prefix") or "")
+        ref = source.get("configMapRef")
+        if isinstance(ref, Mapping):
+            data = configmap_data(str(ref.get("name") or ""), optional=bool(ref.get("optional")))
+            for key, value in data.items():
+                name = prefix + str(key or "")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    continue
+                if _SENSITIVE_ENV_NAME.search(name):
+                    skipped_sensitive.append(name)
+                else:
+                    variables[name] = str(value if value is not None else "")
+        elif isinstance(source.get("secretRef"), Mapping):
+            skipped.append(f"secretRef:{source['secretRef'].get('name') or '-'}")
+    for item in target.get("env") or []:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        if "valueFrom" in item:
+            value_from = item.get("valueFrom")
+            cm_ref = value_from.get("configMapKeyRef") if isinstance(value_from, Mapping) else None
+            if isinstance(cm_ref, Mapping):
+                if _SENSITIVE_ENV_NAME.search(name):
+                    skipped_sensitive.append(name)
+                    continue
+                data = configmap_data(
+                    str(cm_ref.get("name") or ""), optional=bool(cm_ref.get("optional"))
+                )
+                key = str(cm_ref.get("key") or "")
+                if key in data:
+                    variables[name] = str(data[key] if data[key] is not None else "")
+                else:
+                    skipped.append(name)
+            else:
+                skipped.append(name)
+        elif _SENSITIVE_ENV_NAME.search(name):
+            skipped_sensitive.append(name)
+        elif "value" in item:
+            variables[name] = str(item.get("value") if item.get("value") is not None else "")
+    return {
+        "workload_kind": kind,
+        "workload_name": source_name,
+        "container_name": container_name,
+        "variables": dict(sorted(variables.items())),
+        "skipped_value_from_names": sorted(set(skipped)),
+        "skipped_sensitive_names": sorted(set(skipped_sensitive)),
+    }
+
+
 def create_parallel_deployment(
     run_remote: RemoteFn,
     *,
@@ -964,6 +1252,9 @@ def create_parallel_deployment(
     timeout: str,
     source_payload: Mapping[str, Any] | None = None,
     log: Callable[[str], None] | None = None,
+    runtime_variables: Mapping[str, Any] | None = None,
+    runtime_config_revision: str = "",
+    runtime_deleted_names: Iterable[str] = (),
 ) -> dict[str, Any]:
     write = log or (lambda _line: None)
     payload = dict(source_payload) if isinstance(source_payload, Mapping) else get_deployment_payload(
@@ -974,6 +1265,9 @@ def create_parallel_deployment(
     manifest = deployment_manifest_for_parallel_release(
         payload, source_name=source, base_name=base_name, release_id=release_id,
         image=image, container=container, replicas=replicas,
+        runtime_variables=runtime_variables,
+        runtime_config_revision=runtime_config_revision,
+        runtime_deleted_names=runtime_deleted_names,
     )
     name = str(manifest["metadata"]["name"])
     if name == source:
@@ -1150,6 +1444,12 @@ def deploy_job_results(
     env_name = str(environment.get("name") or workload or "environment")
     cluster = str(environment.get("cluster_name") or "").strip()
     kubeconfig_path = str(environment.get("kubeconfig_path") or "/root/.kube/config").strip()
+    runtime_variables = _normalized_runtime_variables(environment.get("runtime_variables"))
+    runtime_deleted_names = [
+        str(item or "").strip() for item in (environment.get("runtime_deleted_names") or [])
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(item or "").strip())
+    ]
+    runtime_config_revision = str(environment.get("runtime_config_revision") or "").strip()
     if not jump_host:
         return False, "环境未配置跳板机"
     if not workload:
@@ -1251,6 +1551,17 @@ def deploy_job_results(
             current = next((img for name, img in containers if name == container), "")
             if current:
                 write(f"当前容器 {container}={current}")
+            template_annotations = (
+                ((source_payload.get("spec") or {}).get("template") or {}).get("metadata") or {}
+            ).get("annotations") or {}
+            has_managed_runtime_config = bool(
+                runtime_variables or runtime_deleted_names or template_annotations.get(RUNTIME_ENV_KEYS_ANNOTATION)
+            )
+            if has_managed_runtime_config:
+                write(
+                    f"应用运行配置 revision={runtime_config_revision or '-'} "
+                    f"variables={len(runtime_variables)}（变量值不写入日志）"
+                )
             if mode == "parallel":
                 if workload_kind != "deployment":
                     raise CceRolloutError(
@@ -1269,6 +1580,9 @@ def deploy_job_results(
                     timeout=rollout_timeout,
                     source_payload=source_payload,
                     log=write,
+                    runtime_variables=runtime_variables if has_managed_runtime_config else None,
+                    runtime_config_revision=runtime_config_revision,
+                    runtime_deleted_names=runtime_deleted_names,
                 )
                 created.update({
                     "service_id": service_id, "source_workload": deploy,
@@ -1282,17 +1596,34 @@ def deploy_job_results(
                 else:
                     write(f"新版本负载已创建 deploy/{created['name']} 实例=0，等待手动扩容")
                 continue
-            write(f"kubectl set image {workload_kind}/{deploy} {container}={image}")
-            code, out, err = set_image_and_rollout(
-                run_remote,
-                namespace=namespace,
-                deploy=deploy,
-                container=container,
-                image=image,
-                timeout=rollout_timeout,
-                kind=workload_kind,
-                force_restart=current == image,
-            )
+            if has_managed_runtime_config:
+                write(f"kubectl patch {workload_kind}/{deploy} image + runtime environment")
+                code, out, err = set_image_runtime_env_and_rollout(
+                    run_remote,
+                    namespace=namespace,
+                    deploy=deploy,
+                    container=container,
+                    image=image,
+                    timeout=rollout_timeout,
+                    kind=workload_kind,
+                    source_payload=source_payload,
+                    variables=runtime_variables,
+                    revision=runtime_config_revision,
+                    deleted_names=runtime_deleted_names,
+                    force_restart=current == image,
+                )
+            else:
+                write(f"kubectl set image {workload_kind}/{deploy} {container}={image}")
+                code, out, err = set_image_and_rollout(
+                    run_remote,
+                    namespace=namespace,
+                    deploy=deploy,
+                    container=container,
+                    image=image,
+                    timeout=rollout_timeout,
+                    kind=workload_kind,
+                    force_restart=current == image,
+                )
         except CceRolloutError as exc:
             return False, str(exc)
         text = ((out or "") + ("\n" + err if err and err.strip() else "")).strip()

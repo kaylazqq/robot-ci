@@ -59,7 +59,7 @@ class EnvironmentApiTests(unittest.TestCase):
 
     def test_environment_crud_and_guiyang_region(self) -> None:
         cookie = self._login()
-        with self._open("/api/permissions?service_id=semantic-schedule", cookie=cookie) as response:
+        with self._open("/api/permissions?service_id=echoagent-router", cookie=cookie) as response:
             permissions = json.loads(response.read().decode())
         self.assertEqual(
             ["production_release", "environment_manage"],
@@ -73,10 +73,10 @@ class EnvironmentApiTests(unittest.TestCase):
 
         payload = {
             "name": "联调",
-            "service_id": "semantic-schedule",
+            "service_id": "echoagent-router",
             "region": "cn-southwest-2",
             "cluster_name": "AgentPlatform",
-            "workload_name": "semantic-schedule",
+            "workload_name": "echoagent-router",
             "namespace": "echo-prod",
             "kubeconfig_path": "/etc/robot-ci/kubeconfigs/dev2.yaml",
             "jump_host": "root@122.9.139.49",
@@ -92,7 +92,7 @@ class EnvironmentApiTests(unittest.TestCase):
         ) as response:
             created = json.loads(response.read().decode())["environment"]
         self.assertEqual("联调", created["name"])
-        self.assertEqual("semantic-schedule", created["service_id"])
+        self.assertEqual("echoagent-router", created["service_id"])
         self.assertEqual("贵阳一", created["region_label"])
         self.assertEqual(["172.31.8.33", "172.31.22.203"], created["nodes"])
         self.assertEqual("echo-prod", created["namespace"])
@@ -112,7 +112,7 @@ class EnvironmentApiTests(unittest.TestCase):
         ) as response:
             updated = json.loads(response.read().decode())["environment"]
         self.assertEqual("service-router", updated["workload_name"])
-        self.assertEqual("semantic-schedule", updated["service_id"])
+        self.assertEqual("echoagent-router", updated["service_id"])
         self.assertNotIn("jump_password", updated)
         self.assertNotIn("node_password", updated)
         stored = server.get_environment(created["id"], include_secrets=True)
@@ -122,11 +122,11 @@ class EnvironmentApiTests(unittest.TestCase):
         with self._open("/api/environments", cookie=cookie) as response:
             listed = json.loads(response.read().decode())["environments"]
         self.assertEqual(1, len(listed))
-        self.assertEqual("semantic-schedule", listed[0]["service_id"])
-        with self._open("/api/environments?service_id=semantic-schedule", cookie=cookie) as response:
+        self.assertEqual("echoagent-router", listed[0]["service_id"])
+        with self._open("/api/environments?service_id=echoagent-router", cookie=cookie) as response:
             scoped = json.loads(response.read().decode())["environments"]
         self.assertEqual(1, len(scoped))
-        with self._open("/api/environments?service_id=memory-service", cookie=cookie) as response:
+        with self._open("/api/environments?service_id=org-admin", cookie=cookie) as response:
             other = json.loads(response.read().decode())["environments"]
         self.assertEqual([], other)
         self.assertNotIn("jump_password", listed[0])
@@ -147,14 +147,94 @@ class EnvironmentApiTests(unittest.TestCase):
     def test_deprecated_gamma_test_base_url_is_ignored(self) -> None:
         cookie = self._login()
         payload = {
-            "name": "gamma", "service_id": "semantic-schedule", "region": "cn-southwest-2",
-            "cluster_name": "cluster", "workload_name": "semantic-schedule", "jump_host": "jump",
+            "name": "gamma", "service_id": "echoagent-router", "region": "cn-southwest-2",
+            "cluster_name": "cluster", "workload_name": "echoagent-router", "jump_host": "jump",
             "jump_password": "jump-secret", "node_password": "node-secret", "nodes": [],
             "test_base_url": "http://semantic-schedule:8766/",
         }
         with self._open("/api/environments", data=json.dumps(payload).encode(), method="POST", cookie=cookie) as response:
             created = json.loads(response.read().decode())["environment"]
         self.assertNotIn("test_base_url", created)
+
+    def test_runtime_config_crud_is_ci_only_and_scoped_to_environment(self) -> None:
+        cookie = self._login()
+        payload = {
+            "name": "dev2", "service_id": "echoagent-router", "region": "cn-southwest-2",
+            "cluster_name": "cluster", "workload_name": "echoagent-router", "jump_host": "jump",
+            "jump_password": "jump-secret", "nodes": [],
+        }
+        with self._open(
+            "/api/environments", data=json.dumps(payload).encode(), method="POST", cookie=cookie
+        ) as response:
+            env_id = json.loads(response.read().decode())["environment"]["id"]
+
+        with self._open(
+            f"/api/environments/{env_id}/runtime-config/variables",
+            data=json.dumps({"name": "AGENT_MCP_PUBLIC_URL", "value": "http://example.test/api/mcp"}).encode(),
+            method="POST", cookie=cookie,
+        ) as response:
+            created = json.loads(response.read().decode())
+        self.assertTrue(created["ok"])
+        self.assertEqual("AGENT_MCP_PUBLIC_URL", created["variables"][0]["name"])
+        first_revision = created["revision"]
+
+        with self._open(
+            f"/api/environments/{env_id}/runtime-config/variables",
+            data=json.dumps({"name": "AGENT_MCP_PUBLIC_URL", "value": "http://example.test/v2/mcp"}).encode(),
+            method="POST", cookie=cookie,
+        ) as response:
+            updated = json.loads(response.read().decode())
+        self.assertNotEqual(first_revision, updated["revision"])
+        self.assertEqual("http://example.test/v2/mcp", updated["variables"][0]["value"])
+
+        with self._open(f"/api/environments/{env_id}/runtime-config", cookie=cookie) as response:
+            current = json.loads(response.read().decode())
+        self.assertEqual(updated["revision"], current["revision"])
+        self.assertEqual(1, len(current["variables"]))
+
+        with self.assertRaises(HTTPError) as invalid:
+            self._open(
+                f"/api/environments/{env_id}/runtime-config/variables",
+                data=json.dumps({"name": "INVALID-NAME", "value": "x"}).encode(),
+                method="POST", cookie=cookie,
+            )
+        self.assertEqual(400, invalid.exception.code)
+
+        with self._open(
+            f"/api/environments/{env_id}/runtime-config/variables/AGENT_MCP_PUBLIC_URL/delete",
+            data=b"{}", method="POST", cookie=cookie,
+        ) as response:
+            deleted = json.loads(response.read().decode())
+        self.assertEqual([], deleted["variables"])
+        self.assertEqual(["AGENT_MCP_PUBLIC_URL"], deleted["deleted_names"])
+
+    def test_sync_runtime_config_imports_safe_literals_and_keeps_secret_values_out(self) -> None:
+        cookie = self._login()
+        payload = {
+            "name": "dev2", "service_id": "echoagent-router", "region": "cn-southwest-2",
+            "cluster_name": "cluster", "workload_name": "echoagent-router", "jump_host": "jump",
+            "jump_password": "jump-secret", "nodes": [],
+        }
+        with self._open(
+            "/api/environments", data=json.dumps(payload).encode(), method="POST", cookie=cookie
+        ) as response:
+            env_id = json.loads(response.read().decode())["environment"]["id"]
+        snapshot = {
+            "workload_kind": "deployment", "workload_name": "echoagent-router", "container_name": "router",
+            "variables": {"PUBLIC_URL": "http://example.test", "EMPTY": ""},
+            "skipped_value_from_names": ["DB_PASSWORD"], "skipped_sensitive_names": ["API_TOKEN"],
+        }
+        with patch.object(server.cce_rollout, "read_workload_runtime_environment", return_value=snapshot):
+            with self._open(
+                f"/api/environments/{env_id}/runtime-config/sync",
+                data=b"{}", method="POST", cookie=cookie,
+            ) as response:
+                synced = json.loads(response.read().decode())
+        self.assertEqual(["EMPTY", "PUBLIC_URL"], [item["name"] for item in synced["variables"]])
+        self.assertTrue(all(item["source"] == "cluster" for item in synced["variables"]))
+        self.assertEqual(["DB_PASSWORD"], synced["sync"]["skipped_value_from_names"])
+        self.assertEqual(["API_TOKEN"], synced["sync"]["skipped_sensitive_names"])
+        self.assertNotIn("jump-secret", json.dumps(synced))
 
     def test_create_rejects_unknown_region(self) -> None:
         cookie = self._login()
@@ -183,7 +263,7 @@ class EnvironmentApiTests(unittest.TestCase):
                 data=json.dumps(
                     {
                         "name": "no-pass",
-                        "service_id": "semantic-schedule",
+                        "service_id": "echoagent-router",
                         "region": "cn-southwest-2",
                         "cluster_name": "x",
                         "workload_name": "y",
@@ -201,10 +281,10 @@ class EnvironmentApiTests(unittest.TestCase):
         cookie = self._login()
         payload = {
             "name": "direct-jump",
-            "service_id": "semantic-schedule",
+            "service_id": "echoagent-router",
             "region": "cn-southwest-2",
             "cluster_name": "cluster",
-            "workload_name": "semantic-schedule",
+            "workload_name": "echoagent-router",
             "namespace": "echo-prod",
             "kubeconfig_path": "/etc/robot-ci/kubeconfigs/prod.yaml",
             "jump_host": "root@jump",
@@ -226,7 +306,7 @@ class EnvironmentApiTests(unittest.TestCase):
     def test_kubeconfig_picker_lists_multiple_files_from_selected_jump_host(self) -> None:
         cookie = self._login()
         payload = {
-            "service_id": "semantic-schedule",
+            "service_id": "echoagent-router",
             "jump_host": "ops@jump.example:2222",
             "jump_password": "jump-secret",
         }
@@ -253,10 +333,10 @@ class EnvironmentApiTests(unittest.TestCase):
     def test_kubeconfig_picker_reuses_saved_jump_password_when_editing(self) -> None:
         env, err = server.create_environment({
             "name": "saved",
-            "service_id": "semantic-schedule",
+            "service_id": "echoagent-router",
             "region": "cn-southwest-2",
             "cluster_name": "cluster",
-            "workload_name": "semantic-schedule",
+            "workload_name": "echoagent-router",
             "jump_host": "root@jump",
             "jump_password": "saved-secret",
             "nodes": [],
@@ -329,7 +409,7 @@ class EnvironmentApiTests(unittest.TestCase):
                         "cn-southwest-2",
                         "贵阳一",
                         "liusong-dev-gamma",
-                        "semantic-schedule",
+                        "echoagent-router",
                         "116.63.173.182",
                         "j",
                         "n",
@@ -345,6 +425,6 @@ class EnvironmentApiTests(unittest.TestCase):
         server.init_store()
         stored = server.get_environment("legacy1")
         self.assertIsNotNone(stored)
-        self.assertEqual("semantic-schedule", stored["service_id"])
-        self.assertEqual(1, len(server.list_environments("semantic-schedule")))
-        self.assertEqual([], server.list_environments("memory-service"))
+        self.assertEqual("echoagent-router", stored["service_id"])
+        self.assertEqual(1, len(server.list_environments("echoagent-router")))
+        self.assertEqual([], server.list_environments("org-admin"))

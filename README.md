@@ -150,6 +150,15 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 
 环境管理卡片对所有已登录用户开放只读查看，展示环境标签、Region、集群、配置负载、当前活动负载、跳板机、节点及密码是否已配置；密码明文始终不返回。具有环境管理权限的责任人可以创建、编辑和删除环境，其他用户没有写操作入口，服务端仍对写请求校验权限。
 
+环境详情分为“基础信息”和“运行配置”两个页签。运行配置可显式从环境绑定的跳板机和 kubeconfig 读取目标 Deployment/StatefulSet 业务容器的普通字面量 `env`，并解析非敏感的 `ConfigMap keyRef/envFrom` 后合并到 robot-ci 配置；Kubernetes Secret 引用以及名称疑似密码、Token、Secret、Key、Cookie 的变量只计数跳过，不读取或保存其值。新增、更新或删除只修改 robot-ci 运行时数据库，不立即变更 Kubernetes；生产发布拿到环境锁后重新读取最新配置，并把变量和镜像在同一次 Pod 模板变更中应用。删除项使用待删除标记，首次由 CI 接管前删除也能在下一次发布移除；`robot-ci.io/runtime-env-keys` 注解继续避免误删其他未纳管变量。敏感配置必须继续使用 Kubernetes Secret。
+
+运行配置 API 供页面和后续 Skill 共用，所有写操作仍校验该服务的环境管理权限：
+
+- `GET /api/environments/{environment_id}/runtime-config`：读取当前 CI 配置及版本号。
+- `POST /api/environments/{environment_id}/runtime-config/sync`：从真实工作负载同步可安全显示的普通字面量变量；已有手工待发布变量保留，同名项以真实环境当前值更新。
+- `POST /api/environments/{environment_id}/runtime-config/variables`：新增或更新变量，请求体为 `{"name":"KEY","value":"value"}`。
+- `POST /api/environments/{environment_id}/runtime-config/variables/{name}/delete`：删除变量。删除只修改 CI 配置，在下一次生产发布时从目标工作负载移除。
+
 超级管理员通过环境变量 `ROBOT_CI_SUPER_ADMINS` 配置，多个账号用逗号分隔；未配置时仅默认账号 `l30042018` 为超级管理员。超级管理员可在“权限管理”页创建登录账号，并可编辑任意微服务的生产发布和环境管理白名单；普通责任人仍只能编辑自己所在的权限项。
 
 ### EchoAgent 代码源切换
