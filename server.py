@@ -173,14 +173,8 @@ PROTECTED_LOCAL_IMAGES = (
 PROTECTED_LOCAL_IMAGE_PREFIXES = ("local/ai-",)
 PROTECTED_IMAGE_HOLD_PREFIX = "ci-protect-"
 ARCHIVE_IMAGE_HOLD_PREFIX = "ci-archive-hold-"
-# Mattermost compile uses a shared 8G build.swap and ~3.6G RAM; a second
-# concurrent job swapoff/OOM-kills webpack. Override via services.json
-# `max_concurrent` when needed.
-DEFAULT_SERVICE_CONCURRENCY = {
-    "mattermost": 1,
-    "kibana-service": 1,
-    "grafana-service": 1,
-}
+# Override via services.json `max_concurrent` when a service needs a lower cap.
+DEFAULT_SERVICE_CONCURRENCY: dict[str, int] = {}
 DEFAULT_SERVICE_MAX_CONCURRENT = 5
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 DEFAULT_PIPELINE_TEMPLATE_NAME = "个人构建流水线"

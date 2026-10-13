@@ -5,24 +5,9 @@
     "excluded_dependencies": ["postgresql", "redis", "kafka", "temporal-server", "mattermost-server", "swr", "cce"]
   },
   "services": {
-    "temporal": {"repository": "aiwelink-temporal", "scope": "Temporal runtime, migration and image fingerprint scripts", "roots": ["tests/unit", "tests/dt"], "convention": "shell"},
-    "service-router": {"repository": "service_router", "scope": "HTTPS mode, Nginx runtime rendering and CCE image export", "roots": ["tests/unit", "tests/dt", "tests/test-*.sh"], "convention": "shell"},
-    "semantic-gateway": {"repository": "semantic-gateway", "scope": "IM ingress, safety filtering, file enrichment and gateway configuration", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "pytest"},
-    "memory-service": {"repository": "CellMem", "scope": "memory payload normalization, configuration, logging and local runtime", "roots": ["tests/unit", "tests/dt", "tests/test_database_config.py", "tests/test_latency_logging.py", "tests/test_runtime_start.py"], "excluded": ["tests/test_postgresql_store.py", "tests/test_postgresql_api_e2e.py"], "convention": "pytest"},
-    "agentlink": {"repository": "AgentLink", "scope": "agent/workspace state, event bridge, provisioning and locking", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "unittest"},
-    "observability": {"repository": "observability", "scope": "event parsing, redaction, trace aggregation and local HTTP handler", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "unittest"},
-    "skills-market": {"repository": "skills-market", "scope": "skills catalog manifests, provider selection and HTTP API", "roots": ["catalog", "internal/httpapi"], "convention": "go"},
-    "plan-ticker": {"repository": "plan-ticker", "scope": "Agent reminder CRUD, due-index ticker and governance delivery", "roots": ["internal/httpapi", "internal/ticker", "internal/deliver"], "convention": "go"},
-    "super-brain": {"repository": "super-brain", "scope": "Hermes log diagnose agent, Elasticsearch query and LLM analysis HTTP API", "roots": ["tests"], "excluded": ["live Elasticsearch", "live LLM"], "convention": "pytest"},
-    "semantic-schedule": {"repository": "semantic-schedule", "scope": "task graph, planner, IM context and fake Redis/Kafka adapters", "roots": ["tests", "tests/unit", "tests/dt"], "convention": "pytest"},
-    "gmagent": {"repository": "gmagent", "scope": "orchestration V2 contract, authentication, intent evaluation, task decomposition, model failover and production runtime policy", "roots": ["tests"], "excluded": ["live model calls", "PostgreSQL integration", "external orchestration services"], "convention": "pytest"},
-    "agent-governance-gw": {"repository": "agent-governance-gw", "scope": "policy normalization, authorization and dispatcher behavior", "roots": ["internal/governance"], "excluded": ["//go:build integration"], "convention": "go"},
-    "llm-gateway": {"repository": "llm-gateway", "scope": "LiteLLM proxy, CodeAgent provider, config builder and auth gateway", "roots": ["tests"], "excluded": ["postgresql", "redis", "live model calls"], "convention": "pytest"},
-    "multica-server": {"repository": "multica-aiwelink", "scope": "agent failure classification, secret redaction and encryption helpers", "roots": ["pkg/redact", "pkg/taskfailure", "internal/util/secretbox"], "convention": "go"},
-    "multica-fleet": {"repository": "multica-fleet", "scope": "Fleet lifecycle, runtime reconciliation, daemon release installation and offline deployment bundle", "roots": ["internal/fleet", "internal/runtimeinit", "tests/unit"], "convention": "go + shell"},
-    "mattermost": {"repository": "mattermost", "scope": "Mattermost server short-mode unit tests", "roots": ["server"], "excluded": ["Docker/database/browser E2E"], "convention": "make"},
-    "config-service": {"repository": "ConfigService", "scope": "centralized runtime config publish, pull, rollback, ops console and structured logs", "roots": ["internal/httpapi", "internal/store", "internal/logging", "internal/dbconn", "sdk/go", "sdk/python", "tests/unit", "tests/dt"], "excluded": ["//go:build integration"], "convention": "go + shell + unittest"},
-    "ops-router": {"repository": "ops-router", "scope": "OpenResty host package, Grafana/Kibana path proxy and nginx runtime rendering", "roots": ["tests/test-*.sh"], "convention": "shell"},
+    "echoagent-backend": {"repository": "EchoAgent", "scope": "EchoAgent backend image", "roots": ["deploy/production"], "convention": "docker"},
+    "echoagent-frontend": {"repository": "EchoAgent", "scope": "EchoAgent frontend image", "roots": ["deploy/production"], "convention": "docker"},
+    "echoagent-router": {"repository": "EchoAgent", "scope": "EchoAgent router image", "roots": ["dev/router"], "convention": "docker"},
     "link-ops": {"repository": "link-ops", "scope": "CoLink ops service image", "roots": ["backend", "frontend"], "convention": "docker"},
     "org-admin": {"repository": "org-admin", "scope": "Workspace admin console image", "roots": ["backend", "frontend"], "convention": "docker"}
   }
