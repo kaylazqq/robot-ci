@@ -108,10 +108,20 @@ class JobCoordinationTests(unittest.TestCase):
         self.assertTrue(raised)
 
     def test_concurrent_jobs_are_accepted_for_distinct_services(self) -> None:
-        barrier = threading.Barrier(8)
-        outcomes: list[tuple[str, dict | None]] = []
         catalog = [item["id"] for item in server.load_services()]
-        self.assertGreaterEqual(len(catalog), 8)
+        self.assertEqual(
+            {
+                "echoagent-backend",
+                "echoagent-frontend",
+                "echoagent-router",
+                "link-ops",
+                "org-admin",
+            },
+            set(catalog),
+        )
+        count = len(catalog)
+        barrier = threading.Barrier(count)
+        outcomes: list[tuple[str, dict | None]] = []
 
         def register(index: int) -> None:
             job_id = f"job-{index}"
@@ -123,15 +133,15 @@ class JobCoordinationTests(unittest.TestCase):
                 )
             )
 
-        threads = [threading.Thread(target=register, args=(index,)) for index in range(8)]
+        threads = [threading.Thread(target=register, args=(index,)) for index in range(count)]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
 
         accepted = [job_id for job_id, active in outcomes if active is None]
-        self.assertEqual(8, len(accepted))
-        self.assertEqual(8, len(server._jobs))
+        self.assertEqual(count, len(accepted))
+        self.assertEqual(count, len(server._jobs))
         self.assertIn(server.active_job_summary()["id"], accepted)
 
     def test_jobs_queue_fifo_when_slots_full(self) -> None:
@@ -1416,39 +1426,42 @@ class JobEndpointTests(unittest.TestCase):
 
     def test_running_endpoint_is_lightweight_and_push_queues_past_slot_cap(self) -> None:
         catalog = [item["id"] for item in server.load_services()]
-        job = make_job("active-job", service_id=catalog[0])
-        job["log"] = ["large raw log"]
-        job["slot_held"] = True
-        self.assertIsNone(server.register_job_if_idle(job))
+        slot_cap = 2
+        self.assertGreater(len(catalog), slot_cap)
+        with patch.object(server, "max_concurrent_jobs", return_value=slot_cap):
+            job = make_job("active-job", service_id=catalog[0])
+            job["log"] = ["large raw log"]
+            job["slot_held"] = True
+            self.assertIsNone(server.register_job_if_idle(job))
 
-        with self._open("/api/running-job") as response:
-            active = json.loads(response.read().decode("utf-8"))
-        self.assertEqual("active-job", active["id"])
-        self.assertNotIn("log", active)
-        self.assertNotIn("test_runs", active)
+            with self._open("/api/running-job") as response:
+                active = json.loads(response.read().decode("utf-8"))
+            self.assertEqual("active-job", active["id"])
+            self.assertNotIn("log", active)
+            self.assertNotIn("test_runs", active)
 
-        for index in range(1, server.max_concurrent_jobs()):
-            extra = make_job(f"active-job-{index}", service_id=catalog[index])
-            extra["slot_held"] = True
-            self.assertIsNone(server.register_job_if_idle(extra))
+            for index in range(1, slot_cap):
+                extra = make_job(f"active-job-{index}", service_id=catalog[index])
+                extra["slot_held"] = True
+                self.assertIsNone(server.register_job_if_idle(extra))
 
-        sixth = catalog[server.max_concurrent_jobs()]
-        with patch.object(server, "run_push_job"):
-            with self._open(
-                "/api/push",
-                data=json.dumps({"items": [{"service_id": sixth, "branch": "main"}]}).encode(),
-                method="POST",
-            ) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        self.assertTrue(payload.get("job_id"))
-        with server._jobs_lock:
-            created = server._jobs[payload["job_id"]]
-        self.assertEqual(sixth, created["service_id"])
-        self.assertIn(created["status"], ("running", "queued"))
+            overflow = catalog[slot_cap]
+            with patch.object(server, "run_push_job"):
+                with self._open(
+                    "/api/push",
+                    data=json.dumps({"items": [{"service_id": overflow, "branch": "main"}]}).encode(),
+                    method="POST",
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            self.assertTrue(payload.get("job_id"))
+            with server._jobs_lock:
+                created = server._jobs[payload["job_id"]]
+            self.assertEqual(overflow, created["service_id"])
+            self.assertIn(created["status"], ("running", "queued"))
 
     def test_package_deploy_uses_existing_artifact_without_docker_check(self) -> None:
         release_template = next(
-            item for item in server.list_pipeline_templates(server.DEFAULT_USERNAME, "memory-service")
+            item for item in server.list_pipeline_templates(server.DEFAULT_USERNAME, "link-ops")
             if item["kind"] == "release" and item["builtin"]
         )
         release_template, error = server.update_pipeline_template(
@@ -1465,18 +1478,18 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual("", error)
         artifact = {
             "job_id": "source-job",
-            "service_id": "memory-service",
-            "title": "memory-service",
+            "service_id": "link-ops",
+            "title": "link-ops",
             "branch": "release",
             "commit_sha": "abc123",
-            "image": "memory-service",
+            "image": "link-ops",
             "tag": "20260916_abcd",
-            "remote": "swr.example.com/public_ai/memory-service:20260916_abcd",
-            "archive": "/tmp/memory.tar",
-            "package_name": "memory.tar",
+            "remote": "swr.example.com/public_ai/link-ops:20260916_abcd",
+            "archive": "/tmp/link-ops.tar",
+            "package_name": "link-ops.tar",
         }
         payload = {
-            "service_id": "memory-service",
+            "service_id": "link-ops",
             "template_id": release_template["id"],
             "deployment_type": "package",
             "artifact_job_id": "source-job",
@@ -1498,17 +1511,17 @@ class JobEndpointTests(unittest.TestCase):
         with server._jobs_lock:
             created = server._jobs[created_payload["job_id"]]
         self.assertEqual("package", created["deployment_type"])
-        self.assertEqual("memory.tar", created["package_name"])
+        self.assertEqual("link-ops.tar", created["package_name"])
         self.assertEqual("package-env", created["optional_steps"]["release_environment_id"])
         self.assertEqual("inplace", created["optional_steps"]["deployment_mode"])
 
     def test_personal_pipeline_rejects_package_and_production_release(self) -> None:
         personal = next(
-            item for item in server.list_pipeline_templates(server.DEFAULT_USERNAME, "memory-service")
+            item for item in server.list_pipeline_templates(server.DEFAULT_USERNAME, "link-ops")
             if item["kind"] == "personal" and item["builtin"]
         )
         payload = {
-            "service_id": "memory-service", "template_id": personal["id"],
+            "service_id": "link-ops", "template_id": personal["id"],
             "deployment_type": "package", "artifact_job_id": "source-job",
             "optional_steps": {"production_release": True, "release_environment_id": "package-env"},
         }
@@ -1517,21 +1530,6 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual(400, denied.exception.code)
         error = json.loads(denied.exception.read().decode("utf-8"))
         self.assertEqual("package_pipeline_required", error["error_code"])
-
-    def test_push_hits_mattermost_service_busy(self) -> None:
-        job = make_job("mm-active", service_id="mattermost")
-        self.assertIsNone(server.register_job_if_idle(job))
-        with patch.object(server, "check_docker", return_value={"ok": True, "detail": ""}):
-            with self.assertRaises(HTTPError) as raised:
-                self._open(
-                    "/api/push",
-                    data=json.dumps({"items": [{"service_id": "mattermost", "branch": "main"}]}).encode(),
-                    method="POST",
-                )
-        self.assertEqual(409, raised.exception.code)
-        payload = json.loads(raised.exception.read().decode("utf-8"))
-        self.assertEqual("service_busy", payload["error_code"])
-        self.assertEqual("mattermost", payload["service"])
 
     def test_removed_service_is_rejected(self) -> None:
         with self.assertRaises(HTTPError) as raised:
@@ -1550,16 +1548,20 @@ class JobEndpointTests(unittest.TestCase):
         with self._open("/api/services") as response:
             payload = json.loads(response.read().decode("utf-8"))
         services = {item["id"]: item for item in payload["services"]}
-        self.assertIn("link-ops", services)
-        self.assertIn("org-admin", services)
+        self.assertEqual(
+            {
+                "echoagent-backend",
+                "echoagent-frontend",
+                "echoagent-router",
+                "link-ops",
+                "org-admin",
+            },
+            set(services),
+        )
         self.assertEqual("pick-shot/link-ops", services["link-ops"]["repo"])
         self.assertEqual("pick-shot/org-admin", services["org-admin"]["repo"])
         self.assertEqual("org-admin", services["org-admin"]["image"])
         self.assertTrue(services["echoagent-backend"]["dockerfile_build"])
-        self.assertEqual(
-            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
-            {service_id for service_id in services if service_id.startswith("echoagent-")},
-        )
         self.assertEqual(
             {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
             {services[service_id]["image"] for service_id in services if service_id.startswith("echoagent-")},
@@ -1571,47 +1573,47 @@ class JobEndpointTests(unittest.TestCase):
             self._open(
                 "/api/push",
                 data=json.dumps(
-                    {"service_id": "memory-service", "branch": "feature/b"}
+                    {"service_id": "link-ops", "branch": "feature/b"}
                 ).encode(),
                 method="POST",
             )
         self.assertEqual(400, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual("branch_not_cached", payload["error_code"])
-        cached.assert_called_once_with("memory-service")
+        cached.assert_called_once_with("link-ops")
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
     def test_branch_lookup_populates_empty_cache_from_remote(self, lookup) -> None:
         with patch.object(server, "cached_branches", return_value=[]):
-            with self._open("/api/services/memory-service/branches") as response:
+            with self._open("/api/services/link-ops/branches") as response:
                 payload = json.loads(response.read().decode("utf-8"))
             self.assertEqual(["main", "feature/latest"], payload["branches"])
             self.assertFalse(payload["cached"])
             self.assertEqual("remote", payload["branch_source"])
             lookup.assert_called_once_with(
-                "rollingfruit/CellMem", cache_key="memory-service"
+                "pick-shot/link-ops", cache_key="link-ops"
             )
 
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
     def test_initial_branch_lookup_falls_back_to_default(self, lookup) -> None:
         with patch.object(server, "cached_branches", return_value=[]):
-            with self._open("/api/services/memory-service/branches") as response:
+            with self._open("/api/services/link-ops/branches") as response:
                 payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(["main"], payload["branches"])
         self.assertFalse(payload["cached"])
         self.assertEqual("default", payload["branch_source"])
         self.assertIn("SSH timeout", payload["refresh_error"])
-        lookup.assert_called_once_with("rollingfruit/CellMem", cache_key="memory-service")
+        lookup.assert_called_once_with("pick-shot/link-ops", cache_key="link-ops")
 
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
     def test_forced_branch_refresh_reports_failure_without_cache(self, lookup) -> None:
         with self.assertRaises(HTTPError) as raised:
-            self._open("/api/services/memory-service/branches?refresh=1")
+            self._open("/api/services/link-ops/branches?refresh=1")
         self.assertEqual(503, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
         self.assertEqual("branch lookup failed", payload["error"])
         self.assertEqual("SSH timeout", payload["detail"])
-        lookup.assert_called_once_with("rollingfruit/CellMem", force=True, cache_key="memory-service")
+        lookup.assert_called_once_with("pick-shot/link-ops", force=True, cache_key="link-ops")
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/echo"]))
     def test_echoagent_branch_lookup_loads_remote_branches(self, lookup) -> None:
@@ -1626,22 +1628,22 @@ class JobEndpointTests(unittest.TestCase):
 
     @patch.object(server, "list_branches_api", return_value=(True, ["main", "feature/latest"]))
     def test_branch_retry_forces_backend_refresh(self, lookup) -> None:
-        with self._open("/api/services/memory-service/branches?refresh=1") as response:
+        with self._open("/api/services/link-ops/branches?refresh=1") as response:
             payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(["main", "feature/latest"], payload["branches"])
         self.assertEqual("main", payload["selected_branch"])
-        lookup.assert_called_once_with("rollingfruit/CellMem", force=True, cache_key="memory-service")
+        lookup.assert_called_once_with("pick-shot/link-ops", force=True, cache_key="link-ops")
 
     @patch.object(server, "list_branches_api", return_value=(False, "SSH timeout"))
     @patch.object(server, "cached_branches", return_value=["main", "feature/cached"])
     def test_branch_refresh_falls_back_to_persisted_cache(self, cached, lookup) -> None:
-        with self._open("/api/services/memory-service/branches?refresh=1") as response:
+        with self._open("/api/services/link-ops/branches?refresh=1") as response:
             payload = json.loads(response.read().decode("utf-8"))
         self.assertEqual(["main", "feature/cached"], payload["branches"])
         self.assertTrue(payload["cached"])
         self.assertIn("远程刷新失败", payload["refresh_error"])
-        cached.assert_called_once_with("memory-service")
-        lookup.assert_called_once_with("rollingfruit/CellMem", force=True, cache_key="memory-service")
+        cached.assert_called_once_with("link-ops")
+        lookup.assert_called_once_with("pick-shot/link-ops", force=True, cache_key="link-ops")
 
 
 class DiskPruneAndArtifactTests(unittest.TestCase):

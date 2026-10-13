@@ -32,10 +32,13 @@ from pathlib import Path
 services = json.loads(Path("services.json").read_text(encoding="utf-8"))
 ids = {item["id"] for item in services}
 print("services:", ", ".join(sorted(ids)))
-assert "org-admin" in ids, "org-admin not registered in services.json"
-assert "link-ops" in ids, "link-ops not registered in services.json"
-assert all("base_image_targets" not in item for item in services)
-assert all("skip_public_service" not in item for item in services)
+assert ids == {
+    "echoagent-backend",
+    "echoagent-frontend",
+    "echoagent-router",
+    "link-ops",
+    "org-admin",
+}, f"unexpected services catalog: {sorted(ids)}"
 PY
 
 if systemctl is-active --quiet swr-push-helper.service 2>/dev/null; then
