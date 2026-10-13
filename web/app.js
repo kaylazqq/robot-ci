@@ -3538,7 +3538,7 @@ function envDetailShell(env, basicHtml) {
     '</div>' +
     '<div data-env-detail-pane="basic">' + basicHtml + '</div>' +
     '<div data-env-detail-pane="runtime" data-env-runtime-id="' + esc(existing ? env.id : '') + '" hidden>' +
-      '<p class="env-secret-hint">配置只保存在 CI；下次生产发布时才应用到目标工作负载。请勿在此填写密码、Token 或密钥。</p>' +
+      '<p class="env-secret-hint">配置只保存在 CI；下次生产发布时写入目标工作负载的 Pod 模板 env，不会修改 ConfigMap。发布后会重新读取并校验。请勿在此填写密码、Token 或密钥。</p>' +
       '<div data-env-runtime-content><p class="env-secret-hint">点击“运行配置”加载变量。</p></div>' +
     '</div>';
 }

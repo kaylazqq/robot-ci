@@ -789,6 +789,54 @@ def set_image_runtime_env_and_rollout(
     return run_remote(" && ".join(commands), rollout_timeout_seconds(timeout) + 60)
 
 
+def verify_runtime_variables_on_workload(
+    run_remote: RemoteFn,
+    *,
+    namespace: str,
+    kind: str,
+    workload: str,
+    container: str,
+    variables: Mapping[str, Any],
+    deleted_names: Iterable[str] = (),
+    revision: str = "",
+) -> None:
+    """Fail a release when the persisted Pod template does not match CI runtime config."""
+    payload = get_workload_payload(
+        run_remote, namespace=namespace, name=workload, kind=kind
+    )
+    if payload is None:
+        raise CceRolloutError(f"发布后校验失败：未找到 {kind}/{workload}")
+    template = payload.get("spec", {}).get("template", {})
+    containers = template.get("spec", {}).get("containers", [])
+    target = next(
+        (item for item in containers if isinstance(item, Mapping) and item.get("name") == container),
+        None,
+    )
+    if target is None:
+        raise CceRolloutError(f"发布后校验失败：未找到容器 {container}")
+    actual = {
+        str(item.get("name") or ""): str(item.get("value") if item.get("value") is not None else "")
+        for item in (target.get("env") or [])
+        if isinstance(item, Mapping) and "valueFrom" not in item
+    }
+    expected = _normalized_runtime_variables(variables)
+    missing_or_changed = sorted(name for name, value in expected.items() if actual.get(name) != value)
+    still_present = sorted(
+        str(name) for name in deleted_names if str(name) in actual
+    )
+    annotations = (template.get("metadata") or {}).get("annotations") or {}
+    actual_revision = str(annotations.get(RUNTIME_CONFIG_REVISION_ANNOTATION) or "")
+    if missing_or_changed or still_present or actual_revision != str(revision or ""):
+        details: list[str] = []
+        if missing_or_changed:
+            details.append("未落地或值不一致=" + ",".join(missing_or_changed))
+        if still_present:
+            details.append("应删除但仍存在=" + ",".join(still_present))
+        if actual_revision != str(revision or ""):
+            details.append(f"revision={actual_revision or '-'}，期望={revision or '-'}")
+        raise CceRolloutError("发布后运行配置校验失败：" + "；".join(details))
+
+
 PARALLEL_RELEASE_LABEL = "robot-ci.io/release"
 PARALLEL_SOURCE_LABEL = "robot-ci.io/source-workload"
 PARALLEL_ATTEMPT_ANNOTATION = "robot-ci.io/create-attempt"
@@ -1591,6 +1639,21 @@ def deploy_job_results(
                 })
                 if on_parallel_created:
                     on_parallel_created(created)
+                if has_managed_runtime_config:
+                    verify_runtime_variables_on_workload(
+                        run_remote,
+                        namespace=namespace,
+                        kind="deployment",
+                        workload=str(created["name"]),
+                        container=container,
+                        variables=runtime_variables,
+                        deleted_names=runtime_deleted_names,
+                        revision=runtime_config_revision,
+                    )
+                    write(
+                        f"运行配置校验通过 revision={runtime_config_revision or '-'} "
+                        f"variables={len(runtime_variables)} deleted={len(runtime_deleted_names)}"
+                    )
                 if int(created.get("desired_replicas") or 0) > 0:
                     write(f"新版本负载已就绪 deploy/{created['name']} 实例={created['desired_replicas']}")
                 else:
@@ -1632,5 +1695,23 @@ def deploy_job_results(
                 write(line)
         if code != 0:
             return False, f"kubectl 升级 {deploy} 失败 (exit {code})"
+        if has_managed_runtime_config:
+            try:
+                verify_runtime_variables_on_workload(
+                    run_remote,
+                    namespace=namespace,
+                    kind=workload_kind,
+                    workload=deploy,
+                    container=container,
+                    variables=runtime_variables,
+                    deleted_names=runtime_deleted_names,
+                    revision=runtime_config_revision,
+                )
+            except CceRolloutError as exc:
+                return False, str(exc)
+            write(
+                f"运行配置校验通过 revision={runtime_config_revision or '-'} "
+                f"variables={len(runtime_variables)} deleted={len(runtime_deleted_names)}"
+            )
         write(f"gamma部署完成 {service_id} {workload_kind}/{deploy} container={container}")
     return True, ""

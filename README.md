@@ -150,7 +150,7 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 
 环境管理卡片对所有已登录用户开放只读查看，展示环境标签、Region、集群、配置负载、当前活动负载、跳板机、节点及密码是否已配置；密码明文始终不返回。具有环境管理权限的责任人可以创建、编辑和删除环境，其他用户没有写操作入口，服务端仍对写请求校验权限。
 
-环境详情分为“基础信息”和“运行配置”两个页签。运行配置可显式从环境绑定的跳板机和 kubeconfig 读取目标 Deployment/StatefulSet 业务容器的普通字面量 `env`，并解析非敏感的 `ConfigMap keyRef/envFrom` 后合并到 robot-ci 配置；Kubernetes Secret 引用以及名称疑似密码、Token、Secret、Key、Cookie 的变量只计数跳过，不读取或保存其值。新增、更新或删除只修改 robot-ci 运行时数据库，不立即变更 Kubernetes；生产发布拿到环境锁后重新读取最新配置，并把变量和镜像在同一次 Pod 模板变更中应用。删除项使用待删除标记，首次由 CI 接管前删除也能在下一次发布移除；`robot-ci.io/runtime-env-keys` 注解继续避免误删其他未纳管变量。敏感配置必须继续使用 Kubernetes Secret。
+环境详情分为“基础信息”和“运行配置”两个页签。运行配置可显式从环境绑定的跳板机和 kubeconfig 读取目标 Deployment/StatefulSet 业务容器的普通字面量 `env`，并解析非敏感的 `ConfigMap keyRef/envFrom` 后合并到 robot-ci 配置；Kubernetes Secret 引用以及名称疑似密码、Token、Secret、Key、Cookie 的变量只计数跳过，不读取或保存其值。新增、更新或删除只修改 robot-ci 运行时数据库，不立即变更 Kubernetes；生产发布拿到环境锁后重新读取最新配置，并把变量和镜像在同一次 Pod 模板变更中写入工作负载的 Pod 模板 `env`，不会反向修改 ConfigMap。发布完成后 CI 会重新读取工作负载，逐项验证变量值、删除项和配置 revision，不一致则发布失败。删除项使用待删除标记，首次由 CI 接管前删除也能在下一次发布移除；`robot-ci.io/runtime-env-keys` 注解继续避免误删其他未纳管变量。敏感配置必须继续使用 Kubernetes Secret。
 
 运行配置 API 供页面和后续 Skill 共用，所有写操作仍校验该服务的环境管理权限：
 
