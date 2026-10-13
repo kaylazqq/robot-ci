@@ -420,14 +420,24 @@ class CceRolloutHelperTests(unittest.TestCase):
 
     def test_deploy_applies_runtime_variables_with_image_in_one_patch(self) -> None:
         commands: list[str] = []
+        patched = False
 
         def direct(command, **_kwargs):  # noqa: ANN001
+            nonlocal patched
             commands.append(command)
+            if "--type=json" in command:
+                patched = True
+                return 0, "patched", ""
             if "get deploy echoagent-router -o json" in command:
                 return 0, json.dumps({
                     "spec": {"template": {
-                        "metadata": {"annotations": {}},
-                        "spec": {"containers": [{"name": "router", "image": "registry/router:old"}]},
+                        "metadata": {"annotations": {
+                            cce_rollout.RUNTIME_CONFIG_REVISION_ANNOTATION: "revision-1" if patched else "",
+                        }},
+                        "spec": {"containers": [{
+                            "name": "router", "image": "registry/router:new" if patched else "registry/router:old",
+                            "env": ([{"name": "AGENT_MCP_PUBLIC_URL", "value": "http://example.test/api/mcp"}] if patched else []),
+                        }]},
                     }},
                 }), ""
             return 0, "rolled out", ""
@@ -456,7 +466,21 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertIn("patch deployment echoagent-router --type=json", release)
         self.assertNotIn("http://example.test/api/mcp", release)
         self.assertTrue(any("variables=1" in line for line in logs))
+        self.assertTrue(any("运行配置校验通过" in line for line in logs))
         self.assertFalse(any("http://example.test/api/mcp" in line for line in logs))
+
+    def test_runtime_config_verification_rejects_missing_variable(self) -> None:
+        def direct(command, _timeout=120):  # noqa: ANN001
+            return 0, json.dumps({"spec": {"template": {
+                "metadata": {"annotations": {cce_rollout.RUNTIME_CONFIG_REVISION_ANNOTATION: "r1"}},
+                "spec": {"containers": [{"name": "router", "env": []}]},
+            }}}), ""
+
+        with self.assertRaisesRegex(cce_rollout.CceRolloutError, "MISSING_VALUE"):
+            cce_rollout.verify_runtime_variables_on_workload(
+                direct, namespace="echo-prod", kind="deployment", workload="echoagent-router",
+                container="router", variables={"MISSING_VALUE": "x"}, revision="r1",
+            )
 
     def test_replacement_release_restarts_when_image_reference_is_unchanged(self) -> None:
         commands: list[str] = []
