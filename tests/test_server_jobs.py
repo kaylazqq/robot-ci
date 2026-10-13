@@ -255,7 +255,7 @@ class JobWorkspaceTests(unittest.TestCase):
                 self.assertEqual(left.parent, right.parent)
                 self.assertTrue(left.name.endswith("--aaa111bbb222"))
                 self.assertTrue(right.name.endswith("--ccc333ddd444"))
-                self.assertEqual(left.parent, server.public_service_dir().parent)
+                self.assertEqual(str(left.parent), tmp)
 
     def test_gc_keeps_running_job_workspace_and_drops_idle_ones(self) -> None:
         svc = {
@@ -293,17 +293,17 @@ class JobWorkspaceTests(unittest.TestCase):
             with patch.dict(server.CFG, {"workspace_root": tmp}):
                 live = server.repo_dir(svc, "livejob00aaaa")
                 other = root / "kibana-service--idlejob00cccc"
-                public = root / "public-service"
+                cache = root / ".robot-ci-cache"
                 live.mkdir()
                 other.mkdir()
-                public.mkdir()
+                cache.mkdir()
                 job = make_job("livejob00aaaa")
                 self.assertIsNone(server.register_job_if_idle(job))
                 try:
                     with patch.object(server, "append_job_log"):
                         server.gc_all_idle_clone_dirs("livejob00aaaa")
                     self.assertTrue(live.is_dir())
-                    self.assertTrue(public.is_dir())
+                    self.assertTrue(cache.is_dir())
                     self.assertFalse(other.exists())
                 finally:
                     with server._jobs_lock:
@@ -358,7 +358,7 @@ class JobPayloadTests(unittest.TestCase):
             "prepare": [
                 "[11:30:24] reusing shared SWR login on this server…",
                 "[11:30:25] shared SWR login still valid",
-                "[11:30:25] ensure shared public-service → /tmp/public-service @ main",
+                "[11:30:25] Docker available",
                 "[11:30:26] shared archive dir=/tmp/archives/x",
             ],
             "sync": [
@@ -963,7 +963,7 @@ class BranchLookupTests(unittest.TestCase):
 
 
 class SourceProviderTests(unittest.TestCase):
-    def test_echo_services_default_to_gitcode_and_can_resolve_github(self) -> None:
+    def test_dual_source_services_default_to_gitcode_and_can_resolve_github(self) -> None:
         with patch.dict(server.CFG, {"source_provider": "gitcode"}):
             gitcode = {item["id"]: item for item in server.load_services()}
         github = {item["id"]: item for item in server.load_services("github")}
@@ -971,7 +971,9 @@ class SourceProviderTests(unittest.TestCase):
         self.assertEqual("hw-colink/EchoAgent", gitcode["echoagent-backend"]["repo"])
         self.assertEqual("hw-colink/EchoAgent", gitcode["echoagent-frontend"]["repo"])
         self.assertEqual("hw-colink/EchoRouter", gitcode["echoagent-router"]["repo"])
+        self.assertEqual("hw-colink/org-admin", gitcode["org-admin"]["repo"])
         self.assertEqual("tech-innovation-group/EchoAgent", github["echoagent-router"]["repo"])
+        self.assertEqual("pick-shot/org-admin", github["org-admin"]["repo"])
 
     def test_gitcode_clone_uses_provider_scoped_ssh_key(self) -> None:
         with tempfile.NamedTemporaryFile() as key, patch.dict(
@@ -1582,30 +1584,30 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual("service_busy", payload["error_code"])
         self.assertEqual("mattermost", payload["service"])
 
-    def test_multica_server_version_is_validated_before_build(self) -> None:
-        with patch.object(server, "save_last_daemon_version") as save_version:
-            with self.assertRaises(HTTPError) as raised:
-                self._open(
-                    "/api/push",
-                    data=json.dumps(
-                        {"items": [{"service_id": "multica-server", "branch": "main", "version": "1.2.3"}]}
-                    ).encode(),
-                    method="POST",
-                )
-            save_version.assert_not_called()
+    def test_removed_service_is_rejected(self) -> None:
+        with self.assertRaises(HTTPError) as raised:
+            self._open(
+                "/api/push",
+                data=json.dumps(
+                    {"items": [{"service_id": "multica-server", "branch": "main", "version": "v1.2.3"}]}
+                ).encode(),
+                method="POST",
+            )
         self.assertEqual(400, raised.exception.code)
         payload = json.loads(raised.exception.read().decode("utf-8"))
-        self.assertIn("vMAJOR.MINOR.PATCH", payload["error"])
+        self.assertIn("unknown service", payload["error"])
 
-    def test_services_expose_version_and_archive_capabilities(self) -> None:
+    def test_services_catalog_keeps_echoagent_link_ops_and_org_admin(self) -> None:
         with self._open("/api/services") as response:
             payload = json.loads(response.read().decode("utf-8"))
         services = {item["id"]: item for item in payload["services"]}
-        self.assertTrue(services["multica-server"]["requires_version"])
-        self.assertEqual("v1.2.3", services["multica-server"]["version_example"])
-        self.assertIn("last_version", services["multica-server"])
-        self.assertTrue(services["multica-fleet"]["archive_only"])
-        self.assertEqual("censong574-spec/multica-fleet", services["multica-fleet"]["repo"])
+        self.assertIn("link-ops", services)
+        self.assertIn("org-admin", services)
+        self.assertEqual("pick-shot/link-ops", services["link-ops"]["repo"])
+        self.assertEqual("hw-colink/org-admin", services["org-admin"]["repo"])
+        self.assertEqual("org-admin", services["org-admin"]["image"])
+        configured = {item["id"]: item for item in server.load_services()}
+        self.assertTrue(configured["echoagent-backend"]["dockerfile_build"])
         self.assertEqual(
             {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
             {service_id for service_id in services if service_id.startswith("echoagent-")},
@@ -1982,7 +1984,7 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         )
         self.assertIn(("image", "prune", "-af"), prune_args)
 
-    def test_gc_all_idle_clone_dirs_keeps_public_service_and_running_jobs(self) -> None:
+    def test_gc_all_idle_clone_dirs_keeps_cache_and_running_jobs(self) -> None:
         svc = {
             "id": "memory-service",
             "repo": "rollingfruit/CellMem",
@@ -1990,18 +1992,16 @@ class DiskPruneAndArtifactTests(unittest.TestCase):
         }
         live = server.repo_dir(svc, "livejob00aaaa")
         idle = self.workspace_root / "kibana-service--deadjob00bbbb"
-        public = self.workspace_root / "public-service"
         cache = self.workspace_root / ".robot-ci-cache"
         leftover_tmp = self.ci_tmp_root / "runtime-apt-debs.abc123"
         keep_tmp = self.ci_tmp_root / "node-compile-cache"
-        for path in (live, idle, public, cache, leftover_tmp, keep_tmp):
+        for path in (live, idle, cache, leftover_tmp, keep_tmp):
             path.mkdir()
         job = make_job("livejob00aaaa")
         self.assertIsNone(server.register_job_if_idle(job))
         server.gc_all_idle_clone_dirs("livejob00aaaa")
         server.reclaim_ci_tmp_leftovers("livejob00aaaa")
         self.assertTrue(live.is_dir())
-        self.assertTrue(public.is_dir())
         self.assertTrue(cache.is_dir())
         self.assertFalse(idle.exists())
         self.assertFalse(leftover_tmp.exists())
@@ -2338,111 +2338,6 @@ class DockerReadyForPushTests(unittest.TestCase):
             ready = server.docker_ready_for_push()
             sched.assert_called()
         self.assertTrue(ready["ok"])
-
-
-class PublicServiceReuseTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.saved_ready = server._public_service_ready_at
-        server._public_service_ready_at = 0.0
-        with server._jobs_lock:
-            self.saved_jobs = dict(server._jobs)
-            server._jobs.clear()
-
-    def tearDown(self) -> None:
-        server._public_service_ready_at = self.saved_ready
-        with server._jobs_lock:
-            server._jobs.clear()
-            server._jobs.update(self.saved_jobs)
-
-    def _tree(self, tmp: str) -> server.Path:
-        dest = server.Path(tmp) / "public-service"
-        (dest / ".git").mkdir(parents=True)
-        rrd = dest / "windows-deploy" / "lib" / "source-rrd.sh"
-        rrd.parent.mkdir(parents=True)
-        rrd.write_text("ok", encoding="utf-8")
-        return dest
-
-    def test_reuses_existing_tree_when_fetch_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            dest = self._tree(tmp)
-            with patch.dict(server.CFG, {"workspace_root": tmp}):
-                with patch.object(server, "run_stream", return_value=1):
-                    with patch.object(server, "run_cmd", return_value=(0, "abc1234")):
-                        with patch.object(server, "append_job_log"):
-                            ok, detail = server.ensure_public_service("ps-job")
-            self.assertTrue(ok)
-            self.assertEqual(str(dest), detail)
-
-    def test_skips_fetch_when_recently_ready(self) -> None:
-        server._public_service_ready_at = time.time()
-        with tempfile.TemporaryDirectory() as tmp:
-            self._tree(tmp)
-            with patch.dict(server.CFG, {"workspace_root": tmp}):
-                with patch.object(server, "run_stream") as stream:
-                    with patch.object(server, "run_cmd", return_value=(0, "abc1234")):
-                        with patch.object(server, "append_job_log"):
-                            ok, _detail = server.ensure_public_service("ps-job")
-            self.assertTrue(ok)
-            stream.assert_not_called()
-
-
-class BaseImageTargetTests(unittest.TestCase):
-    def test_normalize_keeps_known_order(self) -> None:
-        self.assertEqual(
-            ["ubuntu", "openresty", "observability", "python"],
-            server.normalize_base_image_targets(
-                ["python", "observability", "openresty", "ubuntu", "openresty", "bogus", "python"]
-            ),
-        )
-
-    def test_service_defaults_and_skips(self) -> None:
-        self.assertEqual(["ubuntu"], server.base_image_targets_for_service({"id": "agentlink"}))
-        self.assertEqual(
-            ["python"],
-            server.base_image_targets_for_service({"id": "agentlink", "base_image_targets": ["python"]}),
-        )
-        self.assertEqual(
-            ["openresty"],
-            server.base_image_targets_for_service({"id": "service-router", "base_image_targets": ["openresty"]}),
-        )
-        self.assertEqual([], server.base_image_targets_for_service({"id": "llm-gateway", "skip_public_service": True}))
-
-    def test_union_for_batch(self) -> None:
-        targets = server.base_image_targets_for_services(
-            [
-                {"id": "semantic-schedule", "base_image_targets": ["python"]},
-                {"id": "service-router", "base_image_targets": ["openresty"]},
-                {"id": "es-service", "base_image_targets": ["observability"]},
-                {"id": "llm-gateway", "skip_public_service": True},
-            ]
-        )
-        self.assertEqual(["openresty", "observability", "python"], targets)
-
-    def test_ensure_versioned_base_images_passes_selected_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = server.Path(tmp)
-            script = root / "public-service" / "scripts" / "build-versioned-base-images.sh"
-            script.parent.mkdir(parents=True)
-            script.write_text("#!/bin/bash\n", encoding="utf-8")
-            captured: list[str] = []
-
-            def fake_run_stream(job_id, cmd, **kwargs):
-                del job_id, kwargs
-                captured.append(" ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd))
-                return 0
-
-            with patch.dict(server.CFG, {"workspace_root": tmp}):
-                with patch.object(server, "run_stream", side_effect=fake_run_stream):
-                    with patch.object(server, "append_job_log"):
-                        with patch.object(server, "bash_lc", side_effect=lambda s: ["bash", "-lc", s]):
-                            with patch.object(server, "host_path", side_effect=lambda p: str(p)):
-                                ok, detail = server.ensure_versioned_base_images("job-base", ["ubuntu", "openresty"])
-            self.assertTrue(ok)
-            self.assertEqual("", detail)
-            self.assertEqual(1, len(captured))
-            self.assertIn("build-versioned-base-images.sh", captured[0])
-            self.assertIn(" ubuntu openresty", captured[0])
-            self.assertNotIn(" all", captured[0])
 
 
 class ConcurrentPrepareTests(unittest.TestCase):

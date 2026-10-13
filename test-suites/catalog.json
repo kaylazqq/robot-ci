@@ -22,6 +22,8 @@
     "multica-fleet": {"repository": "multica-fleet", "scope": "Fleet lifecycle, runtime reconciliation, daemon release installation and offline deployment bundle", "roots": ["internal/fleet", "internal/runtimeinit", "tests/unit"], "convention": "go + shell"},
     "mattermost": {"repository": "mattermost", "scope": "Mattermost server short-mode unit tests", "roots": ["server"], "excluded": ["Docker/database/browser E2E"], "convention": "make"},
     "config-service": {"repository": "ConfigService", "scope": "centralized runtime config publish, pull, rollback, ops console and structured logs", "roots": ["internal/httpapi", "internal/store", "internal/logging", "internal/dbconn", "sdk/go", "sdk/python", "tests/unit", "tests/dt"], "excluded": ["//go:build integration"], "convention": "go + shell + unittest"},
-    "ops-router": {"repository": "ops-router", "scope": "OpenResty host package, Grafana/Kibana path proxy and nginx runtime rendering", "roots": ["tests/test-*.sh"], "convention": "shell"}
+    "ops-router": {"repository": "ops-router", "scope": "OpenResty host package, Grafana/Kibana path proxy and nginx runtime rendering", "roots": ["tests/test-*.sh"], "convention": "shell"},
+    "link-ops": {"repository": "link-ops", "scope": "CoLink ops service image", "roots": ["backend", "frontend"], "convention": "docker"},
+    "org-admin": {"repository": "org-admin", "scope": "Workspace admin console image", "roots": ["backend", "frontend"], "convention": "docker"}
   }
 }
