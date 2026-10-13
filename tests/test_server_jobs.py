@@ -1289,21 +1289,29 @@ artifacts:
             {svc["image"] for svc in services.values()},
         )
 
-    def test_echoagent_router_contract_accepts_nested_dockerfile(self) -> None:
+    def test_echoagent_router_gitcode_contract_uses_managed_dockerfile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = server.Path(tmp)
-            dockerfile = workspace / "dev" / "router" / "Dockerfile"
-            dockerfile.parent.mkdir(parents=True)
-            dockerfile.write_text("FROM scratch AS router\n", encoding="utf-8")
-            ok, detail = server.validate_cloned_repo_contract(
-                workspace,
-                {
-                    "id": "echoagent-router",
-                    "dockerfile_build": True,
-                    "dockerfile": "dev/router/Dockerfile",
-                },
-            )
+            svc = {
+                "id": "echoagent-router",
+                "dockerfile_build": True,
+                "dockerfile": ".robot-ci/echoagent-router.Dockerfile",
+                "managed_dockerfile": "echoagent-router.Dockerfile",
+            }
+            ok, detail = server.materialize_managed_dockerfile(workspace, svc)
+            self.assertTrue(ok, detail)
+            self.assertTrue((workspace / ".robot-ci" / "echoagent-router.Dockerfile").is_file())
+            ok, detail = server.validate_cloned_repo_contract(workspace, svc)
         self.assertTrue(ok, detail)
+
+    def test_managed_dockerfile_rejects_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, detail = server.materialize_managed_dockerfile(
+                server.Path(tmp),
+                {"dockerfile": "../Dockerfile", "managed_dockerfile": "echoagent-router.Dockerfile"},
+            )
+        self.assertFalse(ok)
+        self.assertIn("invalid managed dockerfile path", detail)
 
     @patch("frozen_builds.resolve", return_value="a" * 40)
     def test_echoagent_components_share_one_pinned_source_revision(self, resolve) -> None:

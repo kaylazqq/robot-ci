@@ -45,6 +45,7 @@ WEB_DIR = ROOT / "web"
 LOG_DIR = ROOT / "logs"
 CONFIG_PATH = ROOT / "config.json"
 SERVICES_PATH = ROOT / "services.json"
+BUILD_ASSETS_DIR = ROOT / "build-assets"
 TEST_PLANS_PATH = ROOT / "test-plans.json"
 TEST_RUNNER_PATH = ROOT / "test_runner.py"
 LAST_DAEMON_VERSION_PATH = LOG_DIR / "last-daemon-version.json"
@@ -7116,7 +7117,9 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
         if not ok:
             return ok, detail
         run_cmd(git_args('-C', str(dest), 'remote', 'set-url', 'origin', public), timeout=30, env=genv)
-        ok, error = validate_cloned_repo_contract(dest, svc)
+        ok, error = materialize_managed_dockerfile(dest, svc)
+        if ok:
+            ok, error = validate_cloned_repo_contract(dest, svc)
         if ok and svc.get('id') == 'multica-fleet':
             restore_fleet_runtime_cache(job_id, dest)
         return (True, str(dest)) if ok else (False, error)
@@ -7154,7 +7157,9 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
             return False, f"checkout {branch} failed"
 
     run_cmd(git_args("-C", str(dest), "remote", "set-url", "origin", public), timeout=30, env=genv)
-    ok_contract, contract_error = validate_cloned_repo_contract(dest, svc)
+    ok_contract, contract_error = materialize_managed_dockerfile(dest, svc)
+    if ok_contract:
+        ok_contract, contract_error = validate_cloned_repo_contract(dest, svc)
     if not ok_contract:
         return False, contract_error
     if svc.get("id") == "multica-fleet":
@@ -7163,6 +7168,34 @@ def sync_repo(job_id: str, svc: dict[str, Any], branch: str) -> tuple[bool, str]
     with log_substep("sha"):
         append_job_log(job_id, f"HEAD={head if code == 0 else '?'} @ {branch}")
     return True, str(dest)
+
+
+def materialize_managed_dockerfile(dest: Path, svc: dict[str, Any]) -> tuple[bool, str]:
+    """Copy a reviewed CI-owned Dockerfile into a disposable source checkout."""
+    asset_name = str(svc.get("managed_dockerfile") or "").strip()
+    if not asset_name:
+        return True, ""
+    asset_path = Path(asset_name)
+    target_path = Path(str(svc.get("dockerfile") or "").strip())
+    if (
+        not asset_name
+        or asset_path.is_absolute()
+        or ".." in asset_path.parts
+        or not str(target_path)
+        or target_path.is_absolute()
+        or ".." in target_path.parts
+    ):
+        return False, "invalid managed dockerfile path"
+    source = BUILD_ASSETS_DIR / asset_path
+    if not source.is_file():
+        return False, f"managed dockerfile not found: {asset_name}"
+    target = dest / target_path
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    except OSError as exc:
+        return False, f"could not materialize managed dockerfile: {exc}"
+    return True, ""
 
 
 def validate_cloned_repo_contract(dest: Path, svc: dict[str, Any]) -> tuple[bool, str]:
@@ -7306,7 +7339,7 @@ def build_from_source(
             docker_args += f" --target {shlex.quote(docker_target)}"
         if svc.get("oci_build_metadata"):
             revision = commit_sha if re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha or "") else git_hash
-            source_url = public_github_url(str(svc.get("github") or ""))
+            source_url = public_git_url(service_git_url(svc))
             docker_args += f" --build-arg VCS_REF={shlex.quote(revision)}"
             docker_args += f" --build-arg SOURCE_URL={shlex.quote(source_url)}"
         static_build_args = svc.get("docker_build_args")
