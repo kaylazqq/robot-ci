@@ -36,7 +36,6 @@ assert ids == {
     "echoagent-backend",
     "echoagent-frontend",
     "echoagent-router",
-    "link-ops",
     "org-admin",
 }, f"unexpected services catalog: {sorted(ids)}"
 PY

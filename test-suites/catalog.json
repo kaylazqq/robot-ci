@@ -8,7 +8,6 @@
     "echoagent-backend": {"repository": "EchoAgent", "scope": "EchoAgent backend image", "roots": ["deploy/production"], "convention": "docker"},
     "echoagent-frontend": {"repository": "EchoAgent", "scope": "EchoAgent frontend image", "roots": ["deploy/production"], "convention": "docker"},
     "echoagent-router": {"repository": "EchoAgent", "scope": "EchoAgent router image", "roots": ["dev/router"], "convention": "docker"},
-    "link-ops": {"repository": "link-ops", "scope": "CoLink ops service image", "roots": ["backend", "frontend"], "convention": "docker"},
     "org-admin": {"repository": "org-admin", "scope": "Workspace admin console image", "roots": ["backend", "frontend"], "convention": "docker"}
   }
 }
