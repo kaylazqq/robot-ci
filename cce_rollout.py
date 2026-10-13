@@ -1156,6 +1156,52 @@ def read_workload_runtime_environment(
     variables: dict[str, str] = {}
     skipped: list[str] = []
     skipped_sensitive: list[str] = []
+    configmaps: dict[str, Mapping[str, Any]] = {}
+
+    def configmap_data(name: str, *, optional: bool = False) -> Mapping[str, Any]:
+        cm_name = str(name or "").strip()
+        if not cm_name:
+            return {}
+        if cm_name not in configmaps:
+            command = (
+                f"kubectl -n {shlex.quote(namespace)} get configmap {shlex.quote(cm_name)} -o json"
+            )
+            code, out, err = run_remote(command, 60)
+            if code != 0:
+                if optional:
+                    configmaps[cm_name] = {}
+                else:
+                    detail = (err or out or "").strip() or f"exit {code}"
+                    raise CceRolloutError(f"读取 ConfigMap {cm_name} 失败: {detail}")
+            else:
+                try:
+                    parsed = json.loads(out)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CceRolloutError(f"ConfigMap {cm_name} 返回格式无效") from exc
+                configmaps[cm_name] = (
+                    parsed.get("data")
+                    if isinstance(parsed, Mapping) and isinstance(parsed.get("data"), Mapping)
+                    else {}
+                )
+        return configmaps[cm_name]
+
+    for source in target.get("envFrom") or []:
+        if not isinstance(source, Mapping):
+            continue
+        prefix = str(source.get("prefix") or "")
+        ref = source.get("configMapRef")
+        if isinstance(ref, Mapping):
+            data = configmap_data(str(ref.get("name") or ""), optional=bool(ref.get("optional")))
+            for key, value in data.items():
+                name = prefix + str(key or "")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    continue
+                if _SENSITIVE_ENV_NAME.search(name):
+                    skipped_sensitive.append(name)
+                else:
+                    variables[name] = str(value if value is not None else "")
+        elif isinstance(source.get("secretRef"), Mapping):
+            skipped.append(f"secretRef:{source['secretRef'].get('name') or '-'}")
     for item in target.get("env") or []:
         if not isinstance(item, Mapping):
             continue
@@ -1163,7 +1209,22 @@ def read_workload_runtime_environment(
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             continue
         if "valueFrom" in item:
-            skipped.append(name)
+            value_from = item.get("valueFrom")
+            cm_ref = value_from.get("configMapKeyRef") if isinstance(value_from, Mapping) else None
+            if isinstance(cm_ref, Mapping):
+                if _SENSITIVE_ENV_NAME.search(name):
+                    skipped_sensitive.append(name)
+                    continue
+                data = configmap_data(
+                    str(cm_ref.get("name") or ""), optional=bool(cm_ref.get("optional"))
+                )
+                key = str(cm_ref.get("key") or "")
+                if key in data:
+                    variables[name] = str(data[key] if data[key] is not None else "")
+                else:
+                    skipped.append(name)
+            else:
+                skipped.append(name)
         elif _SENSITIVE_ENV_NAME.search(name):
             skipped_sensitive.append(name)
         elif "value" in item:

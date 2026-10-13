@@ -3555,7 +3555,7 @@ function renderRuntimeConfigPane(pane, data) {
     '<td>' + (item.source === 'cluster' ? '真实环境' : '手工') + '</td><td>' + esc(item.updated_by || item.created_by || '—') + '</td><td>' + esc(item.updated_at || item.created_at || '—') + '</td>' +
     '<td><button type="button" class="btn ghost danger" data-runtime-delete="' + esc(item.name) + '"' + (editable ? '' : ' disabled') + '>删除</button></td></tr>'
   )).join('') : '<tr><td colspan="6" class="runtime-empty">暂无运行变量</td></tr>';
-  const syncText = sync ? ('上次同步：' + esc(sync.synced_at || '—') + '，' + esc(sync.workload_kind || '') + '/' + esc(sync.workload_name || '') + ' · 容器 ' + esc(sync.container_name || '—') + '；跳过 valueFrom ' + ((sync.skipped_value_from_names || []).length) + ' 项、敏感变量 ' + ((sync.skipped_sensitive_names || []).length) + ' 项') : '尚未从真实环境同步';
+  const syncText = sync ? ('上次同步：' + esc(sync.synced_at || '—') + '，' + esc(sync.workload_kind || '') + '/' + esc(sync.workload_name || '') + ' · 容器 ' + esc(sync.container_name || '—') + '；跳过 Secret/不支持引用 ' + ((sync.skipped_value_from_names || []).length) + ' 项、敏感变量 ' + ((sync.skipped_sensitive_names || []).length) + ' 项') : '尚未从真实环境同步';
   const deletedText = deletedNames.length ? '<div class="runtime-pending-delete">下次发布将删除：' + deletedNames.map((name) => '<code>' + esc(name) + '</code>').join('、') + '</div>' : '';
   root.innerHTML = '<div class="runtime-config-toolbar"><div><div class="runtime-config-meta">当前版本 <code>' + esc((data && data.revision) || '—') + '</code> · 共 ' + rows.length + ' 项</div><div class="env-secret-hint">' + syncText + '</div></div>' +
     (editable ? '<button type="button" class="btn" data-runtime-sync>同步真实环境</button>' : '') + '</div>' + deletedText +
@@ -3566,7 +3566,7 @@ function renderRuntimeConfigPane(pane, data) {
   const envId = pane.getAttribute('data-env-runtime-id') || '';
   const syncButton = root.querySelector('[data-runtime-sync]');
   if (syncButton) syncButton.addEventListener('click', async () => {
-    if (!await askEnvConfirm('确认从目标工作负载读取普通环境变量并合并到当前运行配置吗？Secret/ConfigMap 引用不会读取。', {title:'同步真实环境', confirmLabel:'确认同步'})) return;
+    if (!await askEnvConfirm('确认从目标工作负载读取普通环境变量和非敏感 ConfigMap 配置并合并吗？Secret 引用不会读取。', {title:'同步真实环境', confirmLabel:'确认同步'})) return;
     syncButton.disabled = true;
     try {
       const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/sync', {method:'POST', body:'{}'});

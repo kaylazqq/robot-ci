@@ -384,10 +384,14 @@ class CceRolloutHelperTests(unittest.TestCase):
 
     def test_read_runtime_environment_skips_secret_references_and_sensitive_literals(self) -> None:
         payload = {"spec": {"template": {"spec": {"containers": [{
-            "name": "router", "image": "registry/router:old", "env": [
+            "name": "router", "image": "registry/router:old", "envFrom": [
+                {"configMapRef": {"name": "router-config"}},
+                {"secretRef": {"name": "router-secret"}},
+            ], "env": [
                 {"name": "PUBLIC_URL", "value": "http://example.test"},
                 {"name": "EMPTY_VALUE", "value": ""},
                 {"name": "DB_PASSWORD", "value": "must-not-copy"},
+                {"name": "FROM_CONFIGMAP", "valueFrom": {"configMapKeyRef": {"name": "router-config", "key": "CM_VALUE"}}},
                 {"name": "FROM_SECRET", "valueFrom": {"secretKeyRef": {"name": "s", "key": "x"}}},
             ]
         }]}}}}
@@ -395,6 +399,8 @@ class CceRolloutHelperTests(unittest.TestCase):
         def direct(command, **_kwargs):  # noqa: ANN001
             if "get deploy echoagent-router -o json" in command:
                 return 0, json.dumps(payload), ""
+            if "get configmap router-config -o json" in command:
+                return 0, json.dumps({"data": {"CM_VALUE": "from-cm", "CM_PASSWORD": "skip-me"}}), ""
             return 1, "", "not found"
 
         result = cce_rollout.read_workload_runtime_environment(
@@ -405,9 +411,12 @@ class CceRolloutHelperTests(unittest.TestCase):
             },
             creds={"jump_password": "x"}, direct=direct,
         )
-        self.assertEqual({"EMPTY_VALUE": "", "PUBLIC_URL": "http://example.test"}, result["variables"])
-        self.assertEqual(["FROM_SECRET"], result["skipped_value_from_names"])
-        self.assertEqual(["DB_PASSWORD"], result["skipped_sensitive_names"])
+        self.assertEqual({
+            "CM_VALUE": "from-cm", "EMPTY_VALUE": "", "FROM_CONFIGMAP": "from-cm",
+            "PUBLIC_URL": "http://example.test",
+        }, result["variables"])
+        self.assertEqual(["FROM_SECRET", "secretRef:router-secret"], result["skipped_value_from_names"])
+        self.assertEqual(["CM_PASSWORD", "DB_PASSWORD"], result["skipped_sensitive_names"])
 
     def test_deploy_applies_runtime_variables_with_image_in_one_patch(self) -> None:
         commands: list[str] = []
