@@ -10577,13 +10577,14 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 items[0]["branch"] = str(source_artifact.get("branch") or "")
             client_id = _normalize_client_id(data.get("client_id"))
-            try:
-                frozen_inputs = resolve_frozen_source_inputs(items, catalog, deployment_type)
-            except (ValueError, TypeError, OSError, KeyError, RuntimeError) as exc:
-                self._json(400, {"error": "Source revision resolution failed: " + str(exc)})
-                return
             if ai_request:
-                frozen_inputs[items[0]["service_id"]] = str(ai_request["commit_sha"])
+                frozen_inputs = {items[0]["service_id"]: str(ai_request["commit_sha"])}
+            else:
+                try:
+                    frozen_inputs = resolve_frozen_source_inputs(items, catalog, deployment_type)
+                except (ValueError, TypeError, OSError, KeyError, RuntimeError) as exc:
+                    self._json(400, {"error": "Source revision resolution failed: " + str(exc)})
+                    return
             try:
                 requested_steps = dict(data.get('optional_steps') or {})
                 requested_steps.update({

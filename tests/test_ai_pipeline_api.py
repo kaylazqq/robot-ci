@@ -28,6 +28,7 @@ class AiPipelineApiTests(unittest.TestCase):
         with server._jobs_lock:
             server._jobs.clear()
         server.ensure_default_users()
+        self.service_id = str(server.load_services()[0]["id"])
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
@@ -64,7 +65,7 @@ class AiPipelineApiTests(unittest.TestCase):
             return json.load(response)["token"]["token"]
 
     def enabled_pipeline(self) -> dict:
-        template = server.personal_builtin_template(server.DEFAULT_USERNAME, "memory-service")
+        template = server.personal_builtin_template(server.DEFAULT_USERNAME, self.service_id)
         updated, error = server.update_pipeline_template(
             server.DEFAULT_USERNAME, template["id"], {**template, "api_enabled": True}
         )
@@ -80,7 +81,7 @@ class AiPipelineApiTests(unittest.TestCase):
         self.assertNotIn("token", stored)
         with self.open("/api/ai/pipelines", bearer=token) as response:
             pipelines = json.load(response)["pipelines"]
-        self.assertEqual(["memory-service"], [item["service_id"] for item in pipelines])
+        self.assertEqual([self.service_id], [item["service_id"] for item in pipelines])
 
     def test_run_pins_sha_is_idempotent_and_can_be_polled(self) -> None:
         cookie = self.login()
@@ -101,7 +102,7 @@ class AiPipelineApiTests(unittest.TestCase):
         self.assertEqual(first["run_id"], second["run_id"])
         self.assertTrue(second["reused"])
         job = server._job_copy(first["run_id"])
-        self.assertEqual(sha, job["frozen_inputs"]["memory-service"])
+        self.assertEqual(sha, job["frozen_inputs"][self.service_id])
         self.assertTrue(job["api_approval_exempt"])
         with self.open("/api/ai/pipeline-runs/" + first["run_id"], bearer=token) as response:
             status = json.load(response)
