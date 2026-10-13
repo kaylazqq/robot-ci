@@ -1,3 +1,5 @@
+import argparse
+import importlib.util
 import json
 import tempfile
 import threading
@@ -9,6 +11,12 @@ from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 import server
+
+
+SKILL_SCRIPT = Path(__file__).resolve().parents[1] / "skills/robot-ci-run-pipeline/scripts/robot_ci_pipeline.py"
+SKILL_SPEC = importlib.util.spec_from_file_location("robot_ci_pipeline_e2e", SKILL_SCRIPT)
+SKILL = importlib.util.module_from_spec(SKILL_SPEC)
+SKILL_SPEC.loader.exec_module(SKILL)
 
 
 class AiPipelineApiTests(unittest.TestCase):
@@ -125,6 +133,30 @@ class AiPipelineApiTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as denied:
             self.open("/api/ai/tokens", payload={"name": "nested"}, bearer=token, method="POST")
         self.assertEqual(403, denied.exception.code)
+
+    def test_skill_calls_live_http_api_and_waits_for_success(self) -> None:
+        token = self.token(self.login())
+        pipeline = self.enabled_pipeline()
+        sha = "c" * 40
+
+        def finish(job_id, _items, _login_command, _push_target_id):
+            server.set_job(job_id, status="ok", stage="done", commit_sha=sha,
+                           finished_at=server._now_stamp())
+
+        args = argparse.Namespace(
+            pipeline_id=pipeline["id"], branch="feature/skill-e2e", commit_sha=sha,
+            reason="skill live HTTP test", idempotency_key="skill-live-http-1",
+            timeout=5, poll_interval=0.01,
+        )
+        with patch.dict(SKILL.os.environ, {"ROBOT_CI_URL": self.base_url, "ROBOT_CI_TOKEN": token}), \
+             patch.object(server, "resolve_service_branch_sha", return_value=sha), \
+             patch.object(server, "docker_ready_for_push", return_value={"ok": True, "detail": ""}), \
+             patch.object(server, "run_push_job", side_effect=finish):
+            listed = SKILL.request("GET", "/api/ai/pipelines")
+            result = SKILL.run_pipeline(args)
+        self.assertIn(pipeline["id"], [item["pipeline_id"] for item in listed["pipelines"]])
+        self.assertEqual("success", result["status"])
+        self.assertEqual(sha, result["commit_sha"])
 
 
 if __name__ == "__main__":
