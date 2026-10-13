@@ -482,6 +482,18 @@ class CceRolloutHelperTests(unittest.TestCase):
                 container="router", variables={"MISSING_VALUE": "x"}, revision="r1",
             )
 
+    def test_runtime_config_verification_accepts_kubernetes_omitted_empty_value(self) -> None:
+        def direct(command, _timeout=120):  # noqa: ANN001
+            return 0, json.dumps({"spec": {"template": {
+                "metadata": {"annotations": {cce_rollout.RUNTIME_CONFIG_REVISION_ANNOTATION: "r1"}},
+                "spec": {"containers": [{"name": "router", "env": [{"name": "EMPTY_VALUE"}]}]},
+            }}}), ""
+
+        cce_rollout.verify_runtime_variables_on_workload(
+            direct, namespace="echo-prod", kind="deployment", workload="echoagent-router",
+            container="router", variables={"EMPTY_VALUE": ""}, revision="r1",
+        )
+
     def test_replacement_release_restarts_when_image_reference_is_unchanged(self) -> None:
         commands: list[str] = []
         image = "registry/echoagent-router:202610121637_52337da"

@@ -817,7 +817,7 @@ def verify_runtime_variables_on_workload(
     actual = {
         str(item.get("name") or ""): str(item.get("value") if item.get("value") is not None else "")
         for item in (target.get("env") or [])
-        if isinstance(item, Mapping) and "value" in item
+        if isinstance(item, Mapping) and "valueFrom" not in item
     }
     expected = _normalized_runtime_variables(variables)
     missing_or_changed = sorted(name for name, value in expected.items() if actual.get(name) != value)
