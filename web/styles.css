@@ -1438,6 +1438,39 @@ body.clone-open { overflow: hidden; }
 .env-view-row > strong { min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
 .env-view-nodes strong { display: grid; gap: 5px; }
 .env-view-nodes code { width: fit-content; padding: 2px 6px; border-radius: 5px; background: #eef3f8; color: #23364d; }
+.env-detail-tabs {
+  display: flex;
+  gap: 20px;
+  margin: 0 0 18px;
+  border-bottom: 1px solid var(--line);
+}
+.env-detail-tab {
+  appearance: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  padding: 10px 2px 9px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.env-detail-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+.env-detail-tab:disabled { cursor: not-allowed; opacity: .45; }
+.runtime-config-meta { margin: 16px 0 10px; color: var(--muted); font-size: 13px; }
+.runtime-config-table { min-width: 680px; }
+.runtime-config-table th:last-child,
+.runtime-config-table td:last-child { width: 80px; text-align: right; }
+.runtime-config-table code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.runtime-config-table .runtime-value { max-width: 320px; }
+.runtime-empty { color: var(--muted); text-align: center; padding: 28px 12px !important; }
+.runtime-config-add {
+  display: grid;
+  grid-template-columns: minmax(180px, .8fr) minmax(260px, 1.5fr) auto;
+  gap: 10px;
+  align-items: center;
+  margin-top: 16px;
+}
 .rollout-operation {
   grid-column: 1 / -1;
   margin: 0;
@@ -1619,7 +1652,7 @@ body.clone-open { overflow: hidden; }
 }
 .env-overlay-page {
   position: relative;
-  width: min(560px, calc(100vw - 48px));
+  width: min(820px, calc(100vw - 48px));
   max-height: calc(100vh - 48px);
   overflow: auto;
   background: var(--surface);

@@ -340,6 +340,76 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertTrue(any("container-1=" in cmd for cmd in commands))
         self.assertFalse(any("filebeat=" in cmd for cmd in commands))
 
+    def test_runtime_variables_replace_only_ci_managed_environment(self) -> None:
+        template = {
+            "metadata": {"annotations": {
+                cce_rollout.RUNTIME_ENV_KEYS_ANNOTATION: "OLD_MANAGED,AGENT_MCP_PUBLIC_URL",
+            }},
+            "spec": {"containers": [{
+                "name": "router",
+                "image": "registry/router:old",
+                "env": [
+                    {"name": "KEEP_EXISTING", "valueFrom": {"configMapKeyRef": {"name": "base", "key": "keep"}}},
+                    {"name": "OLD_MANAGED", "value": "remove-me"},
+                    {"name": "AGENT_MCP_PUBLIC_URL", "value": "old"},
+                ],
+            }]},
+        }
+
+        cce_rollout.apply_runtime_variables_to_pod_template(
+            template,
+            container="router",
+            variables={"AGENT_MCP_PUBLIC_URL": "http://example.test/api/mcp", "EMPTY_VALUE": ""},
+            revision="revision-2",
+        )
+
+        env = template["spec"]["containers"][0]["env"]
+        self.assertEqual(["KEEP_EXISTING", "AGENT_MCP_PUBLIC_URL", "EMPTY_VALUE"], [item["name"] for item in env])
+        self.assertEqual("http://example.test/api/mcp", env[1]["value"])
+        annotations = template["metadata"]["annotations"]
+        self.assertEqual("AGENT_MCP_PUBLIC_URL,EMPTY_VALUE", annotations[cce_rollout.RUNTIME_ENV_KEYS_ANNOTATION])
+        self.assertEqual("revision-2", annotations[cce_rollout.RUNTIME_CONFIG_REVISION_ANNOTATION])
+
+    def test_deploy_applies_runtime_variables_with_image_in_one_patch(self) -> None:
+        commands: list[str] = []
+
+        def direct(command, **_kwargs):  # noqa: ANN001
+            commands.append(command)
+            if "get deploy echoagent-router -o json" in command:
+                return 0, json.dumps({
+                    "spec": {"template": {
+                        "metadata": {"annotations": {}},
+                        "spec": {"containers": [{"name": "router", "image": "registry/router:old"}]},
+                    }},
+                }), ""
+            return 0, "rolled out", ""
+
+        logs: list[str] = []
+        ok, err = cce_rollout.deploy_job_results(
+            environment={
+                "name": "dev2",
+                "workload_name": "echoagent-router",
+                "jump_host": "root@jump",
+                "nodes": [],
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/dev2.yaml",
+                "runtime_variables": {"AGENT_MCP_PUBLIC_URL": "http://example.test/api/mcp"},
+                "runtime_config_revision": "revision-1",
+            },
+            results=[{"service_id": "echoagent-router", "ok": True, "remote": "registry/router:new"}],
+            creds={"jump_password": "x"},
+            direct=direct,
+            log=logs.append,
+            mode="inplace",
+        )
+
+        self.assertTrue(ok, err)
+        release = next(command for command in commands if "--type=json" in command)
+        self.assertIn("patch deployment", release)
+        self.assertIn("patch deployment echoagent-router --type=json", release)
+        self.assertNotIn("http://example.test/api/mcp", release)
+        self.assertTrue(any("variables=1" in line for line in logs))
+        self.assertFalse(any("http://example.test/api/mcp" in line for line in logs))
+
     def test_replacement_release_restarts_when_image_reference_is_unchanged(self) -> None:
         commands: list[str] = []
         image = "registry/echoagent-router:202610121637_52337da"

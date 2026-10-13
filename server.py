@@ -301,6 +301,18 @@ def init_store() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_parallel_rollouts_environment
                     ON parallel_rollouts(environment_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS environment_runtime_variables (
+                    environment_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (environment_id, name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_environment_runtime_variables_environment
+                    ON environment_runtime_variables(environment_id, name);
                 CREATE TABLE IF NOT EXISTS service_permissions (
                     service_id TEXT NOT NULL,
                     permission TEXT NOT NULL,
@@ -802,7 +814,114 @@ def delete_environment(env_id: str) -> bool:
     with _db_lock:
         conn = _connect_db()
         try:
+            conn.execute("DELETE FROM environment_runtime_variables WHERE environment_id = ?", (eid,))
             cur = conn.execute("DELETE FROM environments WHERE id = ?", (eid,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+_RUNTIME_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _runtime_config_revision(variables: list[dict[str, Any]]) -> str:
+    payload = [[str(item.get("name") or ""), str(item.get("value") or "")] for item in variables]
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def list_environment_runtime_variables(env_id: str) -> dict[str, Any]:
+    eid = str(env_id or "").strip()
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                """
+                SELECT name, value, created_by, created_at, updated_by, updated_at
+                FROM environment_runtime_variables
+                WHERE environment_id = ?
+                ORDER BY name
+                """,
+                (eid,),
+            ).fetchall()
+        finally:
+            conn.close()
+    variables = [
+        {
+            "name": str(row["name"]),
+            "value": str(row["value"]),
+            "created_by": str(row["created_by"] or ""),
+            "created_at": str(row["created_at"] or ""),
+            "updated_by": str(row["updated_by"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+        for row in rows
+    ]
+    return {
+        "environment_id": eid,
+        "variables": variables,
+        "revision": _runtime_config_revision(variables),
+        "updated_at": max((str(item.get("updated_at") or "") for item in variables), default=""),
+    }
+
+
+def upsert_environment_runtime_variable(
+    env_id: str,
+    data: Mapping[str, Any],
+    *,
+    actor: str,
+) -> tuple[dict[str, Any] | None, str]:
+    eid = str(env_id or "").strip()
+    name = str(data.get("name") or "").strip()
+    raw_value = data.get("value")
+    if not _RUNTIME_VARIABLE_NAME.fullmatch(name) or len(name) > 128:
+        return None, "变量名必须是合法环境变量名称"
+    if raw_value is None:
+        return None, "变量值不能为空"
+    value = str(raw_value)
+    if "\x00" in value:
+        return None, "变量值不能包含空字符"
+    if len(value.encode("utf-8")) > 16384:
+        return None, "变量值不能超过 16 KiB"
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    username = str(actor or "").strip()
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO environment_runtime_variables (
+                    environment_id, name, value, created_by, created_at, updated_by, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(environment_id, name) DO UPDATE SET
+                    value=excluded.value,
+                    updated_by=excluded.updated_by,
+                    updated_at=excluded.updated_at
+                """,
+                (eid, name, value, username, now, username, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return list_environment_runtime_variables(eid), ""
+
+
+def delete_environment_runtime_variable(env_id: str, name: str) -> bool:
+    eid = str(env_id or "").strip()
+    variable_name = str(name or "").strip()
+    if not eid or not variable_name:
+        return False
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            cur = conn.execute(
+                "DELETE FROM environment_runtime_variables WHERE environment_id = ? AND name = ?",
+                (eid, variable_name),
+            )
             conn.commit()
             return cur.rowcount > 0
         finally:
@@ -8491,6 +8610,15 @@ def maybe_run_gamma_after_build(
 
             with rollout_recovery.environment_lock(env_id):
                 env = get_environment(env_id, include_secrets=True) or env
+                runtime_config = list_environment_runtime_variables(env_id)
+                env = {
+                    **env,
+                    "runtime_variables": {
+                        str(item.get("name") or ""): str(item.get("value") or "")
+                        for item in runtime_config.get("variables") or []
+                    },
+                    "runtime_config_revision": str(runtime_config.get("revision") or ""),
+                }
                 if rollout_recovery.pending_operation(list_parallel_rollouts(env_id)):
                     return False, "生产发布失败: 环境存在未完成的回滚，请先重试回滚"
                 ok, err = cce_rollout.deploy_job_results(
@@ -8956,6 +9084,15 @@ class Handler(SimpleHTTPRequestHandler):
                 200,
                 {"environments": list_environments(service_id), "regions": list(ENV_REGIONS)},
             )
+            return
+
+        m_runtime_config = re.fullmatch(r"/api/environments/([^/]+)/runtime-config", path)
+        if m_runtime_config:
+            env = get_environment(m_runtime_config.group(1))
+            if env is None:
+                self._json(404, {"ok": False, "error": "环境不存在"})
+                return
+            self._json(200, {"ok": True, **list_environment_runtime_variables(m_runtime_config.group(1))})
             return
 
         if path == "/api/permissions":
@@ -9584,6 +9721,43 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(400, {"ok": False, "error": err})
                 return
             self._json(200, {"ok": True, "environment": item})
+            return
+
+        m_runtime_delete = re.fullmatch(
+            r"/api/environments/([^/]+)/runtime-config/variables/([^/]+)/delete", path
+        )
+        if m_runtime_delete:
+            env_id, variable_name = m_runtime_delete.groups()
+            env = get_environment(env_id)
+            if env is None:
+                self._json(404, {"ok": False, "error": "环境不存在"})
+                return
+            if not _has_service_permission(str(env.get("service_id") or ""), "environment_manage", user):
+                self._json(403, {"ok": False, "error": "没有环境管理权限"})
+                return
+            if not delete_environment_runtime_variable(env_id, variable_name):
+                self._json(404, {"ok": False, "error": "运行变量不存在"})
+                return
+            self._json(200, {"ok": True, **list_environment_runtime_variables(env_id)})
+            return
+
+        m_runtime_variable = re.fullmatch(
+            r"/api/environments/([^/]+)/runtime-config/variables", path
+        )
+        if m_runtime_variable:
+            env_id = m_runtime_variable.group(1)
+            env = get_environment(env_id)
+            if env is None:
+                self._json(404, {"ok": False, "error": "环境不存在"})
+                return
+            if not _has_service_permission(str(env.get("service_id") or ""), "environment_manage", user):
+                self._json(403, {"ok": False, "error": "没有环境管理权限"})
+                return
+            runtime_config, err = upsert_environment_runtime_variable(env_id, data, actor=user)
+            if err or runtime_config is None:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, **runtime_config})
             return
 
         if path == "/api/permissions":
