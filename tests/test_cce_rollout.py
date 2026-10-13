@@ -370,6 +370,45 @@ class CceRolloutHelperTests(unittest.TestCase):
         self.assertEqual("AGENT_MCP_PUBLIC_URL,EMPTY_VALUE", annotations[cce_rollout.RUNTIME_ENV_KEYS_ANNOTATION])
         self.assertEqual("revision-2", annotations[cce_rollout.RUNTIME_CONFIG_REVISION_ANNOTATION])
 
+    def test_runtime_variables_remove_explicit_deleted_names_before_first_ci_release(self) -> None:
+        template = {"metadata": {"annotations": {}}, "spec": {"containers": [{
+            "name": "router", "env": [
+                {"name": "REMOVE_ME", "value": "old"},
+                {"name": "KEEP_ME", "value": "same"},
+            ]
+        }]}}
+        cce_rollout.apply_runtime_variables_to_pod_template(
+            template, container="router", variables={}, revision="r2", deleted_names=["REMOVE_ME"]
+        )
+        self.assertEqual(["KEEP_ME"], [item["name"] for item in template["spec"]["containers"][0]["env"]])
+
+    def test_read_runtime_environment_skips_secret_references_and_sensitive_literals(self) -> None:
+        payload = {"spec": {"template": {"spec": {"containers": [{
+            "name": "router", "image": "registry/router:old", "env": [
+                {"name": "PUBLIC_URL", "value": "http://example.test"},
+                {"name": "EMPTY_VALUE", "value": ""},
+                {"name": "DB_PASSWORD", "value": "must-not-copy"},
+                {"name": "FROM_SECRET", "valueFrom": {"secretKeyRef": {"name": "s", "key": "x"}}},
+            ]
+        }]}}}}
+
+        def direct(command, **_kwargs):  # noqa: ANN001
+            if "get deploy echoagent-router -o json" in command:
+                return 0, json.dumps(payload), ""
+            return 1, "", "not found"
+
+        result = cce_rollout.read_workload_runtime_environment(
+            environment={
+                "service_id": "echoagent-router", "workload_name": "echoagent-router",
+                "jump_host": "root@jump", "nodes": [], "namespace": "echo-prod",
+                "kubeconfig_path": "/etc/robot-ci/kubeconfigs/dev2.yaml",
+            },
+            creds={"jump_password": "x"}, direct=direct,
+        )
+        self.assertEqual({"EMPTY_VALUE": "", "PUBLIC_URL": "http://example.test"}, result["variables"])
+        self.assertEqual(["FROM_SECRET"], result["skipped_value_from_names"])
+        self.assertEqual(["DB_PASSWORD"], result["skipped_sensitive_names"])
+
     def test_deploy_applies_runtime_variables_with_image_in_one_patch(self) -> None:
         commands: list[str] = []
 

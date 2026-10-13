@@ -1458,6 +1458,9 @@ body.clone-open { overflow: hidden; }
 .env-detail-tab.active { color: var(--primary); border-bottom-color: var(--primary); }
 .env-detail-tab:disabled { cursor: not-allowed; opacity: .45; }
 .runtime-config-meta { margin: 16px 0 10px; color: var(--muted); font-size: 13px; }
+.runtime-config-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.runtime-config-toolbar .runtime-config-meta { margin-bottom: 4px; }
+.runtime-pending-delete { margin: 10px 0; padding: 8px 10px; border-radius: 6px; color: #b54708; background: #fffaeb; font-size: 13px; }
 .runtime-config-table { min-width: 680px; }
 .runtime-config-table th:last-child,
 .runtime-config-table td:last-child { width: 80px; text-align: right; }

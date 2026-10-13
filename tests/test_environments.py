@@ -206,6 +206,35 @@ class EnvironmentApiTests(unittest.TestCase):
         ) as response:
             deleted = json.loads(response.read().decode())
         self.assertEqual([], deleted["variables"])
+        self.assertEqual(["AGENT_MCP_PUBLIC_URL"], deleted["deleted_names"])
+
+    def test_sync_runtime_config_imports_safe_literals_and_keeps_secret_values_out(self) -> None:
+        cookie = self._login()
+        payload = {
+            "name": "dev2", "service_id": "echoagent-router", "region": "cn-southwest-2",
+            "cluster_name": "cluster", "workload_name": "echoagent-router", "jump_host": "jump",
+            "jump_password": "jump-secret", "nodes": [],
+        }
+        with self._open(
+            "/api/environments", data=json.dumps(payload).encode(), method="POST", cookie=cookie
+        ) as response:
+            env_id = json.loads(response.read().decode())["environment"]["id"]
+        snapshot = {
+            "workload_kind": "deployment", "workload_name": "echoagent-router", "container_name": "router",
+            "variables": {"PUBLIC_URL": "http://example.test", "EMPTY": ""},
+            "skipped_value_from_names": ["DB_PASSWORD"], "skipped_sensitive_names": ["API_TOKEN"],
+        }
+        with patch.object(server.cce_rollout, "read_workload_runtime_environment", return_value=snapshot):
+            with self._open(
+                f"/api/environments/{env_id}/runtime-config/sync",
+                data=b"{}", method="POST", cookie=cookie,
+            ) as response:
+                synced = json.loads(response.read().decode())
+        self.assertEqual(["EMPTY", "PUBLIC_URL"], [item["name"] for item in synced["variables"]])
+        self.assertTrue(all(item["source"] == "cluster" for item in synced["variables"]))
+        self.assertEqual(["DB_PASSWORD"], synced["sync"]["skipped_value_from_names"])
+        self.assertEqual(["API_TOKEN"], synced["sync"]["skipped_sensitive_names"])
+        self.assertNotIn("jump-secret", json.dumps(synced))
 
     def test_create_rejects_unknown_region(self) -> None:
         cookie = self._login()

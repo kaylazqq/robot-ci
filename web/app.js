@@ -3547,18 +3547,36 @@ function renderRuntimeConfigPane(pane, data) {
   const root = pane.querySelector('[data-env-runtime-content]');
   if (!root) return;
   const rows = Array.isArray(data && data.variables) ? data.variables : [];
+  const deletedNames = Array.isArray(data && data.deleted_names) ? data.deleted_names : [];
+  const sync = data && data.sync;
   const editable = canManageEnvironments();
   const body = rows.length ? rows.map((item) => (
     '<tr><td><code>' + esc(item.name) + '</code></td><td class="runtime-value"><code>' + esc(item.value) + '</code></td>' +
-    '<td>' + esc(item.updated_by || item.created_by || '—') + '</td><td>' + esc(item.updated_at || item.created_at || '—') + '</td>' +
+    '<td>' + (item.source === 'cluster' ? '真实环境' : '手工') + '</td><td>' + esc(item.updated_by || item.created_by || '—') + '</td><td>' + esc(item.updated_at || item.created_at || '—') + '</td>' +
     '<td><button type="button" class="btn ghost danger" data-runtime-delete="' + esc(item.name) + '"' + (editable ? '' : ' disabled') + '>删除</button></td></tr>'
-  )).join('') : '<tr><td colspan="5" class="runtime-empty">暂无运行变量</td></tr>';
-  root.innerHTML = '<div class="runtime-config-meta">当前版本 <code>' + esc((data && data.revision) || '—') + '</code> · 共 ' + rows.length + ' 项</div>' +
-    '<div class="art-table-wrap"><table class="art-table runtime-config-table"><thead><tr><th>变量名</th><th>变量值</th><th>操作人</th><th>更新时间</th><th></th></tr></thead><tbody>' + body + '</tbody></table></div>' +
+  )).join('') : '<tr><td colspan="6" class="runtime-empty">暂无运行变量</td></tr>';
+  const syncText = sync ? ('上次同步：' + esc(sync.synced_at || '—') + '，' + esc(sync.workload_kind || '') + '/' + esc(sync.workload_name || '') + ' · 容器 ' + esc(sync.container_name || '—') + '；跳过 valueFrom ' + ((sync.skipped_value_from_names || []).length) + ' 项、敏感变量 ' + ((sync.skipped_sensitive_names || []).length) + ' 项') : '尚未从真实环境同步';
+  const deletedText = deletedNames.length ? '<div class="runtime-pending-delete">下次发布将删除：' + deletedNames.map((name) => '<code>' + esc(name) + '</code>').join('、') + '</div>' : '';
+  root.innerHTML = '<div class="runtime-config-toolbar"><div><div class="runtime-config-meta">当前版本 <code>' + esc((data && data.revision) || '—') + '</code> · 共 ' + rows.length + ' 项</div><div class="env-secret-hint">' + syncText + '</div></div>' +
+    (editable ? '<button type="button" class="btn" data-runtime-sync>同步真实环境</button>' : '') + '</div>' + deletedText +
+    '<div class="art-table-wrap"><table class="art-table runtime-config-table"><thead><tr><th>变量名</th><th>变量值</th><th>来源</th><th>操作人</th><th>更新时间</th><th></th></tr></thead><tbody>' + body + '</tbody></table></div>' +
     (editable ? '<div class="runtime-config-add"><input class="input" data-runtime-name maxlength="128" placeholder="变量名，例如 AGENT_MCP_PUBLIC_URL" />' +
       '<input class="input" data-runtime-value maxlength="16384" placeholder="变量值" />' +
       '<button type="button" class="btn primary" data-runtime-save>新增或更新</button></div>' : '');
   const envId = pane.getAttribute('data-env-runtime-id') || '';
+  const syncButton = root.querySelector('[data-runtime-sync]');
+  if (syncButton) syncButton.addEventListener('click', async () => {
+    if (!await askEnvConfirm('确认从目标工作负载读取普通环境变量并合并到当前运行配置吗？Secret/ConfigMap 引用不会读取。', {title:'同步真实环境', confirmLabel:'确认同步'})) return;
+    syncButton.disabled = true;
+    try {
+      const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/sync', {method:'POST', body:'{}'});
+      setEnvFormError('');
+      renderRuntimeConfigPane(pane, result);
+    } catch (error) {
+      setEnvFormError(error.message);
+      syncButton.disabled = false;
+    }
+  });
   root.querySelectorAll('[data-runtime-delete]').forEach((button) => button.addEventListener('click', async () => {
     const name = button.getAttribute('data-runtime-delete') || '';
     if (!await askEnvConfirm('确认删除运行变量“' + name + '”吗？删除只影响 CI 配置，下次生产发布时生效。', {title:'删除运行变量', confirmLabel:'确认删除'})) return;
