@@ -1194,8 +1194,10 @@ function syncRunLayerChrome() {
   }
   const nameBlock = $("runTemplateNameBlock");
   const nameInput = $("runTemplateName");
+  const apiEnabledInput = $("runTemplateApiEnabled");
   if (nameBlock) nameBlock.hidden = runLayerMode !== "edit";
   if (nameInput) nameInput.value = tpl ? (tpl.name || "") : "";
+  if (apiEnabledInput) apiEnabledInput.checked = !!(tpl && tpl.api_enabled);
   const confirm = $("btnRunPreviewConfirm");
   if (confirm) confirm.textContent = runLayerMode === "edit" ? "保存" : "确认";
   const typeBlock = $("deploymentTypeBlock");
@@ -1337,6 +1339,7 @@ async function saveEditedTemplate() {
       gamma_environment_id: runPreviewSelection.gammaEnvironmentId || "",
       deployment_mode: runPreviewSelection.deploymentMode || "parallel",
       push_target_id: runPreviewSelection.pushTargetId || "",
+      api_enabled: !!($("runTemplateApiEnabled") && $("runTemplateApiEnabled").checked),
     }),
   });
   if (data.template) {
