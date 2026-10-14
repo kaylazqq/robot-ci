@@ -20,6 +20,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import parse_qs, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -356,6 +358,7 @@ def init_store() -> None:
             _ensure_environment_runtime_columns(conn)
             _ensure_rollout_recovery_columns(conn)
             _ensure_pipeline_templates_table(conn)
+            _ensure_pipeline_schedules_tables(conn)
             conn.commit()
             try:
                 os.chmod(DB_PATH, 0o600)
@@ -2272,6 +2275,15 @@ def delete_pipeline_template(username: str, template_id: str) -> str:
     with _db_lock:
         conn = _connect_db()
         try:
+            schedule_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM pipeline_schedules WHERE pipeline_template_id = ?", (item["id"],)
+                ).fetchall()
+            ]
+            for schedule_id in schedule_ids:
+                conn.execute("DELETE FROM pipeline_schedule_runs WHERE schedule_id = ?", (schedule_id,))
+            conn.execute("DELETE FROM pipeline_schedules WHERE pipeline_template_id = ?", (item["id"],))
             conn.execute(
                 "DELETE FROM pipeline_templates WHERE id = ?",
                 (item["id"],),
@@ -2312,6 +2324,274 @@ def copy_pipeline_template(
         finally:
             conn.close()
     return copied, ""
+
+
+SCHEDULE_TIMEZONE_DEFAULT = "Asia/Shanghai"
+SCHEDULE_CLAIM_TTL_SEC = 300
+SCHEDULE_POLL_SEC = 10
+_schedule_stop = threading.Event()
+_schedule_thread: threading.Thread | None = None
+_schedule_instance_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def _ensure_pipeline_schedules_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_schedules (
+            id TEXT PRIMARY KEY,
+            pipeline_template_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            cron_expression TEXT NOT NULL,
+            timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            overlap_policy TEXT NOT NULL DEFAULT 'skip',
+            created_by TEXT NOT NULL,
+            updated_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            next_run_at TEXT NOT NULL,
+            last_run_at TEXT NOT NULL DEFAULT '',
+            last_job_id TEXT NOT NULL DEFAULT '',
+            last_status TEXT NOT NULL DEFAULT '',
+            last_error TEXT NOT NULL DEFAULT '',
+            claimed_at TEXT NOT NULL DEFAULT '',
+            claimed_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_pipeline_schedules_template
+            ON pipeline_schedules(pipeline_template_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_pipeline_schedules_due
+            ON pipeline_schedules(enabled, next_run_at);
+        CREATE TABLE IF NOT EXISTS pipeline_schedule_runs (
+            id TEXT PRIMARY KEY,
+            schedule_id TEXT NOT NULL,
+            scheduled_at TEXT NOT NULL,
+            triggered_at TEXT NOT NULL,
+            job_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            error TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_pipeline_schedule_runs_schedule
+            ON pipeline_schedule_runs(schedule_id, triggered_at DESC);
+        """
+    )
+
+
+def _utc_iso(value: datetime | None = None) -> str:
+    current = value or datetime.now(timezone.utc)
+    return current.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc_iso(value: str) -> datetime:
+    text = str(value or "").strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cron_field_values(token: str, minimum: int, maximum: int, *, sunday: bool = False) -> set[int]:
+    result: set[int] = set()
+    for part in str(token).split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError("Cron 字段不能为空")
+        base, slash, step_text = part.partition("/")
+        step = int(step_text) if slash else 1
+        if step < 1:
+            raise ValueError("Cron 步长必须大于 0")
+        if base == "*":
+            start, end = minimum, maximum
+        elif "-" in base:
+            left, right = base.split("-", 1)
+            start, end = int(left), int(right)
+        else:
+            start = end = int(base)
+        if sunday:
+            start = 0 if start == 7 else start
+            end = 0 if end == 7 else end
+        if start < minimum or start > maximum or end < minimum or end > maximum or start > end:
+            raise ValueError(f"Cron 字段超出范围 {minimum}-{maximum}")
+        result.update(range(start, end + 1, step))
+    return result
+
+
+def validate_cron_expression(expression: str) -> tuple[dict[str, set[int]] | None, str]:
+    fields = str(expression or "").strip().split()
+    if len(fields) != 5:
+        return None, "Cron 表达式必须是 5 段：分 时 日 月 周"
+    try:
+        return {
+            "minute": _cron_field_values(fields[0], 0, 59),
+            "hour": _cron_field_values(fields[1], 0, 23),
+            "day": _cron_field_values(fields[2], 1, 31),
+            "month": _cron_field_values(fields[3], 1, 12),
+            "weekday": _cron_field_values(fields[4], 0, 6, sunday=True),
+            "day_any": {1} if fields[2] == "*" else set(),
+            "weekday_any": {1} if fields[4] == "*" else set(),
+        }, ""
+    except (TypeError, ValueError) as exc:
+        return None, f"Cron 表达式无效：{exc}"
+
+
+def next_cron_time(expression: str, timezone_name: str, after: datetime | None = None) -> datetime:
+    spec, err = validate_cron_expression(expression)
+    if err or spec is None:
+        raise ValueError(err)
+    try:
+        zone = ZoneInfo(str(timezone_name or SCHEDULE_TIMEZONE_DEFAULT))
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError("时区无效") from exc
+    cursor = (after or datetime.now(timezone.utc)).astimezone(zone).replace(second=0, microsecond=0) + timedelta(minutes=1)
+    limit = cursor + timedelta(days=366 * 2)
+    while cursor <= limit:
+        cron_weekday = (cursor.weekday() + 1) % 7
+        day_match = cursor.day in spec["day"]
+        weekday_match = cron_weekday in spec["weekday"]
+        if spec["day_any"]:
+            calendar_match = weekday_match
+        elif spec["weekday_any"]:
+            calendar_match = day_match
+        else:
+            calendar_match = day_match or weekday_match
+        if (
+            cursor.minute in spec["minute"]
+            and cursor.hour in spec["hour"]
+            and cursor.month in spec["month"]
+            and calendar_match
+        ):
+            return cursor.astimezone(timezone.utc)
+        cursor += timedelta(minutes=1)
+    raise ValueError("无法在未来两年内计算下一次执行时间")
+
+
+def _schedule_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "pipeline_template_id": str(row["pipeline_template_id"]),
+        "name": str(row["name"]),
+        "cron_expression": str(row["cron_expression"]),
+        "timezone": str(row["timezone"]),
+        "enabled": bool(row["enabled"]),
+        "overlap_policy": str(row["overlap_policy"] or "skip"),
+        "created_by": str(row["created_by"]),
+        "updated_by": str(row["updated_by"]),
+        "created_at": str(row["created_at"]),
+        "updated_at": str(row["updated_at"]),
+        "next_run_at": str(row["next_run_at"]),
+        "last_run_at": str(row["last_run_at"]),
+        "last_job_id": str(row["last_job_id"]),
+        "last_status": str(row["last_status"]),
+        "last_error": str(row["last_error"]),
+    }
+
+
+def list_pipeline_schedules(template_id: str) -> list[dict[str, Any]]:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM pipeline_schedules WHERE pipeline_template_id=? ORDER BY created_at, id",
+                (str(template_id or "").strip(),),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [_schedule_from_row(row) for row in rows]
+
+
+def get_pipeline_schedule(schedule_id: str) -> dict[str, Any] | None:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute("SELECT * FROM pipeline_schedules WHERE id=?", (schedule_id,)).fetchone()
+        finally:
+            conn.close()
+    return _schedule_from_row(row) if row else None
+
+
+def save_pipeline_schedule(
+    template_id: str, data: dict[str, Any], actor: str, schedule_id: str = ""
+) -> tuple[dict[str, Any] | None, str]:
+    template = get_pipeline_template(actor, template_id)
+    if template is None:
+        return None, "流水线不存在"
+    name = str(data.get("name") or "").strip()
+    expression = str(data.get("cron_expression") or "").strip()
+    timezone_name = str(data.get("timezone") or SCHEDULE_TIMEZONE_DEFAULT).strip()
+    if not name:
+        return None, "定时任务名称不能为空"
+    if len(name) > 60:
+        return None, "定时任务名称过长"
+    if not str(template.get("branch") or "").strip():
+        return None, "流水线必须先配置固定分支才能启用定时任务"
+    _, err = validate_cron_expression(expression)
+    if err:
+        return None, err
+    try:
+        next_run_at = _utc_iso(next_cron_time(expression, timezone_name))
+    except ValueError as exc:
+        return None, str(exc)
+    enabled = bool(data.get("enabled", True))
+    now = _now_stamp()
+    sid = str(schedule_id or "").strip() or uuid.uuid4().hex[:12]
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            existing = conn.execute("SELECT * FROM pipeline_schedules WHERE id=?", (sid,)).fetchone()
+            if existing and str(existing["pipeline_template_id"]) != str(template_id):
+                return None, "定时任务不属于当前流水线"
+            if existing:
+                conn.execute(
+                    """UPDATE pipeline_schedules SET name=?, cron_expression=?, timezone=?, enabled=?,
+                       overlap_policy='skip', updated_by=?, updated_at=?, next_run_at=?,
+                       claimed_at='', claimed_by='' WHERE id=?""",
+                    (name, expression, timezone_name, int(enabled), actor, now, next_run_at, sid),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO pipeline_schedules (
+                       id, pipeline_template_id, name, cron_expression, timezone, enabled,
+                       overlap_policy, created_by, updated_by, created_at, updated_at, next_run_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 'skip', ?, ?, ?, ?, ?)""",
+                    (sid, template_id, name, expression, timezone_name, int(enabled), actor, actor, now, now, next_run_at),
+                )
+            conn.commit()
+            row = conn.execute("SELECT * FROM pipeline_schedules WHERE id=?", (sid,)).fetchone()
+        finally:
+            conn.close()
+    return _schedule_from_row(row), ""
+
+
+def delete_pipeline_schedule(schedule_id: str) -> bool:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute("DELETE FROM pipeline_schedule_runs WHERE schedule_id=?", (schedule_id,))
+            changed = conn.execute("DELETE FROM pipeline_schedules WHERE id=?", (schedule_id,)).rowcount
+            conn.commit()
+        finally:
+            conn.close()
+    return bool(changed)
+
+
+def list_pipeline_schedule_runs(schedule_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                """SELECT id, schedule_id, scheduled_at, triggered_at, job_id, status, error
+                   FROM pipeline_schedule_runs WHERE schedule_id=? ORDER BY triggered_at DESC LIMIT ?""",
+                (schedule_id, max(1, min(int(limit), 100))),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [dict(row) for row in rows]
 
 
 def get_service_favorites(username: str) -> list[str]:
@@ -9072,6 +9352,195 @@ def push_service(
     )
 
 
+def _scheduled_job_is_live(job_id: str) -> bool:
+    if not job_id:
+        return False
+    with _jobs_lock:
+        job = deepcopy(_jobs.get(job_id) or {})
+    if not job:
+        job = load_job_from_disk(job_id) or {}
+    return str(job.get("status") or "") in {"queued", "running", "stopping"}
+
+
+def _record_schedule_result(
+    schedule_id: str, scheduled_at: str, *, job_id: str = "", status: str, error: str = ""
+) -> None:
+    now = _utc_iso()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """INSERT INTO pipeline_schedule_runs
+                   (id, schedule_id, scheduled_at, triggered_at, job_id, status, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (uuid.uuid4().hex[:12], schedule_id, scheduled_at, now, job_id, status, error[:1000]),
+            )
+            conn.execute(
+                """UPDATE pipeline_schedules SET last_run_at=?, last_job_id=?, last_status=?,
+                   last_error=?, claimed_at='', claimed_by='' WHERE id=?""",
+                (now, job_id, status, error[:1000], schedule_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def trigger_pipeline_schedule(schedule_id: str, api_origin: str, *, scheduled_at: str = "") -> dict[str, Any]:
+    schedule = get_pipeline_schedule(schedule_id)
+    if schedule is None:
+        return {"ok": False, "error": "定时任务不存在"}
+    template = get_pipeline_template(schedule["created_by"], schedule["pipeline_template_id"])
+    planned = scheduled_at or _utc_iso()
+    if template is None:
+        _record_schedule_result(schedule_id, planned, status="failed", error="流水线不存在")
+        return {"ok": False, "error": "流水线不存在"}
+    if _scheduled_job_is_live(schedule.get("last_job_id") or ""):
+        _record_schedule_result(schedule_id, planned, status="skipped", error="上一次定时执行仍未结束")
+        return {"ok": True, "skipped": True}
+    service_id = str(template.get("service_id") or "")
+    service = next((item for item in load_services() if str(item.get("id")) == service_id), None)
+    payload = {
+        "service_id": service_id,
+        "branch": str(template.get("branch") or ""),
+        "version": load_last_daemon_version() if service and service.get("requires_version") else "",
+        "deployment_type": "code",
+        "template_id": str(template.get("id") or ""),
+        "client_id": f"schedule-{schedule_id}",
+        "trigger_type": "schedule",
+        "trigger_id": schedule_id,
+    }
+    token = create_session(str(schedule.get("created_by") or ""))
+    request = Request(
+        str(api_origin).rstrip("/") + "/api/push",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Cookie": f"{session_cookie_name()}={token}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        job_id = str(result.get("job_id") or "")
+        if not job_id:
+            raise RuntimeError("流水线接口未返回 job_id")
+        _record_schedule_result(schedule_id, planned, job_id=job_id, status="triggered")
+        return {"ok": True, "job_id": job_id}
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        if hasattr(exc, "read"):
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                detail = str(body.get("error") or detail)
+            except Exception:  # noqa: BLE001
+                pass
+        _record_schedule_result(schedule_id, planned, status="failed", error=detail)
+        return {"ok": False, "error": detail}
+    finally:
+        destroy_session(token)
+
+
+def claim_due_pipeline_schedules(now: datetime | None = None) -> list[tuple[str, str]]:
+    current = now or datetime.now(timezone.utc)
+    now_iso = _utc_iso(current)
+    stale_iso = _utc_iso(current - timedelta(seconds=SCHEDULE_CLAIM_TTL_SEC))
+    claimed: list[tuple[str, str]] = []
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """SELECT * FROM pipeline_schedules WHERE enabled=1 AND next_run_at<=?
+                   AND (claimed_at='' OR claimed_at<?) ORDER BY next_run_at LIMIT 20""",
+                (now_iso, stale_iso),
+            ).fetchall()
+            for row in rows:
+                scheduled_at = str(row["next_run_at"])
+                try:
+                    next_at = _utc_iso(
+                        next_cron_time(str(row["cron_expression"]), str(row["timezone"]), current)
+                    )
+                except ValueError as exc:
+                    conn.execute(
+                        "UPDATE pipeline_schedules SET enabled=0, last_status='failed', last_error=? WHERE id=?",
+                        (str(exc), str(row["id"])),
+                    )
+                    continue
+                changed = conn.execute(
+                    """UPDATE pipeline_schedules SET claimed_at=?, claimed_by=?, next_run_at=?
+                       WHERE id=? AND enabled=1 AND next_run_at<=?
+                       AND (claimed_at='' OR claimed_at<?)""",
+                    (now_iso, _schedule_instance_id, next_at, str(row["id"]), now_iso, stale_iso),
+                ).rowcount
+                if changed:
+                    claimed.append((str(row["id"]), scheduled_at))
+            conn.commit()
+        finally:
+            conn.close()
+    return claimed
+
+
+def reconcile_pipeline_schedule_runs() -> None:
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                "SELECT id, job_id FROM pipeline_schedule_runs WHERE status='triggered' AND job_id<>''"
+            ).fetchall()
+            updates: list[tuple[str, str, str]] = []
+            for row in rows:
+                job_id = str(row["job_id"])
+                with _jobs_lock:
+                    job = deepcopy(_jobs.get(job_id) or {})
+                if not job:
+                    job = load_job_from_disk(job_id) or {}
+                status = str(job.get("status") or "")
+                if status in {"ok", "failed", "stopped", "interrupted"}:
+                    updates.append((status, str(job.get("error") or "")[:1000], str(row["id"])))
+            conn.executemany(
+                "UPDATE pipeline_schedule_runs SET status=?, error=? WHERE id=?", updates
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def run_pipeline_schedule_tick(api_origin: str, now: datetime | None = None) -> int:
+    reconcile_pipeline_schedule_runs()
+    claimed = claim_due_pipeline_schedules(now)
+    for schedule_id, scheduled_at in claimed:
+        threading.Thread(
+            target=trigger_pipeline_schedule,
+            args=(schedule_id, api_origin),
+            kwargs={"scheduled_at": scheduled_at},
+            daemon=True,
+        ).start()
+    return len(claimed)
+
+
+def start_pipeline_schedule_runner(api_origin: str) -> threading.Thread:
+    global _schedule_thread
+    _schedule_stop.clear()
+
+    def _loop() -> None:
+        while not _schedule_stop.is_set():
+            try:
+                run_pipeline_schedule_tick(api_origin)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[pipeline-scheduler] tick failed: {exc}", flush=True)
+            _schedule_stop.wait(SCHEDULE_POLL_SEC)
+
+    _schedule_thread = threading.Thread(target=_loop, name="pipeline-scheduler", daemon=True)
+    _schedule_thread.start()
+    return _schedule_thread
+
+
+def stop_pipeline_schedule_runner() -> None:
+    _schedule_stop.set()
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
@@ -9463,6 +9932,24 @@ class Handler(SimpleHTTPRequestHandler):
             )
             return
 
+        m_schedules = re.fullmatch(r"/api/pipeline-templates/([^/]+)/schedules", path)
+        if m_schedules:
+            template = get_pipeline_template(user or "", m_schedules.group(1))
+            if template is None:
+                self._json(404, {"error": "流水线不存在"})
+                return
+            self._json(200, {"schedules": list_pipeline_schedules(template["id"])})
+            return
+
+        m_schedule_runs = re.fullmatch(r"/api/pipeline-schedules/([^/]+)/runs", path)
+        if m_schedule_runs:
+            schedule = get_pipeline_schedule(m_schedule_runs.group(1))
+            if schedule is None:
+                self._json(404, {"error": "定时任务不存在"})
+                return
+            self._json(200, {"runs": list_pipeline_schedule_runs(schedule["id"])})
+            return
+
         if path == "/api/push-targets":
             service_id = str((query.get("service_id") or [""])[0]).strip()
             if service_id not in {str(item.get("id") or "") for item in load_services()}:
@@ -9771,6 +10258,50 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(404 if err == "模板不存在" else 400, {"ok": False, "error": err})
                 return
             self._json(200, {"ok": True, "template": item})
+            return
+
+        m_schedule_create = re.fullmatch(r"/api/pipeline-templates/([^/]+)/schedules", path)
+        if m_schedule_create:
+            item, err = save_pipeline_schedule(m_schedule_create.group(1), data, user)
+            if err or item is None:
+                self._json(404 if err == "流水线不存在" else 400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "schedule": item})
+            return
+
+        m_schedule_delete = re.fullmatch(r"/api/pipeline-schedules/([^/]+)/delete", path)
+        if m_schedule_delete:
+            if not delete_pipeline_schedule(m_schedule_delete.group(1)):
+                self._json(404, {"ok": False, "error": "定时任务不存在"})
+                return
+            self._json(200, {"ok": True})
+            return
+
+        m_schedule_run = re.fullmatch(r"/api/pipeline-schedules/([^/]+)/run-now", path)
+        if m_schedule_run:
+            schedule = get_pipeline_schedule(m_schedule_run.group(1))
+            if schedule is None:
+                self._json(404, {"ok": False, "error": "定时任务不存在"})
+                return
+            host, port = self.server.server_address[:2]
+            origin = f"http://127.0.0.1:{port}"
+            result = trigger_pipeline_schedule(schedule["id"], origin)
+            self._json(200 if result.get("ok") else 400, result)
+            return
+
+        m_schedule_update = re.fullmatch(r"/api/pipeline-schedules/([^/]+)", path)
+        if m_schedule_update:
+            existing = get_pipeline_schedule(m_schedule_update.group(1))
+            if existing is None:
+                self._json(404, {"ok": False, "error": "定时任务不存在"})
+                return
+            item, err = save_pipeline_schedule(
+                existing["pipeline_template_id"], data, user, existing["id"]
+            )
+            if err or item is None:
+                self._json(400, {"ok": False, "error": err})
+                return
+            self._json(200, {"ok": True, "schedule": item})
             return
 
         m_tpl_del = re.fullmatch(r"/api/pipeline-templates/([^/]+)/delete", path)
@@ -10349,6 +10880,8 @@ class Handler(SimpleHTTPRequestHandler):
                 "package_validated": False,
                 "template_id": template_id,
                 "template_name": template_name,
+                "trigger_type": str(data.get("trigger_type") or "manual").strip() or "manual",
+                "trigger_id": str(data.get("trigger_id") or "").strip(),
                 "push_target_id": push_target_id,
                 "push_target": push_target_summary,
                 "status": "running",
@@ -10484,7 +11017,13 @@ def main() -> None:
             print(f"[swr-push-helper] shared SWR login probe skipped: {e}", flush=True)
 
     threading.Thread(target=_bg_login_probe, daemon=True).start()
-    httpd.serve_forever()
+    scheduler_origin = f"http://127.0.0.1:{httpd.server_port}"
+    start_pipeline_schedule_runner(scheduler_origin)
+    print(f"[pipeline-scheduler] active origin={scheduler_origin}", flush=True)
+    try:
+        httpd.serve_forever()
+    finally:
+        stop_pipeline_schedule_runner()
 
 
 if __name__ == "__main__":

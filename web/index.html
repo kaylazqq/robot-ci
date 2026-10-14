@@ -306,6 +306,17 @@
         </div>
         <p class="env-secret-hint" id="pushTargetDetail"></p>
       </div>
+      <div class="run-block schedule-block" id="pipelineScheduleBlock" hidden>
+        <div class="schedule-head">
+          <div>
+            <span class="label">定时任务</span>
+            <p class="env-secret-hint">按流水线固定分支自动执行，可配置多个任务</p>
+          </div>
+          <button type="button" class="btn ghost" id="btnScheduleCreate">新增定时任务</button>
+        </div>
+        <div class="schedule-list" id="pipelineScheduleList"></div>
+        <p class="hint error" id="pipelineScheduleHint" hidden></p>
+      </div>
       <div class="run-block run-block-tasks">
         <label class="label">选择任务</label>
         <section class="job-pipeline" id="runJobPipeline" aria-label="选择任务"></section>

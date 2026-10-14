@@ -30,6 +30,7 @@ let envEditingId = "";
 let runPreviewActive = false;
 let runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "", pushTargetId: "" };
 let pipelineTemplates = [];
+let pipelineSchedules = [];
 let pushTargets = [];
 let pushTargetsCanManage = false;
 let selectedTemplateId = "";
@@ -1201,6 +1202,7 @@ function syncRunLayerChrome() {
   const typeBlock = $("deploymentTypeBlock");
   if (typeBlock) typeBlock.hidden = runLayerMode === "edit" || !isProductionReleaseTemplate();
   renderPushTargetBlock();
+  renderPipelineSchedules();
 }
 function openRunWindow(templateId) {
   const svc = currentService();
@@ -1231,6 +1233,7 @@ function openEditTemplate(templateId) {
   layer.hidden = false;
   document.body.classList.add("run-open");
   enterRunPage(tpl);
+  loadPipelineSchedules(tpl.id).catch((e) => setPipelineScheduleHint(e.message || "加载定时任务失败"));
 }
 function enterRunPage(tpl) {
   runPreviewActive = true;
@@ -1276,6 +1279,7 @@ function cancelRunPreview() {
   previewBranchServiceId = "";
   runLayerMode = "run";
   runLayerTemplateId = "";
+  pipelineSchedules = [];
   runPreviewSelection = { gammaDeploy: false, deploy: false, test: false, environmentId: "", gammaEnvironmentId: "", deploymentMode: "", pushTargetId: "" };
   deploymentType = "code";
   setPreviewHint("");
@@ -1346,6 +1350,124 @@ async function saveEditedTemplate() {
   }
   cancelRunPreview();
   await loadPipelineTemplates();
+}
+
+function setPipelineScheduleHint(text) {
+  const hint = $("pipelineScheduleHint");
+  if (!hint) return;
+  hint.hidden = !text;
+  hint.textContent = text || "";
+}
+
+function scheduleTimeText(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+async function loadPipelineSchedules(templateId) {
+  if (!templateId) return;
+  const data = await api("/api/pipeline-templates/" + encodeURIComponent(templateId) + "/schedules");
+  if (runLayerMode !== "edit" || runLayerTemplateId !== templateId) return;
+  pipelineSchedules = data.schedules || [];
+  setPipelineScheduleHint("");
+  renderPipelineSchedules();
+}
+
+function renderPipelineSchedules() {
+  const block = $("pipelineScheduleBlock");
+  const list = $("pipelineScheduleList");
+  if (!block || !list) return;
+  block.hidden = runLayerMode !== "edit";
+  if (block.hidden) return;
+  if (!pipelineSchedules.length) {
+    list.innerHTML = '<div class="schedule-empty">暂未配置定时任务</div>';
+    return;
+  }
+  list.innerHTML = pipelineSchedules.map((item) => (
+    '<div class="schedule-card" data-schedule-id="' + esc(item.id) + '">' +
+      '<div class="schedule-card-main"><div class="schedule-card-title">' + esc(item.name) +
+      '<span class="schedule-state ' + (item.enabled ? "enabled" : "") + '">' + (item.enabled ? "已启用" : "已停用") + '</span></div>' +
+      '<div class="schedule-card-meta">Cron：' + esc(item.cron_expression) + ' · ' + esc(item.timezone) +
+      '<br>下次：' + esc(item.enabled ? scheduleTimeText(item.next_run_at) : "-") +
+      ' · 最近：' + esc(item.last_status || "未执行") + (item.last_job_id ? (' · Job ' + esc(item.last_job_id)) : '') + '</div></div>' +
+      '<div class="schedule-card-actions">' +
+      '<button type="button" class="btn ghost" data-schedule-run>立即执行</button>' +
+      '<button type="button" class="btn ghost" data-schedule-toggle>' + (item.enabled ? "停用" : "启用") + '</button>' +
+      '<button type="button" class="btn ghost" data-schedule-edit>编辑</button>' +
+      '<button type="button" class="btn ghost" data-schedule-delete>删除</button>' +
+      '</div></div>'
+  )).join("");
+  list.querySelectorAll("[data-schedule-id]").forEach((card) => {
+    const item = pipelineSchedules.find((row) => row.id === card.getAttribute("data-schedule-id"));
+    if (!item) return;
+    card.querySelector("[data-schedule-edit]").addEventListener("click", () => openScheduleEditor(item));
+    card.querySelector("[data-schedule-toggle]").addEventListener("click", () => saveSchedule({...item, enabled: !item.enabled}));
+    card.querySelector("[data-schedule-run]").addEventListener("click", () => runScheduleNow(item));
+    card.querySelector("[data-schedule-delete]").addEventListener("click", () => deleteSchedule(item));
+  });
+}
+
+function openScheduleEditor(item) {
+  const editing = !!(item && item.id);
+  const wrap = document.createElement("div");
+  wrap.innerHTML =
+    '<div class="schedule-form-grid">' +
+    '<label><span class="label">任务名称</span><input class="input" id="scheduleName" maxlength="60"></label>' +
+    '<label><span class="label">Cron 表达式</span><input class="input" id="scheduleCron" placeholder="0 2 * * *"></label>' +
+    '<p class="env-secret-hint">5 段格式：分 时 日 月 周，例如每天 02:00 为 0 2 * * *</p>' +
+    '<label><span class="label">时区</span><select class="input" id="scheduleTimezone"><option>Asia/Shanghai</option><option>UTC</option></select></label>' +
+    '<label class="schedule-form-check"><input type="checkbox" id="scheduleEnabled" checked>启用任务</label>' +
+    '<p class="hint error" id="scheduleFormHint" hidden></p>' +
+    '<div class="row"><button type="button" class="btn primary" id="scheduleSave">保存</button>' +
+    '<button type="button" class="btn ghost" data-close-modal>取消</button></div></div>';
+  openModal(editing ? "编辑定时任务" : "新增定时任务", wrap, { narrow: true });
+  wrap.querySelector("#scheduleName").value = editing ? item.name : "";
+  wrap.querySelector("#scheduleCron").value = editing ? item.cron_expression : "0 2 * * *";
+  wrap.querySelector("#scheduleTimezone").value = editing ? item.timezone : "Asia/Shanghai";
+  wrap.querySelector("#scheduleEnabled").checked = editing ? !!item.enabled : true;
+  wrap.querySelector("#scheduleSave").addEventListener("click", async () => {
+    const payload = {
+      name: wrap.querySelector("#scheduleName").value.trim(),
+      cron_expression: wrap.querySelector("#scheduleCron").value.trim(),
+      timezone: wrap.querySelector("#scheduleTimezone").value,
+      enabled: wrap.querySelector("#scheduleEnabled").checked,
+    };
+    try {
+      await saveSchedule(payload, editing ? item.id : "");
+      closeModal();
+    } catch (e) {
+      const hint = wrap.querySelector("#scheduleFormHint");
+      hint.hidden = false;
+      hint.textContent = e.message || "保存失败";
+    }
+  });
+}
+
+async function saveSchedule(payload, scheduleId) {
+  const path = scheduleId
+    ? ("/api/pipeline-schedules/" + encodeURIComponent(scheduleId))
+    : ("/api/pipeline-templates/" + encodeURIComponent(runLayerTemplateId) + "/schedules");
+  await api(path, { method: "POST", body: JSON.stringify(payload) });
+  await loadPipelineSchedules(runLayerTemplateId);
+}
+
+async function runScheduleNow(item) {
+  try {
+    const data = await api("/api/pipeline-schedules/" + encodeURIComponent(item.id) + "/run-now", { method: "POST", body: "{}" });
+    await loadPipelineSchedules(runLayerTemplateId);
+    if (data.job_id) alert("已触发流水线，Job：" + data.job_id);
+    else if (data.skipped) alert("上一次定时执行仍未结束，本次已跳过");
+  } catch (e) {
+    setPipelineScheduleHint(e.message || "触发失败");
+  }
+}
+
+function deleteSchedule(item) {
+  if (!confirm("确定删除定时任务「" + item.name + "」？")) return;
+  api("/api/pipeline-schedules/" + encodeURIComponent(item.id) + "/delete", { method: "POST", body: "{}" })
+    .then(() => loadPipelineSchedules(runLayerTemplateId))
+    .catch((e) => setPipelineScheduleHint(e.message || "删除失败"));
 }
 function hideTplMenu() {
   const menu = $("tplMenu");
@@ -4448,6 +4570,7 @@ if (pushTargetSelect) pushTargetSelect.addEventListener("change", () => {
   renderPushTargetBlock();
 });
 bind("btnPushTargetCreate", () => openPushTargetEditor(null));
+bind("btnScheduleCreate", () => openScheduleEditor(null));
 bind("btnPushTargetEdit", () => {
   const target = selectedPushTarget();
   if (target && target.id) openPushTargetEditor(target);
