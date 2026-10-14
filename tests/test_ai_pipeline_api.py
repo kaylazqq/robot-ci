@@ -1,9 +1,11 @@
 import argparse
 import importlib.util
+import io
 import json
 import tempfile
 import threading
 import unittest
+import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -157,6 +159,41 @@ class AiPipelineApiTests(unittest.TestCase):
         self.assertIn(pipeline["id"], [item["pipeline_id"] for item in listed["pipelines"]])
         self.assertEqual("success", result["status"])
         self.assertEqual(sha, result["commit_sha"])
+
+    def test_logged_in_user_downloads_cross_agent_skill_and_replaces_token(self) -> None:
+        cookie = self.login()
+        old_token = self.token(cookie)
+        old_id = server.list_user_api_tokens(server.DEFAULT_USERNAME)[0]["id"]
+        with self.open(
+            "/api/ai/skill-packages",
+            payload={"token_name": "desktop agents", "expires_in_days": 30,
+                     "agents": ["codex", "claude", "cursor"], "replace_token_id": old_id},
+            cookie=cookie,
+            method="POST",
+        ) as response:
+            self.assertEqual("application/zip", response.headers.get_content_type())
+            package = response.read()
+        with zipfile.ZipFile(io.BytesIO(package)) as archive:
+            names = set(archive.namelist())
+            self.assertIn("skill/robot-ci-run-pipeline/SKILL.md", names)
+            self.assertIn("skill/robot-ci-run-pipeline/config/robot-ci.json", names)
+            self.assertIn("install.ps1", names)
+            self.assertIn("install.sh", names)
+            manifest = json.loads(archive.read("manifest.json"))
+            config = json.loads(archive.read("skill/robot-ci-run-pipeline/config/robot-ci.json"))
+        self.assertEqual(["codex", "claude", "cursor"], manifest["agents"])
+        self.assertEqual(server.DEFAULT_USERNAME, config["username"])
+        self.assertTrue(config["base_url"].startswith("http://127.0.0.1:"))
+        self.assertTrue(config["token"].startswith("rci_"))
+        self.assertEqual("", server.api_token_username(old_token))
+        self.assertEqual(server.DEFAULT_USERNAME, server.api_token_username(config["token"]))
+
+    def test_skill_package_requires_browser_session(self) -> None:
+        token = self.token(self.login())
+        with self.assertRaises(HTTPError) as denied:
+            self.open("/api/ai/skill-packages", payload={"agents": ["codex"]},
+                      bearer=token, method="POST")
+        self.assertEqual(403, denied.exception.code)
 
 
 if __name__ == "__main__":

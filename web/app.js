@@ -339,7 +339,7 @@ function closeUserMenu() {
 }
 
 function isBuildListTab(name) {
-  return name === "history" || name === "artifacts" || name === "envs" || name === "permissions";
+  return name === "history" || name === "artifacts" || name === "envs" || name === "permissions" || name === "ai";
 }
 function normalizeBuildTab(next) {
   return isBuildListTab(next) ? next : "pipeline";
@@ -377,8 +377,10 @@ function applyServiceChrome() {
   if (pipeBtn) pipeBtn.hidden = all;
   const envBtn = document.querySelector('.subtab[data-tab="envs"]');
   const permissionBtn = document.querySelector('.subtab[data-tab="permissions"]');
+  const aiBtn = document.querySelector('.subtab[data-tab="ai"]');
   if (envBtn) envBtn.hidden = all;
   if (permissionBtn) permissionBtn.hidden = all;
+  if (aiBtn) aiBtn.hidden = all;
   if ($("pageBuild")) $("pageBuild").hidden = nav !== "build";
   if (!$("viewPipeline")) return;
   $("viewPipeline").hidden = tab !== "pipeline";
@@ -386,6 +388,7 @@ function applyServiceChrome() {
   if ($("viewArtifacts")) $("viewArtifacts").hidden = tab !== "artifacts";
   if ($("viewEnvs")) $("viewEnvs").hidden = all || tab !== "envs";
   if ($("viewPermissions")) $("viewPermissions").hidden = all || tab !== "permissions";
+  if ($("viewAi")) $("viewAi").hidden = all || tab !== "ai";
   if ($("pipelineActions")) $("pipelineActions").hidden = all || tab !== "pipeline";
   if ($("jobMetaBar")) $("jobMetaBar").hidden = all || tab !== "pipeline";
   const createBtn = $("btnEnvCreate");
@@ -420,6 +423,7 @@ function setTab(next) {
     if (tab === "artifacts") refreshArtifacts().catch(() => {});
     if (tab === "envs") loadEnvironments().catch((e) => setEnvError(e.message));
     if (tab === "permissions") loadPermissions().catch(() => {});
+    if (tab === "ai") loadAiAccess().catch((e) => setAiAccessError(e.message));
     if (tab === "pipeline" && !isAllServices()) {
       applyJob(null, { loading: true });
       loadPipelineTemplates()
@@ -466,7 +470,7 @@ function readHash() {
   const service = decodeURIComponent(parts[1] || "");
   let nextTab = "pipeline";
   let job = "";
-  if (["history", "artifacts", "envs", "permissions"].includes(parts[2])) nextTab = parts[2];
+  if (["history", "artifacts", "envs", "permissions", "ai"].includes(parts[2])) nextTab = parts[2];
   else if (parts[2] === "job" && parts[3]) job = decodeURIComponent(parts[3]);
   return { nav: "build", service, tab: nextTab, job };
 }
@@ -4365,6 +4369,91 @@ async function deleteEnvironment(id) {
   }
 }
 
+function setAiAccessError(message) {
+  const el = $("aiAccessError");
+  if (!el) return;
+  el.textContent = message || "";
+  el.hidden = !message;
+}
+
+function formatTokenTime(value) {
+  if (!value) return "—";
+  if (typeof value === "number") return new Date(value * 1000).toLocaleString();
+  return String(value);
+}
+
+async function loadAiAccess() {
+  const data = await api("/api/ai/tokens");
+  const tokens = data.tokens || [];
+  const body = $("aiTokenBody");
+  const replacement = $("aiReplaceToken");
+  if (replacement) {
+    replacement.innerHTML = '<option value="">不替换</option>' + tokens
+      .filter((item) => item.enabled)
+      .map((item) => '<option value="' + esc(item.id) + '">' + esc(item.name) + "</option>").join("");
+  }
+  if (!body) return;
+  body.innerHTML = tokens.length ? tokens.map((item) => '<tr><td>' + esc(item.name) + '</td><td>' +
+    esc(formatTokenTime(item.created_at)) + '</td><td>' + esc(formatTokenTime(item.last_used_at)) + '</td><td>' +
+    (item.enabled ? "已启用" : "已吊销") + '</td><td><button type="button" class="btn ghost danger" data-ai-revoke="' +
+    esc(item.id) + '"' + (item.enabled ? "" : " disabled") + '>吊销</button></td></tr>').join("") :
+    '<tr><td colspan="5">暂无 Token</td></tr>';
+  body.querySelectorAll("[data-ai-revoke]").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api("/api/ai/tokens/" + encodeURIComponent(button.dataset.aiRevoke) + "/revoke", {method: "POST", body: "{}"});
+      await loadAiAccess();
+    } catch (error) {
+      setAiAccessError(error.message || "吊销失败");
+      button.disabled = false;
+    }
+  }));
+}
+
+async function downloadAgentSkill() {
+  setAiAccessError("");
+  const agents = Array.from(document.querySelectorAll('input[name="aiAgent"]:checked')).map((item) => item.value);
+  if (!agents.length) {
+    setAiAccessError("请至少选择一个 Agent");
+    return;
+  }
+  const button = $("btnDownloadSkill");
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch("/api/ai/skill-packages", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        token_name: (($("aiTokenName") || {}).value || "Agent Skill").trim(),
+        expires_in_days: Number((($("aiTokenDays") || {}).value || 90)),
+        agents,
+        replace_token_id: (($("aiReplaceToken") || {}).value || ""),
+      }),
+    });
+    if (!response.ok) {
+      let detail = {};
+      try { detail = await response.json(); } catch (_) {}
+      throw new Error(detail.error || "Skill 包下载失败");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "robot-ci-agent-skill.zip";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    if ($("aiAccessHint")) $("aiAccessHint").textContent = "下载完成。解压后运行 install.ps1 或 install.sh。";
+    await loadAiAccess();
+  } catch (error) {
+    setAiAccessError(error.message || "Skill 包下载失败");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 function bind(id, fn) {
   const el = $(id);
   if (el) el.addEventListener("click", fn);
@@ -4482,6 +4571,7 @@ bind("btnAuthLogout", async () => {
   } catch (_) {}
 });
 bind("btnEnvCreate", () => openEnvCreate());
+bind("btnDownloadSkill", () => downloadAgentSkill());
 document.querySelectorAll("[data-env-close]").forEach((el) => el.addEventListener("click", closeEnvOverlay));
 bind("btnEnvConfirmOk", () => closeEnvConfirm(true));
 document.querySelectorAll("[data-env-confirm-cancel]").forEach((el) => {

@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -15,8 +16,22 @@ from urllib.request import Request, urlopen
 def config() -> tuple[str, str]:
     base_url = os.environ.get("ROBOT_CI_URL", "").strip().rstrip("/")
     token = os.environ.get("ROBOT_CI_TOKEN", "").strip()
+    candidates = (
+        Path(__file__).resolve().parents[1] / "config" / "robot-ci.json",
+        Path.home() / ".robot-ci" / "config.json",
+    )
     if not base_url or not token:
-        raise RuntimeError("ROBOT_CI_URL and ROBOT_CI_TOKEN are required")
+        for path in candidates:
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            base_url = base_url or str(saved.get("base_url") or saved.get("url") or "").strip().rstrip("/")
+            token = token or str(saved.get("token") or "").strip()
+            if base_url and token:
+                break
+    if not base_url or not token:
+        raise RuntimeError("Robot CI URL and token are required in environment variables or config/robot-ci.json")
     return base_url, token
 
 

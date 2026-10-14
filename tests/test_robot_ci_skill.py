@@ -1,6 +1,8 @@
 import argparse
 import importlib.util
 import unittest
+import json
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +33,15 @@ class RobotCiSkillTests(unittest.TestCase):
     def test_config_requires_url_and_token(self):
         with patch.dict(MODULE.os.environ, {}, clear=True), self.assertRaises(RuntimeError):
             MODULE.config()
+
+    def test_config_reads_user_file_without_environment_variables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".robot-ci" / "config.json"
+            target.parent.mkdir()
+            target.write_text(json.dumps({"base_url": "http://ci.example", "token": "rci_test"}), encoding="utf-8")
+            with patch.dict(MODULE.os.environ, {}, clear=True), patch.object(MODULE.Path, "home", return_value=root):
+                self.assertEqual(("http://ci.example", "rci_test"), MODULE.config())
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from contextlib import contextmanager
 from copy import deepcopy
 from http import HTTPStatus
@@ -2610,6 +2612,103 @@ def api_token_username(raw_token: str) -> str:
             return str(row["username"])
         finally:
             conn.close()
+
+
+SUPPORTED_SKILL_AGENTS = ("codex", "claude", "cursor")
+
+
+def _skill_release_version() -> str:
+    marker = ROOT / ".release-commit"
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    return value if re.fullmatch(r"[0-9a-f]{7,40}", value) else "development"
+
+
+def build_agent_skill_package(
+    base_url: str, username: str, token: str, agents: list[str] | tuple[str, ...]
+) -> bytes:
+    selected = [item for item in SUPPORTED_SKILL_AGENTS if item in set(agents)]
+    if not selected:
+        raise ValueError("至少选择一个 Agent")
+    skill_root = ROOT / "skills" / "robot-ci-run-pipeline"
+    required = (
+        skill_root / "SKILL.md",
+        skill_root / "agents" / "openai.yaml",
+        skill_root / "scripts" / "robot_ci_pipeline.py",
+    )
+    if any(not path.is_file() for path in required):
+        raise ValueError("服务器 Skill 文件不完整")
+    config = {
+        "base_url": str(base_url or "").strip().rstrip("/"),
+        "token": str(token or "").strip(),
+        "username": str(username or "").strip(),
+    }
+    if not config["base_url"].startswith(("http://", "https://")) or not config["token"]:
+        raise ValueError("Skill 配置无效")
+    manifest = {
+        "name": "robot-ci-run-pipeline",
+        "version": _skill_release_version(),
+        "api_version": 1,
+        "agents": selected,
+    }
+    powershell_agents = ",".join(f'"{item}"' for item in selected)
+    install_ps1 = f'''param([string]$Agent = "")
+$ErrorActionPreference = "Stop"
+$installHome = if ($env:ROBOT_CI_INSTALL_HOME) {{ $env:ROBOT_CI_INSTALL_HOME }} else {{ $HOME }}
+$defaults = @({powershell_agents})
+$allAgents = @("codex", "claude", "cursor")
+$selected = if (-not $Agent) {{ $defaults }} elseif ($Agent -eq "all") {{ $allAgents }} else {{ @($Agent) }}
+$roots = @{{
+  codex = Join-Path $installHome ".codex\\skills"
+  claude = Join-Path $installHome ".claude\\skills"
+  cursor = Join-Path $installHome ".cursor\\skills"
+}}
+foreach ($name in $selected) {{
+  if (-not $roots.ContainsKey($name)) {{ throw "Unsupported agent: $name" }}
+  $target = Join-Path $roots[$name] "robot-ci-run-pipeline"
+  New-Item -ItemType Directory -Force -Path $roots[$name] | Out-Null
+  if (Test-Path -LiteralPath $target) {{ Remove-Item -LiteralPath $target -Recurse -Force }}
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot "skill\\robot-ci-run-pipeline") -Destination $target -Recurse
+  Write-Output "Installed robot-ci-run-pipeline for $name at $target"
+}}
+'''
+    shell_defaults = " ".join(selected)
+    install_sh = f'''#!/usr/bin/env sh
+set -eu
+agent="${{1:-}}"
+install_home="${{ROBOT_CI_INSTALL_HOME:-$HOME}}"
+if [ -z "$agent" ]; then agents="{shell_defaults}"; elif [ "$agent" = "--all" ] || [ "$agent" = "all" ]; then agents="codex claude cursor"; else agents="$agent"; fi
+for name in $agents; do
+  case "$name" in
+    codex) root="$install_home/.codex/skills" ;;
+    claude) root="$install_home/.claude/skills" ;;
+    cursor) root="$install_home/.cursor/skills" ;;
+    *) echo "Unsupported agent: $name" >&2; exit 2 ;;
+  esac
+  target="$root/robot-ci-run-pipeline"
+  mkdir -p "$root"
+  rm -rf "$target"
+  cp -R "$(dirname "$0")/skill/robot-ci-run-pipeline" "$target"
+  echo "Installed robot-ci-run-pipeline for $name at $target"
+done
+'''
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in required:
+            relative = path.relative_to(skill_root).as_posix()
+            archive.writestr("skill/robot-ci-run-pipeline/" + relative, path.read_bytes())
+        archive.writestr(
+            "skill/robot-ci-run-pipeline/config/robot-ci.json",
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        )
+        archive.writestr("install.ps1", install_ps1)
+        info = zipfile.ZipInfo("install.sh")
+        info.external_attr = 0o755 << 16
+        archive.writestr(info, install_sh)
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    return output.getvalue()
 
 
 def _persist_session(token: str, username: str, expires: float) -> None:
@@ -9263,6 +9362,25 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _bytes(self, code: int, body: bytes, content_type: str, filename: str = "") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _public_origin(self) -> str:
+        configured = str(os.environ.get("ROBOT_CI_PUBLIC_ORIGIN") or "").strip().rstrip("/")
+        if configured:
+            return configured
+        forwarded = str(self.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip()
+        scheme = forwarded if forwarded in {"http", "https"} else "http"
+        host = str(self.headers.get("Host") or "").strip()
+        return f"{scheme}://{host}" if host else ""
+
     def _session_token(self) -> str:
         raw = self.headers.get("Cookie") or ""
         cookies = SimpleCookie()
@@ -9831,6 +9949,38 @@ class Handler(SimpleHTTPRequestHandler):
         if user is None:
             return
         ai_request: dict[str, Any] | None = None
+
+        if path == "/api/ai/skill-packages":
+            if not self._session_token():
+                self._json(403, {"error": "Skill 包只能通过已登录的网页会话生成", "error_code": "session_required"})
+                return
+            raw_agents = data.get("agents")
+            agents = [str(item).strip().lower() for item in raw_agents] if isinstance(raw_agents, list) else list(SUPPORTED_SKILL_AGENTS)
+            if not agents or any(item not in SUPPORTED_SKILL_AGENTS for item in agents):
+                self._json(400, {"error": "仅支持 codex、claude、cursor", "error_code": "agents_invalid"})
+                return
+            replace_token_id = str(data.get("replace_token_id") or "").strip()
+            if replace_token_id and replace_token_id not in {str(item["id"]) for item in list_user_api_tokens(user)}:
+                self._json(404, {"error": "要替换的 Token 不存在", "error_code": "token_not_found"})
+                return
+            item, err = create_user_api_token(
+                user,
+                str(data.get("token_name") or "Agent Skill").strip(),
+                data.get("expires_in_days", 90),
+            )
+            if err or item is None:
+                self._json(400, {"error": err, "error_code": "token_invalid"})
+                return
+            try:
+                package = build_agent_skill_package(self._public_origin(), user, str(item["token"]), agents)
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                revoke_user_api_token(user, str(item["id"]))
+                self._json(500, {"error": "Skill 包生成失败: " + str(exc), "error_code": "package_failed"})
+                return
+            if replace_token_id:
+                revoke_user_api_token(user, replace_token_id)
+            self._bytes(200, package, "application/zip", "robot-ci-agent-skill.zip")
+            return
 
         if path == "/api/ai/tokens":
             if not self._session_token():

@@ -5,11 +5,11 @@ description: Run an existing Robot CI pipeline that administrators explicitly en
 
 # Run Robot CI Pipeline
 
-Use `scripts/robot_ci_pipeline.py` for every API call. Never place a token in a command argument, repository file, log, or response.
+Use `scripts/robot_ci_pipeline.py` for every API call. Never print the configured token or place it in a command argument, log, or response.
 
 ## Prerequisites
 
-Require `ROBOT_CI_URL` and `ROBOT_CI_TOKEN` environment variables. Before starting a run, push the requested branch and obtain its full 40-character commit SHA from the remote repository. Do not submit a local-only SHA.
+Use the downloaded `config/robot-ci.json` by default. Allow `ROBOT_CI_URL` and `ROBOT_CI_TOKEN` environment variables to override it. Before starting a run, push the requested branch and obtain its full 40-character commit SHA from the remote repository. Do not submit a local-only SHA.
 
 ## Workflow
 
