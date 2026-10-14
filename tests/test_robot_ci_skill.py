@@ -3,7 +3,9 @@ import importlib.util
 import unittest
 import json
 import tempfile
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 
@@ -42,6 +44,17 @@ class RobotCiSkillTests(unittest.TestCase):
             target.write_text(json.dumps({"base_url": "http://ci.example", "token": "rci_test"}), encoding="utf-8")
             with patch.dict(MODULE.os.environ, {}, clear=True), patch.object(MODULE.Path, "home", return_value=root):
                 self.assertEqual(("http://ci.example", "rci_test"), MODULE.config())
+
+    def test_request_preserves_remote_commit_sha_from_conflict(self):
+        body = BytesIO(json.dumps({
+            "error": "remote branch commit does not match",
+            "remote_commit_sha": "b" * 40,
+        }).encode())
+        conflict = HTTPError("http://ci.example/api/ai/pipeline-runs", 409, "Conflict", {}, body)
+        with patch.object(MODULE, "config", return_value=("http://ci.example", "rci_test")), \
+                patch.object(MODULE, "urlopen", side_effect=conflict):
+            with self.assertRaisesRegex(RuntimeError, r"remote_commit_sha=" + "b" * 40):
+                MODULE.request("POST", "/api/ai/pipeline-runs", {})
 
 
 if __name__ == "__main__":

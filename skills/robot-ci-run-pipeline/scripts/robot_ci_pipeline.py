@@ -48,7 +48,11 @@ def request(method: str, path: str, payload: dict | None = None, headers: dict |
             detail = json.loads(exc.read().decode())
         except (ValueError, UnicodeDecodeError):
             detail = {"error": str(exc)}
-        raise RuntimeError(f"Robot CI HTTP {exc.code}: {detail.get('error') or detail}") from exc
+        message = str(detail.get("error") or detail)
+        remote_sha = str(detail.get("remote_commit_sha") or "").strip()
+        if remote_sha:
+            message += f" (remote_commit_sha={remote_sha})"
+        raise RuntimeError(f"Robot CI HTTP {exc.code}: {message}") from exc
     except URLError as exc:
         raise RuntimeError(f"Robot CI unavailable: {exc.reason}") from exc
 
