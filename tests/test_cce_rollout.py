@@ -382,7 +382,7 @@ class CceRolloutHelperTests(unittest.TestCase):
         )
         self.assertEqual(["KEEP_ME"], [item["name"] for item in template["spec"]["containers"][0]["env"]])
 
-    def test_read_runtime_environment_skips_secret_references_and_sensitive_literals(self) -> None:
+    def test_read_runtime_environment_preserves_configmap_and_secret_sources(self) -> None:
         payload = {"spec": {"template": {"spec": {"containers": [{
             "name": "router", "image": "registry/router:old", "envFrom": [
                 {"configMapRef": {"name": "router-config"}},
@@ -401,6 +401,10 @@ class CceRolloutHelperTests(unittest.TestCase):
                 return 0, json.dumps(payload), ""
             if "get configmap router-config -o json" in command:
                 return 0, json.dumps({"data": {"CM_VALUE": "from-cm", "CM_PASSWORD": "skip-me"}}), ""
+            if "get secret router-secret -o json" in command:
+                return 0, json.dumps({"data": {"SHARED_SECRET": base64.b64encode(b"shared").decode()}}), ""
+            if "get secret s -o json" in command:
+                return 0, json.dumps({"data": {"x": base64.b64encode(b"from-secret").decode()}}), ""
             return 1, "", "not found"
 
         result = cce_rollout.read_workload_runtime_environment(
@@ -413,10 +417,39 @@ class CceRolloutHelperTests(unittest.TestCase):
         )
         self.assertEqual({
             "CM_VALUE": "from-cm", "EMPTY_VALUE": "", "FROM_CONFIGMAP": "from-cm",
-            "PUBLIC_URL": "http://example.test",
+            "FROM_SECRET": "from-secret", "PUBLIC_URL": "http://example.test", "SHARED_SECRET": "shared",
         }, result["variables"])
-        self.assertEqual(["FROM_SECRET", "secretRef:router-secret"], result["skipped_value_from_names"])
+        self.assertEqual([], result["skipped_value_from_names"])
         self.assertEqual(["CM_PASSWORD", "DB_PASSWORD"], result["skipped_sensitive_names"])
+        self.assertEqual("configmap", result["variable_sources"]["FROM_CONFIGMAP"]["storage_type"])
+        self.assertEqual("secret", result["variable_sources"]["FROM_SECRET"]["storage_type"])
+
+    def test_runtime_variables_keep_value_from_references(self) -> None:
+        template = {"metadata": {"annotations": {}}, "spec": {"containers": [{"name": "router", "env": []}]}}
+        cce_rollout.apply_runtime_variables_to_pod_template(
+            template, container="router", revision="r1", variables={
+                "TOKEN": {"valueFrom": {"secretKeyRef": {"name": "router-secret", "key": "token"}}}
+            }
+        )
+        self.assertEqual("router-secret", template["spec"]["containers"][0]["env"][0]["valueFrom"]["secretKeyRef"]["name"])
+
+    def test_apply_runtime_resources_writes_configmap_and_secret(self) -> None:
+        commands = []
+        def run(command, _timeout):  # noqa: ANN001
+            commands.append(command)
+            return 0, "configured", ""
+        cce_rollout.apply_runtime_resources(run, namespace="echo-prod", entries=[
+            {"name":"PUBLIC_URL","value":"https://example","storage_type":"configmap","resource_name":"app-config","resource_key":"PUBLIC_URL"},
+            {"name":"TOKEN","value":"secret-value","storage_type":"secret","resource_name":"app-secret","resource_key":"token"},
+        ])
+        self.assertEqual(2, len(commands))
+        manifests = []
+        for command in commands:
+            encoded = command.split("printf %s ", 1)[1].split(" |", 1)[0].strip("'")
+            manifests.append(json.loads(base64.b64decode(encoded)))
+        self.assertEqual({"ConfigMap", "Secret"}, {item["kind"] for item in manifests})
+        secret = next(item for item in manifests if item["kind"] == "Secret")
+        self.assertEqual("secret-value", secret["stringData"]["token"])
 
     def test_deploy_applies_runtime_variables_with_image_in_one_patch(self) -> None:
         commands: list[str] = []

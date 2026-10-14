@@ -208,6 +208,25 @@ class EnvironmentApiTests(unittest.TestCase):
         self.assertEqual([], deleted["variables"])
         self.assertEqual(["AGENT_MCP_PUBLIC_URL"], deleted["deleted_names"])
 
+    def test_runtime_config_persists_kubernetes_resource_target(self) -> None:
+        cookie = self._login()
+        payload = {"name":"dev2","service_id":"echoagent-router","region":"cn-southwest-2",
+                   "cluster_name":"cluster","workload_name":"echoagent-router","jump_host":"jump",
+                   "jump_password":"jump-secret","nodes":[]}
+        with self._open("/api/environments", data=json.dumps(payload).encode(), method="POST", cookie=cookie) as response:
+            env_id = json.loads(response.read().decode())["environment"]["id"]
+        variable = {"name":"JWT_SECRET","value":"value","storage_type":"secret",
+                    "resource_name":"echoagent-secret","resource_key":"jwt-secret"}
+        with self._open(f"/api/environments/{env_id}/runtime-config/variables",
+                        data=json.dumps(variable).encode(), method="POST", cookie=cookie) as response:
+            saved = json.loads(response.read().decode())["variables"][0]
+        self.assertEqual("secret", saved["storage_type"])
+        self.assertEqual("echoagent-secret", saved["resource_name"])
+        with patch.object(server, "apply_environment_runtime_variables", return_value={"variables": [saved], "applied": {"revision":"r1"}}):
+            with self._open(f"/api/environments/{env_id}/runtime-config/apply", data=b"{}", method="POST", cookie=cookie) as response:
+                applied = json.loads(response.read().decode())
+        self.assertTrue(applied["ok"])
+
     def test_sync_runtime_config_imports_safe_literals_and_keeps_secret_values_out(self) -> None:
         cookie = self._login()
         payload = {

@@ -657,16 +657,52 @@ _SENSITIVE_ENV_NAME = re.compile(
 )
 
 
-def _normalized_runtime_variables(raw: Any) -> dict[str, str]:
+def _normalized_runtime_variables(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         return {}
-    variables: dict[str, str] = {}
+    variables: dict[str, Any] = {}
     for key, value in raw.items():
         name = str(key or "").strip()
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise CceRolloutError(f"运行配置包含非法变量名: {name or '(空)'}")
-        variables[name] = str(value if value is not None else "")
+        if isinstance(value, Mapping) and isinstance(value.get("valueFrom"), Mapping):
+            variables[name] = {"valueFrom": copy.deepcopy(dict(value["valueFrom"]))}
+        else:
+            variables[name] = str(value if value is not None else "")
     return dict(sorted(variables.items()))
+
+
+def apply_runtime_resources(
+    run_remote: RemoteFn, *, namespace: str, entries: Iterable[Mapping[str, Any]]
+) -> None:
+    """Idempotently materialize CI-managed ConfigMap and Secret key/value pairs."""
+    grouped: dict[tuple[str, str], dict[str, str]] = {}
+    for item in entries:
+        storage = str(item.get("storage_type") or "literal").strip().lower()
+        if storage not in {"configmap", "secret"}:
+            continue
+        resource = str(item.get("resource_name") or "").strip()
+        key = str(item.get("resource_key") or item.get("name") or "").strip()
+        if not resource or not key:
+            raise CceRolloutError("ConfigMap/Secret runtime entry is missing resource name or key")
+        grouped.setdefault((storage, resource), {})[key] = str(item.get("value") or "")
+    for (storage, resource), values in sorted(grouped.items()):
+        manifest: dict[str, Any] = {
+            "apiVersion": "v1", "kind": "Secret" if storage == "secret" else "ConfigMap",
+            "metadata": {"name": resource, "namespace": namespace,
+                         "labels": {"app.kubernetes.io/managed-by": "robot-ci"}},
+        }
+        if storage == "secret":
+            manifest["type"] = "Opaque"
+            manifest["stringData"] = values
+        else:
+            manifest["data"] = values
+        encoded = base64.b64encode(json.dumps(manifest, ensure_ascii=False).encode()).decode()
+        command = (f"printf %s {shlex.quote(encoded)} | base64 -d | "
+                   f"kubectl -n {shlex.quote(namespace)} apply -f -")
+        code, out, err = run_remote(command, 60)
+        if code != 0:
+            raise CceRolloutError(f"apply {storage}/{resource} failed: {(err or out).strip() or code}")
 
 
 def apply_runtime_variables_to_pod_template(
@@ -705,7 +741,10 @@ def apply_runtime_variables_to_pod_template(
         copy.deepcopy(item)
         for item in current
         if isinstance(item, Mapping) and str(item.get("name") or "") not in managed
-    ] + [{"name": name, "value": value} for name, value in normalized.items()]
+    ] + [
+        {"name": name, **value} if isinstance(value, Mapping) else {"name": name, "value": value}
+        for name, value in normalized.items()
+    ]
     annotations[RUNTIME_ENV_KEYS_ANNOTATION] = ",".join(normalized)
     annotations[RUNTIME_CONFIG_REVISION_ANNOTATION] = str(revision or "")
 
@@ -814,11 +853,13 @@ def verify_runtime_variables_on_workload(
     )
     if target is None:
         raise CceRolloutError(f"发布后校验失败：未找到容器 {container}")
-    actual = {
-        str(item.get("name") or ""): str(item.get("value") if item.get("value") is not None else "")
-        for item in (target.get("env") or [])
-        if isinstance(item, Mapping) and "valueFrom" not in item
-    }
+    actual = {}
+    for item in target.get("env") or []:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name") or "")
+        actual[name] = ({"valueFrom": item.get("valueFrom")} if "valueFrom" in item
+                        else str(item.get("value") if item.get("value") is not None else ""))
     expected = _normalized_runtime_variables(variables)
     missing_or_changed = sorted(name for name, value in expected.items() if actual.get(name) != value)
     still_present = sorted(
@@ -1202,9 +1243,11 @@ def read_workload_runtime_environment(
     if target is None:
         raise CceRolloutError(f"负载 {source_name} 中未找到容器 {container_name}")
     variables: dict[str, str] = {}
+    variable_sources: dict[str, dict[str, str]] = {}
     skipped: list[str] = []
     skipped_sensitive: list[str] = []
     configmaps: dict[str, Mapping[str, Any]] = {}
+    secrets: dict[str, Mapping[str, Any]] = {}
 
     def configmap_data(name: str, *, optional: bool = False) -> Mapping[str, Any]:
         cm_name = str(name or "").strip()
@@ -1233,6 +1276,28 @@ def read_workload_runtime_environment(
                 )
         return configmaps[cm_name]
 
+    def secret_data(name: str, *, optional: bool = False) -> Mapping[str, Any]:
+        secret_name = str(name or "").strip()
+        if not secret_name:
+            return {}
+        if secret_name not in secrets:
+            code, out, err = run_remote(
+                f"kubectl -n {shlex.quote(namespace)} get secret {shlex.quote(secret_name)} -o json", 60
+            )
+            if code != 0:
+                if optional:
+                    secrets[secret_name] = {}
+                else:
+                    raise CceRolloutError((err or out or f"secret {secret_name} not found").strip())
+            else:
+                parsed = json.loads(out)
+                raw = parsed.get("data") if isinstance(parsed, Mapping) else {}
+                secrets[secret_name] = {
+                    str(k): base64.b64decode(str(v)).decode("utf-8", "replace")
+                    for k, v in (raw.items() if isinstance(raw, Mapping) else [])
+                }
+        return secrets[secret_name]
+
     for source in target.get("envFrom") or []:
         if not isinstance(source, Mapping):
             continue
@@ -1248,8 +1313,15 @@ def read_workload_runtime_environment(
                     skipped_sensitive.append(name)
                 else:
                     variables[name] = str(value if value is not None else "")
+                    variable_sources[name] = {"storage_type": "configmap", "resource_name": str(ref.get("name") or ""), "resource_key": str(key)}
         elif isinstance(source.get("secretRef"), Mapping):
-            skipped.append(f"secretRef:{source['secretRef'].get('name') or '-'}")
+            ref = source["secretRef"]
+            data = secret_data(str(ref.get("name") or ""), optional=bool(ref.get("optional")))
+            for key, value in data.items():
+                name = prefix + str(key)
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    variables[name] = str(value)
+                    variable_sources[name] = {"storage_type": "secret", "resource_name": str(ref.get("name") or ""), "resource_key": str(key)}
     for item in target.get("env") or []:
         if not isinstance(item, Mapping):
             continue
@@ -1269,6 +1341,16 @@ def read_workload_runtime_environment(
                 key = str(cm_ref.get("key") or "")
                 if key in data:
                     variables[name] = str(data[key] if data[key] is not None else "")
+                    variable_sources[name] = {"storage_type": "configmap", "resource_name": str(cm_ref.get("name") or ""), "resource_key": key}
+                else:
+                    skipped.append(name)
+            elif isinstance(value_from, Mapping) and isinstance(value_from.get("secretKeyRef"), Mapping):
+                secret_ref = value_from["secretKeyRef"]
+                data = secret_data(str(secret_ref.get("name") or ""), optional=bool(secret_ref.get("optional")))
+                key = str(secret_ref.get("key") or "")
+                if key in data:
+                    variables[name] = str(data[key])
+                    variable_sources[name] = {"storage_type": "secret", "resource_name": str(secret_ref.get("name") or ""), "resource_key": key}
                 else:
                     skipped.append(name)
             else:
@@ -1277,14 +1359,67 @@ def read_workload_runtime_environment(
             skipped_sensitive.append(name)
         elif "value" in item:
             variables[name] = str(item.get("value") if item.get("value") is not None else "")
+            variable_sources[name] = {"storage_type": "literal", "resource_name": "", "resource_key": ""}
     return {
         "workload_kind": kind,
         "workload_name": source_name,
         "container_name": container_name,
         "variables": dict(sorted(variables.items())),
+        "variable_sources": variable_sources,
         "skipped_value_from_names": sorted(set(skipped)),
         "skipped_sensitive_names": sorted(set(skipped_sensitive)),
     }
+
+
+def apply_workload_runtime_environment(
+    *, environment: Mapping[str, Any], creds: Mapping[str, str],
+    variables: Mapping[str, Any], entries: Iterable[Mapping[str, Any]],
+    deleted_names: Iterable[str], revision: str,
+    hop: Callable[..., tuple[int, str, str]] | None = None,
+    direct: Callable[..., tuple[int, str, str]] | None = None,
+) -> dict[str, Any]:
+    """Materialize referenced resources and patch the selected workload Pod template."""
+    jump_host = str(environment.get("jump_host") or "").strip()
+    workload = str(environment.get("active_workload_name") or environment.get("workload_name") or "").strip()
+    namespace = str(environment.get("namespace") or "default").strip() or "default"
+    kubeconfig_path = str(environment.get("kubeconfig_path") or "/root/.kube/config").strip()
+    nodes = [str(v).strip() for v in (environment.get("nodes") or []) if str(v).strip()]
+    if nodes and not has_explicit_node_auth(creds):
+        nodes = []
+    def run_remote(command: str, timeout: int = 120) -> tuple[int, str, str]:
+        return exec_via_nodes(command, jump_host=jump_host, nodes=nodes, creds=creds,
+                              timeout=timeout, hop=hop, direct=direct,
+                              kubeconfig_path=kubeconfig_path)
+    kind, name, payload = resolve_source_workload(
+        run_remote, namespace=namespace, active=workload, baseline=workload
+    )
+    containers = containers_from_deploy_json(payload)
+    _deploy, preferred = resolve_deploy_target(str(environment.get("service_id") or ""), "", workload)
+    container = pick_container(containers, image="", preferred=preferred)
+    template = copy.deepcopy((payload.get("spec") or {}).get("template") or {})
+    apply_runtime_resources(run_remote, namespace=namespace, entries=entries)
+    apply_runtime_variables_to_pod_template(
+        template, container=container, variables=variables, revision=revision,
+        deleted_names=deleted_names,
+    )
+    target = next(item for item in template["spec"]["containers"] if item.get("name") == container)
+    patch = [
+        {"op": "add", "path": f"/spec/template/spec/containers/{[x.get('name') for x in template['spec']['containers']].index(container)}/env", "value": target.get("env") or []},
+        {"op": "add", "path": "/spec/template/metadata/annotations", "value": (template.get("metadata") or {}).get("annotations") or {}},
+    ]
+    encoded = base64.b64encode(json.dumps(patch, ensure_ascii=False).encode()).decode()
+    command = (f"printf %s {shlex.quote(encoded)} | base64 -d | kubectl -n {shlex.quote(namespace)} "
+               f"patch {kind} {shlex.quote(name)} --type=json --patch-file=/dev/stdin && "
+               f"kubectl -n {shlex.quote(namespace)} rollout restart {kind}/{shlex.quote(name)} && "
+               f"kubectl -n {shlex.quote(namespace)} rollout status {kind}/{shlex.quote(name)} --timeout=180s")
+    code, out, err = run_remote(command, 240)
+    if code != 0:
+        raise CceRolloutError((err or out or f"exit {code}").strip())
+    verify_runtime_variables_on_workload(run_remote, namespace=namespace, kind=kind,
+        workload=name, container=container, variables=variables,
+        deleted_names=deleted_names, revision=revision)
+    return {"workload_kind": kind, "workload_name": name, "container_name": container,
+            "revision": revision}
 
 
 def create_parallel_deployment(
@@ -1493,6 +1628,10 @@ def deploy_job_results(
     cluster = str(environment.get("cluster_name") or "").strip()
     kubeconfig_path = str(environment.get("kubeconfig_path") or "/root/.kube/config").strip()
     runtime_variables = _normalized_runtime_variables(environment.get("runtime_variables"))
+    runtime_entries = [
+        dict(item) for item in (environment.get("runtime_entries") or [])
+        if isinstance(item, Mapping)
+    ]
     runtime_deleted_names = [
         str(item or "").strip() for item in (environment.get("runtime_deleted_names") or [])
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(item or "").strip())
@@ -1577,6 +1716,11 @@ def deploy_job_results(
         if "pem data" in lowered or "invalid key data" in lowered:
             return False, f"kubeconfig 无效或包含 CCE 节点内部加密凭据: {kubeconfig_path}"
         return False, f"Kubernetes 发布前检查失败(namespace={namespace}): {detail}"
+
+    try:
+        apply_runtime_resources(run_remote, namespace=namespace, entries=runtime_entries)
+    except CceRolloutError as exc:
+        return False, str(exc)
 
     for service_id, deploy, image, preferred in planned:
         write(f"gamma部署 {service_id} → workload/{deploy} image={image} mode={mode}")
