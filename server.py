@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -270,6 +272,26 @@ def init_store() -> None:
                     token TEXT PRIMARY KEY,
                     username TEXT NOT NULL,
                     expires REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS user_api_tokens (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    expires_at REAL,
+                    last_used_at TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_api_tokens_username
+                    ON user_api_tokens(username, created_at DESC);
+                CREATE TABLE IF NOT EXISTS api_run_idempotency (
+                    username TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (username, idempotency_key)
                 );
                 CREATE TABLE IF NOT EXISTS environments (
                     id TEXT PRIMARY KEY,
@@ -2014,6 +2036,8 @@ def _ensure_pipeline_templates_table(conn: sqlite3.Connection) -> None:
         )
     if "deployment_mode" not in cols:
         conn.execute("ALTER TABLE pipeline_templates ADD COLUMN deployment_mode TEXT NOT NULL DEFAULT 'parallel'")
+    if "api_enabled" not in cols:
+        conn.execute("ALTER TABLE pipeline_templates ADD COLUMN api_enabled INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pipeline_templates_user_svc "
         "ON pipeline_templates (username, service_id)"
@@ -2039,6 +2063,7 @@ def _pipeline_template_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "gamma_environment_id": gamma_environment_id,
         "deployment_mode": _row_text(row, "deployment_mode").strip() or "parallel",
         "push_target_id": _row_text(row, "push_target_id").strip(),
+        "api_enabled": bool(row["api_enabled"]) if "api_enabled" in row.keys() else False,
         "builtin": bool(row["builtin"]),
         "created_at": str(row["created_at"] or ""),
         "updated_at": str(row["updated_at"] or ""),
@@ -2056,8 +2081,8 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
             id, username, service_id, name, kind, branch,
             gamma_deploy, gamma_test, production_release, environment_id,
             release_environment_id, gamma_environment_id, push_target_id,
-            deployment_mode, builtin, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            deployment_mode, builtin, created_at, updated_at, api_enabled
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"],
@@ -2077,6 +2102,7 @@ def _insert_pipeline_template(conn: sqlite3.Connection, item: dict[str, Any]) ->
             1 if item["builtin"] else 0,
             item["created_at"],
             item["updated_at"],
+            1 if item.get("api_enabled") else 0,
         ),
     )
 
@@ -2129,6 +2155,7 @@ def ensure_default_pipeline_templates(username: str, service_id: str) -> None:
                         "gamma_environment_id": "",
                         "push_target_id": "",
                         "deployment_mode": "parallel",
+                        "api_enabled": False,
                         "builtin": True,
                         "created_at": now,
                         "updated_at": now,
@@ -2216,6 +2243,7 @@ def _normalize_template_fields(data: dict[str, Any], *, require_name: bool = Fal
         "gamma_environment_id": gamma_environment_id,
         "deployment_mode": deployment_mode,
         "push_target_id": str((data or {}).get("push_target_id") or "").strip(),
+        "api_enabled": bool((data or {}).get("api_enabled")),
     }, ""
 
 
@@ -2226,6 +2254,11 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
     fields, err = _normalize_template_fields(data, require_name=True)
     if err or fields is None:
         return None, err
+    if fields["api_enabled"] != bool(item.get("api_enabled")) and not (
+        is_super_admin(username)
+        or _has_service_permission(str(item.get("service_id") or ""), "environment_manage", username)
+    ):
+        return None, "只有超级管理员或环境管理员可以修改 AI API 开放状态"
     if fields["push_target_id"]:
         target = get_registry_target(fields["push_target_id"])
         if target is None or str(target.get("service_id") or "") != str(item.get("service_id") or ""):
@@ -2241,7 +2274,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                 UPDATE pipeline_templates SET
                     name = ?, branch = ?, gamma_deploy = ?, gamma_test = ?, production_release = ?,
                     environment_id = ?, release_environment_id = ?, gamma_environment_id = ?,
-                    push_target_id = ?, deployment_mode = ?, updated_at = ?
+                    push_target_id = ?, deployment_mode = ?, updated_at = ?, api_enabled = ?
                 WHERE id = ?
                 """,
                 (
@@ -2256,6 +2289,7 @@ def update_pipeline_template(username: str, template_id: str, data: dict[str, An
                     fields["push_target_id"],
                     fields["deployment_mode"],
                     now,
+                    1 if fields["api_enabled"] else 0,
                     item["id"],
                 ),
             )
@@ -2312,6 +2346,7 @@ def copy_pipeline_template(
         "builtin": False,
         "username": "",
         "production_release": bool(item["kind"] == "release" and item["production_release"]),
+        "api_enabled": False,
         "created_at": now,
         "updated_at": now,
     }
@@ -2771,6 +2806,191 @@ def session_username(token: str) -> str:
     return username
 
 
+def create_user_api_token(username: str, name: str, expires_in_days: Any = 90) -> tuple[dict[str, Any] | None, str]:
+    user = str(username or "").strip()
+    label = str(name or "AI pipeline token").strip()
+    if not user:
+        return None, "用户不能为空"
+    if not label or len(label) > 80:
+        return None, "Token 名称长度必须为 1-80"
+    try:
+        days = int(expires_in_days)
+    except (TypeError, ValueError):
+        return None, "有效期必须为天数"
+    if days < 1 or days > 365:
+        return None, "有效期必须为 1-365 天"
+    raw = "rci_" + secrets.token_urlsafe(32)
+    token_id = uuid.uuid4().hex[:16]
+    now = time.time()
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            conn.execute(
+                """INSERT INTO user_api_tokens
+                   (id,username,name,token_hash,created_at,expires_at,last_used_at,enabled)
+                   VALUES (?,?,?,?,?,?,?,1)""",
+                (token_id, user, label, hashlib.sha256(raw.encode()).hexdigest(),
+                 _now_stamp(), now + days * 86400, ""),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return {"id": token_id, "name": label, "token": raw, "expires_at": now + days * 86400}, ""
+
+
+def list_user_api_tokens(username: str) -> list[dict[str, Any]]:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            rows = conn.execute(
+                """SELECT id,name,created_at,expires_at,last_used_at,enabled
+                   FROM user_api_tokens WHERE username=? ORDER BY created_at DESC""",
+                (str(username or "").strip(),),
+            ).fetchall()
+        finally:
+            conn.close()
+    return [dict(row) for row in rows]
+
+
+def revoke_user_api_token(username: str, token_id: str) -> bool:
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            cursor = conn.execute(
+                "UPDATE user_api_tokens SET enabled=0 WHERE id=? AND username=?",
+                (str(token_id or "").strip(), str(username or "").strip()),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+
+def api_token_username(raw_token: str) -> str:
+    token = str(raw_token or "").strip()
+    if not token.startswith("rci_") or len(token) < 30:
+        return ""
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    init_store()
+    with _db_lock:
+        conn = _connect_db()
+        try:
+            row = conn.execute(
+                """SELECT id,username,expires_at FROM user_api_tokens
+                   WHERE token_hash=? AND enabled=1""",
+                (digest,),
+            ).fetchone()
+            if not row or (row["expires_at"] is not None and float(row["expires_at"]) <= time.time()):
+                return ""
+            if not conn.execute("SELECT 1 FROM users WHERE username=?", (row["username"],)).fetchone():
+                return ""
+            conn.execute("UPDATE user_api_tokens SET last_used_at=? WHERE id=?", (_now_stamp(), row["id"]))
+            conn.commit()
+            return str(row["username"])
+        finally:
+            conn.close()
+
+
+SUPPORTED_SKILL_AGENTS = ("codex", "claude", "cursor")
+
+
+def _skill_release_version() -> str:
+    marker = ROOT / ".release-commit"
+    try:
+        value = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    return value if re.fullmatch(r"[0-9a-f]{7,40}", value) else "development"
+
+
+def build_agent_skill_package(
+    base_url: str, username: str, token: str, agents: list[str] | tuple[str, ...]
+) -> bytes:
+    selected = [item for item in SUPPORTED_SKILL_AGENTS if item in set(agents)]
+    if not selected:
+        raise ValueError("至少选择一个 Agent")
+    skill_root = ROOT / "skills" / "robot-ci-run-pipeline"
+    required = (
+        skill_root / "SKILL.md",
+        skill_root / "agents" / "openai.yaml",
+        skill_root / "scripts" / "robot_ci_pipeline.py",
+    )
+    if any(not path.is_file() for path in required):
+        raise ValueError("服务器 Skill 文件不完整")
+    config = {
+        "base_url": str(base_url or "").strip().rstrip("/"),
+        "token": str(token or "").strip(),
+        "username": str(username or "").strip(),
+    }
+    if not config["base_url"].startswith(("http://", "https://")) or not config["token"]:
+        raise ValueError("Skill 配置无效")
+    manifest = {
+        "name": "robot-ci-run-pipeline",
+        "version": _skill_release_version(),
+        "api_version": 1,
+        "agents": selected,
+    }
+    powershell_agents = ",".join(f'"{item}"' for item in selected)
+    install_ps1 = f'''param([string]$Agent = "")
+$ErrorActionPreference = "Stop"
+$installHome = if ($env:ROBOT_CI_INSTALL_HOME) {{ $env:ROBOT_CI_INSTALL_HOME }} else {{ $HOME }}
+$defaults = @({powershell_agents})
+$allAgents = @("codex", "claude", "cursor")
+$selected = if (-not $Agent) {{ $defaults }} elseif ($Agent -eq "all") {{ $allAgents }} else {{ @($Agent) }}
+$roots = @{{
+  codex = Join-Path $installHome ".codex\\skills"
+  claude = Join-Path $installHome ".claude\\skills"
+  cursor = Join-Path $installHome ".cursor\\skills"
+}}
+foreach ($name in $selected) {{
+  if (-not $roots.ContainsKey($name)) {{ throw "Unsupported agent: $name" }}
+  $target = Join-Path $roots[$name] "robot-ci-run-pipeline"
+  New-Item -ItemType Directory -Force -Path $roots[$name] | Out-Null
+  if (Test-Path -LiteralPath $target) {{ Remove-Item -LiteralPath $target -Recurse -Force }}
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot "skill\\robot-ci-run-pipeline") -Destination $target -Recurse
+  Write-Output "Installed robot-ci-run-pipeline for $name at $target"
+}}
+'''
+    shell_defaults = " ".join(selected)
+    install_sh = f'''#!/usr/bin/env sh
+set -eu
+agent="${{1:-}}"
+install_home="${{ROBOT_CI_INSTALL_HOME:-$HOME}}"
+if [ -z "$agent" ]; then agents="{shell_defaults}"; elif [ "$agent" = "--all" ] || [ "$agent" = "all" ]; then agents="codex claude cursor"; else agents="$agent"; fi
+for name in $agents; do
+  case "$name" in
+    codex) root="$install_home/.codex/skills" ;;
+    claude) root="$install_home/.claude/skills" ;;
+    cursor) root="$install_home/.cursor/skills" ;;
+    *) echo "Unsupported agent: $name" >&2; exit 2 ;;
+  esac
+  target="$root/robot-ci-run-pipeline"
+  mkdir -p "$root"
+  rm -rf "$target"
+  cp -R "$(dirname "$0")/skill/robot-ci-run-pipeline" "$target"
+  echo "Installed robot-ci-run-pipeline for $name at $target"
+done
+'''
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in required:
+            relative = path.relative_to(skill_root).as_posix()
+            archive.writestr("skill/robot-ci-run-pipeline/" + relative, path.read_bytes())
+        archive.writestr(
+            "skill/robot-ci-run-pipeline/config/robot-ci.json",
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        )
+        archive.writestr("install.ps1", install_ps1)
+        info = zipfile.ZipInfo("install.sh")
+        info.external_attr = 0o755 << 16
+        archive.writestr(info, install_sh)
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    return output.getvalue()
+
+
 def _persist_session(token: str, username: str, expires: float) -> None:
     if not token:
         return
@@ -2868,6 +3088,8 @@ JOB_PUBLIC_FIELDS = (
     "template_name",
     "push_target_id",
     "push_target",
+    "api_invoked",
+    "api_reason",
 )
 
 JOB_COMPACT_FIELDS = (
@@ -2913,6 +3135,8 @@ JOB_COMPACT_FIELDS = (
     "rollback_failed",
     "template_id",
     "template_name",
+    "api_invoked",
+    "api_reason",
     "push_target_id",
     "push_target",
 )
@@ -2920,6 +3144,17 @@ JOB_COMPACT_FIELDS = (
 
 def _has_production_permission(service_id: str, username: str) -> bool:
     return _has_service_permission(service_id, "production_release", username)
+
+
+def _pipeline_targets_production(template: Mapping[str, Any]) -> bool:
+    environment_ids = {
+        str(template.get("release_environment_id") or "").strip(),
+        str(template.get("gamma_environment_id") or "").strip(),
+    } - {""}
+    return any(
+        str((get_environment(environment_id) or {}).get("environment_type") or "dev") == "production"
+        for environment_id in environment_ids
+    )
 
 
 def _has_service_permission(service_id: str, permission_id: str, username: str) -> bool:
@@ -2938,6 +3173,9 @@ def _set_approval_gate(job_id: str, gate_id: str, payload: dict[str, Any]) -> No
 
 
 def wait_for_production_approval(job_id: str, env: dict[str, Any], purpose: str, gate_id: str) -> None:
+    if bool(_job_copy(job_id).get("api_approval_exempt")):
+        append_job_log(job_id, f"SKIP production approval: authorized AI API pipeline ({purpose})")
+        return
     if str(env.get("environment_type") or "dev") != "production":
         return
     approval = {"status": "waiting", "purpose": purpose, "environment": env.get("name"), "gate_id": gate_id}
@@ -5232,6 +5470,9 @@ def persist_job_meta(job_id: str) -> None:
             "frozen_inputs",
             "template_id",
             "template_name",
+            "api_invoked",
+            "api_reason",
+            "api_approval_exempt",
         )
         meta = {k: job.get(k) for k in keys}
         # Keep running-job JSON small so history listing stays cheap.
@@ -5827,6 +6068,24 @@ def resolve_frozen_source_inputs(
         frozen_inputs[item["service_id"]] = resolved_sources[source_key]
 
     return frozen_inputs
+
+
+def resolve_service_branch_sha(service: dict[str, Any], branch: str) -> str:
+    """Resolve one branch tip from the configured source provider."""
+    from frozen_builds import resolve as freeze_ref
+
+    url = service_git_url(service)
+    return freeze_ref(
+        clone_url_for(
+            url,
+            public_https=bool(service.get("public_https")),
+            prefer_token_https=bool(service.get("prefer_token_https")),
+        ),
+        branch,
+        run_cmd,
+        git_args,
+        git_env(url),
+    )
 
 
 def test_report_dir(job_id: str, service_id: str) -> Path:
@@ -9572,6 +9831,25 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _bytes(self, code: int, body: bytes, content_type: str, filename: str = "") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _public_origin(self) -> str:
+        configured = str(os.environ.get("ROBOT_CI_PUBLIC_ORIGIN") or "").strip().rstrip("/")
+        if configured:
+            return configured
+        forwarded = str(self.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip()
+        scheme = forwarded if forwarded in {"http", "https"} else "http"
+        host = str(self.headers.get("Host") or "").strip()
+        return f"{scheme}://{host}" if host else ""
+
     def _session_token(self) -> str:
         raw = self.headers.get("Cookie") or ""
         cookies = SimpleCookie()
@@ -9586,6 +9864,9 @@ class Handler(SimpleHTTPRequestHandler):
         return ""
 
     def _current_user(self) -> str:
+        authorization = str(self.headers.get("Authorization") or "").strip()
+        if authorization.lower().startswith("bearer "):
+            return api_token_username(authorization[7:].strip())
         return session_username(self._session_token())
 
     def _session_cookie_header(self, token: str, *, clear: bool = False, name: str = "") -> str:
@@ -9654,6 +9935,55 @@ class Handler(SimpleHTTPRequestHandler):
                 "user": user or None,
                 "username": user or None,
                 "is_super_admin": bool(user and is_super_admin(user)),
+            })
+            return
+        if path == "/api/ai/tokens":
+            self._json(200, {"tokens": list_user_api_tokens(user or "")})
+            return
+        if path == "/api/ai/pipelines":
+            catalog = {str(item.get("id") or ""): item for item in load_services()}
+            pipelines: list[dict[str, Any]] = []
+            for service_id, service in catalog.items():
+                for template in list_pipeline_templates(user or "", service_id):
+                    if not template.get("api_enabled"):
+                        continue
+                    if _pipeline_targets_production(template) and not _has_production_permission(service_id, user or ""):
+                        continue
+                    environment_id = str(template.get("release_environment_id") or template.get("gamma_environment_id") or "")
+                    environment = get_environment(environment_id) if environment_id else None
+                    pipelines.append({
+                        "pipeline_id": template["id"],
+                        "name": template["name"],
+                        "service_id": service_id,
+                        "repository": public_git_url(service_git_url(service)),
+                        "default_branch": str(service.get("default_branch") or "main"),
+                        "environment_id": environment_id,
+                        "environment": str((environment or {}).get("name") or ""),
+                        "production_release": bool(template.get("production_release")),
+                    })
+            self._json(200, {"pipelines": pipelines})
+            return
+        m_ai_run = re.fullmatch(r"/api/ai/pipeline-runs/([0-9a-f]{12})", path)
+        if m_ai_run:
+            job_id = m_ai_run.group(1)
+            with _jobs_lock:
+                job = deepcopy(_jobs.get(job_id)) if _jobs.get(job_id) else None
+            job = job or load_job_from_disk(job_id)
+            if not job or not job.get("api_invoked") or str(job.get("operator") or "") != (user or ""):
+                self._json(404, {"error": "AI pipeline run not found", "error_code": "run_not_found"})
+                return
+            status = str(job.get("status") or "unknown")
+            mapped = "success" if status == "ok" else status
+            self._json(200, {
+                "run_id": job_id,
+                "status": mapped,
+                "current_stage": str(job.get("stage") or ""),
+                "pipeline_id": str(job.get("template_id") or ""),
+                "branch": str(job.get("branch") or ""),
+                "commit_sha": str(job.get("commit_sha") or (job.get("frozen_inputs") or {}).get(str(job.get("service_id") or "")) or ""),
+                "started_at": str(job.get("created_at") or ""),
+                "finished_at": str(job.get("finished_at") or "") or None,
+                "error": str(job.get("error") or "") or None,
             })
             return
         if path == "/api/login/status":
@@ -10105,6 +10435,125 @@ class Handler(SimpleHTTPRequestHandler):
         user = self._require_api_user(path, "POST")
         if user is None:
             return
+        ai_request: dict[str, Any] | None = None
+
+        if path == "/api/ai/skill-packages":
+            if not self._session_token():
+                self._json(403, {"error": "Skill 包只能通过已登录的网页会话生成", "error_code": "session_required"})
+                return
+            raw_agents = data.get("agents")
+            agents = [str(item).strip().lower() for item in raw_agents] if isinstance(raw_agents, list) else list(SUPPORTED_SKILL_AGENTS)
+            if not agents or any(item not in SUPPORTED_SKILL_AGENTS for item in agents):
+                self._json(400, {"error": "仅支持 codex、claude、cursor", "error_code": "agents_invalid"})
+                return
+            replace_token_id = str(data.get("replace_token_id") or "").strip()
+            if replace_token_id and replace_token_id not in {str(item["id"]) for item in list_user_api_tokens(user)}:
+                self._json(404, {"error": "要替换的 Token 不存在", "error_code": "token_not_found"})
+                return
+            item, err = create_user_api_token(
+                user,
+                str(data.get("token_name") or "Agent Skill").strip(),
+                data.get("expires_in_days", 90),
+            )
+            if err or item is None:
+                self._json(400, {"error": err, "error_code": "token_invalid"})
+                return
+            try:
+                package = build_agent_skill_package(self._public_origin(), user, str(item["token"]), agents)
+            except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                revoke_user_api_token(user, str(item["id"]))
+                self._json(500, {"error": "Skill 包生成失败: " + str(exc), "error_code": "package_failed"})
+                return
+            if replace_token_id:
+                revoke_user_api_token(user, replace_token_id)
+            self._bytes(200, package, "application/zip", "robot-ci-agent-skill.zip")
+            return
+
+        if path == "/api/ai/tokens":
+            if not self._session_token():
+                self._json(403, {"error": "Token 只能通过已登录的网页会话创建", "error_code": "session_required"})
+                return
+            item, err = create_user_api_token(user, data.get("name"), data.get("expires_in_days", 90))
+            if err or item is None:
+                self._json(400, {"error": err, "error_code": "token_invalid"})
+                return
+            self._json(201, {"token": item})
+            return
+
+        m_token_revoke = re.fullmatch(r"/api/ai/tokens/([0-9a-f]{16})/revoke", path)
+        if m_token_revoke:
+            if not self._session_token():
+                self._json(403, {"error": "Token 只能通过已登录的网页会话吊销", "error_code": "session_required"})
+                return
+            if not revoke_user_api_token(user, m_token_revoke.group(1)):
+                self._json(404, {"error": "Token 不存在", "error_code": "token_not_found"})
+                return
+            self._json(200, {"ok": True})
+            return
+
+        if path == "/api/ai/pipeline-runs":
+            pipeline_id = str(data.get("pipeline_id") or "").strip()
+            branch = str(data.get("branch") or "").strip()
+            expected_sha = str(data.get("commit_sha") or "").strip().lower()
+            reason = str(data.get("reason") or "").strip()
+            idempotency_key = str(self.headers.get("Idempotency-Key") or "").strip()
+            if not pipeline_id or not re.fullmatch(r"[\w./-]+", branch) or not re.fullmatch(r"[0-9a-f]{40}", expected_sha):
+                self._json(400, {"error": "pipeline_id、合法 branch 和完整 commit_sha 必填", "error_code": "request_invalid"})
+                return
+            if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", idempotency_key):
+                self._json(400, {"error": "Idempotency-Key 必填，长度 8-128", "error_code": "idempotency_key_invalid"})
+                return
+            template = get_pipeline_template(user, pipeline_id)
+            if not template or not template.get("api_enabled"):
+                self._json(404, {"error": "流水线未开放 AI API", "error_code": "pipeline_not_enabled"})
+                return
+            service_id = str(template.get("service_id") or "")
+            if _pipeline_targets_production(template) and not _has_production_permission(service_id, user):
+                self._json(403, {"error": "没有该流水线的生产发布权限", "error_code": "permission_denied"})
+                return
+            request_hash = hashlib.sha256(json.dumps({
+                "pipeline_id": pipeline_id, "branch": branch, "commit_sha": expected_sha, "reason": reason,
+            }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            init_store()
+            with _db_lock:
+                conn = _connect_db()
+                try:
+                    previous = conn.execute(
+                        "SELECT request_hash,job_id FROM api_run_idempotency WHERE username=? AND idempotency_key=?",
+                        (user, idempotency_key),
+                    ).fetchone()
+                finally:
+                    conn.close()
+            if previous:
+                if str(previous["request_hash"]) != request_hash:
+                    self._json(409, {"error": "Idempotency-Key 已用于不同请求", "error_code": "idempotency_conflict"})
+                    return
+                self._json(200, {"run_id": str(previous["job_id"]), "status": "accepted", "reused": True})
+                return
+            service = next((item for item in load_services() if str(item.get("id") or "") == service_id), None)
+            if not service:
+                self._json(400, {"error": "流水线关联的微服务不存在", "error_code": "service_invalid"})
+                return
+            try:
+                remote_sha = resolve_service_branch_sha(service, branch)
+            except (ValueError, TypeError, OSError, RuntimeError) as exc:
+                self._json(400, {"error": "无法解析远端分支: " + str(exc), "error_code": "branch_resolution_failed"})
+                return
+            if not hmac.compare_digest(remote_sha.lower(), expected_sha):
+                self._json(409, {"error": "远端分支当前提交与 commit_sha 不一致", "error_code": "commit_mismatch", "remote_commit_sha": remote_sha})
+                return
+            ai_request = {
+                "idempotency_key": idempotency_key, "request_hash": request_hash,
+                "commit_sha": expected_sha, "reason": reason,
+            }
+            data = {
+                "service_id": service_id,
+                "branch": branch,
+                "template_id": pipeline_id,
+                "client_id": "ai-" + hashlib.sha256(user.encode()).hexdigest()[:16],
+                "_expected_commit_sha": expected_sha,
+            }
+            path = "/api/push"
 
         if path == "/api/auth/login":
             username = authenticate_user(str(data.get("username") or ""), str(data.get("password") or ""))
@@ -10770,7 +11219,7 @@ class Handler(SimpleHTTPRequestHandler):
                     continue
                 default_branch = str(svc.get("default_branch") or "main")
                 cached = cached_branches(service_branch_cache_key(svc))
-                if cached and item["branch"] not in cached:
+                if not ai_request and cached and item["branch"] not in cached:
                     self._json(
                         400,
                         {
@@ -10779,7 +11228,7 @@ class Handler(SimpleHTTPRequestHandler):
                         },
                     )
                     return
-                if not cached and item["branch"] != default_branch:
+                if not ai_request and not cached and item["branch"] != default_branch:
                     self._json(
                         400,
                         {
@@ -10809,11 +11258,14 @@ class Handler(SimpleHTTPRequestHandler):
                     return
                 items[0]["branch"] = str(source_artifact.get("branch") or "")
             client_id = _normalize_client_id(data.get("client_id"))
-            try:
-                frozen_inputs = resolve_frozen_source_inputs(items, catalog, deployment_type)
-            except (ValueError, TypeError, OSError, KeyError, RuntimeError) as exc:
-                self._json(400, {"error": "Source revision resolution failed: " + str(exc)})
-                return
+            if ai_request:
+                frozen_inputs = {items[0]["service_id"]: str(ai_request["commit_sha"])}
+            else:
+                try:
+                    frozen_inputs = resolve_frozen_source_inputs(items, catalog, deployment_type)
+                except (ValueError, TypeError, OSError, KeyError, RuntimeError) as exc:
+                    self._json(400, {"error": "Source revision resolution failed: " + str(exc)})
+                    return
             try:
                 requested_steps = dict(data.get('optional_steps') or {})
                 requested_steps.update({
@@ -10857,6 +11309,35 @@ class Handler(SimpleHTTPRequestHandler):
                     self._json(503, {"error": "docker unavailable", "detail": docker["detail"]})
                     return
             job_id = uuid.uuid4().hex[:12]
+            if ai_request:
+                try:
+                    with _db_lock:
+                        conn = _connect_db()
+                        try:
+                            conn.execute(
+                                """INSERT INTO api_run_idempotency
+                                   (username,idempotency_key,request_hash,job_id,created_at)
+                                   VALUES (?,?,?,?,?)""",
+                                (user, ai_request["idempotency_key"], ai_request["request_hash"], job_id, _now_stamp()),
+                            )
+                            conn.commit()
+                        finally:
+                            conn.close()
+                except sqlite3.IntegrityError:
+                    with _db_lock:
+                        conn = _connect_db()
+                        try:
+                            previous = conn.execute(
+                                "SELECT request_hash,job_id FROM api_run_idempotency WHERE username=? AND idempotency_key=?",
+                                (user, ai_request["idempotency_key"]),
+                            ).fetchone()
+                        finally:
+                            conn.close()
+                    if previous and str(previous["request_hash"]) == str(ai_request["request_hash"]):
+                        self._json(200, {"run_id": str(previous["job_id"]), "status": "accepted", "reused": True})
+                    else:
+                        self._json(409, {"error": "Idempotency-Key 已用于不同请求", "error_code": "idempotency_conflict"})
+                    return
             log_file = LOG_DIR / f"job-{job_id}.log"
             ids = ",".join(it["service_id"] for it in items)
             service_ids = [it["service_id"] for it in items]
@@ -10907,6 +11388,9 @@ class Handler(SimpleHTTPRequestHandler):
                 "gamma_rollouts": [],
                 "approval": {},
                 "approval_gates": {},
+                "api_invoked": bool(ai_request),
+                "api_reason": str((ai_request or {}).get("reason") or ""),
+                "api_approval_exempt": bool(ai_request),
                 "rollback_requested": False,
                 "rollback_completed": False,
                 "rollback_failed": False,
@@ -10922,6 +11406,17 @@ class Handler(SimpleHTTPRequestHandler):
             }
             conflict = register_concurrent_job(new_job)
             if conflict:
+                if ai_request:
+                    with _db_lock:
+                        conn = _connect_db()
+                        try:
+                            conn.execute(
+                                "DELETE FROM api_run_idempotency WHERE username=? AND idempotency_key=? AND job_id=?",
+                                (user, ai_request["idempotency_key"], job_id),
+                            )
+                            conn.commit()
+                        finally:
+                            conn.close()
                 self._json(409, conflict)
                 return
             for item in items:
@@ -10941,9 +11436,11 @@ class Handler(SimpleHTTPRequestHandler):
                 daemon=True,
             ).start()
             self._json(
-                200,
+                202 if ai_request else 200,
                 {
                     "job_id": job_id,
+                    "run_id": job_id if ai_request else None,
+                    "status": "queued" if ai_request else "running",
                     "client_id": client_id or None,
                     "operator": user,
                     "count": len(items),

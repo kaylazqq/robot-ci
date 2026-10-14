@@ -105,6 +105,7 @@
             <button type="button" class="subtab" data-tab="artifacts">产物管理</button>
             <button type="button" class="subtab" data-tab="envs">环境管理</button>
             <button type="button" class="subtab" data-tab="permissions">权限管理</button>
+            <button type="button" class="subtab" data-tab="ai">AI 接入</button>
           </nav>
         </div>
         <div class="toolbar toolbar-2" id="pipelineActions">
@@ -244,6 +245,31 @@
           <p class="hint error" id="permissionError" hidden></p>
           <div id="permissionGrid"></div>
         </div>
+        <div class="view-pane page-envs" id="viewAi" hidden>
+          <div class="ai-access-card">
+            <h2>Agent Skill 安装包</h2>
+            <p>为当前登录账号生成 Bot Token，并下载可供 Codex、Claude Code 和 Cursor 安装的 Skill 包。</p>
+            <div class="ai-access-form">
+              <label class="label" for="aiTokenName">Token 名称</label>
+              <input id="aiTokenName" class="input" maxlength="80" value="Agent Skill" />
+              <label class="label" for="aiTokenDays">有效期（天）</label>
+              <input id="aiTokenDays" class="input" type="number" min="1" max="365" value="90" />
+              <span class="label">安装目标</span>
+              <div class="ai-agent-options">
+                <label><input type="checkbox" name="aiAgent" value="codex" checked /> Codex</label>
+                <label><input type="checkbox" name="aiAgent" value="claude" checked /> Claude Code</label>
+                <label><input type="checkbox" name="aiAgent" value="cursor" checked /> Cursor</label>
+              </div>
+              <label class="label" for="aiReplaceToken">下载后替换旧 Token（可选）</label>
+              <select id="aiReplaceToken" class="input"><option value="">不替换</option></select>
+              <button type="button" class="btn primary" id="btnDownloadSkill">生成 Token 并下载 Skill</button>
+              <p class="hint error" id="aiAccessError" hidden></p>
+              <p class="hint" id="aiAccessHint"></p>
+            </div>
+            <h3>已有 Token</h3>
+            <div class="art-table-wrap"><table class="art-table"><thead><tr><th>名称</th><th>创建时间</th><th>最后使用</th><th>状态</th><th></th></tr></thead><tbody id="aiTokenBody"></tbody></table></div>
+          </div>
+        </div>
       </section>
 
     </div>
@@ -255,6 +281,10 @@
       <div class="run-block" id="runTemplateNameBlock" hidden>
         <label class="label" for="runTemplateName">流水线名称</label>
         <input id="runTemplateName" class="input" maxlength="60" autocomplete="off" />
+        <label class="deployment-type-option">
+          <input id="runTemplateApiEnabled" type="checkbox" />
+          <span>允许 AI 通过 API 运行该固定流水线</span>
+        </label>
       </div>
       <div class="run-block" id="deploymentTypeBlock">
         <span class="label">部署类型<span class="required-mark">*</span></span>

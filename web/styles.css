@@ -1750,3 +1750,4 @@ body.env-overlay-open { overflow: hidden; }
 }
 .permission-account-admin .row { align-items: center; flex-wrap: wrap; }
 .permission-account-admin .input { width: min(280px, 100%); }
+.ai-access-card{max-width:920px;padding:24px}.ai-access-card h2,.ai-access-card h3{margin:0 0 14px}.ai-access-card>p{color:#667085;margin:0 0 22px}.ai-access-form{display:grid;grid-template-columns:160px minmax(260px,520px);gap:14px 18px;align-items:center;margin-bottom:28px}.ai-access-form .btn,.ai-access-form .hint{grid-column:2}.ai-agent-options{display:flex;gap:22px;flex-wrap:wrap}.ai-agent-options label{display:flex;gap:7px;align-items:center}@media(max-width:760px){.ai-access-form{grid-template-columns:1fr}.ai-access-form .btn,.ai-access-form .hint{grid-column:1}}

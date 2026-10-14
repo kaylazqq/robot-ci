@@ -1,0 +1,4 @@
+interface:
+  display_name: "Robot CI Pipeline Runner"
+  short_description: "Run an authorized fixed Robot CI pipeline"
+  default_prompt: "Use $robot-ci-run-pipeline to run an authorized fixed pipeline for my pushed branch and report the final result."
