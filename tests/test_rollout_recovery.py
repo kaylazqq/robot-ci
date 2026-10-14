@@ -262,7 +262,7 @@ class RecoveryTests(unittest.TestCase):
                     server.set_job("bbbbbbbb", cancel_requested=True)
                     worker.join(5)
 
-    def test_disk_only_job_http_approval_persisted_and_executed(self):
+    def test_disk_only_production_rollback_executes_without_approval(self):
         server._jobs.pop("aaaaaaaa")
         with patch.object(server.Handler, "_require_api_user", return_value="tester"), patch.object(server, "_has_production_permission", return_value=True):
             httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
@@ -277,10 +277,9 @@ class RecoveryTests(unittest.TestCase):
                         return json.load(response)
                 base = "/api/parallel-rollouts/" + self.first["id"]
                 plan = post(base + "/rollback-plan", {})["plan"]
-                self.assertTrue(post(base + "/rollback", {"plan_token": plan["token"]})["approval_required"])
-                self.assertEqual("waiting", server.load_job_from_disk("aaaaaaaa")["approval"]["status"])
-                server._jobs.pop("aaaaaaaa")
-                self.assertTrue(post("/api/jobs/aaaaaaaa/approval", {"action": "continue"})["ok"])
+                result = post(base + "/rollback", {"plan_token": plan["token"]})
+                self.assertTrue(result["operation_started"])
+                self.assertNotIn("approval_required", result)
                 for _ in range(50):
                     stored_job = server.load_job_from_disk("aaaaaaaa") or {}
                     if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back" and stored_job.get("rollback_completed"): break
@@ -292,7 +291,7 @@ class RecoveryTests(unittest.TestCase):
                 httpd.server_close()
                 thread.join()
 
-    def test_release_actions_do_not_require_permission_before_production_rollback_approval(self):
+    def test_release_actions_and_production_rollback_do_not_require_approval(self):
         with patch.object(server.Handler, "_require_api_user", return_value="unprivileged"), patch.object(server, "_has_production_permission", return_value=False):
             httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
             thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -314,17 +313,18 @@ class RecoveryTests(unittest.TestCase):
                     time.sleep(.02)
                 self.assertEqual("old_deleted", server.get_parallel_rollout(self.second["id"])["status"])
 
-                # Production rollback may be initiated by anyone, but still
-                # creates a permission-protected approval gate.
+                # Production rollback starts immediately without an approval gate.
                 first_base = "/api/parallel-rollouts/" + self.first["id"]
                 plan = post(first_base + "/rollback-plan", {})["plan"]
-                self.assertTrue(post(first_base + "/rollback", {"plan_token": plan["token"]})["approval_required"])
-                waiting_pipeline = server.build_job_pipeline(server.ensure_action_job("aaaaaaaa"))
-                self.assertEqual("pending", next(step for step in waiting_pipeline["steps"] if step["id"] == "rollback")["status"])
-                self.assertEqual("queued", next(gate for gate in waiting_pipeline["gates"] if gate["id"] == "rollback")["status"])
-                with self.assertRaises(HTTPError) as denied:
-                    post("/api/jobs/aaaaaaaa/approval", {"action": "continue"})
-                self.assertEqual(403, denied.exception.code)
+                result = post(first_base + "/rollback", {"plan_token": plan["token"]})
+                self.assertTrue(result["operation_started"])
+                self.assertNotIn("approval_required", result)
+                for _ in range(50):
+                    if server.get_parallel_rollout(self.first["id"])["status"] == "rolled_back": break
+                    time.sleep(.02)
+                self.assertEqual({"v1"}, set(self.live))
+                pipeline = server.build_job_pipeline(server.ensure_action_job("aaaaaaaa"))
+                self.assertEqual([], pipeline["gates"])
             finally:
                 httpd.shutdown()
                 httpd.server_close()

@@ -112,6 +112,7 @@ class JobCoordinationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "echoagent-backend",
+                "echoagent-agent",
                 "echoagent-frontend",
                 "echoagent-router",
                 "org-admin",
@@ -455,7 +456,7 @@ class JobPayloadTests(unittest.TestCase):
 
 
 class JobPipelineTests(unittest.TestCase):
-    def test_gamma_deploy_only_keeps_gamma_and_places_production_gate_before_it(self) -> None:
+    def test_gamma_deploy_only_keeps_gamma_without_production_gate(self) -> None:
         job = make_job("pipe-gamma-deploy", status="running")
         job.update({
             "stage": "gamma",
@@ -471,10 +472,7 @@ class JobPipelineTests(unittest.TestCase):
         gamma = next(row for row in payload["steps"] if row["id"] == "gamma")
         self.assertEqual(["deploy"], [row["id"] for row in gamma["subtasks"]])
         self.assertEqual("pending", gamma["status"])
-        self.assertEqual(
-            [{"id": "gamma", "before": "gamma", "purpose": "gamma集成测试", "environment": "prod", "status": "queued", "operator": "", "approved_at": ""}],
-            payload["gates"],
-        )
+        self.assertEqual([], payload["gates"])
 
     def test_release_waits_yellow_and_rollback_stays_gray_until_used(self) -> None:
         job = make_job("pipe-release-wait", status="running")
@@ -978,6 +976,7 @@ class SourceProviderTests(unittest.TestCase):
         github = {item["id"]: item for item in server.load_services("github")}
 
         self.assertEqual("hw-colink/EchoAgent", gitcode["echoagent-backend"]["repo"])
+        self.assertEqual("hw-colink/EchoAgent", gitcode["echoagent-agent"]["repo"])
         self.assertEqual("hw-colink/EchoAgent", gitcode["echoagent-frontend"]["repo"])
         self.assertEqual("hw-colink/EchoRouter", gitcode["echoagent-router"]["repo"])
         self.assertEqual("hw-colink/org-admin", gitcode["org-admin"]["repo"])
@@ -1272,6 +1271,27 @@ artifacts:
         self.assertIn("--build-arg SOURCE_URL=https://github.com/tech-innovation-group/EchoAgent.git", command)
         self.assertIn("-t local/echoagent-frontend:", command)
 
+    @patch.object(server, "run_stream", return_value=0)
+    def test_echoagent_agent_uses_colink_agent_production_target(self, run_stream) -> None:
+        svc = next(item for item in server.load_services("github") if item["id"] == "echoagent-agent")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = server.Path(tmp)
+            dockerfile = workspace / "deploy" / "production" / "Dockerfile"
+            dockerfile.parent.mkdir(parents=True)
+            dockerfile.write_text("FROM scratch AS colink-agent\n", encoding="utf-8")
+            with patch.object(server, "repo_dir", return_value=workspace):
+                ok, detail = server.build_from_source(
+                    "no-job",
+                    svc,
+                    "abcdef1",
+                    commit_sha="abcdef1234567890abcdef1234567890abcdef12",
+                )
+        self.assertTrue(ok, detail)
+        command = " ".join(run_stream.call_args.args[1])
+        self.assertIn("--file deploy/production/Dockerfile", command)
+        self.assertIn("--target colink-agent", command)
+        self.assertIn("-t local/echoagent-agent:", command)
+
     def test_echoagent_services_have_isolated_workspaces(self) -> None:
         services = {
             svc["id"]: svc
@@ -1279,13 +1299,13 @@ artifacts:
             if str(svc.get("id") or "").startswith("echoagent-")
         }
         self.assertEqual(
-            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
+            {"echoagent-backend", "echoagent-agent", "echoagent-frontend", "echoagent-router"},
             set(services),
         )
         paths = {server.repo_dir(svc, "deadbeef") for svc in services.values()}
-        self.assertEqual(3, len(paths))
+        self.assertEqual(4, len(paths))
         self.assertEqual(
-            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
+            {"echoagent-backend", "echoagent-agent", "echoagent-frontend", "echoagent-router"},
             {svc["image"] for svc in services.values()},
         )
 
@@ -1320,6 +1340,7 @@ artifacts:
             {"service_id": service_id, "branch": "feature/echo-branch-build"}
             for service_id in (
                 "echoagent-backend",
+                "echoagent-agent",
                 "echoagent-frontend",
                 "echoagent-router",
             )
@@ -1609,6 +1630,7 @@ class JobEndpointTests(unittest.TestCase):
         self.assertEqual(
             {
                 "echoagent-backend",
+                "echoagent-agent",
                 "echoagent-frontend",
                 "echoagent-router",
                 "org-admin",
@@ -1620,9 +1642,10 @@ class JobEndpointTests(unittest.TestCase):
         configured = {item["id"]: item for item in server.load_services()}
         self.assertTrue(configured["echoagent-backend"]["dockerfile_build"])
         self.assertEqual(
-            {"echoagent-backend", "echoagent-frontend", "echoagent-router"},
+            {"echoagent-backend", "echoagent-agent", "echoagent-frontend", "echoagent-router"},
             {services[service_id]["image"] for service_id in services if service_id.startswith("echoagent-")},
         )
+        self.assertEqual("colink-agent", configured["echoagent-agent"]["docker_target"])
 
     @patch.object(server, "cached_branches", return_value=["main", "feature/a"])
     def test_push_rejects_branch_not_in_selected_service_cache(self, cached) -> None:

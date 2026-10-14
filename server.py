@@ -3173,23 +3173,8 @@ def _set_approval_gate(job_id: str, gate_id: str, payload: dict[str, Any]) -> No
 
 
 def wait_for_production_approval(job_id: str, env: dict[str, Any], purpose: str, gate_id: str) -> None:
-    if bool(_job_copy(job_id).get("api_approval_exempt")):
-        append_job_log(job_id, f"SKIP production approval: authorized AI API pipeline ({purpose})")
-        return
-    if str(env.get("environment_type") or "dev") != "production":
-        return
-    approval = {"status": "waiting", "purpose": purpose, "environment": env.get("name"), "gate_id": gate_id}
-    _set_approval_gate(job_id, gate_id, approval)
-    set_job(job_id, approval=approval)
-    append_job_log(job_id, f"WAIT production approval: {purpose}")
-    while True:
-        if job_cancel_requested(job_id):
-            raise JobStopped()
-        state = str((_job_copy(job_id).get("approval") or {}).get("status") or "")
-        if state == "approved":
-            append_job_log(job_id, f"OK production approval: {purpose}")
-            return
-        time.sleep(1)
+    """Compatibility hook retained for callers; pipeline approvals are disabled."""
+    return
 
 
 def _job_service_ids(job: dict[str, Any]) -> list[str]:
@@ -3427,14 +3412,6 @@ def _package_prepare_lane(job: dict[str, Any]) -> list[dict[str, Any]]:
         "detail": detail,
         "subtasks": _subtask_rows("package", state),
     }]
-
-
-def _job_needs_production_approval(job: dict[str, Any]) -> bool:
-    opts = _normalize_optional_steps(job.get("optional_steps"))
-    ids = []
-    if opts.get("gamma_test"): ids.append(opts.get("gamma_environment_id"))
-    if opts.get("production_release"): ids.append(opts.get("release_environment_id"))
-    return any((get_environment(str(env_id)) or {}).get("environment_type") == "production" for env_id in ids if env_id)
 
 
 def _spread_status_to_subtasks(status: str, count: int, *, fail_index: int | None = None) -> list[str]:
@@ -4295,6 +4272,9 @@ def build_job_pipeline(job: dict[str, Any]) -> dict[str, Any]:
             "operator": state.get("operator") or "",
             "approved_at": state.get("approved_at") or "",
         })
+    # Approval gates are intentionally disabled. Preserve the response field
+    # for API compatibility while keeping both the UI and execution ungated.
+    gates.clear()
     return {
         "progress": progress_text,
         "current_service": current_sid,
@@ -9210,8 +9190,6 @@ def maybe_run_gamma_after_build(
         job_sids = set(_job_service_ids(job))
         if env_sid and env_sid not in job_sids:
             return False, f"gamma测试失败: 环境属于 {env_sid}，与当前微服务不符"
-        if str(gamma_env.get("environment_type") or "dev") == "production":
-            wait_for_production_approval(job_id, gamma_env, "gamma集成测试", "gamma")
         from gamma_real import available, run as run_real_gamma
         if not available(gamma_env_id):
             return False, "该环境尚未配置真实 Gamma 驱动；未执行 Gamma 测试"
@@ -9241,8 +9219,6 @@ def maybe_run_gamma_after_build(
                 msg = f"生产发布失败: 环境属于 {env_sid}，与当前微服务不符"
                 append_job_log(job_id, f"ERROR {msg}")
                 return False, msg
-            if str(env.get("environment_type") or "dev") == "production":
-                wait_for_production_approval(job_id, env, "生产发布", "release")
             creds = cce_rollout.overlay_environment_passwords(
                 cce_rollout.resolve_credentials(CFG, os.environ),
                 env,
@@ -10953,19 +10929,6 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValueError("环境版本已变化，请重新预览并确认回滚")
             except Exception as exc:
                 self._json(409, {"error": str(exc)}); return
-            if str(env.get("environment_type") or "dev") == "production":
-                approval = {
-                    "status": "waiting", "purpose": "一键回滚",
-                    "environment": env.get("name") or "", "gate_id": "rollback",
-                    "rollout_id": str(record.get("id") or ""),
-                    "plan_token": plan["token"],
-                }
-                _mark_rollback_job_running(job_id)
-                _set_approval_gate(job_id, "rollback", approval)
-                set_job(job_id, approval=approval)
-                append_job_step_log(job_id, "rollback", "log", "等待生产环境一键回滚人工确认")
-                self._json(200, {"ok": True, "approval_required": True})
-                return
             item, err = start_parallel_rollout_rollback(m_rollout_rollback.group(1), plan["token"])
             if err or item is None:
                 self._json(400, {"error": err}); return

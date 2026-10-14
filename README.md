@@ -114,7 +114,7 @@ SWR 推送成功后，还会把镜像 `docker save` 到本机 nginx 目录，按
 
 ### EchoAgent 多镜像构建
 
-构建页面提供 `EchoAgent Backend`、`EchoAgent Frontend` 和 `EchoAgent Router` 三个可独立选择的构建项。三个构建项都从 `tech-innovation-group/EchoAgent` 的所选分支拉取源码；Backend、Frontend 使用生产 Dockerfile 的对应 target，Router 使用 `dev/router/Dockerfile` 的 `router` target，然后推送到当前配置的 SWR 组织。每个镜像使用独立工作目录，并在任务创建时锁定所选分支的源码提交；镜像标签仍由 robot-ci 统一生成，镜像内写入完整源码提交和公开源码地址的 OCI 标签。
+构建页面提供 `EchoAgent Backend`、`EchoAgent Agent`、`EchoAgent Frontend` 和 `EchoAgent Router` 四个可独立选择的构建项。四个构建项都从 `tech-innovation-group/EchoAgent` 的所选分支拉取源码；Backend、Agent、Frontend 分别使用生产 Dockerfile 的 `backend`、`colink-agent`、`frontend` target，Router 使用 `dev/router/Dockerfile` 的 `router` target，然后推送到当前配置的 SWR 组织。每个镜像使用独立工作目录，并在任务创建时锁定所选分支的源码提交；镜像标签仍由 robot-ci 统一生成，镜像内写入完整源码提交和公开源码地址的 OCI 标签。
 
 已整改的服务仓以 `.cid/build.yaml` 作为唯一构建契约。robot-ci 在拉取分支后读取该文件，并按 `scripts` 顺序执行启用的 UT、DT 和镜像构建步骤；测试报告格式及路径、构建超时、镜像名称和交付方式也来自该文件。
 
@@ -144,7 +144,7 @@ robot-ci 会校验 YAML 的服务 ID、唯一构建步骤、测试类型、报�
 
 已完成一键回滚的发布记录不能重复回滚，页面保留置灰按钮并由后端同时拒绝重复请求。
 
-发布后的负载操作按环境类型区分：非生产环境的部署、老版本下线和一键回滚不检查生产发布权限；生产环境完成发布审批后，老版本下线不再重复检查权限；生产环境一键回滚允许发起，但继续通过人工卡点要求具有生产发布权限的用户审批。
+生产发布权限在启动流水线时校验。流水线启动后，Gamma、生产发布和一键回滚均直接执行，不再创建或等待人工卡点；发布后的老版本下线仍沿用现有权限边界。
 
 老版本下线和一键回滚采用持久化异步操作：接口提交后立即返回，页面原地显示删除、恢复、等待就绪、清理、完成或失败阶段并轮询更新。未完成操作会在服务重启后恢复，避免长 HTTP 请求无反馈或重启后流水线永久停在等待状态。
 
