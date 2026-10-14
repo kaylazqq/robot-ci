@@ -34,6 +34,7 @@ ids = {item["id"] for item in services}
 print("services:", ", ".join(sorted(ids)))
 assert ids == {
     "echoagent-backend",
+    "echoagent-agent",
     "echoagent-frontend",
     "echoagent-router",
     "org-admin",
