@@ -3667,7 +3667,7 @@ function envDetailShell(env, basicHtml) {
     '</div>' +
     '<div data-env-detail-pane="basic">' + basicHtml + '</div>' +
     '<div data-env-detail-pane="runtime" data-env-runtime-id="' + esc(existing ? env.id : '') + '" hidden>' +
-      '<p class="env-secret-hint">配置只保存在 CI；下次生产发布时写入目标工作负载的 Pod 模板 env，不会修改 ConfigMap。发布后会重新读取并校验。请勿在此填写密码、Token 或密钥。</p>' +
+      '<p class="env-secret-hint">配置持久化在 CI；可选择普通变量、ConfigMap 或 Secret。点击“应用到 Kubernetes”立即写入并重启工作负载，生产发布也会幂等应用并校验。</p>' +
       '<div data-env-runtime-content><p class="env-secret-hint">点击“运行配置”加载变量。</p></div>' +
     '</div>';
 }
@@ -3681,19 +3681,32 @@ function renderRuntimeConfigPane(pane, data) {
   const editable = canManageEnvironments();
   const body = rows.length ? rows.map((item) => (
     '<tr><td><code>' + esc(item.name) + '</code></td><td class="runtime-value"><code>' + esc(item.value) + '</code></td>' +
+    '<td>' + esc(item.storage_type || 'literal') + (item.resource_name ? '<br><code>' + esc(item.resource_name) + '/' + esc(item.resource_key || item.name) + '</code>' : '') + '</td>' +
     '<td>' + (item.source === 'cluster' ? '真实环境' : '手工') + '</td><td>' + esc(item.updated_by || item.created_by || '—') + '</td><td>' + esc(item.updated_at || item.created_at || '—') + '</td>' +
     '<td><button type="button" class="btn ghost danger" data-runtime-delete="' + esc(item.name) + '"' + (editable ? '' : ' disabled') + '>删除</button></td></tr>'
-  )).join('') : '<tr><td colspan="6" class="runtime-empty">暂无运行变量</td></tr>';
+  )).join('') : '<tr><td colspan="7" class="runtime-empty">暂无运行变量</td></tr>';
   const syncText = sync ? ('上次同步：' + esc(sync.synced_at || '—') + '，' + esc(sync.workload_kind || '') + '/' + esc(sync.workload_name || '') + ' · 容器 ' + esc(sync.container_name || '—') + '；跳过 Secret/不支持引用 ' + ((sync.skipped_value_from_names || []).length) + ' 项、敏感变量 ' + ((sync.skipped_sensitive_names || []).length) + ' 项') : '尚未从真实环境同步';
   const deletedText = deletedNames.length ? '<div class="runtime-pending-delete">下次发布将删除：' + deletedNames.map((name) => '<code>' + esc(name) + '</code>').join('、') + '</div>' : '';
   root.innerHTML = '<div class="runtime-config-toolbar"><div><div class="runtime-config-meta">当前版本 <code>' + esc((data && data.revision) || '—') + '</code> · 共 ' + rows.length + ' 项</div><div class="env-secret-hint">' + syncText + '</div></div>' +
-    (editable ? '<button type="button" class="btn" data-runtime-sync>同步真实环境</button>' : '') + '</div>' + deletedText +
-    '<div class="art-table-wrap"><table class="art-table runtime-config-table"><thead><tr><th>变量名</th><th>变量值</th><th>来源</th><th>操作人</th><th>更新时间</th><th></th></tr></thead><tbody>' + body + '</tbody></table></div>' +
+    (editable ? '<div><button type="button" class="btn" data-runtime-sync>同步真实环境</button> <button type="button" class="btn primary" data-runtime-apply>应用到 Kubernetes</button></div>' : '') + '</div>' + deletedText +
+    '<div class="art-table-wrap"><table class="art-table runtime-config-table"><thead><tr><th>变量名</th><th>变量值</th><th>存储类型</th><th>来源</th><th>操作人</th><th>更新时间</th><th></th></tr></thead><tbody>' + body + '</tbody></table></div>' +
     (editable ? '<div class="runtime-config-add"><input class="input" data-runtime-name maxlength="128" placeholder="变量名，例如 AGENT_MCP_PUBLIC_URL" />' +
       '<input class="input" data-runtime-value maxlength="16384" placeholder="变量值" />' +
+      '<select class="input" data-runtime-storage><option value="literal">普通变量</option><option value="configmap">ConfigMap</option><option value="secret">Secret</option></select>' +
+      '<input class="input" data-runtime-resource placeholder="ConfigMap/Secret 名称" />' +
+      '<input class="input" data-runtime-key placeholder="资源 Key（默认变量名）" />' +
       '<button type="button" class="btn primary" data-runtime-save>新增或更新</button></div>' : '');
   const envId = pane.getAttribute('data-env-runtime-id') || '';
   const syncButton = root.querySelector('[data-runtime-sync]');
+  const applyButton = root.querySelector('[data-runtime-apply]');
+  if (applyButton) applyButton.addEventListener('click', async () => {
+    if (!await askEnvConfirm('确认将当前运行配置写入 Kubernetes，并重启工作负载吗？', {title:'应用运行配置', confirmLabel:'确认应用'})) return;
+    applyButton.disabled = true;
+    try {
+      const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/apply', {method:'POST', body:'{}'});
+      setEnvFormError(''); renderRuntimeConfigPane(pane, result);
+    } catch (error) { setEnvFormError(error.message); applyButton.disabled = false; }
+  });
   if (syncButton) syncButton.addEventListener('click', async () => {
     if (!await askEnvConfirm('确认从目标工作负载读取普通环境变量和非敏感 ConfigMap 配置并合并吗？Secret 引用不会读取。', {title:'同步真实环境', confirmLabel:'确认同步'})) return;
     syncButton.disabled = true;
@@ -3722,12 +3735,15 @@ function renderRuntimeConfigPane(pane, data) {
   if (save) save.addEventListener('click', async () => {
     const nameInput = root.querySelector('[data-runtime-name]');
     const valueInput = root.querySelector('[data-runtime-value]');
+    const storageInput = root.querySelector('[data-runtime-storage]');
+    const resourceInput = root.querySelector('[data-runtime-resource]');
+    const keyInput = root.querySelector('[data-runtime-key]');
     const name = (nameInput && nameInput.value || '').trim();
     const value = valueInput ? valueInput.value : '';
     if (!name) { setEnvFormError('请输入变量名'); return; }
     save.disabled = true;
     try {
-      const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/variables', {method:'POST', body:JSON.stringify({name, value})});
+      const result = await api('/api/environments/' + encodeURIComponent(envId) + '/runtime-config/variables', {method:'POST', body:JSON.stringify({name, value, storage_type:storageInput.value, resource_name:resourceInput.value.trim(), resource_key:keyInput.value.trim()})});
       setEnvFormError('');
       renderRuntimeConfigPane(pane, result);
     } catch (error) {

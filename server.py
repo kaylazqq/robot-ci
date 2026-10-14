@@ -335,6 +335,9 @@ def init_store() -> None:
                     updated_at TEXT NOT NULL,
                     state TEXT NOT NULL DEFAULT 'present',
                     source TEXT NOT NULL DEFAULT 'manual',
+                    storage_type TEXT NOT NULL DEFAULT 'literal',
+                    resource_name TEXT NOT NULL DEFAULT '',
+                    resource_key TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (environment_id, name)
                 );
                 CREATE INDEX IF NOT EXISTS idx_environment_runtime_variables_environment
@@ -461,6 +464,12 @@ def _ensure_environment_runtime_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE environment_runtime_variables ADD COLUMN state TEXT NOT NULL DEFAULT 'present'")
     if "source" not in cols:
         conn.execute("ALTER TABLE environment_runtime_variables ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+    if "storage_type" not in cols:
+        conn.execute("ALTER TABLE environment_runtime_variables ADD COLUMN storage_type TEXT NOT NULL DEFAULT 'literal'")
+    if "resource_name" not in cols:
+        conn.execute("ALTER TABLE environment_runtime_variables ADD COLUMN resource_name TEXT NOT NULL DEFAULT ''")
+    if "resource_key" not in cols:
+        conn.execute("ALTER TABLE environment_runtime_variables ADD COLUMN resource_key TEXT NOT NULL DEFAULT ''")
     sync_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(environment_runtime_sync_state)")}
     if "skipped_sensitive_json" not in sync_cols:
         conn.execute("ALTER TABLE environment_runtime_sync_state ADD COLUMN skipped_sensitive_json TEXT NOT NULL DEFAULT '[]'")
@@ -877,7 +886,9 @@ _RUNTIME_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 def _runtime_config_revision(variables: list[dict[str, Any]], deleted_names: list[str] | None = None) -> str:
     payload = {
-        "variables": [[str(item.get("name") or ""), str(item.get("value") or "")] for item in variables],
+        "variables": [[str(item.get("name") or ""), str(item.get("value") or ""),
+                       str(item.get("storage_type") or "literal"), str(item.get("resource_name") or ""),
+                       str(item.get("resource_key") or "")] for item in variables],
         "deleted_names": sorted(str(item) for item in (deleted_names or [])),
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -892,7 +903,8 @@ def list_environment_runtime_variables(env_id: str) -> dict[str, Any]:
         try:
             rows = conn.execute(
                 """
-                SELECT name, value, created_by, created_at, updated_by, updated_at, state, source
+                SELECT name, value, created_by, created_at, updated_by, updated_at, state, source,
+                       storage_type, resource_name, resource_key
                 FROM environment_runtime_variables
                 WHERE environment_id = ?
                 ORDER BY name
@@ -910,6 +922,9 @@ def list_environment_runtime_variables(env_id: str) -> dict[str, Any]:
             "updated_by": str(row["updated_by"] or ""),
             "updated_at": str(row["updated_at"] or ""),
             "source": str(row["source"] or "manual"),
+            "storage_type": str(row["storage_type"] or "literal"),
+            "resource_name": str(row["resource_name"] or ""),
+            "resource_key": str(row["resource_key"] or ""),
         }
         for row in rows if str(row["state"] or "present") == "present"
     ]
@@ -963,6 +978,19 @@ def upsert_environment_runtime_variable(
     if raw_value is None:
         return None, "变量值不能为空"
     value = str(raw_value)
+    storage_type = str(data.get("storage_type") or "literal").strip().lower()
+    resource_name = str(data.get("resource_name") or "").strip()
+    resource_key = str(data.get("resource_key") or name).strip()
+    if storage_type not in {"literal", "configmap", "secret"}:
+        return None, "storage_type must be literal, configmap or secret"
+    if storage_type != "literal":
+        if not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", resource_name) or len(resource_name) > 253:
+            return None, "ConfigMap/Secret name is invalid"
+        if not resource_key or len(resource_key.encode("utf-8")) > 253:
+            return None, "ConfigMap/Secret key is invalid"
+    else:
+        resource_name = ""
+        resource_key = ""
     if "\x00" in value:
         return None, "变量值不能包含空字符"
     if len(value.encode("utf-8")) > 16384:
@@ -976,16 +1004,18 @@ def upsert_environment_runtime_variable(
             conn.execute(
                 """
                 INSERT INTO environment_runtime_variables (
-                    environment_id, name, value, created_by, created_at, updated_by, updated_at, state, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'present', 'manual')
+                    environment_id, name, value, created_by, created_at, updated_by, updated_at, state, source,
+                    storage_type, resource_name, resource_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'present', 'manual', ?, ?, ?)
                 ON CONFLICT(environment_id, name) DO UPDATE SET
                     value=excluded.value,
                     updated_by=excluded.updated_by,
                     updated_at=excluded.updated_at,
                     state='present',
-                    source='manual'
+                    source='manual', storage_type=excluded.storage_type,
+                    resource_name=excluded.resource_name, resource_key=excluded.resource_key
                 """,
-                (eid, name, value, username, now, username, now),
+                (eid, name, value, username, now, username, now, storage_type, resource_name, resource_key),
             )
             conn.commit()
         finally:
@@ -1032,6 +1062,7 @@ def sync_environment_runtime_variables(
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     username = str(actor or "").strip()
     variables = snapshot.get("variables") if isinstance(snapshot.get("variables"), Mapping) else {}
+    sources = snapshot.get("variable_sources") if isinstance(snapshot.get("variable_sources"), Mapping) else {}
     init_store()
     with _db_lock:
         conn = _connect_db()
@@ -1040,13 +1071,18 @@ def sync_environment_runtime_variables(
                 conn.execute(
                     """
                     INSERT INTO environment_runtime_variables (
-                        environment_id, name, value, created_by, created_at, updated_by, updated_at, state, source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'present', 'cluster')
+                    environment_id, name, value, created_by, created_at, updated_by, updated_at, state, source,
+                    storage_type, resource_name, resource_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'present', 'cluster', ?, ?, ?)
                     ON CONFLICT(environment_id, name) DO UPDATE SET
                         value=excluded.value, updated_by=excluded.updated_by, updated_at=excluded.updated_at,
-                        state='present', source='cluster'
+                        state='present', source='cluster', storage_type=excluded.storage_type,
+                        resource_name=excluded.resource_name, resource_key=excluded.resource_key
                     """,
-                    (env_id, str(name), str(value), username, now, username, now),
+                    (env_id, str(name), str(value), username, now, username, now,
+                     str((sources.get(name) or {}).get("storage_type") or "literal"),
+                     str((sources.get(name) or {}).get("resource_name") or ""),
+                     str((sources.get(name) or {}).get("resource_key") or "")),
                 )
             conn.execute(
                 """
@@ -1072,6 +1108,34 @@ def sync_environment_runtime_variables(
         finally:
             conn.close()
     return list_environment_runtime_variables(env_id)
+
+
+def apply_environment_runtime_variables(env_id: str) -> dict[str, Any]:
+    environment = get_environment(env_id, include_secrets=True)
+    if environment is None:
+        raise cce_rollout.CceRolloutError("environment not found")
+    config = list_environment_runtime_variables(env_id)
+    entries = list(config.get("variables") or [])
+    variables: dict[str, Any] = {}
+    for item in entries:
+        name = str(item.get("name") or "")
+        storage = str(item.get("storage_type") or "literal")
+        ref_name = str(item.get("resource_name") or "")
+        ref_key = str(item.get("resource_key") or name)
+        if storage == "configmap":
+            variables[name] = {"valueFrom": {"configMapKeyRef": {"name": ref_name, "key": ref_key}}}
+        elif storage == "secret":
+            variables[name] = {"valueFrom": {"secretKeyRef": {"name": ref_name, "key": ref_key}}}
+        else:
+            variables[name] = str(item.get("value") or "")
+    creds = cce_rollout.overlay_environment_passwords(
+        cce_rollout.resolve_credentials(CFG, os.environ), environment
+    )
+    applied = cce_rollout.apply_workload_runtime_environment(
+        environment=environment, creds=creds, variables=variables, entries=entries,
+        deleted_names=config.get("deleted_names") or [], revision=str(config.get("revision") or ""),
+    )
+    return {**config, "applied": applied}
 
 
 def discover_environment_kubeconfigs(
@@ -9247,12 +9311,27 @@ def maybe_run_gamma_after_build(
             with rollout_recovery.environment_lock(env_id):
                 env = get_environment(env_id, include_secrets=True) or env
                 runtime_config = list_environment_runtime_variables(env_id)
+                runtime_entries = list(runtime_config.get("variables") or [])
+                runtime_variables: dict[str, Any] = {}
+                for item in runtime_entries:
+                    name = str(item.get("name") or "")
+                    storage = str(item.get("storage_type") or "literal")
+                    resource_name = str(item.get("resource_name") or "")
+                    resource_key = str(item.get("resource_key") or name)
+                    if storage == "configmap":
+                        runtime_variables[name] = {"valueFrom": {"configMapKeyRef": {
+                            "name": resource_name, "key": resource_key,
+                        }}}
+                    elif storage == "secret":
+                        runtime_variables[name] = {"valueFrom": {"secretKeyRef": {
+                            "name": resource_name, "key": resource_key,
+                        }}}
+                    else:
+                        runtime_variables[name] = str(item.get("value") or "")
                 env = {
                     **env,
-                    "runtime_variables": {
-                        str(item.get("name") or ""): str(item.get("value") or "")
-                        for item in runtime_config.get("variables") or []
-                    },
+                    "runtime_variables": runtime_variables,
+                    "runtime_entries": runtime_entries,
                     "runtime_deleted_names": list(runtime_config.get("deleted_names") or []),
                     "runtime_config_revision": str(runtime_config.get("revision") or ""),
                 }
@@ -10817,6 +10896,24 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(404, {"ok": False, "error": "运行变量不存在"})
                 return
             self._json(200, {"ok": True, **list_environment_runtime_variables(env_id)})
+            return
+
+        m_runtime_apply = re.fullmatch(r"/api/environments/([^/]+)/runtime-config/apply", path)
+        if m_runtime_apply:
+            env_id = m_runtime_apply.group(1)
+            env = get_environment(env_id)
+            if env is None:
+                self._json(404, {"ok": False, "error": "environment not found"})
+                return
+            if not _has_service_permission(str(env.get("service_id") or ""), "environment_manage", user):
+                self._json(403, {"ok": False, "error": "no environment management permission"})
+                return
+            try:
+                runtime_config = apply_environment_runtime_variables(env_id)
+            except cce_rollout.CceRolloutError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+                return
+            self._json(200, {"ok": True, **runtime_config})
             return
 
         m_runtime_sync = re.fullmatch(r"/api/environments/([^/]+)/runtime-config/sync", path)
