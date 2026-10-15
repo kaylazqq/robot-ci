@@ -1,5 +1,9 @@
 # SWR 一键推送
 
+## 使用文档
+
+- [Robot CI 使用指南](docs/robot-ci-user-guide.md)：登录、手动/AI 执行流水线，以及环境、定时任务和代码源管理。
+
 ## 发给别人（本机 Windows）
 
 只要这些文件，或发 `dist\swr-push-helper-*.zip`：
