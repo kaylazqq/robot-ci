@@ -1352,6 +1352,37 @@ artifacts:
         self.assertEqual({item["service_id"] for item in items}, set(frozen))
         self.assertEqual({"a" * 40}, set(frozen.values()))
 
+    @patch("server.resolve_frozen_source_inputs", return_value={"echoagent-backend": "a" * 40})
+    def test_worker_resolves_and_persists_frozen_source_revision(self, resolve) -> None:
+        job_id = "resolve-source"
+        with server._jobs_lock:
+            server._jobs[job_id] = make_job(job_id, service_id="echoagent-backend")
+            server._jobs[job_id]["frozen_inputs"] = {}
+        items = [{"service_id": "echoagent-backend", "branch": "main"}]
+        catalog = {svc["id"]: svc for svc in server.load_services()}
+
+        frozen = server.prepare_job_frozen_inputs(job_id, items, catalog)
+
+        self.assertEqual({"echoagent-backend": "a" * 40}, frozen)
+        self.assertEqual(frozen, server._job_copy(job_id)["frozen_inputs"])
+        resolve.assert_called_once_with(items, catalog, "code")
+
+    @patch("server.resolve_frozen_source_inputs", side_effect=ValueError("SSH timeout"))
+    def test_worker_records_source_resolution_failure(self, _resolve) -> None:
+        job_id = "resolve-source-failed"
+        with server._jobs_lock:
+            server._jobs[job_id] = make_job(job_id, service_id="echoagent-backend")
+            server._jobs[job_id]["frozen_inputs"] = {}
+        items = [{"service_id": "echoagent-backend", "branch": "main"}]
+        catalog = {svc["id"]: svc for svc in server.load_services()}
+
+        self.assertIsNone(server.prepare_job_frozen_inputs(job_id, items, catalog))
+
+        job = server._job_copy(job_id)
+        self.assertEqual("failed", job["status"])
+        self.assertEqual("source-resolution", job["stage"])
+        self.assertIn("SSH timeout", job["error"])
+
 
 class FleetRuntimeCacheTests(unittest.TestCase):
     @staticmethod
@@ -1537,6 +1568,20 @@ class JobEndpointTests(unittest.TestCase):
                 created = server._jobs[payload["job_id"]]
             self.assertEqual(overflow, created["service_id"])
             self.assertIn(created["status"], ("running", "queued"))
+
+    def test_push_responds_before_remote_source_revision_resolution(self) -> None:
+        payload = {"service_id": "echoagent-backend", "branch": "main"}
+        with patch.object(server, "cached_branches", return_value=["main"]), \
+                patch.object(server, "resolve_frozen_source_inputs", side_effect=AssertionError("must run in worker")) as resolve, \
+                patch.object(server, "run_push_job"):
+            with self._open(
+                "/api/push", data=json.dumps(payload).encode(), method="POST"
+            ) as response:
+                created = json.loads(response.read().decode("utf-8"))
+
+        self.assertTrue(created["job_id"])
+        resolve.assert_not_called()
+        self.assertEqual({}, server._job_copy(created["job_id"])["frozen_inputs"])
 
     def test_package_deploy_uses_existing_artifact_without_docker_check(self) -> None:
         release_template = next(

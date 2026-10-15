@@ -6114,6 +6114,33 @@ def resolve_frozen_source_inputs(
     return frozen_inputs
 
 
+def prepare_job_frozen_inputs(
+    job_id: str,
+    items: list[dict[str, str]],
+    catalog: dict[str, dict[str, Any]],
+) -> dict[str, str] | None:
+    """Resolve immutable source revisions inside the worker, not the HTTP request.
+
+    Remote Git lookup may take up to a minute.  Keeping it in the request handler
+    lets an ingress or reverse proxy return Bad Gateway before a job id exists.
+    API-triggered jobs already carry a caller-verified SHA and skip this lookup.
+    """
+    existing = dict((_job_copy(job_id) or {}).get("frozen_inputs") or {})
+    if existing:
+        return existing
+    set_job(job_id, stage="resolving-source", current="resolve branch revision")
+    append_job_log(job_id, "resolve immutable source revision")
+    try:
+        frozen_inputs = resolve_frozen_source_inputs(items, catalog, "code")
+    except (ValueError, TypeError, OSError, KeyError, RuntimeError) as exc:
+        error = "Source revision resolution failed: " + str(exc)
+        set_job(job_id, status="failed", stage="source-resolution", current="", error=error)
+        append_job_log(job_id, "ERROR " + error)
+        return None
+    set_job(job_id, frozen_inputs=frozen_inputs, current="")
+    return frozen_inputs
+
+
 def resolve_service_branch_sha(service: dict[str, Any], branch: str) -> str:
     """Resolve one branch tip from the configured source provider."""
     from frozen_builds import resolve as freeze_ref
@@ -9467,6 +9494,9 @@ def run_push_job(
             set_job(job_id, status="failed", error="no services selected")
             return
 
+        if prepare_job_frozen_inputs(job_id, items, catalog) is None:
+            return
+
         labels = ", ".join(
             f"{svc['id']}@{br}" + (f"[{version}]" if version else "")
             for svc, br, version in resolved
@@ -11321,11 +11351,10 @@ class Handler(SimpleHTTPRequestHandler):
             if ai_request:
                 frozen_inputs = {items[0]["service_id"]: str(ai_request["commit_sha"])}
             else:
-                try:
-                    frozen_inputs = resolve_frozen_source_inputs(items, catalog, deployment_type)
-                except (ValueError, TypeError, OSError, KeyError, RuntimeError) as exc:
-                    self._json(400, {"error": "Source revision resolution failed: " + str(exc)})
-                    return
+                # Remote SHA resolution belongs to the build worker.  Respond to
+                # the browser first so proxy timeouts cannot turn a valid run
+                # request into a Bad Gateway response.
+                frozen_inputs = {}
             try:
                 requested_steps = dict(data.get('optional_steps') or {})
                 requested_steps.update({
